@@ -628,6 +628,7 @@ name = "priel-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "crossterm",
  "priel-core",
  "priel-player",
