@@ -47,7 +47,7 @@ Where a seam does not exist yet, adding it is the preferred fix. Two known cases
   fresh" or "do nothing". Extract that into a function taking those inputs and returning an intent
   enum; `App` then applies the intent. The guards documented in `CLAUDE.md` become table-driven
   tests instead of comments pleading with the reader.
-- **`Client` hardcodes `const API` and builds its own reqwest client**, so nothing can point it at a
+- **`Client` hardcodes `const API` and builds its own `ureq::Agent`**, so nothing can point it at a
   local mock. Give it an injectable base URL and let the API tests run against a stub server.
 
 ### Running tests
@@ -104,8 +104,14 @@ Where a seam does not exist yet, adding it is the preferred fix. Two known cases
 
 ### Threads, locks and the audio deadline
 
-priel is **blocking and thread-based; there is no async runtime.** Do not introduce one, and do not
-add Tokio to pull in a single utility.
+priel is **blocking and thread-based; there is no async runtime anywhere in the tree.** Not in the
+code, and not transitively - the HTTP client is `ureq` precisely so that no executor is linked in.
+Do not introduce one, and treat a dependency that drags in Tokio as a dependency you are not adding.
+
+That is a deliberate fit for the domain, not inertia. libmpv's `stream_cb` `read` callback is a
+synchronous C function invoked from mpv's own demuxer thread, and it must block until bytes are
+available - you cannot `.await` there. The buffer would stay `Mutex` + `Condvar` under any model, so
+async would buy nothing at the one boundary where it would have to earn its keep.
 
 - Three long-lived threads (UI, worker, player) plus one downloader per buffered track. Ownership
   is strict: only the worker touches `Client`, only the player thread touches `Mpv`. Cross-thread
@@ -205,11 +211,16 @@ add Tokio to pull in a single utility.
 
 ### Dependencies
 
-- The dependency list is small and deliberate: rustls over OpenSSL to keep packaging simple,
-  blocking reqwest because there is no async runtime, libmpv behind a default-on feature.
-  Adding a crate needs a reason that beats writing the small version in-house.
-- Anything new must not break: the `--no-default-features` build, the no-OpenSSL guarantee, or
-  cross-platform buildability (crossterm, ratatui, rustls and libmpv are all portable; keep it so).
+- The dependency list is small and deliberate: rustls over OpenSSL to keep packaging simple, `ureq`
+  because it is blocking and pulls in no executor, libmpv behind a default-on feature. Adding a
+  crate needs a reason that beats writing the small version in-house.
+- Anything new must not break: the `--no-default-features` build, the no-OpenSSL guarantee,
+  the no-async-runtime guarantee, or cross-platform buildability (crossterm, ratatui, rustls and
+  libmpv are all portable; keep it so).
+- **HTTP is HTTP/1.1 only, and that is the right tool.** Segment fetches are a handful of
+  multi-megabyte GETs to one CDN host; parallel keep-alive connections give each its own congestion
+  window, where HTTP/2 would multiplex them onto one and add connection-level head-of-line
+  blocking. Concurrency for downloads comes from more connections, not from multiplexing.
 - A new dependency in `priel-core` or `priel-player` is also a new dependency for every future
   frontend. Weigh it there especially.
 
