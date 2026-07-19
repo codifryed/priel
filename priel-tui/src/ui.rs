@@ -390,24 +390,16 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
     reason = "display-only: seconds and volume percent are non-negative and rendered whole"
 )]
 fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
-    let l0 = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    };
-    let l1 = Rect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: 1,
-    };
-    let l2 = Rect {
-        x: area.x,
-        y: area.y + 2,
-        width: area.width,
-        height: 1,
-    };
+    // Split rather than offset from `area.y`: on a terminal too short for three
+    // rows, hand-computed offsets address cells outside the buffer and ratatui
+    // panics. A layout clamps to what exists, yielding empty rects instead.
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let (l0, l1, l2) = (rows[0], rows[1], rows[2]);
     app.progress_rect = l1;
 
     let s = &app.status;
@@ -728,10 +720,66 @@ fn fmt_hms(secs: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlBar, HINTS, HINTS_ESSENTIAL, button_style, hint_width, push_hints};
-    use crate::app::Hit;
+    use super::{ControlBar, HINTS, HINTS_ESSENTIAL, button_style, hint_width, push_hints, render};
+    use crate::app::{App, Hit, Mode, View};
+    use crate::worker::{FromWorker, ToWorker};
+    use priel_core::{Playlist, Track};
     use ratatui::layout::Rect;
     use ratatui::style::Style;
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::sync::mpsc::{Receiver, Sender};
+
+    /// Holds the worker channel ends alongside the app: dropping them would
+    /// disconnect the channels mid-test.
+    struct Screen {
+        app: App,
+        #[allow(dead_code, reason = "held to keep the worker channels alive")]
+        to_app: Sender<FromWorker>,
+        #[allow(dead_code, reason = "held to keep the worker channels alive")]
+        from_app: Receiver<ToWorker>,
+    }
+
+    /// A renderable app backed by a silent player and a rigged worker. The
+    /// channel ends are held so they do not disconnect mid-test.
+    fn screen() -> Screen {
+        let (app, to_app, from_app) = App::rigged();
+        Screen {
+            app,
+            to_app,
+            from_app,
+        }
+    }
+
+    fn track(id: u64, title: &str) -> Track {
+        Track {
+            id,
+            title: title.into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration: 245,
+            quality: "HI-RES".into(),
+        }
+    }
+
+    /// Render one frame and return it as plain text lines.
+    fn draw(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn text(app: &mut App, w: u16, h: u16) -> String {
+        draw(app, w, h).join("\n")
+    }
 
     fn row(width: u16) -> Rect {
         Rect {
@@ -843,5 +891,264 @@ mod tests {
         bar.button(" bbbb ", Hit::Next, button_style());
         assert_eq!(bar.hits.len(), 1, "only the control inside the row counts");
         assert_eq!(bar.hits[0].1, Hit::Prev);
+    }
+
+    // ---- whole-frame rendering ----
+
+    #[test]
+    fn the_favorites_view_shows_rows_with_metadata() {
+        // Goal: one real frame through the renderer. Track text, quality badge
+        // and duration all have to reach the screen.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Blue in Green")];
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains("Blue in Green"), "{out}");
+        assert!(out.contains("Artist"), "{out}");
+        assert!(out.contains("HI-RES"), "{out}");
+        assert!(out.contains("4:05"), "245s should render as 4:05: {out}");
+        assert!(out.contains("Favorites"), "{out}");
+    }
+
+    #[test]
+    fn the_playlists_view_shows_counts_and_a_running_time() {
+        // Goal: playlists render differently from tracks - count plus a h:mm:ss
+        // total rather than artist and quality.
+        let mut sc = screen();
+        sc.app.playlists = vec![Playlist {
+            uuid: "u".into(),
+            title: "Evening".into(),
+            num_tracks: 12,
+            duration: 3725,
+        }];
+        sc.app.view = View::Playlists;
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains("Evening"), "{out}");
+        assert!(out.contains("12"), "{out}");
+        assert!(out.contains("1:02:05"), "hours format: {out}");
+    }
+
+    #[test]
+    fn an_open_playlist_is_titled_by_its_name() {
+        // Goal: the drill-down has to say which playlist you are inside.
+        let mut sc = screen();
+        sc.app.view = View::PlaylistTracks;
+        sc.app.open_playlist = Some(("u".into(), "Late Night".into()));
+        sc.app.playlist_tracks = vec![track(2, "Track")];
+        assert!(text(&mut sc.app, 120, 12).contains("Late Night"));
+    }
+
+    #[test]
+    fn the_search_view_prompts_before_and_reports_after() {
+        // Goal: the three states of the search title - empty, typing, results.
+        let mut sc = screen();
+        sc.app.view = View::Search;
+        assert!(text(&mut sc.app, 120, 12).contains("Search"));
+
+        sc.app.mode = Mode::Search;
+        sc.app.search_query = "miles".into();
+        assert!(text(&mut sc.app, 120, 12).contains("miles"));
+
+        sc.app.mode = Mode::Normal;
+        sc.app.search_tracks = vec![track(3, "Milestones")];
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains("Milestones"), "{out}");
+        assert!(out.contains("results"), "{out}");
+    }
+
+    #[test]
+    fn a_filter_is_shown_in_the_header_while_it_is_being_typed() {
+        // Goal: the filter is modal and easy to forget you are in; it must be
+        // visible on screen.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Blue")];
+        sc.app.mode = Mode::Filter;
+        sc.app.filter = "blu".into();
+        assert!(text(&mut sc.app, 120, 12).contains("/blu"));
+    }
+
+    #[test]
+    fn the_now_playing_row_shows_the_track_and_source() {
+        // Goal: the badge is the point of a hi-res client - it must show what is
+        // actually being fed to the DAC.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "So What"));
+        sc.app.now_meta = crate::app::StreamMeta {
+            bit_depth: 24,
+            sample_rate: 192_000,
+            codec: "flac".into(),
+            quality: "HI_RES_LOSSLESS".into(),
+        };
+        sc.app.status.duration = 245.0;
+        sc.app.status.position = 61.0;
+        sc.app.status.playing = true;
+        sc.app.status.sample_rate = 192_000;
+        sc.app.status.out_format = "s32".into();
+
+        let out = text(&mut sc.app, 130, 12);
+        assert!(out.contains("So What"), "{out}");
+        assert!(out.contains("24"), "bit depth: {out}");
+        assert!(out.contains("192"), "sample rate: {out}");
+        assert!(out.contains("1:01"), "position: {out}");
+        assert!(out.contains("DAC"), "{out}");
+    }
+
+    #[test]
+    fn nothing_playing_still_renders_a_complete_frame() {
+        // Goal: the first frame, before any track exists, must not be blank or
+        // panic on the missing metadata.
+        let mut sc = screen();
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains("Nothing playing"), "{out}");
+        assert!(out.contains("quit"), "the reference is always up: {out}");
+    }
+
+    #[test]
+    fn activity_shows_one_state_at_a_time() {
+        // Goal: resolving, buffering and buffered are mutually exclusive; two at
+        // once would mean the slot is lying about one of them.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "T"));
+        let buffering = text(&mut sc.app, 130, 12);
+        assert!(buffering.contains("buffering"), "{buffering}");
+
+        sc.app.status.loaded = true;
+        sc.app.status.playing = true;
+        sc.app.status.cache_secs = 42.0;
+        let buffered = text(&mut sc.app, 130, 12);
+        assert!(buffered.contains("42s buffered"), "{buffered}");
+        assert!(!buffered.contains("buffering"), "{buffered}");
+    }
+
+    #[test]
+    fn long_titles_are_truncated_with_an_ellipsis() {
+        // Goal: an over-long title must not push the columns out of alignment.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, &"x".repeat(120))];
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains('…'), "expected an ellipsis in {out}");
+    }
+
+    #[test]
+    fn the_shuffle_and_queue_indicators_appear_when_active() {
+        // Goal: both are state the user has to be able to see at a glance.
+        let mut sc = screen();
+        sc.app.shuffle = true;
+        sc.app.queue = vec![track(1, "A"), track(2, "B")];
+        sc.app.queue_pos = 1;
+        let out = text(&mut sc.app, 130, 12);
+        assert!(out.contains("queue 2/2"), "{out}");
+    }
+
+    // ---- the overlay ----
+
+    #[test]
+    fn the_help_overlay_covers_the_list_and_says_how_to_close() {
+        // Goal: it is modal, so it must actually obscure what is behind it, and
+        // it must always show the way out.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Hidden Title")];
+        let before = text(&mut sc.app, 100, 26);
+        assert!(before.contains("Hidden Title"));
+
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 100, 26);
+        assert!(out.contains("Keyboard and mouse"), "{out}");
+        assert!(out.contains("to close"), "{out}");
+        assert!(
+            out.contains("Mouse"),
+            "the mouse gestures are documented: {out}"
+        );
+        assert!(
+            !out.contains("Hidden Title"),
+            "the list should be covered: {out}"
+        );
+    }
+
+    #[test]
+    fn the_overlay_stacks_into_one_column_on_a_narrow_terminal() {
+        // Goal: two columns on a narrow screen clip every description in half.
+        // Stacking keeps the text readable instead.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let narrow = text(&mut sc.app, 60, 40);
+        assert!(narrow.contains("Views"), "{narrow}");
+        assert!(narrow.contains("Mouse"), "{narrow}");
+        assert!(narrow.contains("to close"), "{narrow}");
+    }
+
+    #[test]
+    fn a_tiny_terminal_renders_without_panicking() {
+        // Goal: every rect here is computed by hand from the frame size. A
+        // terminal smaller than the layout expects must clamp, not overflow.
+        for (w, h) in [(1u16, 1u16), (5, 3), (20, 5), (40, 6)] {
+            let mut sc = screen();
+            sc.app.favorites = vec![track(1, "T")];
+            sc.app.now_playing = Some(track(1, "T"));
+            let _ = draw(&mut sc.app, w, h);
+            sc.app.mode = Mode::Help;
+            let _ = draw(&mut sc.app, w, h);
+        }
+    }
+
+    // ---- render feeds the mouse ----
+
+    #[test]
+    fn rendering_publishes_hit_boxes_that_clicking_a_tab_then_uses() {
+        // Goal: the round trip that makes the mouse work - the renderer records
+        // geometry, the app acts on it. Testing them apart would miss a drift
+        // between the two.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 120, 12);
+        let (rect, _) = *sc
+            .app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == Hit::View(View::Search))
+            .expect("the search tab should be clickable");
+
+        sc.app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(sc.app.view, View::Search);
+    }
+
+    #[test]
+    fn the_list_rect_recorded_by_the_renderer_maps_clicks_to_rows() {
+        // Goal: `list_inner` is written during render and read by the click
+        // handler; if the layout moves and this does not, clicks hit the wrong
+        // row.
+        let mut sc = screen();
+        sc.app.favorites = (0..8).map(|i| track(i, "T")).collect();
+        let _ = draw(&mut sc.app, 120, 14);
+        let inner = sc.app.list_inner;
+        assert!(inner.height > 0, "the list must have been given a rect");
+
+        sc.app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: inner.x + 1,
+            row: inner.y + 2,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(sc.app.selected, 2, "the third visible row");
+    }
+
+    #[test]
+    fn scrolling_keeps_the_selection_on_screen() {
+        // Goal: the list window follows the cursor. Without this the selection
+        // walks off the bottom and the user is moving something invisible.
+        let mut sc = screen();
+        sc.app.favorites = (0..50).map(|i| track(i, "T")).collect();
+        let _ = draw(&mut sc.app, 120, 12);
+        sc.app.selected = 40;
+        let _ = draw(&mut sc.app, 120, 12);
+        assert!(sc.app.list_offset > 0, "the window should have scrolled");
+        assert!(
+            sc.app.selected >= sc.app.list_offset
+                && sc.app.selected < sc.app.list_offset + sc.app.list_inner.height as usize,
+            "the selection must stay inside the window"
+        );
     }
 }

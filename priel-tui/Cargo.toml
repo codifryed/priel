@@ -22,5 +22,8 @@ ratatui = "0.29"
 crossterm = "0.28"
 rand = "0.8"
 
+[dev-dependencies]
+base64.workspace = true
+
 [lints]
 workspace = true

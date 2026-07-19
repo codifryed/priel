@@ -32,6 +32,9 @@ use ratatui::layout::Rect;
 use priel_core::{Playlist, Track};
 use priel_player::{PlaybackStatus, Player};
 
+#[cfg(test)]
+use std::sync::mpsc::{Receiver, Sender};
+
 use crate::worker::{self, FromWorker, ToWorker, Worker};
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -66,7 +69,7 @@ pub enum Hit {
     Quit,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Mode {
     Normal,
     Filter, // local filter of the current list
@@ -158,7 +161,25 @@ impl App {
     pub fn new(device: Option<String>, token_path: String) -> anyhow::Result<Self> {
         let player = Player::new(device)?;
         let worker = worker::spawn(token_path);
-        Ok(Self {
+        Ok(Self::with(player, worker))
+    }
+
+    /// An app with a silent player and a worker whose channels the caller holds.
+    /// Shared by the app and renderer tests; the returned ends must be kept
+    /// alive for the duration of a test or the channels report disconnected.
+    #[cfg(test)]
+    pub fn rigged() -> (Self, Sender<FromWorker>, Receiver<ToWorker>) {
+        let (worker, to_app, from_app) = Worker::rigged();
+        let player = Player::new(Some("null".into())).expect("player");
+        (Self::with(player, worker), to_app, from_app)
+    }
+
+    /// Assemble an app around ready-made parts.
+    ///
+    /// Separate from `new` so tests can supply a silent player and a rigged
+    /// worker; without this seam none of the queue orchestration is reachable.
+    pub fn with(player: Player, worker: Worker) -> Self {
+        Self {
             player,
             worker,
             view: View::Favorites,
@@ -193,7 +214,7 @@ impl App {
             last_click: None,
             dirty: true,
             last_sig: RenderSig::default(),
-        })
+        }
     }
 
     pub fn start(&self) {
@@ -338,8 +359,19 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
-        self.frame = self.frame.wrapping_add(1);
         self.status = self.player.status();
+        self.refresh_from_status();
+    }
+
+    /// The half of `refresh` that reacts to `self.status`, split out so tests can
+    /// drive playback states the null player will never produce on its own.
+    #[cfg(test)]
+    fn refresh_for_test(&mut self) {
+        self.refresh_from_status();
+    }
+
+    fn refresh_from_status(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
 
         let sig = self.render_sig();
         if sig != self.last_sig {
@@ -401,6 +433,9 @@ impl App {
         self.selected = 0;
         self.list_offset = 0;
         self.filter.clear();
+        // Leaving a view leaves its input mode with it. Without this, clicking a
+        // tab while filtering strands the user in a text mode whose text is gone.
+        self.mode = Mode::Normal;
         match v {
             View::Playlists if self.playlists.is_empty() => {
                 self.loading = true;
@@ -664,6 +699,10 @@ impl App {
     fn on_key_search(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
+            // Printable keys are query text - "1999" is a legitimate search - so
+            // Tab is the one view-switch that has to keep working from in here,
+            // or the search box becomes a trap with no keyboard way out.
+            KeyCode::Tab => self.cycle_view(),
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
                 let q = self.search_query.trim().to_string();
@@ -857,6 +896,85 @@ fn row_matches(primary: &str, secondary: &str, filter_lower: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use priel_core::{PlayableSource, ResolvedStream};
+
+    struct Rig {
+        app: App,
+        to_app: Sender<FromWorker>,
+        from_app: Receiver<ToWorker>,
+    }
+
+    /// An app with a silent player and a worker whose both ends the test holds.
+    fn rig() -> Rig {
+        let (app, to_app, from_app) = App::rigged();
+        Rig {
+            app,
+            to_app,
+            from_app,
+        }
+    }
+
+    fn track(id: u64, title: &str, artist: &str) -> Track {
+        Track {
+            id,
+            title: title.into(),
+            artist: artist.into(),
+            album: "Alb".into(),
+            duration: 100,
+            quality: "HI-RES".into(),
+        }
+    }
+
+    fn playlist(uuid: &str, title: &str) -> Playlist {
+        Playlist {
+            uuid: uuid.into(),
+            title: title.into(),
+            num_tracks: 2,
+            duration: 200,
+        }
+    }
+
+    fn stream(id: u64) -> ResolvedStream {
+        ResolvedStream {
+            source: PlayableSource::Direct(format!("http://127.0.0.1:1/{id}")),
+            sample_rate: 192_000,
+            bit_depth: 24,
+            codec: "flac".into(),
+            quality: "HI_RES_LOSSLESS".into(),
+        }
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn code(k: KeyCode) -> KeyEvent {
+        KeyEvent::new(k, KeyModifiers::NONE)
+    }
+
+    fn click(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn requests(r: &Rig) -> Vec<ToWorker> {
+        r.from_app.try_iter().collect()
+    }
+
+    fn resolved_ids(reqs: &[ToWorker]) -> Vec<u64> {
+        reqs.iter()
+            .filter_map(|c| match c {
+                ToWorker::Resolve(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
     use super::row_matches;
 
     #[test]
@@ -888,5 +1006,921 @@ mod tests {
         // Goal: playlists pass "" as the second field; that must not turn into a
         // match for every possible filter via the empty-string-contains rule.
         assert!(!row_matches("Evening", "", "z"));
+    }
+
+    // ---- startup and worker traffic ----
+
+    #[test]
+    fn startup_asks_for_favorites_and_says_it_is_loading() {
+        // Goal: the first frame must not look like an empty library.
+        let r = rig();
+        r.app.start();
+        assert!(matches!(requests(&r)[..], [ToWorker::LoadFavorites]));
+        assert!(r.app.loading);
+    }
+
+    #[test]
+    fn arriving_favorites_replace_the_list_and_clear_loading() {
+        // Goal: the worker reply is the only thing that ends the loading state.
+        let mut r = rig();
+        r.to_app
+            .send(FromWorker::Favorites(vec![track(1, "A", "X")]))
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(r.app.favorites.len(), 1);
+        assert!(!r.app.loading);
+        assert!(r.app.notice.as_deref().unwrap().contains('1'));
+    }
+
+    #[test]
+    fn a_worker_error_becomes_a_visible_notice() {
+        // Goal: errors are the user's only feedback that something broke, and
+        // they must not leave the spinner running forever.
+        let mut r = rig();
+        r.app.loading = true;
+        r.to_app
+            .send(FromWorker::Error("token: expired".into()))
+            .unwrap();
+        r.app.drain_worker();
+        assert!(r.app.notice.as_deref().unwrap().contains("expired"));
+        assert!(!r.app.loading);
+    }
+
+    #[test]
+    fn playlist_tracks_for_a_playlist_no_longer_open_are_discarded() {
+        // Goal: replies are correlated by uuid, not arrival order. A slow reply
+        // for a playlist the user already left must not overwrite the new one.
+        let mut r = rig();
+        r.app.playlists = vec![playlist("wanted", "W")];
+        r.to_app
+            .send(FromWorker::PlaylistTracks(
+                "stale".into(),
+                vec![track(9, "S", "S")],
+            ))
+            .unwrap();
+        r.app.drain_worker();
+        assert!(
+            r.app.playlist_tracks.is_empty(),
+            "a stale reply must be dropped"
+        );
+    }
+
+    // ---- views and navigation ----
+
+    #[test]
+    fn number_keys_and_tab_move_between_views() {
+        // Goal: both routes to a view must agree, and Tab has to cycle back
+        // round rather than stopping at the last one.
+        let mut r = rig();
+        r.app.on_key(key('2'));
+        assert_eq!(r.app.view, View::Playlists);
+        r.app.on_key(key('1'));
+        assert_eq!(r.app.view, View::Favorites);
+
+        r.app.on_key(code(KeyCode::Tab));
+        assert_eq!(r.app.view, View::Playlists);
+        r.app.on_key(code(KeyCode::Tab));
+        assert_eq!(r.app.view, View::Search);
+        assert_eq!(
+            r.app.mode,
+            Mode::Search,
+            "an empty search starts in the box"
+        );
+
+        // Digits are query text once the box is open, so Tab has to be the way
+        // out - and it must restore Normal mode on the way.
+        r.app.on_key(key('1'));
+        assert_eq!(
+            r.app.view,
+            View::Search,
+            "a digit types, it does not switch"
+        );
+        r.app.on_key(code(KeyCode::Tab));
+        assert_eq!(r.app.view, View::Favorites, "Tab wraps around");
+        assert_eq!(r.app.mode, Mode::Normal, "and leaves the input mode behind");
+    }
+
+    #[test]
+    fn opening_the_playlists_view_fetches_them_only_once() {
+        // Goal: switching views repeatedly should not re-fetch a list already
+        // held; the request is what costs a round trip.
+        let mut r = rig();
+        r.app.on_key(key('2'));
+        assert!(matches!(requests(&r)[..], [ToWorker::LoadPlaylists]));
+
+        r.to_app
+            .send(FromWorker::Playlists(vec![playlist("u", "P")]))
+            .unwrap();
+        r.app.drain_worker();
+        r.app.on_key(key('1'));
+        r.app.on_key(key('2'));
+        assert!(requests(&r).is_empty(), "already loaded, no second fetch");
+    }
+
+    #[test]
+    fn entering_a_playlist_loads_its_tracks_and_escape_goes_back() {
+        // Goal: the drill-down is the one nested view, and Esc is the only way
+        // out of it.
+        let mut r = rig();
+        r.app.playlists = vec![playlist("uuid-1", "Mix")];
+        r.app.view = View::Playlists;
+        r.app.on_key(code(KeyCode::Enter));
+
+        assert_eq!(r.app.view, View::PlaylistTracks);
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadPlaylistTracks(ref u)] if u == "uuid-1"
+        ));
+
+        r.to_app
+            .send(FromWorker::PlaylistTracks(
+                "uuid-1".into(),
+                vec![track(4, "T", "A")],
+            ))
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(r.app.playlist_tracks.len(), 1);
+
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.view, View::Playlists);
+    }
+
+    #[test]
+    fn movement_keys_stay_inside_the_list() {
+        // Goal: selection is an index into the *visible* rows; running off
+        // either end would panic on the next render.
+        let mut r = rig();
+        r.app.favorites = (0..5).map(|i| track(i, "T", "A")).collect();
+        r.app.list_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+
+        r.app.on_key(key('G'));
+        assert_eq!(r.app.selected, 4);
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.selected, 4, "cannot move past the last row");
+        r.app.on_key(key('g'));
+        assert_eq!(r.app.selected, 0);
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.selected, 0, "cannot move above the first row");
+
+        r.app.on_key(key('J'));
+        assert!(r.app.selected > 0, "page down moves by a screenful");
+        r.app.on_key(key('K'));
+        assert_eq!(r.app.selected, 0);
+
+        r.app
+            .on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(r.app.selected > 0, "ctrl-d is a half page");
+        r.app
+            .on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(r.app.selected, 0);
+    }
+
+    #[test]
+    fn an_empty_list_survives_every_movement_key() {
+        // Goal: before the first reply arrives the list is empty; none of these
+        // may index into it.
+        let mut r = rig();
+        for k in ['j', 'k', 'g', 'G', 'J', 'K'] {
+            r.app.on_key(key(k));
+        }
+        assert_eq!(r.app.selected, 0);
+        assert!(r.app.visible().is_empty());
+    }
+
+    // ---- filtering and search ----
+
+    #[test]
+    fn typing_a_filter_narrows_the_visible_rows_and_escape_restores_them() {
+        // Goal: the filter is local and non-destructive - Esc must bring the
+        // full list back rather than requiring a refetch.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "Blue", "Miles"), track(2, "Red", "Bill")];
+
+        r.app.on_key(key('/'));
+        assert_eq!(r.app.mode, Mode::Filter);
+        for c in "blue".chars() {
+            r.app.on_key(key(c));
+        }
+        assert_eq!(r.app.visible(), vec![0]);
+
+        r.app.on_key(code(KeyCode::Backspace));
+        assert_eq!(r.app.filter, "blu");
+
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(
+            r.app.mode,
+            Mode::Normal,
+            "Enter keeps the filter, leaves the mode"
+        );
+        assert_eq!(r.app.visible(), vec![0]);
+
+        r.app.on_key(key('/'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert!(r.app.filter.is_empty());
+        assert_eq!(r.app.visible(), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_search_is_only_sent_when_the_query_is_not_blank() {
+        // Goal: an accidental Enter on an empty box should not cost a request.
+        let mut r = rig();
+        r.app.on_key(key('3'));
+        assert_eq!(
+            r.app.mode,
+            Mode::Search,
+            "the search view starts in edit mode"
+        );
+
+        r.app.on_key(code(KeyCode::Enter));
+        assert!(requests(&r).is_empty(), "a blank query is not a search");
+
+        r.app.on_key(key('i'));
+        for c in "mile".chars() {
+            r.app.on_key(key(c));
+        }
+        r.app.on_key(code(KeyCode::Backspace));
+        r.app.on_key(code(KeyCode::Enter));
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::Search(ref q)] if q == "mil"
+        ));
+
+        r.to_app
+            .send(FromWorker::SearchResults(priel_core::SearchResults {
+                tracks: vec![track(3, "Milestones", "Miles")],
+                playlists: vec![],
+            }))
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(r.app.search_tracks.len(), 1);
+    }
+
+    #[test]
+    fn escape_leaves_the_search_box_without_searching() {
+        // Goal: Esc is cancel everywhere; it must not fire a request.
+        let mut r = rig();
+        r.app.on_key(key('3'));
+        r.app.on_key(key('x'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(requests(&r).is_empty());
+    }
+
+    // ---- the play queue ----
+
+    #[test]
+    fn playing_a_row_builds_a_queue_and_resolves_that_track() {
+        // Goal: the queue is built from what is *visible*, so a filtered list
+        // plays only the rows the user can see.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "Y"), track(3, "C", "Z")];
+        r.app.selected = 1;
+        r.app.on_key(code(KeyCode::Enter));
+
+        assert_eq!(r.app.queue.len(), 3);
+        assert_eq!(r.app.queue_pos, 1);
+        assert_eq!(r.app.now_playing.as_ref().unwrap().id, 2);
+        assert_eq!(resolved_ids(&requests(&r)), vec![2]);
+        assert!(
+            r.app.is_resolving(),
+            "the spinner runs until the stream arrives"
+        );
+    }
+
+    #[test]
+    fn a_resolved_stream_starts_playback_and_preloads_the_next() {
+        // Goal: this is the gapless pipeline. Once the current track resolves,
+        // the following one must be requested straight away or the transition
+        // has nothing preloaded to move to.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        r.to_app.send(FromWorker::Resolved(1, stream(1))).unwrap();
+        r.app.drain_worker();
+
+        assert!(!r.app.is_resolving());
+        assert_eq!(
+            r.app.now_meta.sample_rate, 192_000,
+            "the badge reads from here"
+        );
+        assert_eq!(
+            resolved_ids(&requests(&r)),
+            vec![2],
+            "the next is preloaded"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_arrives_for_a_track_we_left_is_ignored() {
+        // Goal: replies are matched by id. A late reply for an abandoned track
+        // must not hijack playback.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X")];
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        r.to_app
+            .send(FromWorker::Resolved(999, stream(999)))
+            .unwrap();
+        r.app.drain_worker();
+        assert!(
+            r.app.is_resolving(),
+            "still waiting for the track we asked for"
+        );
+    }
+
+    #[test]
+    fn the_last_track_in_a_queue_has_nothing_to_preload() {
+        // Goal: scheduling past the end would request a track that does not
+        // exist and leave the queue indicator wrong.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X")];
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+        r.to_app.send(FromWorker::Resolved(1, stream(1))).unwrap();
+        r.app.drain_worker();
+        assert!(resolved_ids(&requests(&r)).is_empty());
+    }
+
+    #[test]
+    fn skipping_forward_without_a_preload_loads_the_next_track_fresh() {
+        // Goal: the user can outrun the preloader; skip must still work, just
+        // with a resolve first.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        r.app.on_key(key('n'));
+        assert_eq!(r.app.queue_pos, 1);
+        assert_eq!(resolved_ids(&requests(&r)), vec![2]);
+    }
+
+    #[test]
+    fn previous_restarts_the_track_before_it_steps_back() {
+        // Goal: the familiar transport behaviour - `p` part-way through a track
+        // returns to its start, and only steps back when already near the start.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.selected = 1;
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        r.app.status.position = 30.0;
+        r.app.on_key(key('p'));
+        assert_eq!(r.app.queue_pos, 1, "still on the same track");
+        assert!(resolved_ids(&requests(&r)).is_empty(), "a seek, not a load");
+
+        r.app.status.position = 1.0;
+        r.app.on_key(key('p'));
+        assert_eq!(r.app.queue_pos, 0);
+        assert_eq!(resolved_ids(&requests(&r)), vec![1]);
+    }
+
+    #[test]
+    fn transport_keys_on_an_empty_queue_do_nothing() {
+        // Goal: pressing skip before anything plays must not panic or request.
+        let mut r = rig();
+        r.app.on_key(key('n'));
+        r.app.on_key(key('p'));
+        assert!(requests(&r).is_empty());
+        assert!(r.app.now_playing.is_none());
+    }
+
+    #[test]
+    fn shuffle_from_a_standstill_starts_playing_something() {
+        // Goal: toggling shuffle with nothing playing is a play command, which
+        // is what makes it usable as the "just play music" button.
+        let mut r = rig();
+        r.app.favorites = (1..=5).map(|i| track(i, "T", "A")).collect();
+        r.app.on_key(key('s'));
+
+        assert!(r.app.shuffle);
+        assert!(r.app.now_playing.is_some());
+        assert_eq!(resolved_ids(&requests(&r)).len(), 1);
+
+        r.app.on_key(key('s'));
+        assert!(!r.app.shuffle);
+        assert!(r.app.notice.as_deref().unwrap().contains("OFF"));
+    }
+
+    #[test]
+    fn shuffle_never_picks_the_track_already_playing() {
+        // Goal: a random pick that lands on the current track looks like a
+        // freeze. With one track there is nothing else to choose.
+        let mut r = rig();
+        r.app.queue = (1..=4).map(|i| track(i, "T", "A")).collect();
+        r.app.shuffle = true;
+        for pos in 0..4 {
+            r.app.queue_pos = pos;
+            for _ in 0..25 {
+                assert_ne!(r.app.rand_other(), pos, "must move somewhere else");
+            }
+        }
+        r.app.queue.truncate(1);
+        r.app.queue_pos = 0;
+        assert_eq!(r.app.rand_other(), 0, "a single-track queue stays put");
+    }
+
+    #[test]
+    fn a_gapless_handover_follows_mpv_to_the_new_track() {
+        // Goal: mpv advances on its own, so the app learns about it from
+        // current_id. Missing this leaves the now-playing bar on the old track.
+        let mut r = rig();
+        r.app.queue = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.now_playing = Some(track(1, "A", "X"));
+        r.app.expected_id = 1;
+
+        r.app.status.current_id = 2;
+        r.app.status.playing = true;
+        r.app.refresh_for_test();
+
+        assert_eq!(r.app.queue_pos, 1);
+        assert_eq!(r.app.now_playing.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn the_end_of_queue_fallback_only_fires_once_playback_really_stopped() {
+        // Goal: this guard is the runaway bug. While audio is still flowing the
+        // fallback must stay quiet, or it walks the whole queue in one tick.
+        let mut r = rig();
+        r.app.queue = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.now_playing = Some(track(1, "A", "X"));
+        r.app.queue_pos = 0;
+        r.app.expected_id = 1;
+
+        r.app.status.ended = true;
+        r.app.status.playing = true;
+        r.app.refresh_for_test();
+        assert_eq!(r.app.queue_pos, 0, "must not advance while audio plays");
+
+        r.app.status.playing = false;
+        r.app.refresh_for_test();
+        assert_eq!(r.app.queue_pos, 1, "a genuinely stopped player advances");
+
+        let before = r.app.queue_pos;
+        r.app.refresh_for_test();
+        assert_eq!(r.app.queue_pos, before, "and it fires only once");
+    }
+
+    #[test]
+    fn a_paused_player_at_the_end_does_not_advance() {
+        // Goal: pause at the last moment of a track is not the end of a track.
+        let mut r = rig();
+        r.app.queue = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.now_playing = Some(track(1, "A", "X"));
+        r.app.expected_id = 1;
+        r.app.status.ended = true;
+        r.app.status.paused = true;
+        r.app.refresh_for_test();
+        assert_eq!(r.app.queue_pos, 0);
+    }
+
+    #[test]
+    fn the_queue_indicator_counts_from_one() {
+        // Goal: it is user-facing, so it is 1-based while queue_pos is not.
+        let mut r = rig();
+        assert!(r.app.queue_indicator().is_none());
+        r.app.queue = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.queue_pos = 1;
+        assert_eq!(r.app.queue_indicator().unwrap(), "2/2");
+    }
+
+    #[test]
+    fn buffering_is_only_reported_between_resolving_and_audio() {
+        // Goal: the activity slot shows one thing at a time, and "buffering"
+        // must not linger once playback starts or after it ends.
+        let mut r = rig();
+        assert!(!r.app.is_buffering(), "nothing playing is not buffering");
+
+        r.app.now_playing = Some(track(1, "A", "X"));
+        assert!(r.app.is_buffering());
+
+        r.app.status.playing = true;
+        assert!(!r.app.is_buffering());
+
+        r.app.status.playing = false;
+        r.app.status.paused = true;
+        assert!(!r.app.is_buffering(), "paused is not buffering");
+    }
+
+    #[test]
+    fn the_spinner_cycles_through_its_frames() {
+        // Goal: a spinner that never changes frame reads as a hang.
+        let mut r = rig();
+        let first = r.app.spinner();
+        r.app.frame += 1;
+        assert_ne!(first, r.app.spinner());
+    }
+
+    // ---- mouse ----
+
+    #[test]
+    fn clicking_a_registered_control_runs_its_action() {
+        // Goal: hit boxes come from the renderer, and a click inside one must
+        // dispatch exactly the action a key press would.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X")];
+        r.app.hits = vec![
+            (
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 5,
+                    height: 1,
+                },
+                Hit::View(View::Search),
+            ),
+            (
+                Rect {
+                    x: 10,
+                    y: 0,
+                    width: 3,
+                    height: 1,
+                },
+                Hit::Shuffle,
+            ),
+        ];
+
+        r.app.on_mouse(click(2, 0));
+        assert_eq!(r.app.view, View::Search);
+
+        r.app.on_mouse(click(11, 0));
+        assert!(r.app.shuffle);
+    }
+
+    #[test]
+    fn a_click_outside_every_control_is_harmless() {
+        // Goal: most of the screen is not a control; clicking it must not
+        // dispatch the nearest one.
+        let mut r = rig();
+        r.app.hits = vec![(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 1,
+            },
+            Hit::Shuffle,
+        )];
+        r.app.on_mouse(click(50, 20));
+        assert!(!r.app.shuffle);
+    }
+
+    #[test]
+    fn the_scroll_wheel_moves_the_selection() {
+        // Goal: scrolling is the most-used mouse gesture in the list.
+        let mut r = rig();
+        r.app.favorites = (0..5).map(|i| track(i, "T", "A")).collect();
+        r.app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(r.app.selected, 1);
+        r.app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(r.app.selected, 0);
+    }
+
+    #[test]
+    fn mouse_motion_changes_nothing_and_forces_no_redraw() {
+        // Goal: motion events arrive in floods. Treating them as changes turned
+        // a mouse sweep across the terminal into a full-speed render loop.
+        let mut r = rig();
+        let _ = r.app.take_dirty();
+        r.app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!r.app.take_dirty(), "motion must not mark the screen dirty");
+    }
+
+    #[test]
+    fn clicking_a_row_selects_it_and_a_double_click_plays_it() {
+        // Goal: single click selects, double click plays - the list gesture
+        // everyone expects from a file manager.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.list_inner = Rect {
+            x: 0,
+            y: 5,
+            width: 40,
+            height: 4,
+        };
+
+        r.app.on_mouse(click(3, 6));
+        assert_eq!(r.app.selected, 1);
+        assert!(r.app.now_playing.is_none(), "one click only selects");
+
+        r.app.on_mouse(click(3, 6));
+        assert_eq!(r.app.now_playing.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn clicking_the_progress_bar_seeks_proportionally() {
+        // Goal: the bar is a scrubber; the click position maps to a fraction of
+        // the track, and a zero-length track must not divide by zero.
+        let mut r = rig();
+        r.app.progress_rect = Rect {
+            x: 0,
+            y: 9,
+            width: 100,
+            height: 1,
+        };
+        r.app.status.duration = 0.0;
+        r.app.on_mouse(click(50, 9)); // must not panic
+
+        r.app.status.duration = 200.0;
+        r.app.on_mouse(click(50, 9));
+        r.app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 75,
+            row: 9,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    // ---- help overlay ----
+
+    #[test]
+    fn question_mark_opens_the_reference_and_it_swallows_input() {
+        // Goal: modal means modal - keys behind it must not reach the list, or
+        // the user quits the app while reading how to quit the app.
+        let mut r = rig();
+        r.app.favorites = (0..5).map(|i| track(i, "T", "A")).collect();
+        r.app.on_key(key('?'));
+        assert_eq!(r.app.mode, Mode::Help);
+
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.selected, 0, "movement must not leak through");
+        r.app.on_key(key('q'));
+        assert_eq!(r.app.mode, Mode::Normal, "q closes the overlay");
+        assert!(!r.app.should_quit, "and does not quit the app");
+
+        for closer in [KeyCode::Esc, KeyCode::Enter] {
+            r.app.on_key(key('?'));
+            r.app.on_key(code(closer));
+            assert_eq!(r.app.mode, Mode::Normal);
+        }
+    }
+
+    #[test]
+    fn a_click_dismisses_the_reference_without_activating_anything() {
+        // Goal: clicking to dismiss must not also press whatever control sits
+        // under the pointer.
+        let mut r = rig();
+        r.app.hits = vec![(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 5,
+                height: 1,
+            },
+            Hit::Shuffle,
+        )];
+        r.app.on_key(key('?'));
+        r.app.on_mouse(click(1, 0));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(!r.app.shuffle, "the click was consumed by the overlay");
+    }
+
+    // ---- redraw gating ----
+
+    #[test]
+    fn only_real_changes_request_a_redraw() {
+        // Goal: an idle player must cost no rendering at all. This is the whole
+        // point of the dirty flag.
+        let mut r = rig();
+        let _ = r.app.take_dirty();
+        r.app.refresh_for_test();
+        assert!(!r.app.take_dirty(), "an unchanged tick draws nothing");
+
+        r.app.status.position = 9.0;
+        r.app.refresh_for_test();
+        assert!(
+            r.app.take_dirty(),
+            "a moving position redraws the progress bar"
+        );
+
+        r.app.on_key(key('j'));
+        assert!(r.app.take_dirty(), "input always redraws");
+    }
+
+    #[test]
+    fn a_running_spinner_keeps_redrawing() {
+        // Goal: while resolving, the frame counter is the only thing changing,
+        // so the signature has to include it or the spinner freezes.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X")];
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = r.app.take_dirty();
+        r.app.refresh_for_test();
+        assert!(r.app.take_dirty(), "the spinner must keep animating");
+    }
+
+    #[test]
+    fn quit_is_reachable_from_a_key_and_a_hint_click() {
+        // Goal: both routes exist and both must work; the hint key *is* the
+        // quit button, so there is no separate control to test.
+        let mut r = rig();
+        r.app.on_key(key('q'));
+        assert!(r.app.should_quit);
+
+        let mut r = rig();
+        r.app.hits = vec![(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            Hit::Quit,
+        )];
+        r.app.on_mouse(click(0, 0));
+        assert!(r.app.should_quit);
+    }
+
+    #[test]
+    fn a_key_release_is_not_a_key_press() {
+        // Goal: terminals that report both would otherwise run every action
+        // twice.
+        let mut r = rig();
+        r.app.on_key(KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(!r.app.should_quit);
+    }
+
+    #[test]
+    fn every_clickable_control_dispatches_to_a_real_action() {
+        // Goal: `Hit` is the contract between the renderer and the input layer.
+        // A variant wired to nothing compiles fine and silently produces a dead
+        // button, so every one is exercised here.
+        let mut r = rig();
+        r.app.favorites = (1..=5).map(|i| track(i, "T", "A")).collect();
+        r.app.queue = r.app.favorites.clone();
+        r.app.now_playing = Some(track(1, "T", "A"));
+
+        let fire = |app: &mut App, h: Hit| {
+            app.mode = Mode::Normal;
+            app.hits = vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                },
+                h,
+            )];
+            app.on_mouse(click(1, 0));
+        };
+
+        fire(&mut r.app, Hit::MoveDown);
+        assert_eq!(r.app.selected, 1);
+        fire(&mut r.app, Hit::Bottom);
+        assert_eq!(r.app.selected, 4);
+        fire(&mut r.app, Hit::MoveUp);
+        assert_eq!(r.app.selected, 3);
+        fire(&mut r.app, Hit::Top);
+        assert_eq!(r.app.selected, 0);
+
+        fire(&mut r.app, Hit::Shuffle);
+        assert!(r.app.shuffle);
+        fire(&mut r.app, Hit::CycleView);
+        assert_eq!(r.app.view, View::Playlists);
+        fire(&mut r.app, Hit::View(View::Favorites));
+        assert_eq!(r.app.view, View::Favorites);
+        fire(&mut r.app, Hit::Filter);
+        assert_eq!(r.app.mode, Mode::Filter);
+        fire(&mut r.app, Hit::Help);
+        assert_eq!(r.app.mode, Mode::Help);
+
+        // These reach the player rather than app state; with a silent player the
+        // observable part is that they are accepted without panicking.
+        for h in [
+            Hit::PlayPause,
+            Hit::Prev,
+            Hit::Next,
+            Hit::SeekBack,
+            Hit::SeekFwd,
+            Hit::VolUp,
+            Hit::VolDown,
+        ] {
+            fire(&mut r.app, h);
+        }
+
+        fire(&mut r.app, Hit::Quit);
+        assert!(r.app.should_quit);
+    }
+
+    #[test]
+    fn every_normal_mode_binding_is_accepted() {
+        // Goal: the help overlay promises these keys. A binding that fell out of
+        // the match would still compile and simply do nothing.
+        let mut r = rig();
+        r.app.favorites = (1..=6).map(|i| track(i, "T", "A")).collect();
+        r.app.queue = r.app.favorites.clone();
+        r.app.now_playing = Some(track(1, "T", "A"));
+        r.app.list_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+
+        for c in [
+            'j', 'k', 'J', 'K', 'g', 'G', ' ', 's', 'n', 'p', 'L', 'H', 'h', 'l', '+', '=', '-',
+        ] {
+            r.app.on_key(key(c));
+            assert_eq!(r.app.mode, Mode::Normal, "{c} should not change mode");
+        }
+        for k in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+        ] {
+            r.app.on_key(code(k));
+        }
+
+        r.app.on_key(key('?'));
+        assert_eq!(r.app.mode, Mode::Help);
+        r.app.on_key(code(KeyCode::Esc));
+        r.app.on_key(key('/'));
+        assert_eq!(r.app.mode, Mode::Filter);
+    }
+
+    #[test]
+    fn escape_outside_a_playlist_does_nothing() {
+        // Goal: Esc only means "go back" inside the drill-down; elsewhere it must
+        // not quit or change the view.
+        let mut r = rig();
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.view, View::Favorites);
+        assert!(!r.app.should_quit);
+    }
+
+    #[test]
+    fn opening_a_playlist_with_nothing_selected_is_harmless() {
+        // Goal: Enter on an empty playlist list must not index into it.
+        let mut r = rig();
+        r.app.view = View::Playlists;
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.view, View::Playlists);
+    }
+
+    #[test]
+    fn the_real_constructor_wires_a_player_and_a_worker() {
+        // Goal: `new` is what main calls. A bad token path must still produce a
+        // usable app - the failure arrives later as a notice.
+        let app = App::new(Some("null".into()), "/nonexistent/priel.json".into())
+            .expect("an app should be constructible without a valid token");
+        assert_eq!(app.view, View::Favorites);
+        assert!(app.loading, "it starts out loading");
+    }
+
+    #[test]
+    fn playing_with_nothing_to_play_is_a_no_op() {
+        // Goal: Enter on an empty or fully filtered-out list must not build a
+        // queue or index into an empty vector.
+        let mut r = rig();
+        r.app.on_key(code(KeyCode::Enter));
+        assert!(r.app.queue.is_empty());
+
+        r.app.favorites = vec![track(1, "A", "X")];
+        r.app.filter = "nomatch".into();
+        r.app.on_key(code(KeyCode::Enter));
+        assert!(
+            r.app.queue.is_empty(),
+            "a filter matching nothing plays nothing"
+        );
+    }
+
+    #[test]
+    fn toggling_shuffle_with_an_empty_list_starts_nothing() {
+        // Goal: the shuffle-from-standstill shortcut must cope with an empty
+        // library rather than picking a random index into it.
+        let mut r = rig();
+        r.app.on_key(key('s'));
+        assert!(r.app.shuffle);
+        assert!(r.app.now_playing.is_none());
     }
 }
