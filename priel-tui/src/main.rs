@@ -132,18 +132,26 @@ fn restore(terminal: &mut Tui) -> Result<()> {
 
 fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
     app.start();
+    // Draw only when something actually changed. priel runs for hours, and an
+    // unconditional redraw every tick spends CPU re-rendering an identical
+    // screen while paused or idle. `App` owns the decision; see `take_dirty`.
+    let mut needs_draw = true;
     loop {
-        terminal.draw(|f| ui::render(f, app))?;
+        if needs_draw {
+            terminal.draw(|f| ui::render(f, app))?;
+        }
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(k) => app.on_key(k),
                 Event::Mouse(m) => app.on_mouse(m),
+                Event::Resize(_, _) => app.mark_dirty(),
                 _ => {}
             }
         }
         app.drain_worker();
         app.refresh();
+        needs_draw = app.take_dirty();
         if app.should_quit {
             break;
         }

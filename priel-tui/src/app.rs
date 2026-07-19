@@ -34,7 +34,7 @@ use priel_player::{PlaybackStatus, Player};
 
 use crate::worker::{self, FromWorker, ToWorker, Worker};
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub enum View {
     Favorites,
     Playlists,
@@ -103,6 +103,28 @@ pub struct App {
     pub list_inner: Rect,
     pub progress_rect: Rect,
     last_click: Option<(u16, Instant)>,
+    dirty: bool,
+    last_sig: RenderSig,
+}
+
+/// Snapshot of the render-relevant state that moves on its own.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "a change-detection snapshot; the fields mirror PlaybackStatus"
+)]
+struct RenderSig {
+    position: u64,
+    duration: u64,
+    paused: bool,
+    playing: bool,
+    loaded: bool,
+    volume: u32,
+    current_id: u64,
+    has_next: bool,
+    cache_secs: u32,
+    sample_rate: u32,
+    spinner: usize,
 }
 
 impl App {
@@ -141,6 +163,8 @@ impl App {
             list_inner: Rect::default(),
             progress_rect: Rect::default(),
             last_click: None,
+            dirty: true,
+            last_sig: RenderSig::default(),
         })
     }
 
@@ -159,24 +183,24 @@ impl App {
     }
 
     /// Indices into the current view's items matching the local filter.
+    ///
+    /// Callers on the render path must call this **once per frame** and reuse
+    /// the result: it allocates and walks the whole list, so calling it per row
+    /// is quadratic.
     pub fn visible(&self) -> Vec<usize> {
         let f = self.filter.to_lowercase();
         if self.view == View::Playlists {
             self.playlists
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| f.is_empty() || p.title.to_lowercase().contains(&f))
+                .filter(|(_, p)| row_matches(&p.title, "", &f))
                 .map(|(i, _)| i)
                 .collect()
         } else {
             self.current_tracks()
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| {
-                    f.is_empty()
-                        || t.title.to_lowercase().contains(&f)
-                        || t.artist.to_lowercase().contains(&f)
-                })
+                .filter(|(_, t)| row_matches(&t.title, &t.artist, &f))
                 .map(|(i, _)| i)
                 .collect()
         }
@@ -189,6 +213,7 @@ impl App {
 
     pub fn drain_worker(&mut self) {
         while let Ok(msg) = self.worker.rx.try_recv() {
+            self.dirty = true;
             match msg {
                 FromWorker::Favorites(t) => {
                     self.favorites = t;
@@ -243,9 +268,56 @@ impl App {
         }
     }
 
+    /// Mark the screen as needing a redraw on the next loop iteration.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Take the pending-redraw flag. The loop draws only when this is true, so
+    /// an idle or paused player costs no rendering at all.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// Everything the view derives from state that changes without user input.
+    /// Seconds are whole because that is the finest granularity the progress bar
+    /// and its label can show.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "display granularity: whole seconds and whole percent"
+    )]
+    fn render_sig(&self) -> RenderSig {
+        let s = &self.status;
+        RenderSig {
+            position: s.position as u64,
+            duration: s.duration as u64,
+            paused: s.paused,
+            playing: s.playing,
+            loaded: s.loaded,
+            volume: s.volume as u32,
+            current_id: s.current_id,
+            has_next: s.has_next,
+            cache_secs: s.cache_secs as u32,
+            sample_rate: s.sample_rate,
+            // While a spinner is on screen it must keep animating.
+            spinner: if self.is_resolving() || self.is_buffering() {
+                self.frame
+            } else {
+                0
+            },
+        }
+    }
+
     pub fn refresh(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         self.status = self.player.status();
+
+        let sig = self.render_sig();
+        if sig != self.last_sig {
+            self.last_sig = sig;
+            self.dirty = true;
+        }
 
         // Clear the advance guard only once real audio is flowing on a settled
         // track. (Not in load_fresh — that caused the fallback to re-fire every
@@ -265,6 +337,7 @@ impl App {
             }
             self.now_meta = self.metas.get(&cur).cloned().unwrap_or_default();
             self.next_intended = None;
+            self.dirty = true;
             self.schedule_next();
         }
 
@@ -506,6 +579,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        self.dirty = true;
         match self.mode {
             Mode::Filter => self.on_key_filter(key),
             Mode::Search => self.on_key_search(key),
@@ -609,8 +683,11 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) if hit(self.progress_rect, m.column, m.row) => {
                 self.seek_to_x(m.column);
             }
-            _ => {}
+            // Everything else, motion in particular, changes nothing on screen.
+            // Redrawing on it turns a mouse sweep into a render storm.
+            _ => return,
         }
+        self.dirty = true;
     }
 
     fn on_click(&mut self, col: u16, row: u16) {
@@ -675,4 +752,50 @@ impl App {
 
 fn hit(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+}
+
+/// Does a row match the local filter? `filter_lower` must already be lowercased
+/// by the caller, which is what keeps this off the per-row allocation path.
+/// An empty filter matches everything; `secondary` may be empty for item kinds
+/// that only have one searchable field.
+fn row_matches(primary: &str, secondary: &str, filter_lower: &str) -> bool {
+    filter_lower.is_empty()
+        || primary.to_lowercase().contains(filter_lower)
+        || (!secondary.is_empty() && secondary.to_lowercase().contains(filter_lower))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::row_matches;
+
+    #[test]
+    fn empty_filter_matches_every_row() {
+        // Goal: an unfiltered list must show everything, including empty fields.
+        assert!(row_matches("Kind of Blue", "Miles Davis", ""));
+        assert!(row_matches("", "", ""));
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_on_both_fields() {
+        // Goal: pin the documented semantics - either field may match, and the
+        // caller-supplied filter is already lowercase while the row data is not.
+        assert!(row_matches("Kind of Blue", "Miles Davis", "blue"));
+        assert!(row_matches("Kind of Blue", "Miles Davis", "miles"));
+        assert!(row_matches("KIND OF BLUE", "", "kind"));
+    }
+
+    #[test]
+    fn substrings_match_anywhere_but_non_matches_do_not() {
+        // Goal: it is a `contains` filter, not a prefix one, and it really can
+        // reject - a filter that always matched would look identical in the UI.
+        assert!(row_matches("Kind of Blue", "Miles Davis", "of b"));
+        assert!(!row_matches("Kind of Blue", "Miles Davis", "coltrane"));
+    }
+
+    #[test]
+    fn empty_secondary_field_is_not_searched() {
+        // Goal: playlists pass "" as the second field; that must not turn into a
+        // match for every possible filter via the empty-string-contains rule.
+        assert!(!row_matches("Evening", "", "z"));
+    }
 }

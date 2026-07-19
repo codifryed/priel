@@ -113,7 +113,7 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
     for (i, vi) in (app.list_offset..(app.list_offset + h).min(vis.len())).enumerate() {
         let y = inner.y + i as u16;
         let selected = vi == app.selected;
-        let (text, is_now) = row_text(app, vi);
+        let (text, is_now) = row_text(app, &vis, vi);
         let style = if selected {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         } else if is_now {
@@ -162,8 +162,10 @@ fn list_title(app: &App, count: usize) -> String {
 }
 
 /// Returns (rendered row text, `is_now_playing`).
-fn row_text(app: &App, vi: usize) -> (String, bool) {
-    let visible = app.visible();
+///
+/// `visible` is passed in rather than recomputed: this runs once per rendered
+/// row, and rebuilding the index list here made rendering O(rows x tracks).
+fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
     let idx = visible[vi];
     if app.view == View::Playlists {
         if let Some(p) = app.playlists.get(idx) {
