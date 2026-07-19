@@ -28,6 +28,9 @@ base64 = "0.22"
 regex = "1"
 # ureq: blocking, rustls, no async runtime. No tokio/hyper anywhere in the tree.
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
 priel-core = { path = "priel-core" }
 # default-features off here so priel-tui's own `libmpv` feature is the single
 # switch that pulls libmpv in (default on) or leaves it out (--no-default-features).

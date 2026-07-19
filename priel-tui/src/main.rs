@@ -23,6 +23,7 @@
 //!   --token-file <path>     hiresTI token (default: ~/.`config/hiresti/hiresti_token.json`)
 
 mod app;
+mod cli;
 mod ui;
 mod worker;
 
@@ -30,6 +31,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::Parser;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
@@ -41,73 +43,19 @@ use app::App;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-const HELP: &str = concat!(
-    "priel ",
-    env!("CARGO_PKG_VERSION"),
-    " — hi-res terminal client for TIDAL (mouse + VIM)
-
-USAGE:
-    priel [OPTIONS]
-
-OPTIONS:
-    --device <mpv-device>  output device, e.g. pipewire/alsa_output.usb-...
-                           (default: the system default sink)
-    --token-file <path>    hiresTI PKCE token file
-                           (default: ~/.config/hiresti/hiresti_token.json)
-    -h, --help             print this help and exit
-    -V, --version          print version and exit
-
-priel is unofficial software. It is not affiliated with, endorsed by, or
-sponsored by TIDAL or Aspiro AB. TIDAL is a trademark of its respective owner.
-A TIDAL subscription is required; priel neither circumvents access controls nor
-exports content for offline use."
-);
-
 fn main() -> Result<()> {
-    let Some((device, token)) = parse_args() else {
-        return Ok(()); // printed help/version
-    };
+    // clap handles --help and --version itself, exiting before we touch the
+    // terminal - important, since setup() puts it in raw mode.
+    let args = cli::Cli::parse();
+    let token = args.token_path();
     let mut terminal = setup()?;
-    let res = App::new(device, token)
+    let res = App::new(args.device, token)
         .and_then(|mut app| run(&mut terminal, &mut app, &mut TerminalEvents));
     restore(&mut terminal)?;
     if let Err(e) = res {
         eprintln!("priel error: {e:?}");
     }
     Ok(())
-}
-
-/// `None` means we printed help/version and the caller should exit quietly.
-fn parse_args() -> Option<(Option<String>, String)> {
-    parse_args_from(std::env::args().skip(1))
-}
-
-/// The parsing itself, over any argument sequence, so it can be tested without
-/// the process environment.
-fn parse_args_from(args: impl Iterator<Item = String>) -> Option<(Option<String>, String)> {
-    let mut device = None;
-    let mut token = priel_core::Client::default_token_path();
-    let mut it = args;
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--device" => device = it.next(),
-            "--token-file" => {
-                if let Some(t) = it.next() {
-                    token = t;
-                }
-            }
-            "-h" | "--help" => {
-                println!("{HELP}");
-                return None;
-            }
-            "-V" | "--version" => {
-                println!("priel {}", env!("CARGO_PKG_VERSION"));
-                return None;
-            }
-            _ => {}
-        }
-    }
-    Some((device, token))
 }
 
 fn setup() -> Result<Tui> {
@@ -192,8 +140,10 @@ fn run<B: ratatui::backend::Backend, E: EventSource>(
 
 #[cfg(test)]
 mod tests {
-    use super::{EventSource, HELP, parse_args_from, run};
+    use super::{EventSource, run};
     use crate::app::App;
+    use crate::cli::{Cli, DISCLAIMER};
+    use clap::{CommandFactory, Parser};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -223,46 +173,80 @@ mod tests {
         app
     }
 
-    fn parse(args: &[&str]) -> Option<(Option<String>, String)> {
-        parse_args_from(args.iter().map(|s| (*s).to_string()))
+    fn parse(args: &[&str]) -> Cli {
+        let mut with_name = vec!["priel"];
+        with_name.extend_from_slice(args);
+        Cli::try_parse_from(with_name).expect("should parse")
     }
 
     #[test]
     fn no_arguments_means_default_sink_and_default_token() {
         // Goal: priel must be runnable with no flags at all.
-        let (device, token) = parse(&[]).expect("should run");
+        let cli = parse(&[]);
         assert!(
-            device.is_none(),
+            cli.device.is_none(),
             "no --device means the system default sink"
         );
-        assert!(token.ends_with("hiresti_token.json"));
+        assert!(cli.token_path().ends_with("hiresti_token.json"));
     }
 
     #[test]
     fn the_device_and_token_flags_are_read() {
         // Goal: --device is how a user reaches their DAC and --token-file is how
         // they point at a non-standard login.
-        let (device, token) =
-            parse(&["--device", "pipewire/dac", "--token-file", "/t.json"]).expect("should run");
-        assert_eq!(device.as_deref(), Some("pipewire/dac"));
-        assert_eq!(token, "/t.json");
+        let cli = parse(&["--device", "pipewire/dac", "--token-file", "/t.json"]);
+        assert_eq!(cli.device.as_deref(), Some("pipewire/dac"));
+        assert_eq!(cli.token_path(), "/t.json");
     }
 
     #[test]
-    fn help_and_version_ask_the_caller_to_exit() {
-        // Goal: `None` is the signal to exit quietly rather than open a TUI over
-        // the text just printed.
+    fn help_and_version_stop_before_the_terminal_is_touched() {
+        // Goal: clap exits on these itself. If it returned normally instead, the
+        // help text would be printed and then hidden by the alternate screen.
         for flag in ["-h", "--help", "-V", "--version"] {
-            assert!(parse(&[flag]).is_none(), "{flag} should stop startup");
+            let err = Cli::try_parse_from(["priel", flag]).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ),
+                "{flag} should be a display-and-exit, got {:?}",
+                err.kind()
+            );
         }
     }
 
     #[test]
-    fn unknown_and_valueless_flags_do_not_derail_startup() {
-        // Goal: a stray argument should not stop the app launching, and a
-        // trailing flag with no value must not panic on the missing argument.
-        let (device, _) = parse(&["--nonsense", "--device"]).expect("should still run");
-        assert!(device.is_none());
+    fn an_unknown_flag_is_an_error_rather_than_being_ignored() {
+        // Goal: the hand-rolled parser silently swallowed typos, so `--devise`
+        // started with the default sink and no explanation.
+        let err = Cli::try_parse_from(["priel", "--devise", "x"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn a_flag_without_its_value_is_an_error() {
+        // Goal: `--device` with nothing after it is a mistake worth reporting.
+        let err = Cli::try_parse_from(["priel", "--device"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn the_command_definition_stays_valid() {
+        // Goal: clap's own consistency check. It also guards the man page and
+        // completions, which are generated from this same definition.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_help_text_carries_the_unofficial_disclaimer() {
+        // Goal: the disclaimer is a distribution requirement, not decoration, so
+        // it must survive edits and reach both --help and the man page.
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("not affiliated"), "{help}");
+        assert!(help.contains("--device"), "{help}");
+        assert!(help.contains("--token-file"), "{help}");
+        assert!(DISCLAIMER.contains("not affiliated"));
     }
 
     #[test]
@@ -308,14 +292,5 @@ mod tests {
             Some(press('q')),
         ]);
         assert!(app.should_quit);
-    }
-
-    #[test]
-    fn the_help_text_carries_the_unofficial_disclaimer() {
-        // Goal: the disclaimer is a distribution requirement, not decoration, so
-        // it must survive edits to the help text.
-        assert!(HELP.contains("not affiliated"));
-        assert!(HELP.contains("--device"));
-        assert!(HELP.contains("--token-file"));
     }
 }

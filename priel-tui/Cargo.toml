@@ -10,14 +10,25 @@ description = "Unofficial hi-res terminal client for TIDAL (mouse + VIM)"
 name = "priel"
 path = "src/main.rs"
 
+# Generates the man page and shell completions from the same clap definition the
+# binary uses. Feature-gated so its two dependencies stay out of what ships.
+[[bin]]
+name = "priel-gen-assets"
+path = "src/bin/gen_assets.rs"
+required-features = ["gen-assets"]
+
 [features]
 default = ["libmpv"]
 libmpv = ["priel-player/libmpv"]
+gen-assets = ["dep:clap_complete", "dep:clap_mangen"]
 
 [dependencies]
 anyhow.workspace = true
 priel-core.workspace = true
 priel-player = { workspace = true }
+clap.workspace = true
+clap_complete = { workspace = true, optional = true }
+clap_mangen = { workspace = true, optional = true }
 ratatui = "0.29"
 crossterm = "0.28"
 rand = "0.8"

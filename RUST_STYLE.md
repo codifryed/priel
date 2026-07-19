@@ -212,8 +212,11 @@ async would buy nothing at the one boundary where it would have to earn its keep
 ### Dependencies
 
 - The dependency list is small and deliberate: rustls over OpenSSL to keep packaging simple, `ureq`
-  because it is blocking and pulls in no executor, libmpv behind a default-on feature. Adding a
-  crate needs a reason that beats writing the small version in-house.
+  because it is blocking and pulls in no executor, libmpv behind a default-on feature, `clap`
+  because a generated man page and shell completions are worth more than a hand-rolled parser.
+  Adding a crate needs a reason that beats writing the small version in-house.
+- Build-time-only crates belong behind a feature, as `clap_mangen` and `clap_complete` are behind
+  `gen-assets`. A tool that produces packaging artefacts has no business in the shipped binary.
 - Anything new must not break: the `--no-default-features` build, the no-OpenSSL guarantee,
   the no-async-runtime guarantee, or cross-platform buildability (crossterm, ratatui, rustls and
   libmpv are all portable; keep it so).

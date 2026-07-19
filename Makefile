@@ -17,6 +17,10 @@ BINDIR     ?= $(PREFIX)/bin
 DATADIR    ?= $(PREFIX)/share
 DOCDIR     ?= $(DATADIR)/doc/priel
 LICENSEDIR ?= $(DATADIR)/licenses/priel
+MANDIR     ?= $(DATADIR)/man
+BASHCOMPDIR ?= $(DATADIR)/bash-completion/completions
+ZSHCOMPDIR  ?= $(DATADIR)/zsh/site-functions
+FISHCOMPDIR ?= $(DATADIR)/fish/vendor_completions.d
 
 # `--locked` keeps a build reproducible from the committed lockfile. Distro
 # builds usually add `--offline` on top, after `make vendor`.
@@ -25,10 +29,11 @@ CARGO_FLAGS ?= --locked
 NAME    := priel
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 BIN     := target/release/$(NAME)
+ASSETS  := target/assets
 
 .DEFAULT_GOAL := all
 .PHONY: all help build release run test test-all lint fmt fmt-check check \
-        coverage build-nolibmpv check-deps install uninstall dist vendor clean
+        coverage build-nolibmpv check-deps assets install uninstall dist vendor clean
 
 all: release ## Build the release binary (default)
 
@@ -86,11 +91,18 @@ check-deps: ## Verify the build dependencies are present
 		|| { echo "missing: libmpv development files (mpv-devel, libmpv-dev)"; exit 1; }
 	@echo "build dependencies ok: $$($(CARGO) --version), libmpv $$(pkg-config --modversion mpv)"
 
+assets: ## Generate the man page and shell completions from the CLI definition
+	$(CARGO) run $(CARGO_FLAGS) --features gen-assets --bin priel-gen-assets -- $(ASSETS)
+
 # ---- installing ----
 
-install: release ## Install the binary, licence and README (see PREFIX below)
+install: release assets ## Install binary, man page, completions, licence and docs
 	$(INSTALL) -Dm0755 $(BIN) $(DESTDIR)$(BINDIR)/$(NAME)
 	$(INSTALL) -Dm0644 COPYING $(DESTDIR)$(LICENSEDIR)/COPYING
+	$(INSTALL) -Dm0644 $(ASSETS)/$(NAME).1 $(DESTDIR)$(MANDIR)/man1/$(NAME).1
+	$(INSTALL) -Dm0644 $(ASSETS)/$(NAME).bash $(DESTDIR)$(BASHCOMPDIR)/$(NAME)
+	$(INSTALL) -Dm0644 $(ASSETS)/_$(NAME) $(DESTDIR)$(ZSHCOMPDIR)/_$(NAME)
+	$(INSTALL) -Dm0644 $(ASSETS)/$(NAME).fish $(DESTDIR)$(FISHCOMPDIR)/$(NAME).fish
 	@# Documentation is optional so a stripped-down tarball still installs; the
 	@# licence above is not.
 	@if [ -f README.md ]; then \
@@ -103,6 +115,10 @@ uninstall: ## Remove what `install` put down
 	rm -f $(DESTDIR)$(BINDIR)/$(NAME)
 	rm -f $(DESTDIR)$(DOCDIR)/README.md
 	rm -f $(DESTDIR)$(LICENSEDIR)/COPYING
+	rm -f $(DESTDIR)$(MANDIR)/man1/$(NAME).1
+	rm -f $(DESTDIR)$(BASHCOMPDIR)/$(NAME)
+	rm -f $(DESTDIR)$(ZSHCOMPDIR)/_$(NAME)
+	rm -f $(DESTDIR)$(FISHCOMPDIR)/$(NAME).fish
 	-rmdir $(DESTDIR)$(DOCDIR) $(DESTDIR)$(LICENSEDIR) 2>/dev/null || true
 
 # ---- packaging ----
