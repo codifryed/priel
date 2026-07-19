@@ -63,6 +63,7 @@ pub enum Hit {
     Shuffle,
     VolUp,
     VolDown,
+    VolUnity,
     Filter,
     CycleView,
     Help,
@@ -646,6 +647,16 @@ impl App {
         }
     }
 
+    /// Restore unity gain.
+    ///
+    /// Worth its own binding: any software volume below 100% multiplies every
+    /// sample, so it is the one bit-perfect fault the listener causes and the
+    /// only one they can clear instantly.
+    fn volume_unity(&mut self) {
+        self.player.set_volume(100.0);
+        self.notice = Some("Volume 100% (unity gain)".into());
+    }
+
     fn volume_step(&self, delta: f64) {
         self.player.set_volume(self.status.volume + delta);
     }
@@ -760,6 +771,7 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.player.seek_relative(5.0),
             KeyCode::Char('+' | '=') => self.volume_step(5.0),
             KeyCode::Char('-') => self.volume_step(-5.0),
+            KeyCode::Char('0') => self.volume_unity(),
             KeyCode::Char('/') => self.start_filter(),
             _ => {}
         }
@@ -804,6 +816,7 @@ impl App {
             Hit::Shuffle => self.toggle_shuffle(),
             Hit::VolUp => self.volume_step(5.0),
             Hit::VolDown => self.volume_step(-5.0),
+            Hit::VolUnity => self.volume_unity(),
             Hit::Filter => self.start_filter(),
             Hit::CycleView => self.cycle_view(),
             Hit::Help => self.mode = Mode::Help,
@@ -1922,5 +1935,42 @@ mod tests {
         r.app.on_key(key('s'));
         assert!(r.app.shuffle);
         assert!(r.app.now_playing.is_none());
+    }
+
+    #[test]
+    fn unity_gain_has_its_own_binding_and_says_so() {
+        // Goal: any volume below 100% costs bit-perfect playback, so getting
+        // back to unity must not mean pressing `+` repeatedly and guessing.
+        let mut r = rig();
+        r.app.on_key(key('-'));
+        r.app.on_key(key('0'));
+        assert!(
+            r.app
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unity"),
+            "the restore should be acknowledged: {:?}",
+            r.app.notice
+        );
+
+        let mut r = rig();
+        r.app.hits = vec![(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 6,
+                height: 1,
+            },
+            Hit::VolUnity,
+        )];
+        r.app.on_mouse(click(1, 0));
+        assert!(
+            r.app
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unity")
+        );
     }
 }

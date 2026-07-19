@@ -78,6 +78,13 @@ pub struct PlaybackStatus {
     pub has_next: bool,
     /// Seconds of decoded audio buffered ahead (`demuxer-cache-duration`).
     pub cache_secs: f64,
+    /// The audio server's own volume for our stream (`ao-volume`), when the
+    /// output driver exposes it. `None` means the driver has no such concept.
+    ///
+    /// This is separate from [`Self::volume`], which is mpv's internal software
+    /// volume. `PipeWire` attenuates in software too, so a stream turned down in
+    /// the system mixer is no more bit-perfect than one turned down in priel.
+    pub ao_volume: Option<f64>,
 }
 
 /// How faithfully the decoded samples are reaching the output device.
@@ -105,8 +112,13 @@ pub enum Alteration {
     /// The output format is narrower than the source, so low bits are being
     /// discarded. A 24-bit track played out as `s16` loses eight bits.
     Truncated,
-    /// Software volume is scaling every sample. Only exact at 100%.
+    /// priel's own software volume is scaling every sample. Only exact at 100%,
+    /// and the one cause the listener can clear with a single keypress.
     VolumeScaled,
+    /// The audio server is attenuating our stream. Usually software, so it costs
+    /// resolution the same way - unless the sink maps volume onto a hardware
+    /// mixer control on the DAC itself, which priel cannot tell from here.
+    ServerVolumeScaled,
 }
 
 /// Bits of resolution an mpv sample format can carry.
@@ -163,6 +175,14 @@ impl PlaybackStatus {
         // mpv's software volume multiplies every sample; only unity is exact.
         if (self.volume - 100.0).abs() > f64::EPSILON {
             return Fidelity::Altered(Alteration::VolumeScaled);
+        }
+        // Then the server's. Reported second because clearing priel's own volume
+        // is a keypress, while this one lives in the system mixer.
+        if self
+            .ao_volume
+            .is_some_and(|v| (v - 100.0).abs() > f64::EPSILON)
+        {
+            return Fidelity::Altered(Alteration::ServerVolumeScaled);
         }
         Fidelity::BitPerfect
     }
@@ -473,5 +493,40 @@ mod tests {
 
         let s = playing(44_100, 44_100, "s16", "s16");
         assert_eq!(s.fidelity(0), Fidelity::BitPerfect);
+    }
+
+    #[test]
+    fn the_audio_servers_own_volume_also_breaks_the_chain() {
+        // Goal: PipeWire attenuates in software just as mpv does, so a stream
+        // turned down in the system mixer is not bit-perfect either - and priel
+        // being at unity does not make it so.
+        let mut s = playing(96_000, 96_000, "s32", "s32");
+        s.ao_volume = Some(60.0);
+        assert_eq!(
+            s.fidelity(24),
+            Fidelity::Altered(Alteration::ServerVolumeScaled)
+        );
+
+        s.ao_volume = Some(100.0);
+        assert_eq!(s.fidelity(24), Fidelity::BitPerfect);
+    }
+
+    #[test]
+    fn an_output_with_no_volume_concept_is_not_a_fault() {
+        // Goal: `ao-volume` is absent on drivers that do not expose one. Absent
+        // must not read as "turned down".
+        let mut s = playing(96_000, 96_000, "s32", "s32");
+        s.ao_volume = None;
+        assert_eq!(s.fidelity(24), Fidelity::BitPerfect);
+    }
+
+    #[test]
+    fn priels_own_volume_is_reported_before_the_servers() {
+        // Goal: when both are down, name the one the listener can clear with a
+        // keypress first.
+        let mut s = playing(96_000, 96_000, "s32", "s32");
+        s.volume = 50.0;
+        s.ao_volume = Some(50.0);
+        assert_eq!(s.fidelity(24), Fidelity::Altered(Alteration::VolumeScaled));
     }
 }

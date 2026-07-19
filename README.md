@@ -22,11 +22,18 @@ water in and out of the flats twice a day, on the pull of the moon.*
   the next track is preloaded and the transition is gapless.
 - **A bit-perfect indicator that does not flatter you.** The now-playing row
   shows `✓ bit-perfect` only when the output rate matches the decoded rate, the
-  output format is wide enough for the source depth, and software volume is at
-  unity. Otherwise it names the fault: `⚠ resampled 44→48 kHz`,
-  `⚠ truncated to S16`, or `⚠ volume scaled`. A wider container is not a fault -
-  24-bit content in an `S32` frame is exactly how a USB DAC expects it, so that
-  reads green.
+  output format is wide enough for the source depth, and *both* volume stages -
+  priel's and the audio server's - are at unity. Otherwise it names the fault:
+  `⚠ resampled 44→48 kHz`, `⚠ truncated to S16`, `⚠ volume 70% · 0 for unity`, or
+  `⚠ system volume below unity`. A wider container is not a fault: 24-bit content
+  in an `S32` frame is exactly how a USB DAC expects it, so that reads green.
+  The badge is labelled `OUT`, not `DAC`, because it reports what priel hands to
+  the audio server - see the roadmap for why that distinction is not pedantry.
+- **Unity gain is a first-class state.** Any software volume below 100%
+  multiplies every sample and costs you resolution. The header shows `100%` in
+  green when you are at unity and in yellow when you are not, and `0` restores
+  it. Enthusiasts: leave both priel and the system mixer at unity and set level
+  on the DAC.
 - **VIM keys first, with alternatives for everyone else.** `j`/`k` and the arrow
   keys, `g`/`G`, `J`/`K` and `Ctrl-D`/`Ctrl-U`, `/` to filter. Every action has a
   key binding, and `?` opens the full reference rather than making you read this
@@ -107,6 +114,7 @@ row of the interface is also clickable.
 | Search the catalogue | `3`, type, `Enter`; `i` to re-edit | — |
 | Shuffle the current view | `s` | click `⇄` |
 | Volume | `+` / `-` | click `-` / `+` |
+| Restore unity gain | `0` | click the percentage |
 | Quit | `q` | click `[q]` |
 
 `Esc` cancels: it leaves a filter or search box, and steps back out of an opened
@@ -122,10 +130,14 @@ DAC badge and a bit-perfect indicator; the `?` reference overlay.
 
 Roadmap, roughly in order:
 
-- **PipeWire configuration help** — detect and explain the `allowed-rates` setup
-  a bit-perfect chain needs. The indicator above reports what priel hands to the
-  audio API, which is as far as mpv can see; confirming that the graph beyond it
-  does not resample means reading the PipeWire graph directly.
+- **PipeWire configuration help, and a truly live output readout.** The `OUT`
+  badge reports the format priel negotiated with the audio server, which is as
+  far as mpv can see. PipeWire can accept a 44.1 kHz stream and resample it into
+  a 48 kHz graph without mpv ever knowing. The real device state is readable —
+  `/proc/asound/card*/pcm*p/sub*/hw_params` gives the live rate and format, and
+  `pw-dump` gives the graph — so a future `DAC` badge can report the hardware
+  rather than the negotiation, alongside guidance on the `allowed-rates` setup a
+  bit-perfect chain needs.
 - **Native PKCE authentication**, replacing the borrowed hiresTI token.
 - **Per-track memory ceiling.** Buffers are bounded and downloads apply
   backpressure, but a fully played track is still retained; trimming it needs a

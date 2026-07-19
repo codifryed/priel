@@ -534,6 +534,9 @@ fn read_status(mpv: &Mpv, entries: &[Entry]) -> PlaybackStatus {
         .get_property::<String>("audio-codec-name")
         .unwrap_or_default();
     let bitrate = mpv.get_property::<f64>("audio-bitrate").unwrap_or(0.0) as i64;
+    // The audio server's volume for our stream. Absent on outputs with no such
+    // concept (the null AO used by the tests, for one), which is not a fault.
+    let ao_volume = mpv.get_property::<f64>("ao-volume").ok();
     let cache_secs = mpv
         .get_property::<f64>("demuxer-cache-duration")
         .unwrap_or(0.0);
@@ -554,6 +557,7 @@ fn read_status(mpv: &Mpv, entries: &[Entry]) -> PlaybackStatus {
         current_id: entries.first().map_or(0, |e| e.id),
         has_next: entries.len() > 1,
         cache_secs,
+        ao_volume,
     }
 }
 

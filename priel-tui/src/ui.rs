@@ -72,10 +72,11 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
     (
         "Output",
         &[
-            ("bit-perfect", "samples reach the DAC"),
-            ("resampled", "sink rate differs"),
-            ("truncated", "sink format narrower"),
-            ("volume scaled", "press + for unity"),
+            ("OUT", "what priel sends out"),
+            ("bit-perfect", "sent unaltered"),
+            ("resampled", "rate changed on the way"),
+            ("truncated", "format too narrow"),
+            ("volume", "0 restores unity gain"),
         ],
     ),
 ];
@@ -263,7 +264,19 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     bar.button(" ⇄ ", Hit::Shuffle, toggle_style(shuffle));
     bar.label(" ", Style::default());
     bar.button(" - ", Hit::VolDown, button_style());
-    bar.label(format!(" {volume}% "), dim);
+    // Unity gain is the desirable state, so say so rather than leaving the
+    // listener to infer it from a number.
+    let (vol_text, vol_style) = if volume == 100 {
+        (" 100% ".to_string(), Style::default().fg(Color::Green))
+    } else {
+        (
+            format!(" {volume}% "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    bar.button(vol_text, Hit::VolUnity, vol_style);
     bar.button(" + ", Hit::VolUp, button_style());
     bar.label("  ", Style::default());
 
@@ -690,6 +703,11 @@ fn source_badge(app: &App) -> String {
 /// It reports what priel hands to the audio API. A `PipeWire` graph can still
 /// resample downstream, which mpv cannot see - hence "to device" rather than an
 /// unqualified claim.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "display-only: volume percent is clamped non-negative and shown whole"
+)]
 fn fidelity_badge(app: &App) -> (String, Color) {
     match app.status.fidelity(app.now_meta.bit_depth) {
         Fidelity::Unknown => (String::new(), Color::DarkGray),
@@ -706,15 +724,26 @@ fn fidelity_badge(app: &App) -> (String, Color) {
             format!("  ⚠ truncated to {}", app.status.out_format.to_uppercase()),
             Color::Red,
         ),
-        Fidelity::Altered(Alteration::VolumeScaled) => {
-            ("  ⚠ volume scaled".to_string(), Color::Yellow)
+        Fidelity::Altered(Alteration::VolumeScaled) => (
+            format!("  ⚠ volume {}% · 0 for unity", app.status.volume as u32),
+            Color::Yellow,
+        ),
+        Fidelity::Altered(Alteration::ServerVolumeScaled) => {
+            ("  ⚠ system volume below unity".to_string(), Color::Yellow)
         }
     }
 }
 
+/// What priel is handing to the audio server.
+///
+/// Labelled `OUT`, not `DAC`, on purpose: mpv's `audio-out-params` describe the
+/// format written to the audio API, which is what the server accepted from us -
+/// not the rate the hardware is clocked at. `PipeWire` can accept 44.1 kHz and
+/// resample it into a 48 kHz graph without mpv ever seeing it. Showing the real
+/// device rate means reading the graph, which is a separate piece of work.
 fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
     if s.sample_rate == 0 && s.out_format.is_empty() {
-        return " DAC —".into();
+        return " OUT —".into();
     }
     let fmt = if s.out_format.is_empty() {
         "?".into()
@@ -726,7 +755,7 @@ fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
     } else {
         "?".into()
     };
-    format!(" DAC {fmt} · {rate}")
+    format!(" OUT {fmt} · {rate}")
 }
 
 fn short_quality(q: &str) -> String {
@@ -1036,7 +1065,7 @@ mod tests {
         assert!(out.contains("24"), "bit depth: {out}");
         assert!(out.contains("192"), "sample rate: {out}");
         assert!(out.contains("1:01"), "position: {out}");
-        assert!(out.contains("DAC"), "{out}");
+        assert!(out.contains("OUT"), "the output badge: {out}");
     }
 
     #[test]
@@ -1271,7 +1300,11 @@ mod tests {
         chain(&mut sc, 24, 96_000, 96_000, "s32");
         sc.app.status.volume = 70.0;
         let out = text(&mut sc.app, 140, 12);
-        assert!(out.contains("volume scaled"), "{out}");
+        assert!(out.contains("volume 70%"), "{out}");
+        assert!(
+            out.contains("0 for unity"),
+            "the fix belongs in the warning: {out}"
+        );
     }
 
     #[test]
@@ -1282,5 +1315,42 @@ mod tests {
         let out = text(&mut sc.app, 140, 12);
         assert!(!out.contains("bit-perfect"), "{out}");
         assert!(!out.contains('⚠'), "{out}");
+    }
+
+    #[test]
+    fn the_output_badge_does_not_claim_to_be_the_dac() {
+        // Goal: mpv reports the format it wrote to the audio API, not the rate
+        // the hardware is clocked at. Labelling that "DAC" would tell an
+        // audiophile something priel cannot actually know.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("OUT S32"), "{out}");
+        assert!(!out.contains("DAC"), "the badge must not overstate: {out}");
+    }
+
+    #[test]
+    fn the_volume_readout_marks_unity_as_the_good_state() {
+        // Goal: enthusiasts need to see at a glance that 100% is the wanted
+        // value, not just read a number with no reference.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        assert!(text(&mut sc.app, 140, 12).contains("100%"));
+
+        sc.app.status.volume = 65.0;
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("65%"), "{out}");
+        assert!(out.contains("0 for unity"), "the fix must be stated: {out}");
+    }
+
+    #[test]
+    fn a_system_volume_below_unity_is_reported_separately() {
+        // Goal: the fix lives in the system mixer, not in priel, so it must not
+        // be confused with priel's own volume.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        sc.app.status.ao_volume = Some(40.0);
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("system volume"), "{out}");
     }
 }
