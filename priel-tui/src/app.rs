@@ -34,7 +34,7 @@ use priel_player::{PlaybackStatus, Player};
 
 use crate::worker::{self, FromWorker, ToWorker, Worker};
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum View {
     Favorites,
     Playlists,
@@ -45,7 +45,7 @@ pub enum View {
 /// A clickable region recorded by the renderer. Mouse support is a headline
 /// feature, so every control that has a key binding also has a hit box: the
 /// renderer knows the geometry, and only the renderer should have to.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
     View(View),
     PlayPause,
@@ -54,7 +54,6 @@ pub enum Hit {
     Shuffle,
     VolUp,
     VolDown,
-    Quit,
 }
 
 #[derive(PartialEq)]
@@ -718,7 +717,6 @@ impl App {
             Hit::Shuffle => self.toggle_shuffle(),
             Hit::VolUp => self.volume_step(5.0),
             Hit::VolDown => self.volume_step(-5.0),
-            Hit::Quit => self.should_quit = true,
         }
     }
 

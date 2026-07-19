@@ -38,23 +38,45 @@ pub fn render(f: &mut Frame, app: &mut App) {
     now_playing(f, app, rows[2]);
 }
 
-fn tab(label: &str, active: bool) -> Span<'static> {
+fn tab_style(active: bool) -> Style {
     if active {
-        Span::styled(
-            format!(" {label} "),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Span::styled(format!(" {label} "), Style::default().fg(Color::DarkGray))
+        Style::default().fg(Color::DarkGray)
     }
 }
 
+/// A transport control. Rendered as a glyph on a raised background rather than
+/// bracketed text: brackets read as punctuation to scan past, a filled block
+/// reads as something to click.
+///
+/// The glyphs are deliberately the *white* triangles (U+25C1/U+25B7) and not the
+/// media-player codepoints (U+23EE..U+23EF). The latter have emoji presentation,
+/// so a terminal with an emoji font paints them two cells wide while
+/// unicode-width calls them one - and every control to their right would then sit
+/// one cell away from its own hit box.
+fn button_style() -> Style {
+    Style::default().fg(Color::Cyan).bg(Color::DarkGray)
+}
+
+fn toggle_style(on: bool) -> Style {
+    if on {
+        Style::default().fg(Color::Black).bg(Color::Green)
+    } else {
+        Style::default().fg(Color::Gray).bg(Color::DarkGray)
+    }
+}
+
+/// Tabs on the left, transport controls next to them, then status. Controls live
+/// up here because this is the row the eye already tracks; the bottom row stays
+/// the keyboard reference.
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "tab labels are compile-time constants, far below u16::MAX"
+    clippy::cast_sign_loss,
+    reason = "display-only: volume percent is non-negative and rendered whole"
 )]
 fn header(f: &mut Frame, app: &mut App, area: Rect) {
     let in_playlists = matches!(app.view, View::Playlists | View::PlaylistTracks);
@@ -63,48 +85,48 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
         ("2 Playlists", View::Playlists, in_playlists),
         ("3 Search", View::Search, app.view == View::Search),
     ];
-    let mut spans = Vec::with_capacity(tabs.len() + 3);
-    let mut x = area.x;
+    // Read what the bar needs up front: it borrows `app` mutably to record hits.
+    let playing = app.status.playing;
+    let shuffle = app.shuffle;
+    let volume = app.status.volume as u32;
+    let queue = app.queue_indicator();
+    let filtering = app.mode == Mode::Filter;
+    let filter = app.filter.clone();
+    let notice = app.notice.clone();
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut bar = ControlBar::new(area);
     for (label, view, active) in tabs {
-        // `tab` pads with one space either side; keep the width in step with it.
-        let width = label.chars().count() as u16 + 2;
-        app.hits.push((
-            Rect {
-                x,
-                y: area.y,
-                width,
-                height: 1,
-            },
-            Hit::View(view),
-        ));
-        x += width;
-        spans.push(tab(label, active));
+        bar.button(format!(" {label} "), Hit::View(view), tab_style(active));
     }
-    spans.push(Span::raw("  "));
-    if app.shuffle {
-        spans.push(Span::styled(
-            "⇄ shuffle  ",
-            Style::default().fg(Color::Green),
-        ));
+
+    bar.label("   ", Style::default());
+    bar.button(" |◁ ", Hit::Prev, button_style());
+    // A control shows the action it performs, not the state it is in.
+    bar.button(
+        if playing { " ‖ " } else { " ▷ " },
+        Hit::PlayPause,
+        button_style(),
+    );
+    bar.button(" ▷| ", Hit::Next, button_style());
+    bar.label(" ", Style::default());
+    bar.button(" ⇄ ", Hit::Shuffle, toggle_style(shuffle));
+    bar.label(" ", Style::default());
+    bar.button(" - ", Hit::VolDown, button_style());
+    bar.label(format!(" {volume}% "), dim);
+    bar.button(" + ", Hit::VolUp, button_style());
+    bar.label("  ", Style::default());
+
+    if let Some(q) = queue {
+        bar.label(format!("queue {q}  "), Style::default().fg(Color::Blue));
     }
-    if let Some(q) = app.queue_indicator() {
-        spans.push(Span::styled(
-            format!("queue {q}  "),
-            Style::default().fg(Color::Blue),
-        ));
+    if filtering {
+        bar.label(format!("/{filter}"), Style::default().fg(Color::Yellow));
+    } else if let Some(n) = notice {
+        bar.label(n, dim);
     }
-    if app.mode == Mode::Filter {
-        spans.push(Span::styled(
-            format!("/{}", app.filter),
-            Style::default().fg(Color::Yellow),
-        ));
-    } else if let Some(n) = &app.notice {
-        spans.push(Span::styled(
-            n.clone(),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    app.hits.extend(bar.hits);
+    f.render_widget(Paragraph::new(Line::from(bar.spans)), area);
 }
 
 #[allow(
@@ -287,41 +309,50 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
         l1,
     );
 
-    // DAC badge, then the shared activity slot (resolving / buffering / buffered),
-    // then the clickable controls.
+    // DAC badge, the shared activity slot (resolving / buffering / buffered),
+    // then the keyboard reference. The clickable controls live in the header.
     let (act_text, act_color) = activity(app);
-    let badge = dac_badge(&app.status);
-    let paused = app.status.paused;
-    let shuffle = app.shuffle;
-    let volume = app.status.volume as u32;
-
     let mut bar = ControlBar::new(l2);
-    bar.label(badge, Style::default().fg(Color::Green));
+    bar.label(dac_badge(&app.status), Style::default().fg(Color::Green));
     bar.label(act_text, Style::default().fg(act_color));
-    bar.label("  ".into(), Style::default());
-    bar.button(app, "[|<]".into(), Hit::Prev);
-    bar.button(
-        app,
-        if paused { "[ > ]" } else { "[ || ]" }.into(),
-        Hit::PlayPause,
-    );
-    bar.button(app, "[>|]".into(), Hit::Next);
-    bar.label("  ".into(), Style::default());
-    bar.toggle(app, "[shuffle]".into(), Hit::Shuffle, shuffle);
-    bar.label("  ".into(), Style::default());
-    bar.button(app, "[-]".into(), Hit::VolDown);
-    bar.label(format!(" {volume}% "), Style::default().fg(Color::DarkGray));
-    bar.button(app, "[+]".into(), Hit::VolUp);
-    bar.label("  ".into(), Style::default());
-    bar.button(app, "[quit]".into(), Hit::Quit);
+    bar.label("  ", Style::default());
+    let hint = hints(bar.remaining());
+    bar.label(hint, Style::default().fg(Color::DarkGray));
     f.render_widget(Paragraph::new(Line::from(bar.spans)), l2);
+}
+
+/// Keyboard reference tiers, widest first.
+///
+/// priel is keyboard-first, so this row is not decoration - it is how bindings
+/// are discovered. Letting the renderer clip it silently drops the keys on the
+/// right, which is how `[q] quit` once vanished from a narrow terminal. Pick the
+/// widest tier that fits instead, so the most important keys always survive.
+const HINT_TIERS: [&str; 4] = [
+    "[space] play  [h/l] seek  [H/L] skip  [j/k] move  [g/G] ends  [s] shuffle  [+/-] vol  [/] filter  [Tab] view  [q] quit",
+    "[space] play  [h/l] seek  [H/L] skip  [j/k] move  [s] shuffle  [+/-] vol  [/] filter  [q] quit",
+    "[space] play  [h/l] seek  [H/L] skip  [s] shuffle  [+/-] vol  [q] quit",
+    "[space] [h/l] [H/L] [s] [+/-] [/] [q]",
+];
+
+fn hints(available: u16) -> &'static str {
+    HINT_TIERS
+        .iter()
+        .copied()
+        .find(|h| u16::try_from(h.chars().count()).unwrap_or(u16::MAX) <= available)
+        .unwrap_or("")
 }
 
 /// Lays spans out left to right on one row, registering a hit box for anything
 /// clickable. Keeping the layout and the hit boxes in the same walk is what
 /// stops them drifting apart.
+///
+/// Widths come from `Span::width`, the same unicode-width measurement ratatui
+/// uses to draw, so a multi-cell glyph gets a hit box that matches what was
+/// actually painted. Counting `char`s here would misplace every control to the
+/// right of the first wide glyph.
 struct ControlBar {
     spans: Vec<Span<'static>>,
+    hits: Vec<(Rect, Hit)>,
     x: u16,
     y: u16,
     end: u16,
@@ -331,18 +362,15 @@ impl ControlBar {
     fn new(area: Rect) -> Self {
         Self {
             spans: Vec::new(),
+            hits: Vec::new(),
             x: area.x,
             y: area.y,
             end: area.x.saturating_add(area.width),
         }
     }
 
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "control labels are short ASCII constants"
-    )]
-    fn advance(&mut self, text: &str) -> Rect {
-        let width = text.chars().count() as u16;
+    fn push(&mut self, span: Span<'static>) -> Rect {
+        let width = u16::try_from(span.width()).unwrap_or(u16::MAX);
         let r = Rect {
             x: self.x,
             y: self.y,
@@ -350,34 +378,25 @@ impl ControlBar {
             height: 1,
         };
         self.x = self.x.saturating_add(width);
+        self.spans.push(span);
         r
     }
 
-    fn label(&mut self, text: String, style: Style) {
-        self.advance(&text);
-        self.spans.push(Span::styled(text, style));
+    /// Cells left on the row. Used to choose how much detail still fits.
+    fn remaining(&self) -> u16 {
+        self.end.saturating_sub(self.x)
     }
 
-    fn button(&mut self, app: &mut App, text: String, hit: Hit) {
-        self.push_hit(app, text, hit, Style::default().fg(Color::Cyan));
+    fn label(&mut self, text: impl Into<String>, style: Style) {
+        self.push(Span::styled(text.into(), style));
     }
 
-    fn toggle(&mut self, app: &mut App, text: String, hit: Hit, on: bool) {
-        let style = if on {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        self.push_hit(app, text, hit, style);
-    }
-
-    fn push_hit(&mut self, app: &mut App, text: String, hit: Hit, style: Style) {
-        let r = self.advance(&text);
+    fn button(&mut self, text: impl Into<String>, hit: Hit, style: Style) {
+        let r = self.push(Span::styled(text.into(), style));
         // Do not register a control the row was too narrow to draw.
         if r.x < self.end {
-            app.hits.push((r, hit));
+            self.hits.push((r, hit));
         }
-        self.spans.push(Span::styled(text, style));
     }
 }
 
@@ -486,5 +505,101 @@ fn fmt_hms(secs: u32) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m}:{s:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ControlBar, HINT_TIERS, button_style, hints};
+    use crate::app::Hit;
+    use ratatui::layout::Rect;
+    use ratatui::style::Style;
+
+    fn row(width: u16) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: 1,
+        }
+    }
+
+    #[test]
+    fn hit_boxes_tile_the_row_without_gaps_or_overlap() {
+        // Goal: the hit box of every control must start exactly where the
+        // previous span ended. A gap or overlap here is a click landing on the
+        // wrong control, which is invisible in a screenshot.
+        let mut bar = ControlBar::new(row(80));
+        bar.button(" a ", Hit::Prev, button_style());
+        bar.label("--", Style::default());
+        bar.button(" bb ", Hit::Next, button_style());
+
+        assert_eq!(bar.hits.len(), 2);
+        assert_eq!(bar.hits[0].0.x, 0);
+        assert_eq!(bar.hits[0].0.width, 3);
+        // 3 for the first button + 2 for the label.
+        assert_eq!(bar.hits[1].0.x, 5);
+        assert_eq!(bar.hits[1].0.width, 4);
+    }
+
+    #[test]
+    fn wide_glyphs_are_measured_by_render_width_not_char_count() {
+        // Goal: the transport glyphs are multi-cell. Counting chars would place
+        // every later control one cell left per glyph, so clicks would drift.
+        // `Span::width` is what ratatui itself draws with, so they cannot drift.
+        let mut bar = ControlBar::new(row(80));
+        bar.button(" |◁ ", Hit::Prev, button_style());
+        bar.button(" ▷| ", Hit::Next, button_style());
+
+        let first = bar.hits[0].0;
+        let second = bar.hits[1].0;
+        assert!(
+            first.width >= 3,
+            "a padded glyph occupies at least its two spaces plus one cell"
+        );
+        assert_eq!(
+            second.x,
+            first.x + first.width,
+            "the second control must start where the first ended"
+        );
+    }
+
+    #[test]
+    fn hints_pick_the_widest_tier_that_fits() {
+        // Goal: the bottom row must never be clipped by the renderer. Every tier
+        // has to fit the width it is chosen for, and a wide row gets the fullest.
+        for available in [0u16, 20, 40, 60, 80, 100, 140, 200] {
+            let h = hints(available);
+            assert!(
+                h.chars().count() <= available as usize,
+                "tier {h:?} does not fit in {available} cells"
+            );
+        }
+        assert_eq!(
+            hints(200),
+            HINT_TIERS[0],
+            "a wide row gets the full reference"
+        );
+        assert_eq!(hints(0), "", "nothing fits in no space");
+    }
+
+    #[test]
+    fn every_hint_tier_keeps_quit_reachable() {
+        // Goal: quit is the one binding a user cannot guess their way out of
+        // without. No tier may drop it, however narrow.
+        for tier in HINT_TIERS {
+            assert!(tier.contains("[q]"), "tier {tier:?} dropped the quit hint");
+        }
+    }
+
+    #[test]
+    fn controls_past_the_right_edge_are_not_clickable() {
+        // Goal: on a narrow terminal a control that was never painted must not
+        // still swallow clicks at a position it does not occupy.
+        let mut bar = ControlBar::new(row(4));
+        bar.button(" aaaa ", Hit::Prev, button_style());
+        bar.button(" bbbb ", Hit::Next, button_style());
+        assert_eq!(bar.hits.len(), 1, "only the control inside the row counts");
+        assert_eq!(bar.hits[0].1, Hit::Prev);
     }
 }
