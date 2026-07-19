@@ -34,7 +34,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use libmpv2::{Mpv, protocol::Protocol};
+use libmpv2::{Mpv, SetData, protocol::Protocol};
 use priel_core::PlayableSource;
 use ureq::{Agent, Body, http::Response};
 
@@ -284,31 +284,45 @@ pub fn spawn(
     })
 }
 
+/// Set an mpv property, asserting in debug builds that mpv accepted it.
+///
+/// There is no channel to report a rejected property on, so a wrong name or type
+/// would silently do nothing. That is not hypothetical: `demuxer-readahead-secs`
+/// was set here for a while and had no effect, and nothing said so.
+fn set_prop<V: SetData>(mpv: &Mpv, name: &str, value: V) {
+    let accepted = mpv.set_property(name, value).is_ok();
+    debug_assert!(accepted, "mpv rejected property {name}");
+}
+
 /// Apply the fixed player settings and select the output device.
 fn init_mpv(mpv: &Mpv, audio_device: Option<&str>) {
-    let _ = mpv.set_property("vid", "no");
-    let _ = mpv.set_property("volume", 100i64);
+    set_prop(mpv, "vid", "no");
+    set_prop(mpv, "volume", 100i64);
     // "weak" = gapless only when the format matches; a sample-rate change
     // reinits the output (keeps playback bit-perfect). Do NOT force "yes".
-    let _ = mpv.set_property("gapless-audio", "weak");
-    // Prefetch ahead of playback: the default readahead of 1.0s is why the
-    // buffered readout used to sit at ~1s. These bounds are a memory decision as
-    // much as a buffering one - mpv holds demuxed packets per *playlist entry*,
-    // and with a preloaded next track that cost is paid twice. 30s of hi-res
-    // FLAC is roughly 35 MB, which still rides out a CDN stall comfortably.
-    let _ = mpv.set_property("cache", "yes");
-    let _ = mpv.set_property("demuxer-readahead-secs", 30.0);
-    let _ = mpv.set_property("demuxer-max-bytes", 64i64 * 1024 * 1024);
+    set_prop(mpv, "gapless-audio", "weak");
+
+    // Buffering bounds. This is a memory decision as much as a resilience one:
+    // mpv holds demuxed packets per *playlist entry*, so with a preloaded next
+    // track the cost is paid twice.
+    //
+    // The duration limit that applies here is `cache-secs`, NOT
+    // `demuxer-readahead-secs`: mpv overrides the latter once the cache is on and
+    // the stream counts as a network stream, and `cache-secs` defaults to
+    // 3600000 (unbounded). Both are set explicitly so whichever binds first does
+    // so deliberately:
+    //   - 64 MiB caps memory: about 58s of 24/192, or ~190s of 24/96;
+    //   - 120s caps duration for material compressed far enough to get there.
+    set_prop(mpv, "cache", "yes");
+    set_prop(mpv, "cache-secs", 120.0);
+    set_prop(mpv, "demuxer-max-bytes", 64i64 * 1024 * 1024);
+    // Only consulted on the non-network path, where cache-secs does not apply.
+    set_prop(mpv, "demuxer-readahead-secs", 30.0);
+
     match audio_device {
-        Some("null") => {
-            let _ = mpv.set_property("ao", "null");
-        }
-        Some(dev) => {
-            let _ = mpv.set_property("audio-device", dev);
-        }
-        None => {
-            let _ = mpv.set_property("ao", "pipewire");
-        }
+        Some("null") => set_prop(mpv, "ao", "null"),
+        Some(dev) => set_prop(mpv, "audio-device", dev),
+        None => set_prop(mpv, "ao", "pipewire"),
     }
 }
 
