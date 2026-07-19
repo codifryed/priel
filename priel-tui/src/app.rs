@@ -51,9 +51,19 @@ pub enum Hit {
     PlayPause,
     Prev,
     Next,
+    SeekBack,
+    SeekFwd,
+    MoveUp,
+    MoveDown,
+    Top,
+    Bottom,
     Shuffle,
     VolUp,
     VolDown,
+    Filter,
+    CycleView,
+    Help,
+    Quit,
 }
 
 #[derive(PartialEq)]
@@ -61,6 +71,7 @@ pub enum Mode {
     Normal,
     Filter, // local filter of the current list
     Search, // editing the global TIDAL search query
+    Help,   // the shortcut reference is up; it swallows input until dismissed
 }
 
 /// Source-side metadata (from the TIDAL API — authoritative).
@@ -527,6 +538,20 @@ impl App {
         r
     }
 
+    fn goto_top(&mut self) {
+        self.selected = 0;
+    }
+
+    fn goto_bottom(&mut self) {
+        self.selected = self.visible().len().saturating_sub(1);
+    }
+
+    fn start_filter(&mut self) {
+        self.mode = Mode::Filter;
+        self.filter.clear();
+        self.selected = 0;
+    }
+
     fn play_selected(&mut self) {
         self.start_queue_at(self.selected);
     }
@@ -600,7 +625,19 @@ impl App {
         match self.mode {
             Mode::Filter => self.on_key_filter(key),
             Mode::Search => self.on_key_search(key),
+            Mode::Help => self.on_key_help(key),
             Mode::Normal => self.on_key_normal(key),
+        }
+    }
+
+    /// The help overlay is modal: anything that reads as "done" dismisses it, and
+    /// nothing else leaks through to the list underneath.
+    fn on_key_help(&mut self, key: KeyEvent) {
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q' | ' ')
+        ) {
+            self.mode = Mode::Normal;
         }
     }
 
@@ -672,8 +709,9 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_up(1),
             KeyCode::Char('J') => self.move_down(self.full_page()),
             KeyCode::Char('K') => self.move_up(self.full_page()),
-            KeyCode::Char('g') => self.selected = 0,
-            KeyCode::Char('G') => self.selected = self.visible().len().saturating_sub(1),
+            KeyCode::Char('g') => self.goto_top(),
+            KeyCode::Char('G') => self.goto_bottom(),
+            KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Enter => self.on_enter(),
             KeyCode::Char(' ') => self.player.toggle_pause(),
             KeyCode::Char('s') => self.toggle_shuffle(),
@@ -683,16 +721,20 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.player.seek_relative(5.0),
             KeyCode::Char('+' | '=') => self.volume_step(5.0),
             KeyCode::Char('-') => self.volume_step(-5.0),
-            KeyCode::Char('/') => {
-                self.mode = Mode::Filter;
-                self.filter.clear();
-                self.selected = 0;
-            }
+            KeyCode::Char('/') => self.start_filter(),
             _ => {}
         }
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.mode == Mode::Help {
+            // Any click dismisses; scrolling the list behind it would be odd.
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.mode = Mode::Normal;
+                self.dirty = true;
+            }
+            return;
+        }
         match m.kind {
             MouseEventKind::ScrollDown => self.move_down(1),
             MouseEventKind::ScrollUp => self.move_up(1),
@@ -714,9 +756,19 @@ impl App {
             Hit::PlayPause => self.player.toggle_pause(),
             Hit::Prev => self.user_prev(),
             Hit::Next => self.user_next(),
+            Hit::SeekBack => self.player.seek_relative(-5.0),
+            Hit::SeekFwd => self.player.seek_relative(5.0),
+            Hit::MoveUp => self.move_up(1),
+            Hit::MoveDown => self.move_down(1),
+            Hit::Top => self.goto_top(),
+            Hit::Bottom => self.goto_bottom(),
             Hit::Shuffle => self.toggle_shuffle(),
             Hit::VolUp => self.volume_step(5.0),
             Hit::VolDown => self.volume_step(-5.0),
+            Hit::Filter => self.start_filter(),
+            Hit::CycleView => self.cycle_view(),
+            Hit::Help => self.mode = Mode::Help,
+            Hit::Quit => self.should_quit = true,
         }
     }
 

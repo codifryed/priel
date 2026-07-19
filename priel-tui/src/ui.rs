@@ -19,7 +19,7 @@
 //! Rendering. Also records list/progress rects into `App` for mouse hit-testing.
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
 
 use crate::app::{App, Hit, Mode, View};
 
@@ -36,6 +36,145 @@ pub fn render(f: &mut Frame, app: &mut App) {
     header(f, app, rows[0]);
     list(f, app, rows[1]);
     now_playing(f, app, rows[2]);
+
+    // Drawn last so it sits over everything, and after the hit boxes above have
+    // been registered - `App` ignores them while the overlay is up.
+    if app.mode == Mode::Help {
+        help_overlay(f, f.area());
+    }
+}
+
+/// The complete reference, in two columns. The bottom row carries only what is
+/// used constantly; everything else is discoverable from here, which is what
+/// keeps that row short enough to survive a narrow terminal.
+const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Views",
+        &[
+            ("Tab", "cycle views"),
+            ("1 2 3", "jump to a view"),
+            ("Enter", "open playlist"),
+            ("Esc", "back to playlists"),
+        ],
+    ),
+    (
+        "Move",
+        &[
+            ("j k", "move the selection"),
+            ("Down Up", "move the selection"),
+            ("J K", "page down / up"),
+            ("Ctrl-D Ctrl-U", "half page down / up"),
+            ("g G", "first / last row"),
+        ],
+    ),
+];
+
+const HELP_RIGHT: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Play",
+        &[
+            ("Enter", "play selected track"),
+            ("space", "play / pause"),
+            ("h l", "seek -5s / +5s"),
+            ("L H", "next / previous track"),
+            ("n p", "next / previous track"),
+            ("s", "shuffle this view"),
+            ("+ -", "volume up / down"),
+        ],
+    ),
+    (
+        "Find",
+        &[
+            ("/", "filter this list"),
+            ("i", "edit search query"),
+            ("Enter Esc", "accept / cancel"),
+        ],
+    ),
+    (
+        "Mouse",
+        &[
+            ("wheel", "move the selection"),
+            ("double-click", "play a row"),
+            ("click drag", "seek on progress bar"),
+            ("click", "header and hint keys"),
+        ],
+    ),
+];
+
+fn help_lines(sections: &[(&str, &[(&str, &str)])]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (title, rows) in sections {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(
+            (*title).to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (keys, what) in *rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {keys:<14}"), Style::default().fg(Color::White)),
+                Span::styled((*what).to_string(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    lines
+}
+
+fn help_overlay(f: &mut Frame, area: Rect) {
+    let left = help_lines(HELP_LEFT);
+    let right = help_lines(HELP_RIGHT);
+    let width = area.width.min(84);
+    // Two columns need a 14-cell key field plus a description, twice over.
+    // Below that, stacking beats clipping every description in half.
+    let stacked = width.saturating_sub(2) < 76;
+    let rows = if stacked {
+        u16::try_from(left.len() + right.len() + 1).unwrap_or(u16::MAX)
+    } else {
+        u16::try_from(left.len().max(right.len())).unwrap_or(u16::MAX)
+    };
+
+    // Fit the terminal rather than assume it: a short window clips the overlay
+    // otherwise, and the one thing it must always show is how to close it.
+    let height = rows.saturating_add(4).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Keyboard and mouse ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let cols =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(Rect {
+            height: inner.height.saturating_sub(1),
+            ..inner
+        });
+    f.render_widget(Paragraph::new(left), cols[0]);
+    f.render_widget(Paragraph::new(right), cols[1]);
+
+    if inner.height > 0 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  press ?, Esc or q to close",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Rect {
+                y: inner.y + inner.height.saturating_sub(1),
+                height: 1,
+                ..inner
+            },
+        );
+    }
 }
 
 fn tab_style(active: bool) -> Style {
@@ -316,30 +455,109 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     bar.label(dac_badge(&app.status), Style::default().fg(Color::Green));
     bar.label(act_text, Style::default().fg(act_color));
     bar.label("  ", Style::default());
-    let hint = hints(bar.remaining());
-    bar.label(hint, Style::default().fg(Color::DarkGray));
+    push_hints(&mut bar);
+    app.hits.extend(bar.hits);
     f.render_widget(Paragraph::new(Line::from(bar.spans)), l2);
 }
 
-/// Keyboard reference tiers, widest first.
+/// One entry in the bottom keyboard reference.
 ///
-/// priel is keyboard-first, so this row is not decoration - it is how bindings
-/// are discovered. Letting the renderer clip it silently drops the keys on the
-/// right, which is how `[q] quit` once vanished from a narrow terminal. Pick the
-/// widest tier that fits instead, so the most important keys always survive.
-const HINT_TIERS: [&str; 4] = [
-    "[space] play  [h/l] seek  [H/L] skip  [j/k] move  [g/G] ends  [s] shuffle  [+/-] vol  [/] filter  [Tab] view  [q] quit",
-    "[space] play  [h/l] seek  [H/L] skip  [j/k] move  [s] shuffle  [+/-] vol  [/] filter  [q] quit",
-    "[space] play  [h/l] seek  [H/L] skip  [s] shuffle  [+/-] vol  [q] quit",
-    "[space] [h/l] [H/L] [s] [+/-] [/] [q]",
+/// Each key is individually clickable and maps to the same action its key press
+/// runs, so the reference doubles as the mouse control strip - there is no
+/// separate button to keep in sync with it.
+struct Hint {
+    keys: &'static [(&'static str, Hit)],
+    label: &'static str,
+}
+
+/// Shown whenever there is room, in descending order of everyday use.
+const HINTS: &[Hint] = &[
+    Hint {
+        keys: &[("space", Hit::PlayPause)],
+        label: "play",
+    },
+    Hint {
+        keys: &[("h", Hit::SeekBack), ("l", Hit::SeekFwd)],
+        label: "seek",
+    },
+    Hint {
+        keys: &[("H", Hit::Prev), ("L", Hit::Next)],
+        label: "skip",
+    },
+    Hint {
+        keys: &[("s", Hit::Shuffle)],
+        label: "shuffle",
+    },
+    Hint {
+        keys: &[("-", Hit::VolDown), ("+", Hit::VolUp)],
+        label: "vol",
+    },
+    Hint {
+        keys: &[("/", Hit::Filter)],
+        label: "filter",
+    },
+    Hint {
+        keys: &[("j", Hit::MoveDown), ("k", Hit::MoveUp)],
+        label: "move",
+    },
+    Hint {
+        keys: &[("Tab", Hit::CycleView)],
+        label: "view",
+    },
+    Hint {
+        keys: &[("g", Hit::Top), ("G", Hit::Bottom)],
+        label: "ends",
+    },
 ];
 
-fn hints(available: u16) -> &'static str {
-    HINT_TIERS
-        .iter()
-        .copied()
-        .find(|h| u16::try_from(h.chars().count()).unwrap_or(u16::MAX) <= available)
-        .unwrap_or("")
+/// Never dropped, however narrow the row: `?` is how everything else is found,
+/// and `q` is the one binding a user cannot guess their way out of without.
+const HINTS_ESSENTIAL: &[Hint] = &[
+    Hint {
+        keys: &[("?", Hit::Help)],
+        label: "keys",
+    },
+    Hint {
+        keys: &[("q", Hit::Quit)],
+        label: "quit",
+    },
+];
+
+/// Rendered width of a hint: `[a/b] label` plus its trailing gap.
+fn hint_width(h: &Hint) -> u16 {
+    let keys: usize = h.keys.iter().map(|(k, _)| k.chars().count()).sum();
+    let separators = h.keys.len().saturating_sub(1);
+    let width = 1 + keys + separators + 2 + h.label.chars().count() + 2;
+    u16::try_from(width).unwrap_or(u16::MAX)
+}
+
+fn push_hint(bar: &mut ControlBar, h: &Hint) {
+    let dim = Style::default().fg(Color::DarkGray);
+    bar.label("[", dim);
+    for (i, (key, hit)) in h.keys.iter().enumerate() {
+        if i > 0 {
+            bar.label("/", dim);
+        }
+        bar.button(*key, *hit, Style::default().fg(Color::Cyan));
+    }
+    bar.label(format!("] {}  ", h.label), dim);
+}
+
+/// Fill the row with hints, reserving room for the essential ones so they are
+/// never the ones clipped off the right edge.
+fn push_hints(bar: &mut ControlBar) {
+    let reserved: u16 = HINTS_ESSENTIAL.iter().map(hint_width).sum();
+    for h in HINTS {
+        if bar.remaining() < hint_width(h).saturating_add(reserved) {
+            break;
+        }
+        push_hint(bar, h);
+    }
+    for h in HINTS_ESSENTIAL {
+        if bar.remaining() >= hint_width(h) {
+            push_hint(bar, h);
+        }
+    }
 }
 
 /// Lays spans out left to right on one row, registering a hit box for anything
@@ -510,7 +728,7 @@ fn fmt_hms(secs: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlBar, HINT_TIERS, button_style, hints};
+    use super::{ControlBar, HINTS, HINTS_ESSENTIAL, button_style, hint_width, push_hints};
     use crate::app::Hit;
     use ratatui::layout::Rect;
     use ratatui::style::Style;
@@ -565,31 +783,55 @@ mod tests {
     }
 
     #[test]
-    fn hints_pick_the_widest_tier_that_fits() {
-        // Goal: the bottom row must never be clipped by the renderer. Every tier
-        // has to fit the width it is chosen for, and a wide row gets the fullest.
-        for available in [0u16, 20, 40, 60, 80, 100, 140, 200] {
-            let h = hints(available);
-            assert!(
-                h.chars().count() <= available as usize,
-                "tier {h:?} does not fit in {available} cells"
+    fn hint_width_matches_what_is_rendered() {
+        // Goal: the fitting logic reserves space using hint_width, so if that
+        // disagrees with the spans push_hint emits, the row silently overflows
+        // and the essential hints fall off the edge again.
+        for h in HINTS.iter().chain(HINTS_ESSENTIAL) {
+            let mut bar = ControlBar::new(row(200));
+            super::push_hint(&mut bar, h);
+            let rendered: usize = bar.spans.iter().map(ratatui::text::Span::width).sum();
+            assert_eq!(
+                u16::try_from(rendered).unwrap(),
+                hint_width(h),
+                "hint {:?} measures differently than it renders",
+                h.label
             );
         }
-        assert_eq!(
-            hints(200),
-            HINT_TIERS[0],
-            "a wide row gets the full reference"
-        );
-        assert_eq!(hints(0), "", "nothing fits in no space");
     }
 
     #[test]
-    fn every_hint_tier_keeps_quit_reachable() {
-        // Goal: quit is the one binding a user cannot guess their way out of
-        // without. No tier may drop it, however narrow.
-        for tier in HINT_TIERS {
-            assert!(tier.contains("[q]"), "tier {tier:?} dropped the quit hint");
+    fn the_escape_hatches_survive_a_narrow_row() {
+        // Goal: quit and help must be reachable at any width. They are reserved
+        // for, so optional hints get dropped before they do.
+        for width in [24u16, 40, 60, 80, 120, 200] {
+            let mut bar = ControlBar::new(row(width));
+            push_hints(&mut bar);
+            let text: String = bar.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                text.contains("quit") && text.contains("keys"),
+                "width {width} dropped an escape hatch: {text:?}"
+            );
+            let drawn: usize = bar.spans.iter().map(ratatui::text::Span::width).sum();
+            assert!(
+                drawn <= width as usize,
+                "width {width} overflowed: {text:?}"
+            );
         }
+    }
+
+    #[test]
+    fn every_hint_key_is_clickable() {
+        // Goal: the reference doubles as the mouse strip, so each key glyph must
+        // register a hit box - that is why there is no separate quit button.
+        let mut bar = ControlBar::new(row(200));
+        push_hints(&mut bar);
+        let keys: usize = HINTS
+            .iter()
+            .chain(HINTS_ESSENTIAL)
+            .map(|h| h.keys.len())
+            .sum();
+        assert_eq!(bar.hits.len(), keys);
     }
 
     #[test]
