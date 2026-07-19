@@ -1,0 +1,180 @@
+# priel — hi-res terminal client for TIDAL
+
+A VIM-first, mouse-first terminal client with bit-perfect, rate-following
+playback. Blocking HTTP (ureq, no async runtime) + libmpv over a custom
+`stream_cb` segment protocol → PipeWire node-targeted output.
+
+> **Unofficial software.** priel is not affiliated with, endorsed by, or
+> sponsored by TIDAL or Aspiro AB. TIDAL is a trademark of its respective owner
+> and is named here only to describe what this client connects to. An active
+> TIDAL subscription is required. priel does not circumvent access controls and
+> has no offline-export or download feature.
+
+*A **Priel** is a tidal channel in the Wadden Sea — the creek that carries the
+water in and out of the flats twice a day, on the pull of the moon.*
+
+## Why this one is different
+
+- **Bit-perfect on purpose, not by accident.** mpv runs with
+  `gapless-audio=weak`, so a track at a different sample rate *reinitialises the
+  output* instead of being resampled to whatever the last one used. You pay a
+  short gap at a rate change and get the bits you paid for. Within a sample rate
+  the next track is preloaded and the transition is gapless.
+- **VIM keys first, with alternatives for everyone else.** `j`/`k` and the arrow
+  keys, `g`/`G`, `J`/`K` and `Ctrl-D`/`Ctrl-U`, `/` to filter. Every action has a
+  key binding, and `?` opens the full reference rather than making you read this
+  file.
+- **First-class mouse, not an afterthought.** Clickable view tabs and transport
+  controls, a scrubbable progress bar, wheel scrolling, double-click to play —
+  and every key shown in the bottom hint row is itself a button. There is no
+  control that only the mouse can reach, and none that only the keyboard can.
+- **A dependency list you can actually audit.** No async runtime anywhere in the
+  tree — no tokio, no hyper. No OpenSSL: TLS is rustls. 41 crates for the API
+  library, 105 for the whole binary. **libmpv is the only non-Rust runtime
+  dependency**, and it is the one doing the work that matters.
+- **Small and quiet at rest.** A ~4 MiB binary that redraws only when something
+  on screen actually changed, backs its player thread off when nothing is
+  playing, and applies backpressure to downloads so a preloaded hi-res track
+  cannot quietly consume hundreds of megabytes.
+- **Built to survive the boring failures.** Zero `.unwrap()` calls in the
+  workspace; poisoned locks are recovered rather than propagated, because mpv
+  invokes our callbacks across an FFI boundary where unwinding is undefined
+  behaviour. 144 tests at ~96% line coverage, all of which run with no network,
+  no credentials, no audio device and no terminal.
+- **Packaged like a native tool.** A generated man page and bash, zsh and fish
+  completions, plus a `Makefile` that honours `DESTDIR`/`PREFIX`, so a distro
+  packager needs no patch.
+- **Stays inside the lines.** No download or offline-export feature, no attempt
+  to work around access controls. It plays the subscription you already have.
+- **Library-first.** The API and player crates contain no UI code, so a GUI
+  frontend can be added later as a second binary sharing both.
+
+Next up, and the reason this list has a gap: **PipeWire setup assistance** —
+detecting your `allowed-rates` configuration, explaining what a bit-perfect
+chain needs, and showing the sink's *live* bit depth and sample rate. See the
+roadmap below.
+
+## Install
+
+Needs Rust ≥ 1.85, `libmpv` (`mpv-devel` / `libmpv-dev` to build), a working
+PipeWire or ALSA setup, and a hiresTI login — priel reuses its token at
+`~/.config/hiresti/hiresti_token.json` until native authentication lands.
+
+```bash
+make check-deps        # verify cargo and libmpv are present
+make                   # release build
+sudo make install      # binary, man page, completions, licence
+```
+
+`make help` lists every target. Install paths follow the GNU conventions, so
+`make PREFIX=/usr DESTDIR=/tmp/stage install` stages cleanly for a package.
+
+```bash
+make run ARGS="--device pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0"
+```
+
+`--device` is optional; the default sink is used when it is omitted.
+`--token-file` overrides the token path. See `man priel` or `priel --help`.
+
+For UI work or a machine without mpv headers, `make build-nolibmpv` compiles the
+interface with playback stubbed out.
+
+## Keys & mouse
+
+Press `?` in the app for the complete reference. Every key listed in the bottom
+row of the interface is also clickable.
+
+| Action | Keyboard | Mouse |
+|---|---|---|
+| Full key reference | `?` | click `[?]` |
+| Switch view | `Tab` cycles, `1`/`2`/`3` | click a tab |
+| Move selection | `j`/`k`, `↑`/`↓` | scroll wheel |
+| First / last | `g` / `G` | click `[g/G]` |
+| Page up/down | `J`/`K` full, `Ctrl-U`/`Ctrl-D` half | — |
+| Open playlist / back | `Enter` / `Esc` | double-click |
+| Play selected | `Enter` | double-click a row |
+| Play / pause | `Space` | click `▷` / `‖` |
+| Seek ±5s | `h`/`l`, `←`/`→` | click or drag the progress bar |
+| Previous / next track | `H`/`L`, or `p`/`n` | click `|◁` / `▷|` |
+| Filter the current list | `/`, type, `Enter`/`Esc` | click `[/]` |
+| Search the catalogue | `3`, type, `Enter`; `i` to re-edit | — |
+| Shuffle the current view | `s` | click `⇄` |
+| Volume | `+` / `-` | click `-` / `+` |
+| Quit | `q` | click `[q]` |
+
+`Esc` cancels: it leaves a filter or search box, and steps back out of an opened
+playlist. It never quits.
+
+## Status
+
+Working: favorites, playlists and catalogue search; local filtering; hi-res
+resolution and playback (24/192 via progressive segment streaming); a gapless
+play queue with a preloaded next track; shuffle with auto-advance; play, pause,
+seek, skip and volume; a now-playing bar with a scrubbable progress bar and a
+live DAC badge; the `?` reference overlay.
+
+Roadmap, roughly in order:
+
+- **PipeWire configuration help** — detect and explain the `allowed-rates` setup
+  a bit-perfect chain needs, and surface the sink's current bit depth and sample
+  rate live.
+- **Native PKCE authentication**, replacing the borrowed hiresTI token.
+- **Per-track memory ceiling.** Buffers are bounded and downloads apply
+  backpressure, but a fully played track is still retained; trimming it needs a
+  segment offset index so a backward seek can refetch.
+- **Typed errors across the worker boundary**, so the interface can tell an
+  expired token from a dropped network and prompt accordingly.
+- **Incremental paging** — listings currently fetch a first page only.
+- MPRIS, a configuration file for keybindings, cover art (kitty/sixel).
+- **Spectrum visualiser**, if it can coexist with bit-perfect output.
+
+## Workspace
+
+```
+priel-core     lib  — API access + hi-res stream resolution (blocking, UI-agnostic)
+priel-player   lib  — embedded libmpv player, thread-owned, stream_cb protocol
+priel-tui      bin  — ratatui frontend (builds the `priel` binary)
+```
+
+Development uses `make check` (formatting, clippy at pedantic over both feature
+configurations, and the full test suite) and `make coverage`. Style and testing
+rules live in [`RUST_STYLE.md`](RUST_STYLE.md).
+
+## Packaging (Linux-first)
+
+- **Single binary** `priel`; runtime dependencies are libmpv (`libmpv.so.2`) and
+  a working PipeWire/ALSA. TLS is rustls, so there is **no OpenSSL** dependency
+  and **no async runtime** in the tree.
+- `make install` places the binary, `priel.1`, bash/zsh/fish completions, the
+  licence and the README, honouring `DESTDIR`, `PREFIX`, `BINDIR`, `MANDIR` and
+  the completion directories.
+- The man page and completions are **generated from the same clap definition the
+  binary parses with** (`make assets`), so they cannot drift from reality.
+- `make dist` produces a source tarball; `make vendor` vendors the crates for an
+  offline build. `CARGO_FLAGS` defaults to `--locked`.
+- Minimum supported Rust is 1.85, declared as `rust-version` in the workspace.
+- No trademarked term appears in the package name, binary name, crate names, or
+  any identifier — the service is named only in prose describing what the client
+  talks to. Do not ship the TIDAL logo, wordmark, or brand typography with the
+  package, and keep the disclaimer above in the RPM `%description`.
+- **Cross-OS later** is feasible: crossterm, ratatui, ureq, rustls and libmpv are
+  all cross-platform (libmpv via brew/scoop). There is no Linux-only code in the
+  crates; the player reads the output rate from mpv properties.
+
+## License
+
+Copyright (C) 2026 Guy Boldon
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <https://www.gnu.org/licenses/>.
+
+The full license text is in [`COPYING`](COPYING).
