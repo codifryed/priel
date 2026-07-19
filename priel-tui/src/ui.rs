@@ -677,7 +677,7 @@ fn source_badge(app: &App) -> String {
         parts.push(format!("{}-bit", m.bit_depth));
     }
     if m.sample_rate > 0 {
-        parts.push(format!("{} kHz", m.sample_rate / 1000));
+        parts.push(fmt_khz(m.sample_rate));
     }
     if !m.codec.is_empty() {
         parts.push(m.codec.to_uppercase());
@@ -726,10 +726,14 @@ fn fidelity_badge(app: &App) -> (String, Color) {
             Color::Yellow,
         ),
         Fidelity::Altered(Alteration::Resampled) => (
+            // The destination is the *effective* output - the device rate when
+            // one was read. Printing `status.sample_rate` here showed the rate
+            // the audio server claimed, which in a resample is the source rate
+            // again: "resampled 44.1 to 44.1 kHz".
             format!(
-                "  ⚠ resampled {}→{} kHz",
-                app.status.in_sample_rate / 1000,
-                app.status.sample_rate / 1000
+                "  ⚠ resampled {}→{}",
+                fmt_khz(app.status.in_sample_rate),
+                fmt_khz(app.status.effective_output().0)
             ),
             Color::Red,
         ),
@@ -772,7 +776,7 @@ fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
         format.to_uppercase()
     };
     let rate = if rate_hz > 0 {
-        format!("{} kHz", rate_hz / 1000)
+        fmt_khz(rate_hz)
     } else {
         "?".to_string()
     };
@@ -799,6 +803,22 @@ fn trunc(s: &str, n: usize) -> String {
         let mut r: String = s.chars().take(n.saturating_sub(1)).collect();
         r.push('…');
         r
+    }
+}
+
+/// Sample rates the way the people who care about them write them.
+///
+/// 44100 is "44.1 kHz", not "44 kHz": the 44.1 and 48 kHz families are the whole
+/// distinction a bit-perfect chain turns on, and truncating the decimal away
+/// makes 44.1 and 48 look like neighbours rather than different worlds.
+fn fmt_khz(hz: u32) -> String {
+    if hz == 0 {
+        return "?".to_string();
+    }
+    if hz % 1000 == 0 {
+        format!("{} kHz", hz / 1000)
+    } else {
+        format!("{:.1} kHz", f64::from(hz) / 1000.0)
     }
 }
 
@@ -1397,5 +1417,39 @@ mod tests {
             out.contains("resampled"),
             "the device rate contradicts the stream, which is the whole point: {out}"
         );
+    }
+
+    #[test]
+    fn rates_keep_the_decimal_that_distinguishes_the_families() {
+        // Goal: 44.1 and 48 kHz are the two worlds a bit-perfect chain lives
+        // between. Rendering 44100 as "44 kHz" makes them look adjacent, and
+        // hides that a 44.1 source on a 48 kHz device is being rebuilt.
+        assert_eq!(super::fmt_khz(44_100), "44.1 kHz");
+        assert_eq!(super::fmt_khz(88_200), "88.2 kHz");
+        assert_eq!(super::fmt_khz(176_400), "176.4 kHz");
+        assert_eq!(super::fmt_khz(48_000), "48 kHz", "whole rates stay whole");
+        assert_eq!(super::fmt_khz(192_000), "192 kHz");
+        assert_eq!(super::fmt_khz(0), "?");
+    }
+
+    #[test]
+    fn a_resample_names_the_rate_the_hardware_is_actually_running_at() {
+        // Goal: the destination must come from the device, not from the audio
+        // server. In a resample the server reports back the rate it accepted -
+        // the source rate - so reading it there produced "resampled 44.1→44.1".
+        let mut sc = screen();
+        chain(&mut sc, 24, 44_100, 44_100, "s32");
+        sc.app.status.hw = Some(priel_player::hw::HwParams {
+            card: "AUDIO".into(),
+            rate: 48_000,
+            format: "S32_LE".into(),
+            channels: 2,
+        });
+        let out = text(&mut sc.app, 160, 12);
+        assert!(
+            out.contains("resampled 44.1 kHz→48 kHz"),
+            "both ends of the conversion must be real: {out}"
+        );
+        assert!(out.contains("DAC S32_LE · 48 kHz"), "{out}");
     }
 }
