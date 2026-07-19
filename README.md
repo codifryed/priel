@@ -20,20 +20,25 @@ water in and out of the flats twice a day, on the pull of the moon.*
   output* instead of being resampled to whatever the last one used. You pay a
   short gap at a rate change and get the bits you paid for. Within a sample rate
   the next track is preloaded and the transition is gapless.
-- **A bit-perfect indicator that does not flatter you.** The now-playing row
-  shows `✓ bit-perfect` only when the output rate matches the decoded rate, the
-  output format is wide enough for the source depth, and *both* volume stages -
-  priel's and the audio server's - are at unity. Otherwise it names the fault:
-  `⚠ resampled 44→48 kHz`, `⚠ truncated to S16`, `⚠ volume 70% · 0 for unity`, or
-  `⚠ system volume below unity`. A wider container is not a fault: 24-bit content
-  in an `S32` frame is exactly how a USB DAC expects it, so that reads green.
-  The badge is labelled `OUT`, not `DAC`, because it reports what priel hands to
-  the audio server - see the roadmap for why that distinction is not pedantry.
+- **A bit-perfect indicator that reads the hardware, not the promise.** priel
+  reads the ALSA device's live parameters from `/proc/asound` and judges against
+  those. That matters: PipeWire will accept a 44.1 kHz stream, report 44.1 kHz
+  back, and clock the card at 48 kHz — every player that trusts the audio server
+  shows a green light through that. When the device is readable the badge says
+  `DAC S32_LE · 48 kHz`; when it is not, it says `OUT` and admits it is only
+  reporting what the server accepted.
+- **Three honest grades, not a binary.** `✓ bit-perfect` when nothing alters the
+  samples. `≈ near bit-perfect` when only the *level* changed — digital
+  attenuation costs about one bit per 6 dB, which most people trade for a volume
+  key, and lumping it in with a resample would make the indicator useless.
+  `⚠ resampled 44→48 kHz` or `⚠ truncated to S16` when the stream is being
+  rebuilt. A wider container is not a fault: 24-bit content in an `S32` frame is
+  exactly how a USB DAC expects it, so that reads green.
 - **Unity gain is a first-class state.** Any software volume below 100%
-  multiplies every sample and costs you resolution. The header shows `100%` in
-  green when you are at unity and in yellow when you are not, and `0` restores
-  it. Enthusiasts: leave both priel and the system mixer at unity and set level
-  on the DAC.
+  multiplies every sample. The header shows `100%` in green at unity and yellow
+  otherwise, `0` restores it, and both stages are watched — priel's own volume
+  and the audio server's volume for our stream. Enthusiasts: leave both at unity
+  and set level on the DAC.
 - **VIM keys first, with alternatives for everyone else.** `j`/`k` and the arrow
   keys, `g`/`G`, `J`/`K` and `Ctrl-D`/`Ctrl-U`, `/` to filter. Every action has a
   key binding, and `?` opens the full reference rather than making you read this
@@ -130,14 +135,16 @@ DAC badge and a bit-perfect indicator; the `?` reference overlay.
 
 Roadmap, roughly in order:
 
-- **PipeWire configuration help, and a truly live output readout.** The `OUT`
-  badge reports the format priel negotiated with the audio server, which is as
-  far as mpv can see. PipeWire can accept a 44.1 kHz stream and resample it into
-  a 48 kHz graph without mpv ever knowing. The real device state is readable —
-  `/proc/asound/card*/pcm*p/sub*/hw_params` gives the live rate and format, and
-  `pw-dump` gives the graph — so a future `DAC` badge can report the hardware
-  rather than the negotiation, alongside guidance on the `allowed-rates` setup a
-  bit-perfect chain needs.
+- **PipeWire configuration help.** The live device readout tells you *whether*
+  the chain is clean; it does not yet tell you how to fix it. Detect and explain
+  the `allowed-rates` setup a bit-perfect chain needs, and read the graph with
+  `pw-dump` to name which node is doing the resampling.
+- **ALSA setup helpers, for true bit-perfect.** PipeWire is the right default,
+  but it is a mixer: even configured well it owns the device and the graph can
+  change under you. Enthusiasts will want the DAC out of the PipeWire graph
+  entirely and priel talking to ALSA directly (`hw:` device, exclusive access).
+  Detect when a device is claimed by PipeWire, explain how to reserve it, and
+  offer a direct-ALSA output path.
 - **Native PKCE authentication**, replacing the borrowed hiresTI token.
 - **Per-track memory ceiling.** Buffers are bounded and downloads apply
   backpressure, but a fully played track is still retained; trimming it needs a

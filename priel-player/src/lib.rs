@@ -31,6 +31,10 @@ use std::thread::JoinHandle;
 use anyhow::Result;
 use priel_core::PlayableSource;
 
+use crate::hw::HwParams;
+
+pub mod hw;
+
 #[cfg(feature = "libmpv")]
 mod backend_mpv;
 #[cfg(feature = "libmpv")]
@@ -85,6 +89,12 @@ pub struct PlaybackStatus {
     /// volume. `PipeWire` attenuates in software too, so a stream turned down in
     /// the system mixer is no more bit-perfect than one turned down in priel.
     pub ao_volume: Option<f64>,
+    /// Live parameters of the ALSA device, when one could be read.
+    ///
+    /// This is the only unmediated view of the hardware. When present it decides
+    /// the verdict; when absent the judgement falls back to what the audio
+    /// server reported, which can hide a resample it performed itself.
+    pub hw: Option<HwParams>,
 }
 
 /// How faithfully the decoded samples are reaching the output device.
@@ -94,11 +104,19 @@ pub struct PlaybackStatus {
 /// that needs to inspect the `PipeWire` graph itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fidelity {
-    /// Nothing is playing, or mpv has not reported the parameters yet.
+    /// Nothing is playing, or the parameters are not known yet.
     Unknown,
     /// Every sample reaches the device unaltered.
     BitPerfect,
-    /// Something in the path changes the samples.
+    /// Only the level is changed: no resampling, no truncation, the sample
+    /// stream otherwise intact.
+    ///
+    /// Digital attenuation costs roughly one bit per 6 dB, which is a trade most
+    /// listeners make happily for a volume key. It is a different kind of thing
+    /// from rebuilding the stream, and flattening the two into one warning makes
+    /// the indicator useless for the people who care most.
+    NearBitPerfect(Alteration),
+    /// The sample stream itself is being rebuilt.
     Altered(Alteration),
 }
 
@@ -130,13 +148,25 @@ pub enum Alteration {
     reason = "s24 and float coincide numerically for unrelated reasons; merging them would hide why"
 )]
 fn format_bits(fmt: &str) -> Option<u32> {
-    match fmt.trim_end_matches('p') {
+    // Two vocabularies reach this: mpv's (`s32`, `floatp`) and ALSA's from
+    // /proc/asound (`S32_LE`, `S24_3LE`). Normalise both.
+    let lower = fmt.to_ascii_lowercase();
+    // `S24_3LE` is 24 bits packed into 3 bytes and has no underscore before the
+    // endianness, so it has to be stripped before the plain `_le` case - which
+    // is precisely the device format a packed-24 DAC reports.
+    let f = lower
+        .trim_end_matches("_3le")
+        .trim_end_matches("_3be")
+        .trim_end_matches("_le")
+        .trim_end_matches("_be")
+        .trim_end_matches('p');
+    match f {
         "u8" | "s8" => Some(8),
         "s16" => Some(16),
         "s24" => Some(24),
         "s32" => Some(32),
         "float" => Some(24),
-        "double" => Some(53),
+        "float64" | "double" => Some(53),
         _ => None,
     }
 }
@@ -149,12 +179,35 @@ impl PlaybackStatus {
     /// comparing container widths would call a lossless `s32 -> s24` output a
     /// truncation. Pass 0 when the depth is unknown and the container width is
     /// used as an upper bound instead.
+    /// The output rate and format actually in force.
+    ///
+    /// Prefers the ALSA readout over what the audio server told mpv, because a
+    /// server that resampled on our behalf still reports the rate we asked for.
+    #[must_use]
+    pub fn effective_output(&self) -> (u32, &str) {
+        match &self.hw {
+            Some(h) => (h.rate, h.format.as_str()),
+            None => (self.sample_rate, self.out_format.as_str()),
+        }
+    }
+
+    /// True when the verdict is based on the hardware rather than on what the
+    /// audio server claimed.
+    #[must_use]
+    pub fn verdict_is_from_hardware(&self) -> bool {
+        self.hw.is_some()
+    }
+
     #[must_use]
     pub fn fidelity(&self, source_bits: u32) -> Fidelity {
-        if !self.loaded || self.sample_rate == 0 || self.in_sample_rate == 0 {
+        if !self.loaded || self.in_sample_rate == 0 {
             return Fidelity::Unknown;
         }
-        let Some(out_bits) = format_bits(&self.out_format) else {
+        let (out_rate, out_format) = self.effective_output();
+        if out_rate == 0 {
+            return Fidelity::Unknown;
+        }
+        let Some(out_bits) = format_bits(out_format) else {
             return Fidelity::Unknown;
         };
         let source_bits = if source_bits > 0 {
@@ -166,7 +219,7 @@ impl PlaybackStatus {
             }
         };
 
-        if self.sample_rate != self.in_sample_rate {
+        if out_rate != self.in_sample_rate {
             return Fidelity::Altered(Alteration::Resampled);
         }
         if out_bits < source_bits {
@@ -174,7 +227,7 @@ impl PlaybackStatus {
         }
         // mpv's software volume multiplies every sample; only unity is exact.
         if (self.volume - 100.0).abs() > f64::EPSILON {
-            return Fidelity::Altered(Alteration::VolumeScaled);
+            return Fidelity::NearBitPerfect(Alteration::VolumeScaled);
         }
         // Then the server's. Reported second because clearing priel's own volume
         // is a keypress, while this one lives in the system mixer.
@@ -182,7 +235,7 @@ impl PlaybackStatus {
             .ao_volume
             .is_some_and(|v| (v - 100.0).abs() > f64::EPSILON)
         {
-            return Fidelity::Altered(Alteration::ServerVolumeScaled);
+            return Fidelity::NearBitPerfect(Alteration::ServerVolumeScaled);
         }
         Fidelity::BitPerfect
     }
@@ -282,6 +335,7 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hw::HwParams;
     use std::time::{Duration, Instant};
 
     /// A player wired to mpv's null output: real command handling, no audio
@@ -456,7 +510,11 @@ mod tests {
         // listener controls, so it has to be distinguishable from the others.
         let mut s = playing(96_000, 96_000, "s32", "s32");
         s.volume = 80.0;
-        assert_eq!(s.fidelity(24), Fidelity::Altered(Alteration::VolumeScaled));
+        assert_eq!(
+            s.fidelity(24),
+            Fidelity::NearBitPerfect(Alteration::VolumeScaled),
+            "a level change is graded, not lumped in with a rebuilt stream"
+        );
         s.volume = 100.0;
         assert_eq!(s.fidelity(24), Fidelity::BitPerfect);
     }
@@ -504,7 +562,7 @@ mod tests {
         s.ao_volume = Some(60.0);
         assert_eq!(
             s.fidelity(24),
-            Fidelity::Altered(Alteration::ServerVolumeScaled)
+            Fidelity::NearBitPerfect(Alteration::ServerVolumeScaled)
         );
 
         s.ao_volume = Some(100.0);
@@ -527,6 +585,74 @@ mod tests {
         let mut s = playing(96_000, 96_000, "s32", "s32");
         s.volume = 50.0;
         s.ao_volume = Some(50.0);
-        assert_eq!(s.fidelity(24), Fidelity::Altered(Alteration::VolumeScaled));
+        assert_eq!(
+            s.fidelity(24),
+            Fidelity::NearBitPerfect(Alteration::VolumeScaled)
+        );
+    }
+
+    #[test]
+    fn the_hardware_readout_overrules_what_the_server_claimed() {
+        // Goal: the whole point of reading /proc/asound. PipeWire accepts a
+        // 44.1 kHz stream, tells mpv it got 44.1 kHz, and clocks the card at
+        // 48 kHz. Trusting mpv alone would show a green light on a resample.
+        let mut s = playing(44_100, 44_100, "s32", "s32");
+        assert_eq!(
+            s.fidelity(24),
+            Fidelity::BitPerfect,
+            "with no hardware readout there is nothing to contradict the server"
+        );
+
+        s.hw = Some(HwParams {
+            card: "AUDIO".into(),
+            rate: 48_000,
+            format: "S32_LE".into(),
+            channels: 2,
+        });
+        assert_eq!(
+            s.fidelity(24),
+            Fidelity::Altered(Alteration::Resampled),
+            "the device is clocked elsewhere, so this is a resample"
+        );
+    }
+
+    #[test]
+    fn alsa_format_names_are_understood_too() {
+        // Goal: /proc speaks `S24_3LE`, mpv speaks `s24`. Both must map to the
+        // same width or the hardware readout would read as unknown.
+        let mut s = playing(96_000, 96_000, "s32", "s32");
+        for (fmt, verdict) in [
+            ("S32_LE", Fidelity::BitPerfect),
+            ("S24_3LE", Fidelity::BitPerfect),
+            ("FLOAT_LE", Fidelity::BitPerfect),
+            ("S16_LE", Fidelity::Altered(Alteration::Truncated)),
+        ] {
+            s.hw = Some(HwParams {
+                card: "AUDIO".into(),
+                rate: 96_000,
+                format: fmt.into(),
+                channels: 2,
+            });
+            assert_eq!(s.fidelity(24), verdict, "format {fmt}");
+        }
+    }
+
+    #[test]
+    fn the_source_of_the_verdict_is_reported() {
+        // Goal: the badge says `DAC` or `OUT` based on this, and claiming the
+        // hardware when the reading came from the server would be the exact
+        // overstatement this work removed.
+        let mut s = playing(96_000, 96_000, "s32", "s32");
+        assert!(!s.verdict_is_from_hardware());
+        assert_eq!(s.effective_output(), (96_000, "s32"));
+
+        s.hw = Some(HwParams {
+            card: "AUDIO".into(),
+            rate: 96_000,
+            format: "S32_LE".into(),
+            channels: 2,
+        });
+        assert!(s.verdict_is_from_hardware());
+        assert_eq!(s.effective_output(), (96_000, "S32_LE"));
     }
 }

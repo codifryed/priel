@@ -32,12 +32,13 @@ use std::io::Read;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libmpv2::{Mpv, SetData, protocol::Protocol};
 use priel_core::PlayableSource;
 use ureq::{Agent, Body, http::Response};
 
+use crate::hw::{self, HwParams};
 use crate::{Cmd, PlaybackStatus};
 
 /// Lock a mutex, tolerating poisoning.
@@ -78,6 +79,10 @@ struct Buf {
 /// it, so nothing consumes those bytes in the meantime. 32 MiB is around 28s of
 /// 24/192 FLAC, enough of a head start to cover the transition.
 const DOWNLOAD_AHEAD_MAX: u64 = 32 * 1024 * 1024;
+
+/// How often the ALSA device parameters are re-read. The hardware rate only
+/// changes on a track boundary, so once a second is generous.
+const HW_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 type Registry = Arc<Mutex<HashMap<u64, Arc<Shared>>>>;
 
@@ -235,6 +240,11 @@ pub fn spawn(
 
         let mut entries: Vec<Entry> = Vec::new();
         let mut seq: u64 = 0;
+        // The ALSA readout costs a handful of /proc reads, so it is refreshed on
+        // its own slower cadence rather than on every status tick.
+        let mut hw: Option<HwParams> = None;
+        // `None` means "never probed", which forces the first tick to look.
+        let mut hw_checked: Option<Instant> = None;
 
         loop {
             let mut quit = false;
@@ -257,7 +267,11 @@ pub fn spawn(
                 break;
             }
             cleanup_playlist(&mpv, &registry, &mut entries);
-            let st = read_status(&mpv, &entries);
+            if hw_checked.is_none_or(|t| t.elapsed() >= HW_PROBE_INTERVAL) {
+                hw = hw::probe(audio_device.as_deref());
+                hw_checked = Some(Instant::now());
+            }
+            let st = read_status(&mpv, &entries, hw.clone());
             // Poll fast enough for a smooth progress bar while audio is moving,
             // and back off when it is not. `recv_timeout` rather than `sleep` so
             // a command still wakes the thread immediately either way - the
@@ -505,7 +519,7 @@ fn read_body(resp: &mut Response<Body>) -> Option<Vec<u8>> {
     clippy::cast_possible_truncation,
     reason = "bitrate is a display value; fractional bits/s are meaningless"
 )]
-fn read_status(mpv: &Mpv, entries: &[Entry]) -> PlaybackStatus {
+fn read_status(mpv: &Mpv, entries: &[Entry], hw: Option<HwParams>) -> PlaybackStatus {
     let position = mpv.get_property::<f64>("time-pos").unwrap_or(0.0);
     let duration = mpv.get_property::<f64>("duration").unwrap_or(0.0);
     let paused = mpv.get_property::<bool>("pause").unwrap_or(false);
@@ -558,6 +572,7 @@ fn read_status(mpv: &Mpv, entries: &[Entry]) -> PlaybackStatus {
         has_next: entries.len() > 1,
         cache_secs,
         ao_volume,
+        hw,
     }
 }
 
@@ -937,7 +952,7 @@ mod tests {
         // this snapshot, so an idle player must report honestly rather than
         // looking like a loaded track at position zero.
         let mpv = silent_mpv();
-        let st = read_status(&mpv, &[]);
+        let st = read_status(&mpv, &[], None);
         assert!(!st.loaded);
         assert!(!st.playing);
         assert_eq!(st.current_id, 0, "no entry means no track id");
@@ -951,7 +966,7 @@ mod tests {
         // tells it whether a preload already exists.
         let mpv = silent_mpv();
         let entries = vec![Entry { id: 11, seq: None }, Entry { id: 22, seq: None }];
-        let st = read_status(&mpv, &entries);
+        let st = read_status(&mpv, &entries, None);
         assert_eq!(st.current_id, 11);
         assert!(st.has_next);
     }

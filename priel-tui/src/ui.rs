@@ -72,11 +72,13 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
     (
         "Output",
         &[
-            ("OUT", "what priel sends out"),
-            ("bit-perfect", "sent unaltered"),
-            ("resampled", "rate changed on the way"),
+            ("DAC", "live from the device"),
+            ("OUT", "what the server took"),
+            ("bit-perfect", "nothing altered"),
+            ("near", "level changed only"),
+            ("resampled", "rate changed"),
             ("truncated", "format too narrow"),
-            ("volume", "0 restores unity gain"),
+            ("0", "restore unity gain"),
         ],
     ),
 ];
@@ -712,6 +714,17 @@ fn fidelity_badge(app: &App) -> (String, Color) {
     match app.status.fidelity(app.now_meta.bit_depth) {
         Fidelity::Unknown => (String::new(), Color::DarkGray),
         Fidelity::BitPerfect => ("  ✓ bit-perfect".to_string(), Color::Green),
+        Fidelity::NearBitPerfect(Alteration::VolumeScaled) => (
+            format!(
+                "  ≈ near bit-perfect · volume {}% · 0 for unity",
+                app.status.volume as u32
+            ),
+            Color::Yellow,
+        ),
+        Fidelity::NearBitPerfect(_) => (
+            "  ≈ near bit-perfect · system volume below unity".to_string(),
+            Color::Yellow,
+        ),
         Fidelity::Altered(Alteration::Resampled) => (
             format!(
                 "  ⚠ resampled {}→{} kHz",
@@ -742,20 +755,28 @@ fn fidelity_badge(app: &App) -> (String, Color) {
 /// resample it into a 48 kHz graph without mpv ever seeing it. Showing the real
 /// device rate means reading the graph, which is a separate piece of work.
 fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
-    if s.sample_rate == 0 && s.out_format.is_empty() {
+    let (rate_hz, format) = s.effective_output();
+    if rate_hz == 0 && format.is_empty() {
         return " OUT —".into();
     }
-    let fmt = if s.out_format.is_empty() {
-        "?".into()
+    // `DAC` only when the numbers came from the ALSA device itself. Otherwise
+    // this is what the audio server accepted from us, which it may yet resample.
+    let label = if s.verdict_is_from_hardware() {
+        "DAC"
     } else {
-        s.out_format.to_uppercase()
+        "OUT"
     };
-    let rate = if s.sample_rate > 0 {
-        format!("{} kHz", s.sample_rate / 1000)
+    let fmt = if format.is_empty() {
+        "?".to_string()
     } else {
-        "?".into()
+        format.to_uppercase()
     };
-    format!(" OUT {fmt} · {rate}")
+    let rate = if rate_hz > 0 {
+        format!("{} kHz", rate_hz / 1000)
+    } else {
+        "?".to_string()
+    };
+    format!(" {label} {fmt} · {rate}")
 }
 
 fn short_quality(q: &str) -> String {
@@ -1350,7 +1371,31 @@ mod tests {
         let mut sc = screen();
         chain(&mut sc, 24, 96_000, 96_000, "s32");
         sc.app.status.ao_volume = Some(40.0);
-        let out = text(&mut sc.app, 140, 12);
+        let out = text(&mut sc.app, 160, 12);
+        assert!(out.contains("near bit-perfect"), "{out}");
         assert!(out.contains("system volume"), "{out}");
+    }
+
+    #[test]
+    fn the_badge_says_dac_only_when_it_read_the_device() {
+        // Goal: `DAC` is a claim about hardware. It may appear only when the
+        // numbers came from /proc/asound, and the hardware rate must win over
+        // whatever the audio server reported.
+        let mut sc = screen();
+        chain(&mut sc, 24, 44_100, 44_100, "s32");
+        assert!(text(&mut sc.app, 160, 12).contains("OUT S32"));
+
+        sc.app.status.hw = Some(priel_player::hw::HwParams {
+            card: "AUDIO".into(),
+            rate: 48_000,
+            format: "S32_LE".into(),
+            channels: 2,
+        });
+        let out = text(&mut sc.app, 160, 12);
+        assert!(out.contains("DAC S32_LE · 48 kHz"), "{out}");
+        assert!(
+            out.contains("resampled"),
+            "the device rate contradicts the stream, which is the whole point: {out}"
+        );
     }
 }
