@@ -163,3 +163,115 @@ impl Drop for Player {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A player wired to mpv's null output: real command handling, no audio
+    /// device, so it behaves identically on a headless machine.
+    fn silent() -> Player {
+        Player::new(Some("null".into())).expect("player")
+    }
+
+    fn wait_for(p: &Player, cond: impl Fn(&PlaybackStatus) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if cond(&p.status()) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_new_player_starts_idle() {
+        // Goal: the UI reads this snapshot before anything is loaded, and the
+        // end-of-track fallback keys off `ended`, so a fresh player must not
+        // look like a finished one.
+        let p = silent();
+        let s = p.status();
+        assert!(!s.loaded);
+        assert!(!s.playing);
+        assert!(!s.ended);
+        assert_eq!(s.current_id, 0);
+    }
+
+    #[test]
+    fn commands_are_non_blocking_and_reach_the_thread() {
+        // Goal: every command is fire-and-forget by design - the UI thread must
+        // never wait on the player. Volume is the one with a value we can watch
+        // come back through the shared snapshot.
+        let p = silent();
+        let before = Instant::now();
+        p.set_volume(55.0);
+        assert!(
+            before.elapsed() < Duration::from_millis(50),
+            "sending must not block the caller"
+        );
+        assert!(
+            wait_for(&p, |s| (s.volume - 55.0).abs() < f64::EPSILON),
+            "the player thread should have applied it"
+        );
+    }
+
+    #[test]
+    fn volume_is_clamped_to_a_sane_range() {
+        // Goal: mpv accepts absurd values and will happily distort; the clamp is
+        // the only thing between a scroll wheel and blown ears.
+        let p = silent();
+        p.set_volume(1_000.0);
+        assert!(
+            wait_for(&p, |s| s.volume <= 130.0),
+            "must not exceed the ceiling"
+        );
+        p.set_volume(-50.0);
+        assert!(wait_for(&p, |s| s.volume >= 0.0), "must not go negative");
+    }
+
+    #[test]
+    fn every_command_is_accepted_without_a_track_loaded() {
+        // Goal: the UI does not gate its controls on playback state, so pressing
+        // skip or seek on an empty queue must be harmless rather than a panic.
+        let p = silent();
+        p.play_now(1, PlayableSource::Direct("http://127.0.0.1:1/a".into()));
+        p.append_next(
+            2,
+            PlayableSource::Segments(vec!["http://127.0.0.1:1/b".into()]),
+        );
+        p.skip_next();
+        p.toggle_pause();
+        p.seek(10.0);
+        p.seek_relative(-5.0);
+        p.stop();
+        assert!(wait_for(&p, |_| true), "the thread is still answering");
+    }
+
+    #[test]
+    fn dropping_a_player_stops_its_thread() {
+        // Goal: `Drop` sends Quit and joins. If it did not, quitting priel would
+        // leave mpv holding the audio device open.
+        let started = Instant::now();
+        drop(silent());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "drop must not hang waiting for the player thread"
+        );
+    }
+
+    #[test]
+    fn an_idle_player_keeps_ticking_without_commands() {
+        // Goal: with nothing playing the thread waits on a longer timeout and
+        // then loops. If the timeout arm were wrong the status would freeze at
+        // whatever it was when the last command arrived.
+        let p = silent();
+        std::thread::sleep(Duration::from_millis(700));
+        p.set_volume(33.0);
+        assert!(
+            wait_for(&p, |s| (s.volume - 33.0).abs() < f64::EPSILON),
+            "the thread should still be responsive after idling"
+        );
+    }
+}
