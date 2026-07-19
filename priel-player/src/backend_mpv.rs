@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -66,7 +66,18 @@ struct Buf {
     complete: bool,
     total: Option<u64>,
     aborted: bool,
+    /// Furthest byte offset any reader has consumed. Only ever moves forward, so
+    /// a backward seek does not let the downloader run away again.
+    read_pos: u64,
 }
+
+/// How far the downloader may run ahead of the reader before it parks.
+///
+/// Without this, appending a preloaded next track downloads that whole track
+/// immediately - and mpv does not open a queued playlist entry until it reaches
+/// it, so nothing consumes those bytes in the meantime. 32 MiB is around 28s of
+/// 24/192 FLAC, enough of a head start to cover the transition.
+const DOWNLOAD_AHEAD_MAX: u64 = 32 * 1024 * 1024;
 
 type Registry = Arc<Mutex<HashMap<u64, Arc<Shared>>>>;
 
@@ -94,6 +105,7 @@ fn empty_complete() -> Arc<Shared> {
             complete: true,
             total: Some(0),
             aborted: false,
+            read_pos: 0,
         }),
         cv: Condvar::new(),
     })
@@ -134,6 +146,9 @@ fn read(cookie: &mut Cookie, buf: &mut [i8]) -> i64 {
                 *d = i8::from_ne_bytes([*s]);
             }
             cookie.pos += n as u64;
+            // Let the downloader know it may resume (see DOWNLOAD_AHEAD_MAX).
+            g.read_pos = g.read_pos.max(cookie.pos);
+            cookie.shared.cv.notify_all();
             return n as i64;
         }
         if g.complete || g.aborted {
@@ -157,6 +172,8 @@ fn seek(cookie: &mut Cookie, offset: i64) -> i64 {
     loop {
         if target <= g.data.len() as u64 || g.complete || g.aborted {
             cookie.pos = target;
+            g.read_pos = g.read_pos.max(target);
+            cookie.shared.cv.notify_all();
             return target as i64;
         }
         g = wait(&cookie.shared.cv, g);
@@ -240,8 +257,26 @@ pub fn spawn(
                 break;
             }
             cleanup_playlist(&mpv, &registry, &mut entries);
-            *lock(&status) = read_status(&mpv, &entries);
-            thread::sleep(Duration::from_millis(100));
+            let st = read_status(&mpv, &entries);
+            // Poll fast enough for a smooth progress bar while audio is moving,
+            // and back off when it is not. `recv_timeout` rather than `sleep` so
+            // a command still wakes the thread immediately either way - the
+            // backoff must not cost keypress latency.
+            let idle_backoff = if st.playing {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_millis(500)
+            };
+            *lock(&status) = st;
+            match rx.recv_timeout(idle_backoff) {
+                Ok(cmd) => {
+                    if handle_cmd(&mpv, &registry, &mut entries, &mut seq, cmd) {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
         }
 
         let _ = mpv.command("stop", &[]);
@@ -256,11 +291,14 @@ fn init_mpv(mpv: &Mpv, audio_device: Option<&str>) {
     // "weak" = gapless only when the format matches; a sample-rate change
     // reinits the output (keeps playback bit-perfect). Do NOT force "yes".
     let _ = mpv.set_property("gapless-audio", "weak");
-    // Prefetch well ahead: default demuxer-readahead-secs is 1.0 (why the
-    // buffered readout was stuck at ~1s). Also smooths brief download stalls.
+    // Prefetch ahead of playback: the default readahead of 1.0s is why the
+    // buffered readout used to sit at ~1s. These bounds are a memory decision as
+    // much as a buffering one - mpv holds demuxed packets per *playlist entry*,
+    // and with a preloaded next track that cost is paid twice. 30s of hi-res
+    // FLAC is roughly 35 MB, which still rides out a CDN stall comfortably.
     let _ = mpv.set_property("cache", "yes");
-    let _ = mpv.set_property("demuxer-readahead-secs", 120.0);
-    let _ = mpv.set_property("demuxer-max-bytes", 200i64 * 1024 * 1024);
+    let _ = mpv.set_property("demuxer-readahead-secs", 30.0);
+    let _ = mpv.set_property("demuxer-max-bytes", 64i64 * 1024 * 1024);
     match audio_device {
         Some("null") => {
             let _ = mpv.set_property("ao", "null");
@@ -337,6 +375,7 @@ fn register_source(
                     complete: false,
                     total: None,
                     aborted: false,
+                    read_pos: 0,
                 }),
                 cv: Condvar::new(),
             });
@@ -378,6 +417,11 @@ fn clear_all(registry: &Registry, entries: &mut Vec<Entry>) {
 fn abort(sh: &Arc<Shared>) {
     let mut g = lock(&sh.inner);
     g.aborted = true;
+    // Drop the bytes now. mpv may still hold a cookie pointing at this buffer,
+    // but an aborted stream reports EOF before it ever indexes `data`, so
+    // reclaiming here rather than waiting for the cookie to close is safe - and
+    // for a skipped hi-res track that is hundreds of megabytes freed at once.
+    g.data = Vec::new();
     sh.cv.notify_all();
 }
 
@@ -397,8 +441,18 @@ static HTTP: LazyLock<Agent> = LazyLock::new(|| {
 fn spawn_downloader(urls: Vec<String>, shared: Arc<Shared>) {
     thread::spawn(move || {
         for u in &urls {
-            if lock(&shared.inner).aborted {
-                return;
+            {
+                // Backpressure: never hold more than DOWNLOAD_AHEAD_MAX bytes
+                // that nothing has read yet.
+                let mut g = lock(&shared.inner);
+                while !g.aborted
+                    && (g.data.len() as u64).saturating_sub(g.read_pos) > DOWNLOAD_AHEAD_MAX
+                {
+                    g = wait(&shared.cv, g);
+                }
+                if g.aborted {
+                    return;
+                }
             }
             // A non-2xx is an `Err` here (the agent keeps ureq's default
             // `http_status_as_error`), matching the old `error_for_status`.
