@@ -9,7 +9,7 @@
 # added later as a second binary sharing them.
 
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["priel-core", "priel-player", "priel-tui"]
 
 [workspace.package]
@@ -36,6 +36,9 @@ priel-player = { path = "priel-player", default-features = false }
 [workspace.lints.clippy]
 # `priority = -1` so the group sits below the individual overrides that follow.
 pedantic = { level = "warn", priority = -1 }
+
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 2
