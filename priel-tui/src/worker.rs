@@ -60,12 +60,17 @@ impl Worker {
     }
 }
 
-pub fn spawn(token_path: String) -> Worker {
+/// Start a worker.
+///
+/// Both paths are passed in rather than resolved here so the caller decides,
+/// and so a test is not at the mercy of whatever happens to be configured on
+/// the machine running it.
+pub fn spawn(token_path: String, credentials_path: String) -> Worker {
     spawn_with(move || {
         // With credentials configured the client renews its own session, which
         // is what stops the access token expiring mid-listen. Without them it
         // still works from the stored token, until that token runs out.
-        let mut client = match Credentials::load(&Credentials::default_path()) {
+        let mut client = match Credentials::load(&credentials_path) {
             Ok(creds) => Client::with_auth(&token_path, creds.into_config())
                 .map_err(|e| format!("token: {e}"))?,
             Err(_) => Client::from_token_file(&token_path).map_err(|e| format!("token: {e}"))?,
@@ -325,7 +330,10 @@ mod tests {
         // Goal: the standard startup failure. `spawn` builds the client from a
         // path, and a user who has not logged in must be told that, not shown an
         // empty library.
-        let w = super::spawn("/nonexistent/priel/token.json".into());
+        let w = super::spawn(
+            "/nonexistent/priel/token.json".into(),
+            "/nonexistent/priel/credentials.json".into(),
+        );
         match next(&w) {
             FromWorker::Error(e) => {
                 assert!(e.starts_with("token:"), "should name the stage: {e}");

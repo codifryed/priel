@@ -29,6 +29,7 @@ use crossterm::event::{
 use rand::Rng;
 use ratatui::layout::Rect;
 
+use priel_core::auth::Credentials;
 use priel_core::{Playlist, Track};
 use priel_player::{PlaybackStatus, Player};
 
@@ -161,7 +162,7 @@ struct RenderSig {
 impl App {
     pub fn new(device: Option<String>, token_path: String) -> anyhow::Result<Self> {
         let player = Player::new(device)?;
-        let worker = worker::spawn(token_path);
+        let worker = worker::spawn(token_path, Credentials::default_path());
         Ok(Self::with(player, worker))
     }
 
