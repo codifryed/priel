@@ -21,7 +21,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 
-use crate::app::{App, Mode, View};
+use crate::app::{App, Hit, Mode, View};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([
@@ -31,6 +31,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     ])
     .split(f.area());
 
+    // Hit boxes are geometry, so the renderer owns them. Rebuilt every frame.
+    app.hits.clear();
     header(f, app, rows[0]);
     list(f, app, rows[1]);
     now_playing(f, app, rows[2]);
@@ -50,14 +52,35 @@ fn tab(label: &str, active: bool) -> Span<'static> {
     }
 }
 
-fn header(f: &mut Frame, app: &App, area: Rect) {
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "tab labels are compile-time constants, far below u16::MAX"
+)]
+fn header(f: &mut Frame, app: &mut App, area: Rect) {
     let in_playlists = matches!(app.view, View::Playlists | View::PlaylistTracks);
-    let mut spans = vec![
-        tab("1 Favorites", app.view == View::Favorites),
-        tab("2 Playlists", in_playlists),
-        tab("3 Search", app.view == View::Search),
-        Span::raw("  "),
+    let tabs = [
+        ("1 Favorites", View::Favorites, app.view == View::Favorites),
+        ("2 Playlists", View::Playlists, in_playlists),
+        ("3 Search", View::Search, app.view == View::Search),
     ];
+    let mut spans = Vec::with_capacity(tabs.len() + 3);
+    let mut x = area.x;
+    for (label, view, active) in tabs {
+        // `tab` pads with one space either side; keep the width in step with it.
+        let width = label.chars().count() as u16 + 2;
+        app.hits.push((
+            Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            Hit::View(view),
+        ));
+        x += width;
+        spans.push(tab(label, active));
+    }
+    spans.push(Span::raw("  "));
     if app.shuffle {
         spans.push(Span::styled(
             "⇄ shuffle  ",
@@ -265,22 +288,97 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     );
 
     // DAC badge, then the shared activity slot (resolving / buffering / buffered),
-    // then controls.
+    // then the clickable controls.
     let (act_text, act_color) = activity(app);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(dac_badge(s), Style::default().fg(Color::Green)),
-            Span::styled(act_text, Style::default().fg(act_color)),
-            Span::styled(
-                format!(
-                    "  [space] play  [h/l] seek  [H/L] skip  [s] shuffle  [+/-] vol {}%  [q] quit",
-                    s.volume as u32
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
-        l2,
+    let badge = dac_badge(&app.status);
+    let paused = app.status.paused;
+    let shuffle = app.shuffle;
+    let volume = app.status.volume as u32;
+
+    let mut bar = ControlBar::new(l2);
+    bar.label(badge, Style::default().fg(Color::Green));
+    bar.label(act_text, Style::default().fg(act_color));
+    bar.label("  ".into(), Style::default());
+    bar.button(app, "[|<]".into(), Hit::Prev);
+    bar.button(
+        app,
+        if paused { "[ > ]" } else { "[ || ]" }.into(),
+        Hit::PlayPause,
     );
+    bar.button(app, "[>|]".into(), Hit::Next);
+    bar.label("  ".into(), Style::default());
+    bar.toggle(app, "[shuffle]".into(), Hit::Shuffle, shuffle);
+    bar.label("  ".into(), Style::default());
+    bar.button(app, "[-]".into(), Hit::VolDown);
+    bar.label(format!(" {volume}% "), Style::default().fg(Color::DarkGray));
+    bar.button(app, "[+]".into(), Hit::VolUp);
+    bar.label("  ".into(), Style::default());
+    bar.button(app, "[quit]".into(), Hit::Quit);
+    f.render_widget(Paragraph::new(Line::from(bar.spans)), l2);
+}
+
+/// Lays spans out left to right on one row, registering a hit box for anything
+/// clickable. Keeping the layout and the hit boxes in the same walk is what
+/// stops them drifting apart.
+struct ControlBar {
+    spans: Vec<Span<'static>>,
+    x: u16,
+    y: u16,
+    end: u16,
+}
+
+impl ControlBar {
+    fn new(area: Rect) -> Self {
+        Self {
+            spans: Vec::new(),
+            x: area.x,
+            y: area.y,
+            end: area.x.saturating_add(area.width),
+        }
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "control labels are short ASCII constants"
+    )]
+    fn advance(&mut self, text: &str) -> Rect {
+        let width = text.chars().count() as u16;
+        let r = Rect {
+            x: self.x,
+            y: self.y,
+            width,
+            height: 1,
+        };
+        self.x = self.x.saturating_add(width);
+        r
+    }
+
+    fn label(&mut self, text: String, style: Style) {
+        self.advance(&text);
+        self.spans.push(Span::styled(text, style));
+    }
+
+    fn button(&mut self, app: &mut App, text: String, hit: Hit) {
+        self.push_hit(app, text, hit, Style::default().fg(Color::Cyan));
+    }
+
+    fn toggle(&mut self, app: &mut App, text: String, hit: Hit, on: bool) {
+        let style = if on {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        self.push_hit(app, text, hit, style);
+    }
+
+    fn push_hit(&mut self, app: &mut App, text: String, hit: Hit, style: Style) {
+        let r = self.advance(&text);
+        // Do not register a control the row was too narrow to draw.
+        if r.x < self.end {
+            app.hits.push((r, hit));
+        }
+        self.spans.push(Span::styled(text, style));
+    }
 }
 
 /// The mutually-exclusive activity slot: resolving → buffering → buffered-ahead.

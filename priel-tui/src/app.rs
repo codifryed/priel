@@ -42,6 +42,21 @@ pub enum View {
     Search,
 }
 
+/// A clickable region recorded by the renderer. Mouse support is a headline
+/// feature, so every control that has a key binding also has a hit box: the
+/// renderer knows the geometry, and only the renderer should have to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    View(View),
+    PlayPause,
+    Prev,
+    Next,
+    Shuffle,
+    VolUp,
+    VolDown,
+    Quit,
+}
+
 #[derive(PartialEq)]
 pub enum Mode {
     Normal,
@@ -102,6 +117,8 @@ pub struct App {
 
     pub list_inner: Rect,
     pub progress_rect: Rect,
+    /// Clickable regions, rebuilt by the renderer every frame.
+    pub hits: Vec<(Rect, Hit)>,
     last_click: Option<(u16, Instant)>,
     dirty: bool,
     last_sig: RenderSig,
@@ -162,6 +179,7 @@ impl App {
             should_quit: false,
             list_inner: Rect::default(),
             progress_rect: Rect::default(),
+            hits: Vec::new(),
             last_click: None,
             dirty: true,
             last_sig: RenderSig::default(),
@@ -690,7 +708,30 @@ impl App {
         self.dirty = true;
     }
 
+    /// Act on a control the renderer registered a hit box for.
+    fn dispatch(&mut self, h: Hit) {
+        match h {
+            Hit::View(v) => self.switch_view(v),
+            Hit::PlayPause => self.player.toggle_pause(),
+            Hit::Prev => self.user_prev(),
+            Hit::Next => self.user_next(),
+            Hit::Shuffle => self.toggle_shuffle(),
+            Hit::VolUp => self.volume_step(5.0),
+            Hit::VolDown => self.volume_step(-5.0),
+            Hit::Quit => self.should_quit = true,
+        }
+    }
+
     fn on_click(&mut self, col: u16, row: u16) {
+        if let Some(h) = self
+            .hits
+            .iter()
+            .find(|(r, _)| hit(*r, col, row))
+            .map(|(_, h)| *h)
+        {
+            self.dispatch(h);
+            return;
+        }
         if hit(self.progress_rect, col, row) {
             self.seek_to_x(col);
             return;
