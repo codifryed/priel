@@ -57,6 +57,14 @@ fn wait<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
     cv.wait(guard).unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Wait with a deadline, tolerating poisoning. See [`lock`].
+fn wait_for<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>, dur: Duration) -> MutexGuard<'a, T> {
+    let (guard, _) = cv
+        .wait_timeout(guard, dur)
+        .unwrap_or_else(PoisonError::into_inner);
+    guard
+}
+
 /// Growing per-track buffer shared between a downloader and mpv's callbacks.
 struct Shared {
     inner: Mutex<Buf>,
@@ -90,6 +98,19 @@ const HW_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// per-chunk overhead is a lock and a condvar wake, measured at ~0.2 microseconds
 /// even with a reader parked, so a small first chunk costs nothing worth counting.
 const SEGMENT_CHUNK_MIN: usize = 16 * 1024;
+
+/// How long a seek may wait for bytes that have not arrived yet.
+///
+/// This is the difference between a track starting promptly and a track
+/// starting when its *entire* download finishes. mpv probes a newly opened
+/// stream by seeking around it, and an unbounded wait there turns a probe near
+/// the end of the file into "download the whole track first" - which is exactly
+/// what the first track of a session used to do, while a preloaded one appeared
+/// fast only because it had already finished downloading in the background.
+///
+/// Short enough not to stall a start, long enough that a seek just ahead of the
+/// download still succeeds rather than failing over a few hundred milliseconds.
+const SEEK_WAIT_MAX: Duration = Duration::from_millis(500);
 
 /// The ceiling the chunk size ramps up to once playback is under way, where
 /// fewer, larger reads are the cheaper shape and latency no longer matters.
@@ -192,6 +213,7 @@ fn seek(cookie: &mut Cookie, offset: i64) -> i64 {
         return -1;
     }
     let target = offset as u64;
+    let deadline = Instant::now() + SEEK_WAIT_MAX;
     let mut g = lock(&cookie.shared.inner);
     loop {
         if target <= g.data.len() as u64 || g.complete || g.aborted {
@@ -200,7 +222,14 @@ fn seek(cookie: &mut Cookie, offset: i64) -> i64 {
             cookie.shared.cv.notify_all();
             return target as i64;
         }
-        g = wait(&cookie.shared.cv, g);
+        // Out of patience: report the seek as unsupported rather than holding
+        // mpv's demuxer thread until the download catches up. -1 is the honest
+        // answer for a position this stream cannot serve yet, and mpv falls back
+        // to reading forward.
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return -1;
+        };
+        g = wait_for(&cookie.shared.cv, g, left);
     }
 }
 
@@ -1110,10 +1139,9 @@ mod tests {
     }
 
     #[test]
-    fn a_seek_beyond_the_download_waits_for_the_bytes() {
-        // Goal: mpv may seek ahead of what has been fetched. On an incomplete
-        // stream that must block until the data lands rather than report a
-        // position the buffer cannot serve.
+    fn a_seek_just_ahead_of_the_download_waits_briefly() {
+        // Goal: bytes about to arrive are worth a short wait - failing a seek
+        // over a couple of hundred milliseconds would make scrubbing flaky.
         let sh = shared(b"12".to_vec(), false);
         let writer = sh.clone();
         thread::spawn(move || {
@@ -1123,7 +1151,32 @@ mod tests {
             writer.cv.notify_all();
         });
         let mut c = cookie(&sh);
-        assert_eq!(seek(&mut c, 6), 6, "should have waited rather than failed");
+        assert_eq!(seek(&mut c, 6), 6, "should have waited for bytes in flight");
+    }
+
+    #[test]
+    fn a_seek_far_beyond_the_download_gives_up_rather_than_blocking() {
+        // Goal: this is what made the first track of a session wait for its
+        // whole download. mpv probes a newly opened stream by seeking around
+        // it; blocking there until the bytes exist means blocking until the
+        // entire track has been fetched. A later track only looked fast because
+        // preloading had already finished it.
+        let sh = shared(b"tiny".to_vec(), false);
+        let mut c = cookie(&sh);
+
+        let started = Instant::now();
+        let result = seek(&mut c, 500_000_000);
+        let waited = started.elapsed();
+
+        assert_eq!(result, -1, "an unreachable position must be refused");
+        assert!(
+            waited < SEEK_WAIT_MAX * 3,
+            "gave up after {waited:?}, which is not promptly enough"
+        );
+        assert!(
+            !lock(&sh.inner).complete,
+            "and it must not have waited for the download to finish"
+        );
     }
 
     /// Serves a body in two halves with a pause between them, so a test can tell
