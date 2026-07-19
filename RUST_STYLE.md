@@ -18,41 +18,37 @@ buffer. Everything below serves those two.
 - Refactor: with the test as a net. This is where the design improves, not an optional third step.
 - When fixing a bug, the regression test comes first and must fail against the unfixed code.
 
-The workspace currently has **no tests**. Filling them in is active work, so new code is held to
-TDD from now on and existing code gets covered as it is touched. Do not treat the absence of
-neighbouring tests as precedent.
+The workspace sits at **96% line coverage** across 144 tests. That is the floor, not the target:
+`make coverage` reports it, and a change that drops it wants a reason. New code is held to TDD.
 
-### Where the seams are
+### The seams that exist
 
-Test at the seam, not through the whole app. In priority order:
+Test at the seam, not through the whole app. The ones already built, which new tests should reuse
+rather than reinvent:
 
-1. **`priel_core::mpd::parse`** - a pure `&str -> MpdInfo` function. Zero setup. Segment-count
-   arithmetic is exactly the off-by-one-prone logic that earns a test per branch: no `<S>` element,
-   `<S>` without `r=`, `<S r="N">`, several `<S>` runs, and a missing `media=` template (error case).
-2. **`quality_label` and `decode_manifest`** - private, so test them in a `#[cfg(test)] mod tests`
-   in the same file. `decode_manifest` covers both manifest arms (BTS and DASH) plus the
-   unknown-mime and empty-urls errors from a base64 string fixture.
-3. **The queue state machine** in `priel-tui/src/app.rs`. Highest value in the repo: this is where
-   the runaway-advance bug lived. It is driven entirely by `PlaybackStatus` in and player commands
-   out, so it can be tested as a pure transition function once extracted (see below).
-4. **`visible()` / filter and selection index math** - pure over the backing `Vec`, and the
-   visible-index indirection is easy to get wrong.
+- **`Client::with_base_url`** points the API client at a stub origin. The `priel-core` tests run a
+  `std::net` HTTP stub; no mock framework, no dependency.
+- **`Player::new(Some("null"))`** gives a real mpv handle on the null output, so command handling,
+  property reads and the protocol callbacks are all testable headlessly.
+- **`App::rigged()`** returns an app with a silent player plus both ends of the worker channels, so
+  a test can post `FromWorker` replies and assert on the `ToWorker` requests the app makes.
+- **`worker::spawn_with`** takes a client factory, so the worker loop runs against a stub.
+- **`EventSource`** (in `main.rs`) lets the event loop be driven by a scripted sequence.
+- **`TestBackend`** renders real frames; `ui` tests assert on the resulting text and on the hit
+  boxes the renderer publishes.
 
-### Let testability drive the design
-
-Where a seam does not exist yet, adding it is the preferred fix. Two known cases:
+Where a seam does not exist yet, adding one is the preferred fix. Still outstanding:
 
 - **`App::refresh` should not need an `App`.** The advance logic reads `status`, `queue_pos`,
   `expected_id`, `current_target`, `next_intended` and `advanced`, and decides "preload", "advance
-  fresh" or "do nothing". Extract that into a function taking those inputs and returning an intent
-  enum; `App` then applies the intent. The guards documented in `CLAUDE.md` become table-driven
-  tests instead of comments pleading with the reader.
-- **`Client` hardcodes `const API` and builds its own `ureq::Agent`**, so nothing can point it at a
-  local mock. Give it an injectable base URL and let the API tests run against a stub server.
+  fresh" or "do nothing". Extracting that into a function returning an intent enum would turn the
+  guards into table-driven tests instead of comments pleading with the reader.
 
 ### Running tests
 
-- `cargo test` must pass with no network, no credentials, no audio device, and no libmpv.
+- `make test-all` runs both feature configurations; `make coverage` reports line coverage.
+- Tests must pass with no network, no credentials, no audio device and no TTY. Anything reaching
+  the network points at `127.0.0.1`, and mpv runs on the null output.
 - Tests needing a live account, real hardware output, or the network are `#[ignore]`d, with the
   reason in the ignore reason string. They are run deliberately, never in the default suite.
 - `cargo test -p priel-tui --no-default-features` exercises app logic against the stub backend with
