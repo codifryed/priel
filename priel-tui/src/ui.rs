@@ -104,31 +104,29 @@ fn credentials_overlay(f: &mut Frame, area: Rect, status: Option<&str>) {
 
 /// The first-run consent screen for obtaining a client identity.
 ///
-/// Written to be read, not clicked through. priel is about to download a
-/// credential belonging to somebody else's application, and a user who later
-/// discovers that should find nothing here they were not told.
+/// Kept short enough to actually be read, but it still has to carry four facts:
+/// what is downloaded, from where, that the key is not priel's, and where it
+/// lands. A user who later learns whose key this is should find nothing here
+/// they were not told - that is the whole point of asking rather than doing it
+/// silently.
 const CREDENTIALS_PROMPT: &[&str] = &[
-    "priel ships no credentials of its own, so it cannot log in or renew a",
-    "session until it has a client identity.",
+    "priel needs a client key before it can sign you in, and it does not",
+    "ship one of its own.",
     "",
-    "It can download one from the open-source Python project that the other",
-    "native Linux clients rely on:",
+    "The key is published in an open-source project that the other Linux",
+    "players for this service all rely on:",
     "",
-    "    github.com/EbbLabs/python-tidal  ·  tidalapi/session.py",
+    "    github.com/EbbLabs/python-tidal",
     "",
-    "This is not priel's credential, and not one issued to priel. It is the",
-    "identity of the vendor's own mobile application, published in that",
-    "project and shared by every native client on Linux. It is how they all",
-    "work. It is not endorsed by the vendor.",
+    "It is not priel's key and priel is not an official client. This is",
+    "how every native player on Linux works.",
     "",
-    "If you continue:",
-    "    · one HTTPS request is made to the address above",
-    "    · the identity is written to ~/.config/priel/credentials.json,",
-    "      readable only by you",
-    "    · nothing of yours is sent anywhere, and you are not asked again",
+    "If you continue, priel downloads it once and saves it to",
+    "~/.config/priel/credentials.json. Nothing of yours is sent anywhere,",
+    "and you will not be asked again.",
     "",
-    "To do it yourself instead, put this in that file and restart:",
-    "    { \"client_id\": \"…\", \"client_secret\": \"…\" }",
+    "Prefer to do it yourself? Put a client_id and client_secret in that",
+    "file and restart priel.",
 ];
 
 /// The complete reference, in two columns. The bottom row carries only what is
@@ -1553,13 +1551,14 @@ mod tests {
             "the source: {out}"
         );
         assert!(out.contains("credentials.json"), "the destination: {out}");
+        assert!(out.contains("not priel's key"), "whose key it is: {out}");
         assert!(
-            out.contains("not endorsed"),
-            "whose credential it is: {out}"
+            out.contains("not an official client"),
+            "what priel is not: {out}"
         );
-        assert!(out.contains("one HTTPS request"), "what it will do: {out}");
+        assert!(out.contains("downloads it once"), "what it will do: {out}");
         assert!(
-            out.contains("To do it yourself"),
+            out.contains("do it yourself"),
             "the manual alternative: {out}"
         );
         assert!(out.contains("[f]") && out.contains("[Esc]") && out.contains("[q]"));

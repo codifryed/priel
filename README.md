@@ -84,17 +84,20 @@ Needs Rust ≥ 1.85, `libmpv` (`mpv-devel` / `libmpv-dev` to build), a working
 PipeWire or ALSA setup, and a login — priel reads the session at
 `~/.config/hiresti/hiresti_token.json`.
 
-**priel ships no client credentials**, so it cannot log in or renew a session
-until you provide a client identity of your own at
-`~/.config/priel/credentials.json` (mode 0600):
+**priel ships no client credentials.** On first run it asks whether to download
+one from the open-source project the other native Linux players rely on, saying
+plainly what it fetches and where it saves it. Decline and priel still runs, just
+without the ability to renew a session.
+
+To configure one yourself instead, write `~/.config/priel/credentials.json`
+(mode 0600) and priel will not ask:
 
 ```json
 { "client_id": "...", "client_secret": "..." }
 ```
 
-With that file present priel renews the access token by itself — before expiry,
-and again if a request is rejected early. Without it priel still runs, but only
-until the stored token expires.
+With a client identity present priel renews the access token by itself — before
+expiry, and again if a request is rejected early.
 
 ```bash
 make check-deps        # verify cargo and libmpv are present

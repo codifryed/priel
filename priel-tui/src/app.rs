@@ -142,6 +142,9 @@ pub struct App {
     /// Where the credentials file should live, and the state of any attempt to
     /// populate it. `None` once there is nothing left to ask about.
     credentials_path: Option<String>,
+    /// Kept so the worker can be rebuilt once credentials arrive, rather than
+    /// asking the user to restart.
+    token_path: Option<String>,
     credential_status: Option<String>,
     fetching: Option<Receiver<Result<(), String>>>,
 }
@@ -171,10 +174,14 @@ impl App {
         let player = Player::new(device)?;
         let creds_path = Credentials::default_path();
         let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
-        let worker = worker::spawn(token_path, creds_path.clone());
+        let worker = worker::spawn(token_path.clone(), creds_path.clone());
         let mut app = Self::with(player, worker);
-        if !has_credentials {
-            app.prompt_for_credentials(creds_path);
+        if has_credentials {
+            // Remembered anyway, so a later re-login can rebuild the worker.
+            app.credentials_path = Some(creds_path);
+            app.token_path = Some(token_path);
+        } else {
+            app.prompt_for_credentials(creds_path, token_path);
         }
         Ok(app)
     }
@@ -230,6 +237,7 @@ impl App {
             dirty: true,
             last_sig: RenderSig::default(),
             credentials_path: None,
+            token_path: None,
             credential_status: None,
             fetching: None,
         }
@@ -239,9 +247,38 @@ impl App {
     ///
     /// Only called when none could be found, and only from `new` - a rigged app
     /// in a test is never put in this state.
-    fn prompt_for_credentials(&mut self, path: String) {
-        self.credentials_path = Some(path);
+    fn prompt_for_credentials(&mut self, creds_path: String, token_path: String) {
+        self.credentials_path = Some(creds_path);
+        self.token_path = Some(token_path);
         self.mode = Mode::Credentials;
+    }
+
+    /// Replace the worker with one that can see the new credentials.
+    ///
+    /// Cheaper for the user than being told to restart: the old worker's
+    /// channels drop, which ends its thread, and the new one repeats the
+    /// initial load so the view fills in as it would have at startup.
+    fn restart_worker(&mut self) {
+        let (Some(token), Some(creds)) = (self.token_path.clone(), self.credentials_path.clone())
+        else {
+            return;
+        };
+        self.worker = worker::spawn(token, creds);
+        self.loading = true;
+        let _ = self.worker.tx.send(ToWorker::LoadFavorites);
+    }
+
+    /// Point the app at token and credential files, for tests.
+    #[cfg(test)]
+    pub fn set_paths_for_test(&mut self, token: String, credentials: String) {
+        self.token_path = Some(token);
+        self.credentials_path = Some(credentials);
+    }
+
+    /// Rebuild the worker, for tests.
+    #[cfg(test)]
+    pub fn restart_worker_for_test(&mut self) {
+        self.restart_worker();
     }
 
     /// Force a mode, for renderer tests.
@@ -284,7 +321,8 @@ impl App {
             Ok(Ok(())) => {
                 self.fetching = None;
                 self.mode = Mode::Normal;
-                self.notice = Some("Client identity saved. Restart priel to use it.".into());
+                self.notice = Some("Signed in. Loading your library…".into());
+                self.restart_worker();
                 self.dirty = true;
             }
             Ok(Err(e)) => {
@@ -2124,5 +2162,40 @@ mod tests {
         r.app.set_mode_for_test(Mode::Credentials);
         r.app.on_mouse(click(1, 1));
         assert_eq!(r.app.mode, Mode::Credentials, "a click is not consent");
+    }
+
+    #[test]
+    fn a_saved_credential_reloads_the_library_without_a_restart() {
+        // Goal: telling a user to restart after they just signed in is a poor
+        // ending to the flow. The worker is rebuilt in place and repeats the
+        // initial load, so the view fills in as it would have at startup.
+        let dir = std::env::temp_dir().join(format!("priel-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp");
+        let creds = dir.join("credentials.json");
+        std::fs::write(&creds, r#"{"client_id":"x"}"#).expect("write");
+
+        let mut r = rig();
+        r.app.set_paths_for_test(
+            dir.join("token.json").to_str().expect("path").to_string(),
+            creds.to_str().expect("path").to_string(),
+        );
+        r.app.set_mode_for_test(Mode::Credentials);
+        r.app.restart_worker_for_test();
+
+        assert!(r.app.loading, "the rebuilt worker starts by loading again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rebuilding_without_configured_paths_is_a_no_op() {
+        // Goal: a rigged app has no paths. Rebuilding must not replace a working
+        // worker with one pointed at nothing.
+        let mut r = rig();
+        r.app.restart_worker_for_test();
+        r.app.start();
+        assert!(
+            matches!(requests(&r)[..], [ToWorker::LoadFavorites]),
+            "the original worker should still be the one listening"
+        );
     }
 }
