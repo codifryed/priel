@@ -15,11 +15,18 @@ water in and out of the flats twice a day, on the pull of the moon.*
 
 ## Why this one is different
 
-- **Bit-perfect on purpose, not by accident.** mpv runs with
+- **Bit-perfect on purpose, and it tells you.** mpv runs with
   `gapless-audio=weak`, so a track at a different sample rate *reinitialises the
   output* instead of being resampled to whatever the last one used. You pay a
   short gap at a rate change and get the bits you paid for. Within a sample rate
   the next track is preloaded and the transition is gapless.
+- **A bit-perfect indicator that does not flatter you.** The now-playing row
+  shows `✓ bit-perfect` only when the output rate matches the decoded rate, the
+  output format is wide enough for the source depth, and software volume is at
+  unity. Otherwise it names the fault: `⚠ resampled 44→48 kHz`,
+  `⚠ truncated to S16`, or `⚠ volume scaled`. A wider container is not a fault -
+  24-bit content in an `S32` frame is exactly how a USB DAC expects it, so that
+  reads green.
 - **VIM keys first, with alternatives for everyone else.** `j`/`k` and the arrow
   keys, `g`/`G`, `J`/`K` and `Ctrl-D`/`Ctrl-U`, `/` to filter. Every action has a
   key binding, and `?` opens the full reference rather than making you read this
@@ -110,14 +117,15 @@ playlist. It never quits.
 Working: favorites, playlists and catalogue search; local filtering; hi-res
 resolution and playback (24/192 via progressive segment streaming); a gapless
 play queue with a preloaded next track; shuffle with auto-advance; play, pause,
-seek, skip and volume; a now-playing bar with a scrubbable progress bar and a
-live DAC badge; the `?` reference overlay.
+seek, skip and volume; a now-playing bar with a scrubbable progress bar, a live
+DAC badge and a bit-perfect indicator; the `?` reference overlay.
 
 Roadmap, roughly in order:
 
 - **PipeWire configuration help** — detect and explain the `allowed-rates` setup
-  a bit-perfect chain needs, and surface the sink's current bit depth and sample
-  rate live.
+  a bit-perfect chain needs. The indicator above reports what priel hands to the
+  audio API, which is as far as mpv can see; confirming that the graph beyond it
+  does not resample means reading the PipeWire graph directly.
 - **Native PKCE authentication**, replacing the borrowed hiresTI token.
 - **Per-track memory ceiling.** Buffers are bounded and downloads apply
   backpressure, but a fully played track is still retained; trimming it needs a

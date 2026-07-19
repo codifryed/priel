@@ -520,6 +520,16 @@ fn read_status(mpv: &Mpv, entries: &[Entry]) -> PlaybackStatus {
     let out_format = mpv
         .get_property::<String>("audio-out-params/format")
         .unwrap_or_default();
+    // The decoder side, for comparison: a rate that differs from the output rate
+    // means something resampled between the two.
+    let in_sample_rate = mpv
+        .get_property::<i64>("audio-params/samplerate")
+        .ok()
+        .and_then(|r| u32::try_from(r).ok())
+        .unwrap_or(0);
+    let in_format = mpv
+        .get_property::<String>("audio-params/format")
+        .unwrap_or_default();
     let codec = mpv
         .get_property::<String>("audio-codec-name")
         .unwrap_or_default();
@@ -535,6 +545,8 @@ fn read_status(mpv: &Mpv, entries: &[Entry]) -> PlaybackStatus {
         duration,
         sample_rate,
         out_format,
+        in_sample_rate,
+        in_format,
         codec,
         bitrate,
         ended,

@@ -21,6 +21,8 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
 
+use priel_player::{Alteration, Fidelity};
+
 use crate::app::{App, Hit, Mode, View};
 
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -65,6 +67,15 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
             ("J K", "page down / up"),
             ("Ctrl-D Ctrl-U", "half page down / up"),
             ("g G", "first / last row"),
+        ],
+    ),
+    (
+        "Output",
+        &[
+            ("bit-perfect", "samples reach the DAC"),
+            ("resampled", "sink rate differs"),
+            ("truncated", "sink format narrower"),
+            ("volume scaled", "press + for unity"),
         ],
     ),
 ];
@@ -443,8 +454,13 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     // DAC badge, the shared activity slot (resolving / buffering / buffered),
     // then the keyboard reference. The clickable controls live in the header.
     let (act_text, act_color) = activity(app);
+    let (fid_text, fid_color) = fidelity_badge(app);
     let mut bar = ControlBar::new(l2);
     bar.label(dac_badge(&app.status), Style::default().fg(Color::Green));
+    bar.label(
+        fid_text,
+        Style::default().fg(fid_color).add_modifier(Modifier::BOLD),
+    );
     bar.label(act_text, Style::default().fg(act_color));
     bar.label("  ", Style::default());
     push_hints(&mut bar);
@@ -662,6 +678,37 @@ fn source_badge(app: &App) -> String {
         String::new()
     } else {
         format!("   ·  {}", parts.join(" · "))
+    }
+}
+
+/// The bit-perfect indicator.
+///
+/// Deliberately understated when it is good news and specific when it is not: a
+/// listener who sees a warning needs to know *which* link broke, because the fix
+/// differs (sink rate, sink format, or their own volume key).
+///
+/// It reports what priel hands to the audio API. A `PipeWire` graph can still
+/// resample downstream, which mpv cannot see - hence "to device" rather than an
+/// unqualified claim.
+fn fidelity_badge(app: &App) -> (String, Color) {
+    match app.status.fidelity(app.now_meta.bit_depth) {
+        Fidelity::Unknown => (String::new(), Color::DarkGray),
+        Fidelity::BitPerfect => ("  ✓ bit-perfect".to_string(), Color::Green),
+        Fidelity::Altered(Alteration::Resampled) => (
+            format!(
+                "  ⚠ resampled {}→{} kHz",
+                app.status.in_sample_rate / 1000,
+                app.status.sample_rate / 1000
+            ),
+            Color::Red,
+        ),
+        Fidelity::Altered(Alteration::Truncated) => (
+            format!("  ⚠ truncated to {}", app.status.out_format.to_uppercase()),
+            Color::Red,
+        ),
+        Fidelity::Altered(Alteration::VolumeScaled) => {
+            ("  ⚠ volume scaled".to_string(), Color::Yellow)
+        }
     }
 }
 
@@ -1150,5 +1197,90 @@ mod tests {
                 && sc.app.selected < sc.app.list_offset + sc.app.list_inner.height as usize,
             "the selection must stay inside the window"
         );
+    }
+
+    // ---- the bit-perfect indicator ----
+
+    /// Put the app into a playing state with a given decode/output chain.
+    fn chain(sc: &mut Screen, source_bits: u32, in_rate: u32, out_rate: u32, out_fmt: &str) {
+        sc.app.now_playing = Some(track(1, "T"));
+        sc.app.now_meta = crate::app::StreamMeta {
+            bit_depth: source_bits,
+            sample_rate: in_rate,
+            codec: "flac".into(),
+            quality: "HI_RES_LOSSLESS".into(),
+        };
+        sc.app.status.loaded = true;
+        sc.app.status.playing = true;
+        sc.app.status.volume = 100.0;
+        sc.app.status.in_sample_rate = in_rate;
+        sc.app.status.in_format = "s32".into();
+        sc.app.status.sample_rate = out_rate;
+        sc.app.status.out_format = out_fmt.into();
+    }
+
+    #[test]
+    fn a_clean_chain_is_announced_on_screen() {
+        // Goal: this is the payoff for the whole bit-perfect design, so it has
+        // to be visible without hunting for it.
+        let mut sc = screen();
+        chain(&mut sc, 24, 192_000, 192_000, "s32");
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("bit-perfect"), "{out}");
+    }
+
+    #[test]
+    fn a_wider_output_container_does_not_raise_a_warning() {
+        // Goal: 24-bit content leaving as s32 is the ordinary case on a USB DAC.
+        // Warning about it would train the listener to ignore the indicator.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("bit-perfect"), "{out}");
+        assert!(!out.contains('⚠'), "{out}");
+    }
+
+    #[test]
+    fn a_truncating_output_names_the_format_it_dropped_to() {
+        // Goal: 24-bit content leaving as s16 is a real loss, and the listener
+        // needs to know which link to fix.
+        let mut sc = screen();
+        chain(&mut sc, 24, 44_100, 44_100, "s16");
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("truncated"), "{out}");
+        assert!(out.contains("S16"), "should name the output format: {out}");
+        assert!(!out.contains("bit-perfect"), "{out}");
+    }
+
+    #[test]
+    fn resampling_shows_both_rates() {
+        // Goal: the rate pair is the diagnosis - it points straight at a sink
+        // locked to one rate.
+        let mut sc = screen();
+        chain(&mut sc, 24, 44_100, 48_000, "s32");
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("resampled"), "{out}");
+        assert!(out.contains("44") && out.contains("48"), "{out}");
+    }
+
+    #[test]
+    fn lowering_the_volume_is_reported_as_the_listeners_own_doing() {
+        // Goal: distinguishable from the chain faults, because the fix is to
+        // press `+` rather than to reconfigure anything.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        sc.app.status.volume = 70.0;
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("volume scaled"), "{out}");
+    }
+
+    #[test]
+    fn nothing_is_claimed_before_playback_starts() {
+        // Goal: a green light on an idle player would be a lie, and this badge
+        // is the one thing in the interface that must never overstate.
+        let mut sc = screen();
+        let out = text(&mut sc.app, 140, 12);
+        assert!(!out.contains("bit-perfect"), "{out}");
+        assert!(!out.contains('⚠'), "{out}");
     }
 }

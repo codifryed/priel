@@ -57,6 +57,13 @@ pub struct PlaybackStatus {
     pub sample_rate: u32,
     /// DAC / output sample format from `audio-out-params/format` (e.g. "s32").
     pub out_format: String,
+    /// Decoded sample rate (Hz) from `audio-params/samplerate`, before the
+    /// output stage. Differing from `sample_rate` means something resampled.
+    pub in_sample_rate: u32,
+    /// Decoded sample format from `audio-params/format`. This is a *container*
+    /// width, not the source's real bit depth: ffmpeg hands 24-bit FLAC back as
+    /// `s32`, so it cannot be compared against the output width on its own.
+    pub in_format: String,
     /// Decoded codec name (e.g. "flac").
     pub codec: String,
     /// Decoded bitrate in bits/s (0 if unknown).
@@ -71,6 +78,94 @@ pub struct PlaybackStatus {
     pub has_next: bool,
     /// Seconds of decoded audio buffered ahead (`demuxer-cache-duration`).
     pub cache_secs: f64,
+}
+
+/// How faithfully the decoded samples are reaching the output device.
+///
+/// This describes **what priel hands to the audio API**, which is as far as mpv
+/// can see. A server further down the graph can still resample or mix; detecting
+/// that needs to inspect the `PipeWire` graph itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fidelity {
+    /// Nothing is playing, or mpv has not reported the parameters yet.
+    Unknown,
+    /// Every sample reaches the device unaltered.
+    BitPerfect,
+    /// Something in the path changes the samples.
+    Altered(Alteration),
+}
+
+/// Why playback is not bit-perfect, most damaging first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alteration {
+    /// The output rate differs from the decoded rate, so samples are being
+    /// interpolated. Usually a sink locked to one rate, or `allowed-rates` not
+    /// listing the track's rate.
+    Resampled,
+    /// The output format is narrower than the source, so low bits are being
+    /// discarded. A 24-bit track played out as `s16` loses eight bits.
+    Truncated,
+    /// Software volume is scaling every sample. Only exact at 100%.
+    VolumeScaled,
+}
+
+/// Bits of resolution an mpv sample format can carry.
+///
+/// `float` is 32-bit with a 24-bit mantissa, which represents any integer source
+/// up to 24 bits exactly - so it counts as 24, not 32.
+#[allow(
+    clippy::match_same_arms,
+    reason = "s24 and float coincide numerically for unrelated reasons; merging them would hide why"
+)]
+fn format_bits(fmt: &str) -> Option<u32> {
+    match fmt.trim_end_matches('p') {
+        "u8" | "s8" => Some(8),
+        "s16" => Some(16),
+        "s24" => Some(24),
+        "s32" => Some(32),
+        "float" => Some(24),
+        "double" => Some(53),
+        _ => None,
+    }
+}
+
+impl PlaybackStatus {
+    /// Judge the output chain, given the source's true bit depth.
+    ///
+    /// `source_bits` must come from the stream metadata, not from `in_format`:
+    /// the decoder reports a container width (24-bit FLAC arrives as `s32`), so
+    /// comparing container widths would call a lossless `s32 -> s24` output a
+    /// truncation. Pass 0 when the depth is unknown and the container width is
+    /// used as an upper bound instead.
+    #[must_use]
+    pub fn fidelity(&self, source_bits: u32) -> Fidelity {
+        if !self.loaded || self.sample_rate == 0 || self.in_sample_rate == 0 {
+            return Fidelity::Unknown;
+        }
+        let Some(out_bits) = format_bits(&self.out_format) else {
+            return Fidelity::Unknown;
+        };
+        let source_bits = if source_bits > 0 {
+            source_bits
+        } else {
+            match format_bits(&self.in_format) {
+                Some(b) => b,
+                None => return Fidelity::Unknown,
+            }
+        };
+
+        if self.sample_rate != self.in_sample_rate {
+            return Fidelity::Altered(Alteration::Resampled);
+        }
+        if out_bits < source_bits {
+            return Fidelity::Altered(Alteration::Truncated);
+        }
+        // mpv's software volume multiplies every sample; only unity is exact.
+        if (self.volume - 100.0).abs() > f64::EPSILON {
+            return Fidelity::Altered(Alteration::VolumeScaled);
+        }
+        Fidelity::BitPerfect
+    }
 }
 
 /// Commands sent to the player thread.
@@ -273,5 +368,110 @@ mod tests {
             wait_for(&p, |s| (s.volume - 33.0).abs() < f64::EPSILON),
             "the thread should still be responsive after idling"
         );
+    }
+
+    /// A status as it looks mid-playback; tests override the fields they care
+    /// about.
+    fn playing(in_rate: u32, out_rate: u32, in_fmt: &str, out_fmt: &str) -> PlaybackStatus {
+        PlaybackStatus {
+            loaded: true,
+            playing: true,
+            volume: 100.0,
+            sample_rate: out_rate,
+            out_format: out_fmt.into(),
+            in_sample_rate: in_rate,
+            in_format: in_fmt.into(),
+            ..PlaybackStatus::default()
+        }
+    }
+
+    #[test]
+    fn a_wider_output_container_is_still_bit_perfect() {
+        // Goal: 24-bit content played out as s32 is the *normal* case on USB
+        // DACs - the samples sit in the high bits and nothing is altered.
+        // Reporting that as a downgrade would cry wolf on almost every track.
+        let s = playing(192_000, 192_000, "s32", "s32");
+        assert_eq!(s.fidelity(24), Fidelity::BitPerfect);
+
+        // And 24-bit content in a 24-bit container likewise.
+        let s = playing(96_000, 96_000, "s32", "s24");
+        assert_eq!(s.fidelity(24), Fidelity::BitPerfect);
+    }
+
+    #[test]
+    fn a_narrower_output_truncates_and_must_be_reported() {
+        // Goal: the case worth warning about. 24-bit content leaving as s16
+        // discards eight bits, which is exactly what a listener paying for
+        // hi-res does not want happening silently.
+        let s = playing(44_100, 44_100, "s32", "s16");
+        assert_eq!(s.fidelity(24), Fidelity::Altered(Alteration::Truncated));
+    }
+
+    #[test]
+    fn sixteen_bit_content_at_sixteen_bits_is_bit_perfect() {
+        // Goal: the same s16 output is correct for 16-bit content. The judgement
+        // is about the source, not about the number being small.
+        let s = playing(44_100, 44_100, "s16", "s16");
+        assert_eq!(s.fidelity(16), Fidelity::BitPerfect);
+    }
+
+    #[test]
+    fn a_rate_change_between_decode_and_output_is_resampling() {
+        // Goal: the most damaging failure and the one a locked sink causes.
+        // 44.1k content forced out at 48k is interpolated end to end.
+        let s = playing(44_100, 48_000, "s32", "s32");
+        assert_eq!(s.fidelity(24), Fidelity::Altered(Alteration::Resampled));
+    }
+
+    #[test]
+    fn resampling_is_reported_ahead_of_truncation() {
+        // Goal: when both are wrong, name the one that does more damage.
+        let s = playing(44_100, 48_000, "s32", "s16");
+        assert_eq!(s.fidelity(24), Fidelity::Altered(Alteration::Resampled));
+    }
+
+    #[test]
+    fn software_volume_below_unity_breaks_the_chain() {
+        // Goal: mpv's volume multiplies every sample. This is the one cause the
+        // listener controls, so it has to be distinguishable from the others.
+        let mut s = playing(96_000, 96_000, "s32", "s32");
+        s.volume = 80.0;
+        assert_eq!(s.fidelity(24), Fidelity::Altered(Alteration::VolumeScaled));
+        s.volume = 100.0;
+        assert_eq!(s.fidelity(24), Fidelity::BitPerfect);
+    }
+
+    #[test]
+    fn float_output_carries_twenty_four_bits_exactly() {
+        // Goal: 32-bit float has a 24-bit mantissa, so it represents any 24-bit
+        // integer source exactly. Counting it as 32 bits would be flattering.
+        let s = playing(96_000, 96_000, "s32", "float");
+        assert_eq!(s.fidelity(24), Fidelity::BitPerfect);
+    }
+
+    #[test]
+    fn nothing_is_claimed_before_the_parameters_are_known() {
+        // Goal: an unknown chain must read as unknown, never as bit-perfect. A
+        // false green light is worse than no light.
+        assert_eq!(PlaybackStatus::default().fidelity(24), Fidelity::Unknown);
+
+        let mut s = playing(96_000, 96_000, "s32", "s32");
+        s.loaded = false;
+        assert_eq!(s.fidelity(24), Fidelity::Unknown);
+
+        let mut s = playing(96_000, 96_000, "s32", "");
+        s.out_format = "wat".into();
+        assert_eq!(s.fidelity(24), Fidelity::Unknown);
+    }
+
+    #[test]
+    fn an_unknown_source_depth_falls_back_to_the_container_width() {
+        // Goal: before the manifest metadata arrives the decoded container is
+        // the only bound available. It is conservative, not wrong.
+        let s = playing(44_100, 44_100, "s32", "s16");
+        assert_eq!(s.fidelity(0), Fidelity::Altered(Alteration::Truncated));
+
+        let s = playing(44_100, 44_100, "s16", "s16");
+        assert_eq!(s.fidelity(0), Fidelity::BitPerfect);
     }
 }
