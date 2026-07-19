@@ -31,6 +31,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::engine::general_purpose::STANDARD;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,148 @@ impl Credentials {
     pub fn into_config(self) -> AuthConfig {
         AuthConfig::new(self.client_id, self.client_secret)
     }
+}
+
+/// Where the upstream project publishes the source, tried in order.
+///
+/// The branch is not knowable in advance, so both conventions are tried.
+pub const UPSTREAM_SOURCES: &[&str] = &[
+    "https://raw.githubusercontent.com/EbbLabs/python-tidal/main/tidalapi/session.py",
+    "https://raw.githubusercontent.com/EbbLabs/python-tidal/master/tidalapi/session.py",
+];
+
+/// Where a client identity came from, so the interface can say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// The user's own `credentials.json`.
+    Configured,
+    /// A Python `tidalapi` installed on this machine.
+    LocalPackage,
+    /// Downloaded from the upstream project.
+    Upstream,
+}
+
+/// A client identity from the user's config, or from a local install.
+///
+/// Never touches the network: fetching is a separate action the user has to ask
+/// for, so priel does not quietly reach out on first start.
+#[must_use]
+pub fn local_credentials(path: &str) -> Option<(Credentials, CredentialSource)> {
+    if let Ok(creds) = Credentials::load(path) {
+        return Some((creds, CredentialSource::Configured));
+    }
+    discover_credentials().map(|c| (c, CredentialSource::LocalPackage))
+}
+
+/// Download a client identity from the upstream project's source.
+///
+/// **Performs a network request, and should only run when the user has asked for
+/// it.** priel ships no credentials and most users will have no Python package
+/// installed to read them from, so this is the practical bootstrap - but it
+/// fetches from a repository priel does not control, and reaching out without
+/// being asked would be the wrong default.
+///
+/// The result is meant to be written to the user's credentials file so this
+/// happens once rather than on every start.
+///
+/// # Errors
+/// If none of the sources can be reached, or none contains a recognisable
+/// client identity - most likely because the upstream file was restructured.
+pub fn fetch_credentials(agent: &Agent, urls: &[&str]) -> Result<Credentials> {
+    let mut last: Option<String> = None;
+    for url in urls {
+        match agent.get(*url).call() {
+            Ok(mut resp) => {
+                let body = resp.body_mut().read_to_string().unwrap_or_default();
+                if let Some(creds) = extract_credentials(&body) {
+                    return Ok(creds);
+                }
+                last = Some(format!("{url}: no client identity found in that source"));
+            }
+            Err(e) => last = Some(format!("{url}: {e}")),
+        }
+    }
+    bail!(
+        "could not obtain a client identity ({}). Configure one at {} instead.",
+        last.unwrap_or_else(|| "no sources tried".to_string()),
+        Credentials::default_path()
+    )
+}
+
+/// Recover a client identity from a locally installed Python `tidalapi`.
+///
+/// Opportunistic only: most users will have no Python package installed, and one
+/// installed as a Flatpak is inside a sandbox where this will not find it. When
+/// it does hit, it saves a network round trip and is free; when it misses, the
+/// caller falls back to [`fetch_credentials`].
+#[must_use]
+pub fn discover_credentials() -> Option<Credentials> {
+    for dir in python_site_packages() {
+        let path = format!("{dir}/tidalapi/session.py");
+        if let Ok(source) = std::fs::read_to_string(&path)
+            && let Some(creds) = extract_credentials(&source)
+        {
+            return Some(creds);
+        }
+    }
+    None
+}
+
+/// Pull the PKCE client identity out of `tidalapi`'s session source.
+///
+/// The values are stored double-base64 encoded, which is obfuscation rather
+/// than encryption - it keeps them out of a plain grep. Returns `None` on
+/// anything unexpected: a wrong guess here would produce a client identity that
+/// fails at login with no useful message.
+#[must_use]
+pub fn extract_credentials(source: &str) -> Option<Credentials> {
+    let client_id = extract_b64_pair(source, "client_id_pkce")?;
+    // A missing secret is not a failure: not every client has one.
+    let client_secret = extract_b64_pair(source, "client_secret_pkce");
+    Some(Credentials {
+        client_id,
+        client_secret,
+    })
+}
+
+fn extract_b64_pair(source: &str, name: &str) -> Option<String> {
+    let pattern = format!(
+        r#"(?s){name}\s*=\s*base64\.b64decode\(\s*base64\.b64decode\(b"([^"]+)"\)\s*\+\s*base64\.b64decode\(b"([^"]+)"\)\s*\)"#
+    );
+    let re = regex::Regex::new(&pattern).ok()?;
+    let caps = re.captures(source)?;
+    let outer: Vec<u8> = STANDARD
+        .decode(caps.get(1)?.as_str())
+        .ok()?
+        .into_iter()
+        .chain(STANDARD.decode(caps.get(2)?.as_str()).ok()?)
+        .collect();
+    String::from_utf8(STANDARD.decode(outer).ok()?).ok()
+}
+
+/// Plausible `site-packages` directories, most specific first.
+fn python_site_packages() -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let roots = [
+        format!("{home}/.local/lib"),
+        "/usr/lib".to_string(),
+        "/usr/lib64".to_string(),
+        "/usr/local/lib".to_string(),
+    ];
+    let mut found = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with("python3") {
+                found.push(format!("{root}/{name}/site-packages"));
+            }
+        }
+    }
+    found
 }
 
 /// A PKCE verifier and its S256 challenge.
@@ -825,5 +968,141 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&token).unwrap()).unwrap();
         assert_eq!(again.expiry_time, token.expiry_time);
         assert_eq!(again.access_token, token.access_token);
+    }
+
+    // ---- obtaining a client identity ----
+
+    /// The shape `tidalapi` stores its client identity in: double base64, split
+    /// across two literals so it does not appear in a plain grep.
+    fn fake_session_py(id_a: &str, id_b: &str, secret: bool) -> String {
+        let mut out = format!(
+            r#"
+        self.client_unique_key = format(random.getrandbits(64), "02x")
+        self.client_id_pkce = base64.b64decode(
+            base64.b64decode(b"{id_a}")
+            + base64.b64decode(b"{id_b}")
+        ).decode("utf-8")
+"#
+        );
+        if secret {
+            use std::fmt::Write as _;
+            let (a, b) = double_encode("secret");
+            let _ = write!(
+                out,
+                r#"
+        self.client_secret_pkce = base64.b64decode(
+            base64.b64decode(b"{a}")
+            + base64.b64decode(b"{b}")
+        ).decode("utf-8")
+"#
+            );
+        }
+        out
+    }
+
+    /// Double-encode a value the way the upstream source stores it, split in two.
+    fn double_encode(value: &str) -> (String, String) {
+        let inner = STANDARD.encode(value);
+        // Split the way upstream does: two independently decodable halves whose
+        // plaintexts concatenate back into the inner encoding.
+        let half = inner.len() / 2;
+        (
+            STANDARD.encode(&inner[..half]),
+            STANDARD.encode(&inner[half..]),
+        )
+    }
+
+    #[test]
+    fn a_client_identity_is_recovered_from_the_upstream_shape() {
+        // Goal: the value is deliberately obfuscated, split across two literals
+        // and encoded twice. Getting the layering wrong yields a plausible
+        // string that fails only at login.
+        let (a, b) = double_encode("my-client-id");
+        let creds = extract_credentials(&fake_session_py(&a, &b, true))
+            .expect("should recover the identity");
+        assert_eq!(creds.client_id, "my-client-id");
+        assert_eq!(creds.client_secret.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn a_client_without_a_published_secret_is_still_usable() {
+        // Goal: not every client has a secret, and its absence must not throw
+        // away the id alongside it.
+        let (a, b) = double_encode("only-an-id");
+        let creds =
+            extract_credentials(&fake_session_py(&a, &b, false)).expect("id alone is enough");
+        assert_eq!(creds.client_id, "only-an-id");
+        assert!(creds.client_secret.is_none());
+    }
+
+    #[test]
+    fn unrecognisable_source_yields_nothing_rather_than_a_guess() {
+        // Goal: the upstream file can be restructured at any time. A wrong guess
+        // produces a client identity that fails at login with no useful message,
+        // so no answer is better than a bad one.
+        assert!(extract_credentials("").is_none());
+        assert!(extract_credentials("client_id_pkce = 'plaintext'").is_none());
+        assert!(
+            extract_credentials(r#"self.client_id_pkce = base64.b64decode(b"!!!")"#).is_none(),
+            "a single-layer form is not the shape we know"
+        );
+    }
+
+    #[test]
+    fn the_configured_file_wins_over_a_local_package() {
+        // Goal: an explicit choice by the user must never be silently overridden
+        // by whatever happens to be installed on the machine.
+        let dir = std::env::temp_dir().join(format!("priel-creds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp");
+        let path = dir.join("credentials.json");
+        std::fs::write(&path, r#"{"client_id":"configured"}"#).expect("write");
+
+        let (creds, source) =
+            local_credentials(path.to_str().expect("path")).expect("should find the file");
+        assert_eq!(creds.client_id, "configured");
+        assert_eq!(source, CredentialSource::Configured);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fetch_falls_through_the_sources_and_explains_a_total_failure() {
+        // Goal: the branch name upstream uses is not knowable, so several URLs
+        // are tried. If none works the message has to point at the manual
+        // alternative rather than leaving the user stuck.
+        let good = stub_source(&{
+            let (a, b) = double_encode("fetched-id");
+            fake_session_py(&a, &b, false)
+        });
+        let agent = Agent::new_with_defaults();
+
+        let creds = fetch_credentials(&agent, &["http://127.0.0.1:1/nope", &good])
+            .expect("the second source should answer");
+        assert_eq!(creds.client_id, "fetched-id");
+
+        let err = fetch_credentials(&agent, &["http://127.0.0.1:1/a"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not obtain"), "{err}");
+        assert!(
+            err.contains("credentials.json"),
+            "should name the fallback: {err}"
+        );
+    }
+
+    /// Serve one body over HTTP and return its URL.
+    fn stub_source(body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/session.py", listener.local_addr().expect("addr"));
+        let body = body.to_string();
+        thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let resp = format!(
+                    "HTTP/1.1 200 S\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        url
     }
 }
