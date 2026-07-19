@@ -84,6 +84,11 @@ const DOWNLOAD_AHEAD_MAX: u64 = 32 * 1024 * 1024;
 /// changes on a track boundary, so once a second is generous.
 const HW_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How much of a segment to publish at a time. Small enough that the first audio
+/// is decodable almost immediately, large enough not to wake the reader for
+/// every packet.
+const SEGMENT_CHUNK: usize = 64 * 1024;
+
 type Registry = Arc<Mutex<HashMap<u64, Arc<Shared>>>>;
 
 /// One mpv playlist entry we know about.
@@ -329,6 +334,17 @@ fn init_mpv(mpv: &Mpv, audio_device: Option<&str>) {
     //   - 120s caps duration for material compressed far enough to get there.
     set_prop(mpv, "cache", "yes");
     set_prop(mpv, "cache-secs", 120.0);
+
+    // Start playing as soon as there is something to decode, and let mpv handle
+    // a slow link by pausing on underrun rather than by pre-filling a buffer up
+    // front. That is the adaptive version of a download-rate check: it costs
+    // nothing on a fast connection and only intervenes when the bytes genuinely
+    // are not arriving. The two-second resume window is deliberately longer than
+    // mpv's default of one, because a hi-res stream that resumes with a single
+    // second in hand tends to stall again immediately.
+    set_prop(mpv, "cache-pause-initial", "no");
+    set_prop(mpv, "cache-pause", "yes");
+    set_prop(mpv, "cache-pause-wait", 2.0);
     set_prop(mpv, "demuxer-max-bytes", 64i64 * 1024 * 1024);
     // Only consulted on the non-network path, where cache-secs does not apply.
     set_prop(mpv, "demuxer-readahead-secs", 30.0);
@@ -473,31 +489,29 @@ fn too_far_ahead(b: &Buf) -> bool {
     (b.data.len() as u64).saturating_sub(b.read_pos) > DOWNLOAD_AHEAD_MAX
 }
 
+/// Why a segment stopped feeding the buffer.
+enum Stop {
+    /// The stream was discarded; do not touch the buffer again.
+    Aborted,
+    /// The fetch failed. Playback ends short, but the buffer must still be
+    /// completed so a waiting reader is released rather than hanging.
+    Failed,
+}
+
 fn spawn_downloader(urls: Vec<String>, shared: Arc<Shared>) {
     thread::spawn(move || {
         for u in &urls {
-            {
-                // Backpressure: never hold more than DOWNLOAD_AHEAD_MAX bytes
-                // that nothing has read yet.
-                let mut g = lock(&shared.inner);
-                while !g.aborted && too_far_ahead(&g) {
-                    g = wait(&shared.cv, g);
-                }
-                if g.aborted {
-                    return;
-                }
-            }
             // A non-2xx is an `Err` here (the agent keeps ureq's default
             // `http_status_as_error`), matching the old `error_for_status`.
-            let Some(bytes) = HTTP.get(u).call().ok().and_then(|mut r| read_body(&mut r)) else {
-                break;
+            let outcome = match HTTP.get(u).call() {
+                Ok(mut resp) => stream_body(&mut resp, &shared),
+                Err(_) => Err(Stop::Failed),
             };
-            let mut g = lock(&shared.inner);
-            if g.aborted {
-                return;
+            match outcome {
+                Ok(()) => {}
+                Err(Stop::Aborted) => return,
+                Err(Stop::Failed) => break,
             }
-            g.data.extend_from_slice(&bytes);
-            shared.cv.notify_all();
         }
         let mut g = lock(&shared.inner);
         g.total = Some(g.data.len() as u64);
@@ -506,13 +520,43 @@ fn spawn_downloader(urls: Vec<String>, shared: Arc<Shared>) {
     });
 }
 
-/// Read a whole segment body. `as_reader` is used rather than `read_to_vec`
-/// because the latter applies ureq's body-size limit, and hi-res segments run
-/// to several megabytes.
-fn read_body(resp: &mut Response<Body>) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    resp.body_mut().as_reader().read_to_end(&mut bytes).ok()?;
-    Some(bytes)
+/// Feed one segment into the shared buffer *as it arrives*.
+///
+/// Appending in chunks rather than a segment at a time is what lets playback
+/// start promptly. A hi-res DASH segment is several megabytes; reading it to the
+/// end before publishing any of it meant mpv had nothing to decode until the
+/// whole thing landed, which is seconds of silence on every track change.
+///
+/// Backpressure is checked per chunk for the same reason: a segment can be
+/// larger than the whole allowance.
+fn stream_body(resp: &mut Response<Body>, shared: &Arc<Shared>) -> Result<(), Stop> {
+    let mut reader = resp.body_mut().as_reader();
+    let mut chunk = vec![0u8; SEGMENT_CHUNK];
+    loop {
+        {
+            let mut g = lock(&shared.inner);
+            while !g.aborted && too_far_ahead(&g) {
+                g = wait(&shared.cv, g);
+            }
+            if g.aborted {
+                return Err(Stop::Aborted);
+            }
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                let mut g = lock(&shared.inner);
+                if g.aborted {
+                    return Err(Stop::Aborted);
+                }
+                g.data.extend_from_slice(&chunk[..n]);
+                // Wake whoever is blocked in `read`: this is the notification
+                // that turns a downloaded chunk into audible sound.
+                shared.cv.notify_all();
+            }
+            Err(_) => return Err(Stop::Failed),
+        }
+    }
 }
 
 #[allow(
@@ -931,6 +975,15 @@ mod tests {
             64 * 1024 * 1024
         );
         assert!((mpv.get_property::<f64>("cache-secs").unwrap() - 120.0).abs() < f64::EPSILON);
+        assert!(
+            !mpv.get_property::<bool>("cache-pause-initial").unwrap(),
+            "playback must start as soon as it can decode, not once a buffer is full"
+        );
+        assert!(
+            mpv.get_property::<bool>("cache-pause").unwrap(),
+            "a slow link should pause cleanly rather than stutter"
+        );
+        assert!((mpv.get_property::<f64>("cache-pause-wait").unwrap() - 2.0).abs() < f64::EPSILON);
         assert_eq!(mpv.get_property::<String>("ao").unwrap(), "null");
     }
 
@@ -1053,5 +1106,96 @@ mod tests {
         });
         let mut c = cookie(&sh);
         assert_eq!(seek(&mut c, 6), 6, "should have waited rather than failed");
+    }
+
+    /// Serves a body in two halves with a pause between them, so a test can tell
+    /// "published as it arrived" from "published when it finished".
+    fn trickle(first: &'static [u8], second: &'static [u8], gap: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/seg", listener.local_addr().expect("addr"));
+        thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let head = format!(
+                    "HTTP/1.1 200 S\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    first.len() + second.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(first);
+                let _ = sock.flush();
+                thread::sleep(gap);
+                let _ = sock.write_all(second);
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn audio_becomes_readable_before_the_segment_has_finished() {
+        // Goal: the whole reason playback starts promptly. A hi-res segment is
+        // megabytes; publishing it only once complete meant mpv had nothing to
+        // decode until the entire thing landed, which is seconds of silence on
+        // every track change. The first half must be readable while the second
+        // is still in flight.
+        let url = trickle(b"first-half", b"second-half", Duration::from_millis(400));
+        let sh = shared(Vec::new(), false);
+        spawn_downloader(vec![url], sh.clone());
+
+        // A reader blocked on an empty buffer must be released by the first
+        // chunk, well before the response completes.
+        let mut c = cookie(&sh);
+        let mut buf = [0i8; 64];
+        let started = std::time::Instant::now();
+        let n = read(&mut c, &mut buf);
+        let waited = started.elapsed();
+
+        assert!(n > 0, "the first chunk should have woken the reader");
+        assert!(
+            waited < Duration::from_millis(300),
+            "waited {waited:?}, which means it held the bytes back until the end"
+        );
+        assert!(
+            !lock(&sh.inner).complete,
+            "the segment should still be arriving"
+        );
+    }
+
+    #[test]
+    fn a_trickled_segment_still_arrives_whole() {
+        // Goal: chunking must not drop or reorder anything - the concatenated
+        // bytes are a FLAC stream and a gap in the middle is a decode failure.
+        let url = trickle(b"AAAA", b"BBBB", Duration::from_millis(50));
+        let sh = shared(Vec::new(), false);
+        spawn_downloader(vec![url], sh.clone());
+        for _ in 0..200 {
+            if lock(&sh.inner).complete {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let g = lock(&sh.inner);
+        assert_eq!(g.data, b"AAAABBBB");
+        assert_eq!(g.total, Some(8));
+    }
+
+    #[test]
+    fn aborting_mid_segment_stops_the_download_there() {
+        // Goal: skipping a track while a segment is still streaming must release
+        // the thread rather than let it keep filling a discarded buffer.
+        let url = trickle(b"early", b"late", Duration::from_secs(3));
+        let sh = shared(Vec::new(), false);
+        spawn_downloader(vec![url], sh.clone());
+        for _ in 0..200 {
+            if !lock(&sh.inner).data.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        abort(&sh);
+        let g = lock(&sh.inner);
+        assert!(g.aborted);
+        assert!(
+            g.data.is_empty(),
+            "the discarded buffer is released at once"
+        );
     }
 }

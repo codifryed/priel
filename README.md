@@ -51,6 +51,11 @@ water in and out of the flats twice a day, on the pull of the moon.*
   tree — no tokio, no hyper. No OpenSSL: TLS is rustls. 41 crates for the API
   library, 105 for the whole binary. **libmpv is the only non-Rust runtime
   dependency**, and it is the one doing the work that matters.
+- **Starts playing quickly.** Segment bytes reach the decoder as they arrive
+  rather than a segment at a time, so a track begins when the first chunk lands
+  instead of after several megabytes. On a slow link mpv pauses on underrun and
+  resumes with a couple of seconds in hand, which adapts to the connection
+  instead of taxing every fast one with a fixed pre-buffer.
 - **Small and quiet at rest.** A ~4 MiB binary that redraws only when something
   on screen actually changed, backs its player thread off when nothing is
   playing, and applies backpressure to downloads so a preloaded hi-res track
