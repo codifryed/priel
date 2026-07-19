@@ -128,6 +128,7 @@ pub struct Client {
     http: Agent,
     token: String,
     session: Option<Session>,
+    base: String,
 }
 
 // ---- wire types ----
@@ -266,6 +267,7 @@ impl Client {
             http,
             token,
             session: None,
+            base: API.to_string(),
         })
     }
 
@@ -289,6 +291,20 @@ impl Client {
         format!("{base}/hiresti/hiresti_token.json")
     }
 
+    /// Point the client at a different API origin.
+    ///
+    /// The only reason this exists is testability: without it every request is
+    /// nailed to the live service and nothing can be exercised against a stub.
+    #[must_use]
+    pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
+        self.base = base.into();
+        self
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
+    }
+
     fn get(&self, url: &str, query: &[(&str, &str)]) -> Result<Response<Body>> {
         let mut req = self
             .http
@@ -306,7 +322,7 @@ impl Client {
     /// On a transport failure, or a non-success status - most often an expired
     /// token, which the message calls out.
     pub fn connect(&mut self) -> Result<Session> {
-        let mut resp = self.get(&format!("{API}/v1/sessions"), &[])?;
+        let mut resp = self.get(&self.url("/v1/sessions"), &[])?;
         if !resp.status().is_success() {
             bail!(
                 "GET /v1/sessions -> HTTP {} (token expired? re-login in hiresTI)",
@@ -335,7 +351,7 @@ impl Client {
     /// non-success status.
     pub fn favorite_tracks(&self, offset: u32, limit: u32) -> Result<Vec<Track>> {
         let sess = self.session()?;
-        let url = format!("{API}/v1/users/{}/favorites/tracks", sess.user_id);
+        let url = self.url(&format!("/v1/users/{}/favorites/tracks", sess.user_id));
         let (off, lim) = (offset.to_string(), limit.to_string());
         let mut resp = self.get(
             &url,
@@ -367,7 +383,7 @@ impl Client {
         }
 
         let sess = self.session()?;
-        let url = format!("{API}/v1/users/{}/playlists", sess.user_id);
+        let url = self.url(&format!("/v1/users/{}/playlists", sess.user_id));
         let (off, lim) = (offset.to_string(), limit.to_string());
         let mut resp = self.get(
             &url,
@@ -400,7 +416,7 @@ impl Client {
         }
 
         let sess = self.session()?;
-        let url = format!("{API}/v1/playlists/{uuid}/tracks");
+        let url = self.url(&format!("/v1/playlists/{uuid}/tracks"));
         let (off, lim) = (offset.to_string(), limit.to_string());
         let mut resp = self.get(
             &url,
@@ -441,7 +457,7 @@ impl Client {
         }
 
         let sess = self.session()?;
-        let url = format!("{API}/v1/search");
+        let url = self.url("/v1/search");
         let lim = limit.to_string();
         let mut resp = self.get(
             &url,
@@ -479,7 +495,7 @@ impl Client {
     /// included, since it carries the reason a track is unplayable), or a
     /// manifest that is not valid base64, not a known mime type, or empty.
     pub fn resolve_stream(&self, track_id: u64, quality: Quality) -> Result<ResolvedStream> {
-        let url = format!("{API}/v1/tracks/{track_id}/playbackinfopostpaywall");
+        let url = self.url(&format!("/v1/tracks/{track_id}/playbackinfopostpaywall"));
         let mut resp = self.get(
             &url,
             &[
@@ -531,4 +547,396 @@ fn decode_manifest(s: &Stream) -> Result<ResolvedStream> {
         codec,
         quality: s.audio_quality.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread;
+
+    /// A throwaway HTTP origin that serves canned responses in order and records
+    /// the request lines it saw. Written against `std::net` on purpose: a stub
+    /// server is not worth a dependency in a crate this small.
+    struct Stub {
+        base: String,
+        seen: Receiver<String>,
+    }
+
+    fn stub(responses: Vec<(u16, String)>) -> Stub {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, seen) = mpsc::channel();
+        thread::spawn(move || {
+            for (code, body) in responses {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(sock.try_clone().expect("clone"));
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if header == "\r\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+                let _ = tx.send(line.trim().to_string());
+                let resp = format!(
+                    "HTTP/1.1 {code} S\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        Stub { base, seen }
+    }
+
+    fn client(s: &Stub) -> Client {
+        Client::new("tok".into())
+            .expect("client")
+            .with_base_url(s.base.clone())
+    }
+
+    /// A client that has already been through `connect`, so the session-scoped
+    /// calls can be exercised without repeating the handshake in every test.
+    fn connected(s: &Stub) -> Client {
+        let mut c = client(s);
+        c.connect().expect("connect");
+        c
+    }
+
+    const SESSION: &str = r#"{"userId":7,"countryCode":"DE"}"#;
+
+    fn ok(body: &str) -> (u16, String) {
+        (200, body.to_string())
+    }
+
+    // ---- session ----
+
+    #[test]
+    fn connect_caches_the_identity_the_other_calls_need() {
+        // Goal: connect both returns and stores the session, since every later
+        // request interpolates the user id and country code.
+        let s = stub(vec![ok(SESSION)]);
+        let mut c = client(&s);
+        let sess = c.connect().unwrap();
+        assert_eq!(sess.user_id, 7);
+        assert_eq!(sess.country_code, "DE");
+        assert!(s.seen.recv().unwrap().starts_with("GET /v1/sessions"));
+    }
+
+    #[test]
+    fn an_unauthorised_session_says_the_token_may_have_expired() {
+        // Goal: this is the error a user hits most, so the message has to point
+        // at the fix rather than just report a status code.
+        let s = stub(vec![(401, "no".into())]);
+        let err = client(&s).connect().unwrap_err().to_string();
+        assert!(err.contains("401"), "should carry the status: {err}");
+        assert!(
+            err.contains("token expired"),
+            "should suggest a cause: {err}"
+        );
+    }
+
+    #[test]
+    fn session_scoped_calls_refuse_to_run_before_connect() {
+        // Goal: failing with a clear programmer error beats sending a request
+        // with an empty user id and getting a confusing 404 back.
+        let s = stub(vec![]);
+        let err = client(&s).favorite_tracks(0, 10).unwrap_err().to_string();
+        assert!(err.contains("connect"), "{err}");
+    }
+
+    // ---- listings ----
+
+    #[test]
+    fn favorites_are_mapped_and_paged_through_the_query_string() {
+        // Goal: the wire shape is nested (items[].item) and the paging arguments
+        // must actually reach the URL, or every page returns the same rows.
+        let body = r#"{"items":[{"item":{"id":1,"title":"T","duration":100,
+            "artists":[{"name":"A"},{"name":"B"}],"album":{"title":"Alb"},
+            "audioQuality":"LOSSLESS","mediaMetadata":{"tags":["HIRES_LOSSLESS"]}}}]}"#;
+        let s = stub(vec![ok(SESSION), ok(body)]);
+        let c = connected(&s);
+        let tracks = c.favorite_tracks(20, 5).unwrap();
+
+        assert_eq!(tracks.len(), 1);
+        let t = &tracks[0];
+        assert_eq!((t.id, t.duration), (1, 100));
+        assert_eq!(t.artist, "A", "the first artist represents the track");
+        assert_eq!(t.album, "Alb");
+        assert_eq!(t.quality, "HI-RES", "the hi-res tag wins over audioQuality");
+
+        let _ = s.seen.recv().unwrap();
+        let req = s.seen.recv().unwrap();
+        assert!(req.contains("offset=20"), "{req}");
+        assert!(req.contains("limit=5"), "{req}");
+        assert!(req.contains("countryCode=DE"), "{req}");
+    }
+
+    #[test]
+    fn absent_optional_track_fields_do_not_fail_the_page() {
+        // Goal: the catalogue omits fields freely. One sparse row must not throw
+        // away the whole listing.
+        let s = stub(vec![ok(SESSION), ok(r#"{"items":[{"item":{"id":9}}]}"#)]);
+        let tracks = connected(&s).favorite_tracks(0, 1).unwrap();
+        assert_eq!(tracks[0].id, 9);
+        assert_eq!(tracks[0].artist, "");
+        assert_eq!(tracks[0].quality, "");
+    }
+
+    #[test]
+    fn playlists_and_their_tracks_are_parsed() {
+        // Goal: playlists key off a uuid rather than a numeric id, and the uuid
+        // has to land in the path.
+        let s = stub(vec![
+            ok(SESSION),
+            ok(r#"{"items":[{"uuid":"abc","title":"Mix","numberOfTracks":3,"duration":60}]}"#),
+            ok(r#"{"items":[{"id":5,"title":"X"}]}"#),
+        ]);
+        let c = connected(&s);
+
+        let lists = c.user_playlists(0, 10).unwrap();
+        assert_eq!(lists[0].uuid, "abc");
+        assert_eq!(lists[0].num_tracks, 3);
+
+        let tracks = c.playlist_tracks("abc", 0, 10).unwrap();
+        assert_eq!(tracks[0].id, 5);
+
+        let _ = s.seen.recv().unwrap();
+        let _ = s.seen.recv().unwrap();
+        assert!(s.seen.recv().unwrap().contains("/v1/playlists/abc/tracks"));
+    }
+
+    #[test]
+    fn search_returns_both_kinds_and_an_empty_result_is_not_an_error() {
+        // Goal: a query with no hits is a normal answer. Treating it as an error
+        // would put a scary notice on screen for an ordinary typo.
+        let s = stub(vec![
+            ok(SESSION),
+            ok(r#"{"tracks":{"items":[{"id":2,"title":"S"}]},
+                  "playlists":{"items":[{"uuid":"u","title":"P"}]}}"#),
+            ok("{}"),
+        ]);
+        let c = connected(&s);
+
+        let hits = c.search("blue", 50).unwrap();
+        assert_eq!(hits.tracks.len(), 1);
+        assert_eq!(hits.playlists.len(), 1);
+
+        let empty = c.search("zzz", 50).unwrap();
+        assert!(empty.tracks.is_empty() && empty.playlists.is_empty());
+    }
+
+    #[test]
+    fn a_failed_listing_reports_which_call_failed() {
+        // Goal: the worker turns these into a one-line notice, so the message
+        // has to identify the request on its own.
+        let s = stub(vec![ok(SESSION), (500, "boom".into())]);
+        let err = connected(&s).user_playlists(0, 1).unwrap_err().to_string();
+        assert!(err.contains("playlists") && err.contains("500"), "{err}");
+    }
+
+    // ---- stream resolution ----
+
+    fn manifest(mime: &str, payload: &str) -> String {
+        let encoded = STANDARD.encode(payload);
+        format!(
+            r#"{{"audioQuality":"HI_RES_LOSSLESS","manifestMimeType":"{mime}",
+                "manifest":"{encoded}","bitDepth":24,"sampleRate":192000}}"#
+        )
+    }
+
+    #[test]
+    fn a_bts_manifest_resolves_to_a_single_direct_url() {
+        // Goal: BTS hands back a ready URL that mpv can fetch itself, so it must
+        // not go down the segment path.
+        let s = stub(vec![
+            ok(SESSION),
+            ok(&manifest(
+                "application/vnd.tidal.bts",
+                r#"{"codecs":"flac","urls":["https://cdn/one.flac"]}"#,
+            )),
+        ]);
+        let r = connected(&s).resolve_stream(1, Quality::HiRes).unwrap();
+        match r.source {
+            PlayableSource::Direct(u) => assert_eq!(u, "https://cdn/one.flac"),
+            PlayableSource::Segments(_) => panic!("BTS must not produce segments"),
+        }
+        assert_eq!((r.bit_depth, r.sample_rate), (24, 192_000));
+    }
+
+    #[test]
+    fn a_dash_manifest_resolves_to_ordered_segments() {
+        // Goal: DASH has to go through the MPD parser and come back as the list
+        // the player concatenates.
+        let mpd = r#"<MPD><SegmentTemplate media="https://cdn/$Number$.mp4"/>
+                     <S d="1"/></MPD>"#;
+        let s = stub(vec![
+            ok(SESSION),
+            ok(&manifest("application/dash+xml", mpd)),
+        ]);
+        let r = connected(&s).resolve_stream(1, Quality::HiRes).unwrap();
+        match r.source {
+            PlayableSource::Segments(u) => {
+                assert_eq!(u.len(), 3);
+                assert_eq!(u[0], "https://cdn/0.mp4");
+            }
+            PlayableSource::Direct(_) => panic!("DASH must not produce a direct url"),
+        }
+    }
+
+    #[test]
+    fn the_sample_rate_falls_back_to_the_manifest_when_absent() {
+        // Goal: the outer response usually carries the rate, but not always;
+        // the MPD's own audioSamplingRate is the backstop the badge relies on.
+        let payload = STANDARD.encode(
+            r#"<MPD><Representation audioSamplingRate="48000"/>
+               <SegmentTemplate media="https://cdn/$Number$.mp4"/></MPD>"#,
+        );
+        let body =
+            format!(r#"{{"manifestMimeType":"application/dash+xml","manifest":"{payload}"}}"#);
+        let s = stub(vec![ok(SESSION), ok(&body)]);
+        let r = connected(&s).resolve_stream(1, Quality::Lossless).unwrap();
+        assert_eq!(r.sample_rate, 48_000);
+        assert_eq!(r.bit_depth, 0, "unknown depth reads as zero, not a guess");
+    }
+
+    #[test]
+    fn unusable_manifests_are_rejected_with_a_reason() {
+        // Goal: three distinct failures that would otherwise surface as a silent
+        // non-playing track: unknown container, empty url list, bad base64.
+        let cases: Vec<(String, &str)> =
+            vec![
+            (manifest("application/octet-stream", "{}"), "manifestMimeType"),
+            (
+                manifest("application/vnd.tidal.bts", r#"{"urls":[]}"#),
+                "no urls",
+            ),
+            (
+                r#"{"manifestMimeType":"application/vnd.tidal.bts","manifest":"!!not base64!!"}"#
+                    .to_string(),
+                "base64",
+            ),
+        ];
+        for (body, expected) in cases {
+            let s = stub(vec![ok(SESSION), ok(&body)]);
+            let err = connected(&s)
+                .resolve_stream(1, Quality::HiRes)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "expected {expected:?} in {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_playback_request_includes_the_service_reason() {
+        // Goal: the body explains *why* a track is unplayable (region, tier), so
+        // it must be carried into the error rather than dropped for the status.
+        let s = stub(vec![
+            ok(SESSION),
+            (403, "not available in your country".into()),
+        ]);
+        let err = connected(&s)
+            .resolve_stream(1, Quality::HiRes)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("403"), "{err}");
+        assert!(err.contains("not available"), "{err}");
+    }
+
+    #[test]
+    fn the_requested_quality_reaches_the_query() {
+        // Goal: asking for hi-res and silently receiving lossless is the whole
+        // point of the app, so the tier must be on the wire.
+        let s = stub(vec![
+            ok(SESSION),
+            ok(&manifest(
+                "application/vnd.tidal.bts",
+                r#"{"urls":["https://cdn/a"]}"#,
+            )),
+        ]);
+        let _ = connected(&s).resolve_stream(42, Quality::HiRes);
+        let _ = s.seen.recv().unwrap();
+        let req = s.seen.recv().unwrap();
+        assert!(
+            req.contains("/v1/tracks/42/playbackinfopostpaywall"),
+            "{req}"
+        );
+        assert!(req.contains("audioquality=HI_RES_LOSSLESS"), "{req}");
+    }
+
+    // ---- pure helpers ----
+
+    #[test]
+    fn quality_tiers_map_to_the_api_spelling() {
+        // Goal: these strings are protocol, not display text.
+        assert_eq!(Quality::Low.as_api_str(), "LOW");
+        assert_eq!(Quality::High.as_api_str(), "HIGH");
+        assert_eq!(Quality::Lossless.as_api_str(), "LOSSLESS");
+        assert_eq!(Quality::HiRes.as_api_str(), "HI_RES_LOSSLESS");
+    }
+
+    #[test]
+    fn the_quality_label_prefers_the_tag_over_the_field() {
+        // Goal: pin the precedence the badge depends on. A hi-res track is often
+        // still marked LOSSLESS in audioQuality, and showing that would be wrong.
+        assert_eq!(
+            quality_label(&["HIRES_LOSSLESS".into()], "LOSSLESS"),
+            "HI-RES"
+        );
+        assert_eq!(quality_label(&["hires".into()], ""), "HI-RES");
+        assert_eq!(quality_label(&["LOSSLESS".into()], "HIGH"), "LOSSLESS");
+        assert_eq!(quality_label(&[], "lossless"), "LOSSLESS");
+        assert_eq!(quality_label(&[], "HIGH"), "HIGH");
+        assert_eq!(
+            quality_label(&[], "LOW"),
+            "LOW",
+            "unknown tiers pass through"
+        );
+        assert_eq!(quality_label(&[], ""), "", "nothing known means no badge");
+    }
+
+    #[test]
+    fn a_token_file_is_read_or_explained() {
+        // Goal: the three startup outcomes. Both failures name the file, because
+        // this runs before the UI exists and the message is all the user gets.
+        let dir = std::env::temp_dir().join(format!("priel-tok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.json");
+        std::fs::write(&good, r#"{"access_token":"abc","other":1}"#).unwrap();
+        assert!(Client::from_token_file(good.to_str().unwrap()).is_ok());
+
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "not json").unwrap();
+        let err = Client::from_token_file(bad.to_str().unwrap())
+            .err()
+            .expect("malformed json must fail")
+            .to_string();
+        assert!(err.contains("parsing token file"), "{err}");
+
+        let err = Client::from_token_file(dir.join("nope.json").to_str().unwrap())
+            .err()
+            .expect("a missing file must fail")
+            .to_string();
+        assert!(err.contains("reading token file"), "{err}");
+        assert!(err.contains("hiresTI"), "should say how to fix it: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_default_token_path_is_xdg_shaped() {
+        // Goal: the location is part of the contract with hiresTI. Not asserted
+        // against a fixed prefix because it follows the caller's environment.
+        let p = Client::default_token_path();
+        assert!(p.ends_with("/hiresti/hiresti_token.json"), "{p}");
+        assert!(p.starts_with('/'), "must be absolute: {p}");
+    }
 }
