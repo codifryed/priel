@@ -41,12 +41,7 @@ pedantic = { level = "warn", priority = -1 }
 debug = "line-tables-only"
 
 [profile.release]
-# priel runs for hours, so steady-state CPU beats binary size. LTO + one codegen
-# unit are what buy that: they let the render path inline through ratatui and
-# crossterm. opt-level 3 over 2 is marginal here (the heavy lifting is inside
-# libmpv and ring, which this profile does not govern), but it is the right
-# default given the priority. `strip` is deliberately unset so distro packaging
-# can still split debuginfo.
+# priel runs for hours, so steady-state CPU beats binary size.
 opt-level = 3
 lto = "fat"
 codegen-units = 1
