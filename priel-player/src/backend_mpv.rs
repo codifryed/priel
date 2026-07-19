@@ -57,14 +57,6 @@ fn wait<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
     cv.wait(guard).unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Wait with a deadline, tolerating poisoning. See [`lock`].
-fn wait_for<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>, dur: Duration) -> MutexGuard<'a, T> {
-    let (guard, _) = cv
-        .wait_timeout(guard, dur)
-        .unwrap_or_else(PoisonError::into_inner);
-    guard
-}
-
 /// Growing per-track buffer shared between a downloader and mpv's callbacks.
 struct Shared {
     inner: Mutex<Buf>,
@@ -98,19 +90,6 @@ const HW_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// per-chunk overhead is a lock and a condvar wake, measured at ~0.2 microseconds
 /// even with a reader parked, so a small first chunk costs nothing worth counting.
 const SEGMENT_CHUNK_MIN: usize = 16 * 1024;
-
-/// How long a seek may wait for bytes that have not arrived yet.
-///
-/// This is the difference between a track starting promptly and a track
-/// starting when its *entire* download finishes. mpv probes a newly opened
-/// stream by seeking around it, and an unbounded wait there turns a probe near
-/// the end of the file into "download the whole track first" - which is exactly
-/// what the first track of a session used to do, while a preloaded one appeared
-/// fast only because it had already finished downloading in the background.
-///
-/// Short enough not to stall a start, long enough that a seek just ahead of the
-/// download still succeeds rather than failing over a few hundred milliseconds.
-const SEEK_WAIT_MAX: Duration = Duration::from_millis(500);
 
 /// The ceiling the chunk size ramps up to once playback is under way, where
 /// fewer, larger reads are the cheaper shape and latency no longer matters.
@@ -203,36 +182,6 @@ fn read(cookie: &mut Cookie, buf: &mut [i8]) -> i64 {
     }
 }
 
-#[allow(
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    reason = "the stream_cb ABI is i64; negative offsets are rejected above"
-)]
-fn seek(cookie: &mut Cookie, offset: i64) -> i64 {
-    if offset < 0 {
-        return -1;
-    }
-    let target = offset as u64;
-    let deadline = Instant::now() + SEEK_WAIT_MAX;
-    let mut g = lock(&cookie.shared.inner);
-    loop {
-        if target <= g.data.len() as u64 || g.complete || g.aborted {
-            cookie.pos = target;
-            g.read_pos = g.read_pos.max(target);
-            cookie.shared.cv.notify_all();
-            return target as i64;
-        }
-        // Out of patience: report the seek as unsupported rather than holding
-        // mpv's demuxer thread until the download catches up. -1 is the honest
-        // answer for a position this stream cannot serve yet, and mpv falls back
-        // to reading forward.
-        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-            return -1;
-        };
-        g = wait_for(&cookie.shared.cv, g, left);
-    }
-}
-
 fn size(cookie: &mut Cookie) -> i64 {
     lock(&cookie.shared.inner)
         .total
@@ -277,7 +226,14 @@ pub fn spawn(
                 open,
                 close,
                 read,
-                Some(seek),
+                // No seek callback, deliberately. Advertising the stream as
+                // seekable makes the MP4 demuxer index the whole fragmented
+                // file before it will play anything: measured at 100% of the
+                // file downloaded before the first note, scaling with the
+                // connection. Without it, audio starts on the first fragment.
+                // In-track seeking still works through mpv's demuxer cache,
+                // which it enables precisely because the stream is not seekable.
+                None,
                 Some(size),
             )
         };
@@ -385,6 +341,10 @@ fn init_mpv(mpv: &Mpv, audio_device: Option<&str>) {
     // are not arriving. The two-second resume window is deliberately longer than
     // mpv's default of one, because a hi-res stream that resumes with a single
     // second in hand tends to stall again immediately.
+    // The stream is served without a seek callback (see `spawn`), so mpv keeps a
+    // seekable cache instead. Stated outright rather than left to the `auto`
+    // heuristic, because in-track seeking depends on it.
+    set_prop(mpv, "demuxer-seekable-cache", "yes");
     set_prop(mpv, "cache-pause-initial", "no");
     set_prop(mpv, "cache-pause", "yes");
     set_prop(mpv, "cache-pause-wait", 2.0);
@@ -829,32 +789,6 @@ mod tests {
         );
     }
 
-    // ---- seeking ----
-
-    #[test]
-    fn seeks_move_the_cursor_and_reject_negatives() {
-        // Goal: the stream_cb contract is a byte offset; negative is invalid and
-        // must be refused rather than wrapped into a huge unsigned value.
-        let sh = shared(b"0123456789".to_vec(), true);
-        let mut c = cookie(&sh);
-        assert_eq!(seek(&mut c, -1), -1);
-        assert_eq!(seek(&mut c, 4), 4);
-        let mut buf = [0i8; 2];
-        assert_eq!(read(&mut c, &mut buf), 2);
-        assert_eq!(&buf, b"45".map(|b| i8::from_ne_bytes([b])).as_slice());
-    }
-
-    #[test]
-    fn a_seek_past_a_complete_stream_is_allowed() {
-        // Goal: mpv probes past the end while parsing; on a complete buffer that
-        // must resolve instead of blocking forever.
-        let sh = shared(b"abc".to_vec(), true);
-        let mut c = cookie(&sh);
-        assert_eq!(seek(&mut c, 99), 99);
-        let mut buf = [0i8; 4];
-        assert_eq!(read(&mut c, &mut buf), 0);
-    }
-
     #[test]
     fn size_is_unknown_until_the_download_finishes() {
         // Goal: mpv treats -1 as "not seekable yet"; claiming a size before the
@@ -1032,6 +966,13 @@ mod tests {
         );
         assert!((mpv.get_property::<f64>("cache-pause-wait").unwrap() - 2.0).abs() < f64::EPSILON);
         assert_eq!(mpv.get_property::<String>("ao").unwrap(), "null");
+        assert!(
+            mpv.get_property::<String>("demuxer-seekable-cache")
+                .unwrap()
+                != "no",
+            "the stream is served without a seek callback, so in-track seeking \
+             depends entirely on mpv's cache"
+        );
     }
 
     #[test]
@@ -1136,47 +1077,6 @@ mod tests {
         let mut entries = vec![Entry { id: 1, seq: None }];
         cleanup_playlist(&mpv, &reg, &mut entries);
         assert_eq!(entries.len(), 1);
-    }
-
-    #[test]
-    fn a_seek_just_ahead_of_the_download_waits_briefly() {
-        // Goal: bytes about to arrive are worth a short wait - failing a seek
-        // over a couple of hundred milliseconds would make scrubbing flaky.
-        let sh = shared(b"12".to_vec(), false);
-        let writer = sh.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            let mut g = lock(&writer.inner);
-            g.data.extend_from_slice(b"345678");
-            writer.cv.notify_all();
-        });
-        let mut c = cookie(&sh);
-        assert_eq!(seek(&mut c, 6), 6, "should have waited for bytes in flight");
-    }
-
-    #[test]
-    fn a_seek_far_beyond_the_download_gives_up_rather_than_blocking() {
-        // Goal: this is what made the first track of a session wait for its
-        // whole download. mpv probes a newly opened stream by seeking around
-        // it; blocking there until the bytes exist means blocking until the
-        // entire track has been fetched. A later track only looked fast because
-        // preloading had already finished it.
-        let sh = shared(b"tiny".to_vec(), false);
-        let mut c = cookie(&sh);
-
-        let started = Instant::now();
-        let result = seek(&mut c, 500_000_000);
-        let waited = started.elapsed();
-
-        assert_eq!(result, -1, "an unreachable position must be refused");
-        assert!(
-            waited < SEEK_WAIT_MAX * 3,
-            "gave up after {waited:?}, which is not promptly enough"
-        );
-        assert!(
-            !lock(&sh.inner).complete,
-            "and it must not have waited for the download to finish"
-        );
     }
 
     /// Serves a body in two halves with a pause between them, so a test can tell
@@ -1291,5 +1191,136 @@ mod tests {
             SEGMENT_CHUNK_MAX,
             "the doubling must not overflow"
         );
+    }
+
+    // ---- diagnosis harness ----
+    //
+    // Not part of the normal suite: it needs a media file and measures real
+    // playback timing. Run deliberately:
+    //   cargo test -p priel-player --  --ignored --nocapture measure_
+
+    /// The seek callback priel deliberately does **not** register, kept here so
+    /// the comparison that justified that can be re-run. See
+    /// `measure_time_to_first_audio`.
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        reason = "the stream_cb ABI is i64; negative offsets are rejected"
+    )]
+    fn probe_seek(cookie: &mut Cookie, offset: i64) -> i64 {
+        if offset < 0 {
+            return -1;
+        }
+        let target = offset as u64;
+        let mut g = lock(&cookie.shared.inner);
+        loop {
+            if target <= g.data.len() as u64 || g.complete || g.aborted {
+                cookie.pos = target;
+                g.read_pos = g.read_pos.max(target);
+                cookie.shared.cv.notify_all();
+                return target as i64;
+            }
+            g = wait(&cookie.shared.cv, g);
+        }
+    }
+
+    /// Feed a file through the protocol at `bytes_per_sec` and report how long
+    /// until audio actually starts, and how much of the file had been fed by
+    /// then. If playback needs the whole file, the second number is ~100%.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a percentage of a file size; precision beyond a byte is irrelevant"
+    )]
+    fn measure_start(with_seek: bool, bytes_per_sec: usize) -> Option<(Duration, f64)> {
+        let path = std::env::var("PRIEL_TEST_MEDIA").unwrap_or("/tmp/t.mp4".to_string());
+        let media = std::fs::read(&path).ok()?;
+        let total = media.len();
+
+        let mpv = Mpv::new().ok()?;
+        init_mpv(&mpv, Some("null"));
+        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let sh = shared(Vec::new(), false);
+        lock(&registry).insert(1, sh.clone());
+
+        // SAFETY: same contract as the player thread; see `spawn`.
+        let protocol = unsafe {
+            Protocol::new(
+                &mpv,
+                "prielseg".into(),
+                registry.clone(),
+                open,
+                close,
+                read,
+                if with_seek { Some(probe_seek) } else { None },
+                Some(size),
+            )
+        };
+        protocol.register().ok()?;
+
+        // Feed at a fixed rate, as a download would.
+        let feeder = sh.clone();
+        let fed = Arc::new(Mutex::new(0usize));
+        let fed_w = fed.clone();
+        thread::spawn(move || {
+            let step = (bytes_per_sec / 20).max(1);
+            let mut at = 0usize;
+            while at < media.len() {
+                let end = (at + step).min(media.len());
+                {
+                    let mut g = lock(&feeder.inner);
+                    if g.aborted {
+                        return;
+                    }
+                    g.data.extend_from_slice(&media[at..end]);
+                    feeder.cv.notify_all();
+                }
+                *lock(&fed_w) = end;
+                at = end;
+                thread::sleep(Duration::from_millis(50));
+            }
+            let mut g = lock(&feeder.inner);
+            g.total = Some(g.data.len() as u64);
+            g.complete = true;
+            feeder.cv.notify_all();
+        });
+
+        let started = Instant::now();
+        let _ = mpv.command("loadfile", &["prielseg://1", "replace"]);
+        let deadline = started + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.0 {
+                let elapsed = started.elapsed();
+                let pct = *lock(&fed) as f64 / total as f64 * 100.0;
+                return Some((elapsed, pct));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    #[test]
+    #[ignore = "needs a media file and measures real timing"]
+    fn measure_time_to_first_audio() {
+        // Goal: settle whether playback starts on the first bytes or waits for
+        // the whole stream, and whether advertising the stream as seekable is
+        // what makes the difference.
+        for rate in [2_000_000usize, 8_000_000] {
+            for with_seek in [true, false] {
+                match measure_start(with_seek, rate) {
+                    Some((took, pct)) => println!(
+                        "MEASURE feed={:>5} KB/s  seek={:<5}  audio after {:>6.2}s, {:>5.1}% fed",
+                        rate / 1000,
+                        with_seek,
+                        took.as_secs_f64(),
+                        pct
+                    ),
+                    None => println!(
+                        "MEASURE feed={:>5} KB/s  seek={:<5}  NO AUDIO within 60s",
+                        rate / 1000,
+                        with_seek
+                    ),
+                }
+            }
+        }
     }
 }
