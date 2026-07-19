@@ -29,7 +29,7 @@ use crossterm::event::{
 use rand::Rng;
 use ratatui::layout::Rect;
 
-use priel_core::auth::Credentials;
+use priel_core::auth::{Credentials, Pkce};
 use priel_core::{Playlist, Track};
 use priel_player::{PlaybackStatus, Player};
 
@@ -79,6 +79,30 @@ pub enum Mode {
     Search,      // editing the global TIDAL search query
     Help,        // the shortcut reference is up; it swallows input until dismissed
     Credentials, // first run with no client identity; asking before fetching one
+    Login,       // signing in: browser is open, waiting for the redirected URL
+}
+
+/// State of a sign-in in progress.
+///
+/// The verifier has to survive from building the authorize URL until the code
+/// comes back, which is a separate user-driven step, so it lives here rather
+/// than being regenerated.
+pub struct LoginFlow {
+    pub url: String,
+    pkce: Pkce,
+    unique_key: String,
+    /// What the user has pasted so far.
+    pub pasted: String,
+    pub status: Option<String>,
+    exchanging: Option<Receiver<Result<(), String>>>,
+}
+
+impl LoginFlow {
+    /// Is an exchange in flight? The screen shows this instead of the prompt.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.exchanging.is_some()
+    }
 }
 
 /// Source-side metadata (from the TIDAL API — authoritative).
@@ -147,6 +171,7 @@ pub struct App {
     token_path: Option<String>,
     credential_status: Option<String>,
     fetching: Option<Receiver<Result<(), String>>>,
+    login: Option<LoginFlow>,
 }
 
 /// Snapshot of the render-relevant state that moves on its own.
@@ -176,12 +201,16 @@ impl App {
         let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
         let worker = worker::spawn(token_path.clone(), creds_path.clone());
         let mut app = Self::with(player, worker);
-        if has_credentials {
-            // Remembered anyway, so a later re-login can rebuild the worker.
-            app.credentials_path = Some(creds_path);
-            app.token_path = Some(token_path);
-        } else {
+        let has_session = priel_core::auth::StoredToken::load(&token_path).is_ok();
+        app.credentials_path = Some(creds_path.clone());
+        app.token_path = Some(token_path.clone());
+        // The screens chain: a client key is needed before signing in, and a
+        // session before anything can load. Each step leads to the next rather
+        // than failing on its own.
+        if !has_credentials {
             app.prompt_for_credentials(creds_path, token_path);
+        } else if !has_session {
+            app.start_login();
         }
         Ok(app)
     }
@@ -240,6 +269,7 @@ impl App {
             token_path: None,
             credential_status: None,
             fetching: None,
+            login: None,
         }
     }
 
@@ -251,6 +281,31 @@ impl App {
         self.credentials_path = Some(creds_path);
         self.token_path = Some(token_path);
         self.mode = Mode::Credentials;
+    }
+
+    /// Offer to sign in again after the session is refused.
+    ///
+    /// A refresh token expires too, and when it does every request fails with
+    /// the same message. Turning that into the sign-in screen is the difference
+    /// between a dead application and one keystroke.
+    fn offer_relogin(&mut self, reason: &str) {
+        self.notice = Some(format!("⚠ {reason}"));
+        if self.mode == Mode::Normal {
+            self.start_login();
+        }
+    }
+
+    /// With a client identity in hand, either sign in or just reload.
+    fn continue_after_credentials(&mut self) {
+        let has_session = self
+            .token_path
+            .as_ref()
+            .is_some_and(|p| priel_core::auth::StoredToken::load(p).is_ok());
+        if has_session {
+            self.restart_worker();
+        } else {
+            self.start_login();
+        }
     }
 
     /// Replace the worker with one that can see the new credentials.
@@ -268,11 +323,185 @@ impl App {
         let _ = self.worker.tx.send(ToWorker::LoadFavorites);
     }
 
+    /// The sign-in in progress, if any.
+    #[must_use]
+    pub fn login(&self) -> Option<&LoginFlow> {
+        self.login.as_ref()
+    }
+
+    /// Begin signing in: build the authorization URL and open a browser at it.
+    ///
+    /// Needs a client identity, so the credentials screen comes first when there
+    /// is none - the two screens chain rather than each failing on their own.
+    pub fn start_login(&mut self) {
+        let Some(creds_path) = self.credentials_path.clone() else {
+            return;
+        };
+        let Some((creds, _)) = priel_core::auth::local_credentials(&creds_path) else {
+            self.mode = Mode::Credentials;
+            return;
+        };
+        let (Ok(pkce), Ok(unique_key)) = (Pkce::generate(), priel_core::auth::client_unique_key())
+        else {
+            self.notice = Some("⚠ could not start sign-in: no system randomness".into());
+            return;
+        };
+        let url = priel_core::auth::authorize_url(&creds.into_config(), &pkce, &unique_key);
+        open_in_browser(&url);
+        self.login = Some(LoginFlow {
+            url,
+            pkce,
+            unique_key,
+            pasted: String::new(),
+            status: None,
+            exchanging: None,
+        });
+        self.mode = Mode::Login;
+        self.dirty = true;
+    }
+
+    /// Hand the pasted redirect back to the service for a session.
+    fn submit_login(&mut self) {
+        let (Some(flow), Some(creds_path), Some(token_path)) = (
+            self.login.as_mut(),
+            self.credentials_path.clone(),
+            self.token_path.clone(),
+        ) else {
+            return;
+        };
+        if flow.exchanging.is_some() {
+            return;
+        }
+        let code = match priel_core::auth::code_from_redirect(flow.pasted.trim()) {
+            Ok(code) => code,
+            Err(e) => {
+                // Reported inline rather than as a failure: the usual cause is
+                // pasting the login page instead of the page it redirected to.
+                flow.status = Some(format!("{e}"));
+                self.dirty = true;
+                return;
+            }
+        };
+        let Some((creds, _)) = priel_core::auth::local_credentials(&creds_path) else {
+            flow.status = Some("the client identity went missing".into());
+            return;
+        };
+
+        flow.status = Some("signing in…".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (pkce, key) = (flow.pkce.clone(), flow.unique_key.clone());
+        std::thread::spawn(move || {
+            let agent = priel_core::new_agent();
+            let outcome = priel_core::auth::exchange_code(
+                &agent,
+                &creds.into_config(),
+                &code,
+                &pkce,
+                &key,
+                priel_core::auth::now_epoch(),
+            )
+            .and_then(|token| token.save(&token_path))
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(outcome);
+        });
+        flow.exchanging = Some(rx);
+        self.dirty = true;
+    }
+
+    /// Collect the result of an in-flight sign-in.
+    fn drain_login(&mut self) {
+        let Some(flow) = self.login.as_mut() else {
+            return;
+        };
+        let Some(rx) = &flow.exchanging else { return };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.login = None;
+                self.mode = Mode::Normal;
+                self.notice = Some("Signed in. Loading your library…".into());
+                self.restart_worker();
+                self.dirty = true;
+            }
+            Ok(Err(e)) => {
+                flow.exchanging = None;
+                flow.status = Some(e);
+                flow.pasted.clear();
+                self.dirty = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                flow.exchanging = None;
+                flow.status = Some("the sign-in did not finish".into());
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Text arriving as one block, from a terminal that supports bracketed
+    /// paste. Far better than character-by-character for a URL this long.
+    pub fn on_paste(&mut self, text: &str) {
+        if self.mode == Mode::Login
+            && let Some(flow) = self.login.as_mut()
+            && !flow.is_busy()
+        {
+            flow.pasted.push_str(text.trim());
+            self.dirty = true;
+        }
+    }
+
+    fn on_key_login(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                // Letters go into the pasted text, so the actions take a
+                // modifier rather than stealing characters from a URL.
+                KeyCode::Char('o') => {
+                    if let Some(flow) = &self.login {
+                        open_in_browser(&flow.url);
+                    }
+                }
+                KeyCode::Char('u') => {
+                    if let Some(flow) = self.login.as_mut() {
+                        flow.pasted.clear();
+                        flow.status = None;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.login = None;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Enter => self.submit_login(),
+            KeyCode::Backspace => {
+                if let Some(flow) = self.login.as_mut() {
+                    flow.pasted.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(flow) = self.login.as_mut()
+                    && !flow.is_busy()
+                {
+                    flow.pasted.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Point the app at token and credential files, for tests.
     #[cfg(test)]
     pub fn set_paths_for_test(&mut self, token: String, credentials: String) {
         self.token_path = Some(token);
         self.credentials_path = Some(credentials);
+    }
+
+    /// Drive the post-credentials step, for tests.
+    #[cfg(test)]
+    pub fn continue_after_credentials_for_test(&mut self) {
+        self.continue_after_credentials();
     }
 
     /// Rebuild the worker, for tests.
@@ -321,8 +550,8 @@ impl App {
             Ok(Ok(())) => {
                 self.fetching = None;
                 self.mode = Mode::Normal;
-                self.notice = Some("Signed in. Loading your library…".into());
-                self.restart_worker();
+                self.notice = Some("Client key saved.".into());
+                self.continue_after_credentials();
                 self.dirty = true;
             }
             Ok(Err(e)) => {
@@ -442,8 +671,14 @@ impl App {
                     }
                 }
                 FromWorker::Error(e) => {
-                    self.notice = Some(format!("⚠ {e}"));
                     self.loading = false;
+                    // "log in again" is the phrase the core uses when a refresh
+                    // was refused, which is the one error a user can act on.
+                    if e.contains("log in again") || e.starts_with("token:") {
+                        self.offer_relogin(&e);
+                    } else {
+                        self.notice = Some(format!("⚠ {e}"));
+                    }
                 }
             }
         }
@@ -492,6 +727,7 @@ impl App {
 
     pub fn refresh(&mut self) {
         self.drain_fetch();
+        self.drain_login();
         self.status = self.player.status();
         self.refresh_from_status();
     }
@@ -805,6 +1041,7 @@ impl App {
             Mode::Search => self.on_key_search(key),
             Mode::Help => self.on_key_help(key),
             Mode::Credentials => self.on_key_credentials(key),
+            Mode::Login => self.on_key_login(key),
             Mode::Normal => self.on_key_normal(key),
         }
     }
@@ -895,6 +1132,7 @@ impl App {
             KeyCode::Char('g') => self.goto_top(),
             KeyCode::Char('G') => self.goto_bottom(),
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('A') => self.start_login(),
             KeyCode::Enter => self.on_enter(),
             KeyCode::Char(' ') => self.player.toggle_pause(),
             KeyCode::Char('s') => self.toggle_shuffle(),
@@ -911,8 +1149,8 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
-        if self.mode == Mode::Credentials {
-            return; // the consent screen takes no mouse input
+        if matches!(self.mode, Mode::Credentials | Mode::Login) {
+            return; // these screens take no mouse input
         }
         if self.mode == Mode::Help {
             // Any click dismisses; scrolling the list behind it would be odd.
@@ -1027,6 +1265,25 @@ impl App {
         const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         FRAMES[self.frame % FRAMES.len()]
     }
+}
+
+/// Open a URL in the user's browser, best effort.
+///
+/// A failure is not reported: the screen always shows the URL as well, so a
+/// user on a machine with no handler can still copy it.
+fn open_in_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn hit(r: Rect, col: u16, row: u16) -> bool {
@@ -2197,5 +2454,144 @@ mod tests {
             matches!(requests(&r)[..], [ToWorker::LoadFavorites]),
             "the original worker should still be the one listening"
         );
+    }
+
+    // ---- signing in ----
+
+    fn credentials_fixture() -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "priel-app-login-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp");
+        let path = dir.join("credentials.json");
+        std::fs::write(&path, r#"{"client_id":"cid","client_secret":"sec"}"#).expect("write");
+        path.to_str().expect("path").to_string()
+    }
+
+    fn start_signin(r: &mut Rig) {
+        r.app
+            .set_paths_for_test("/nonexistent/token.json".into(), credentials_fixture());
+        r.app.start_login();
+    }
+
+    #[test]
+    fn signing_in_builds_a_url_carrying_the_challenge() {
+        // Goal: the URL is the whole first half of the flow. A missing challenge
+        // means the exchange is refused at the very end, after the user has
+        // already logged in.
+        let mut r = rig();
+        start_signin(&mut r);
+        assert_eq!(r.app.mode, Mode::Login);
+        let url = &r.app.login().expect("a flow").url;
+        assert!(
+            url.starts_with("https://login.tidal.com/authorize?"),
+            "{url}"
+        );
+        assert!(url.contains("code_challenge="), "{url}");
+        assert!(url.contains("client_id=cid"), "{url}");
+    }
+
+    #[test]
+    fn a_paste_arrives_whole_and_can_be_cleared() {
+        // Goal: bracketed paste delivers the URL in one event. Typing it by hand
+        // is not realistic at ~200 characters, so the box must accept both and
+        // offer a way to start over.
+        let mut r = rig();
+        start_signin(&mut r);
+        r.app.on_paste("https://tidal.com/x?code=ABC");
+        assert_eq!(
+            r.app.login().expect("flow").pasted,
+            "https://tidal.com/x?code=ABC"
+        );
+
+        r.app
+            .on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(r.app.login().expect("flow").pasted.is_empty());
+
+        r.app.on_key(key('z'));
+        assert_eq!(
+            r.app.login().expect("flow").pasted,
+            "z",
+            "typing still works"
+        );
+        r.app.on_key(code(KeyCode::Backspace));
+        assert!(r.app.login().expect("flow").pasted.is_empty());
+    }
+
+    #[test]
+    fn letters_reach_the_box_rather_than_triggering_actions() {
+        // Goal: a URL contains every letter, so no unmodified key may be an
+        // action - otherwise pasting one would fire commands at random.
+        let mut r = rig();
+        start_signin(&mut r);
+        for c in ['q', 'o', 'u', 'f', 'j'] {
+            r.app.on_key(key(c));
+        }
+        assert!(!r.app.should_quit, "`q` must not quit while signing in");
+        assert_eq!(r.app.login().expect("flow").pasted, "qoufj");
+    }
+
+    #[test]
+    fn a_wrong_paste_is_reported_in_place() {
+        // Goal: pasting the login page rather than the redirected page is the
+        // likeliest mistake, and it must be correctable without starting over.
+        let mut r = rig();
+        start_signin(&mut r);
+        r.app.on_paste("https://login.tidal.com/authorize");
+        r.app.on_key(code(KeyCode::Enter));
+
+        let flow = r.app.login().expect("still signing in");
+        assert!(
+            flow.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("query string"),
+            "{:?}",
+            flow.status
+        );
+        assert_eq!(r.app.mode, Mode::Login, "the screen must stay up");
+    }
+
+    #[test]
+    fn signing_in_can_be_abandoned() {
+        // Goal: a user who cannot complete the sign-in must be able to leave.
+        let mut r = rig();
+        start_signin(&mut r);
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(r.app.login().is_none());
+    }
+
+    #[test]
+    fn a_refused_session_leads_into_signing_in_again() {
+        // Goal: a refresh token expires too. When it does, every request fails
+        // with the same message, and turning that into the sign-in screen is the
+        // difference between a dead application and one keystroke.
+        let mut r = rig();
+        r.app
+            .set_paths_for_test("/nonexistent/token.json".into(), credentials_fixture());
+        r.to_app
+            .send(FromWorker::Error("resolve: log in again".into()))
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(r.app.mode, Mode::Login, "it should offer the way back in");
+    }
+
+    #[test]
+    fn a_saved_client_key_leads_straight_into_signing_in() {
+        // Goal: the screens chain. Once a client key exists, a user with no
+        // session should be taken to the sign-in rather than dropped on an
+        // empty library with no hint about what to do.
+        //
+        // The reverse case - no key anywhere - is deliberately not asserted
+        // here: `local_credentials` falls back to scanning the machine for an
+        // installed package, so its absence is not something a test can arrange.
+        let mut r = rig();
+        r.app
+            .set_paths_for_test("/nonexistent/token.json".into(), credentials_fixture());
+        r.app.continue_after_credentials_for_test();
+        assert_eq!(r.app.mode, Mode::Login, "no session means sign in");
     }
 }

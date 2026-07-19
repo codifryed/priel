@@ -33,7 +33,10 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -61,13 +64,26 @@ fn main() -> Result<()> {
 fn setup() -> Result<Tui> {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste turns a pasted URL into one event rather than a couple of
+    // hundred key presses, which is the difference between the sign-in screen
+    // feeling instant and feeling broken.
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
 
     // Restore the terminal even if we panic mid-render.
     let orig = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         orig(info);
     }));
 
@@ -79,7 +95,8 @@ fn restore(terminal: &mut Tui) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
     Ok(())
@@ -125,6 +142,7 @@ fn run<B: ratatui::backend::Backend, E: EventSource>(
         match events.next(Duration::from_millis(100))? {
             Some(Event::Key(k)) => app.on_key(k),
             Some(Event::Mouse(m)) => app.on_mouse(m),
+            Some(Event::Paste(text)) => app.on_paste(&text),
             Some(Event::Resize(_, _)) => app.mark_dirty(),
             Some(_) | None => {}
         }

@@ -81,8 +81,12 @@ roadmap below.
 ## Install
 
 Needs Rust ≥ 1.85, `libmpv` (`mpv-devel` / `libmpv-dev` to build), a working
-PipeWire or ALSA setup, and a login — priel reads the session at
-`~/.config/hiresti/hiresti_token.json`.
+PipeWire or ALSA setup, and a subscription.
+
+**Signing in.** On first run priel opens your browser, you sign in, and you land
+on a page that looks like an error — that is expected. Copy its address, paste it
+back into priel, and you are in. The session is renewed automatically from then
+on; if it ever lapses, `A` signs in again.
 
 **priel ships no client credentials.** On first run it asks whether to download
 one from the open-source project the other native Linux players rely on, saying
@@ -126,6 +130,7 @@ row of the interface is also clickable.
 | Action | Keyboard | Mouse |
 |---|---|---|
 | Full key reference | `?` | click `[?]` |
+| Sign in again | `A` | — |
 | Switch view | `Tab` cycles, `1`/`2`/`3` | click a tab |
 | Move selection | `j`/`k`, `↑`/`↓` | scroll wheel |
 | First / last | `g` / `G` | click `[g/G]` |
@@ -165,9 +170,10 @@ Roadmap, roughly in order:
   entirely and priel talking to ALSA directly (`hw:` device, exclusive access).
   Detect when a device is claimed by PipeWire, explain how to reserve it, and
   offer a direct-ALSA output path.
-- **A login screen.** The PKCE engine and automatic renewal are in place; what
-  remains is the first-login flow: open the browser, take the redirected URL
-  back, store the session. Until then the initial login comes from elsewhere.
+- **A cleaner sign-in.** The redirect lands on the vendor's own page, which priel
+  cannot listen on, so the flow ends with a paste. A client registered with a
+  loopback redirect would remove that step; the developer terms do not currently
+  permit a native player, so it stands.
 - **Per-track memory ceiling.** Buffers are bounded and downloads apply
   backpressure, but a fully played track is still retained; trimming it needs a
   segment offset index so a backward seek can refetch.

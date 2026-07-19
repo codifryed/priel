@@ -47,6 +47,114 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.mode == Mode::Credentials {
         credentials_overlay(f, f.area(), app.credential_status());
     }
+    if app.mode == Mode::Login
+        && let Some(flow) = app.login()
+    {
+        login_overlay(f, f.area(), flow);
+    }
+}
+
+/// The sign-in screen.
+///
+/// The redirect lands on the service's own site, which priel cannot listen on,
+/// so the last step is unavoidably a paste. Everything around it is made as
+/// short as possible: the browser is already open, the box is already focused,
+/// and one paste plus Enter finishes the job.
+fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
+    let width = area.width.min(76);
+    let height = 16u16.min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Sign in ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let dim = Style::default().fg(Color::Gray);
+    let key = Style::default().fg(Color::Cyan);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "A browser should have opened. Sign in there.",
+            dim,
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "You will land on a page that looks like an error. That is",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "expected. Copy its address and paste it below.",
+            dim,
+        )),
+        Line::raw(""),
+    ];
+
+    if flow.is_busy() {
+        lines.push(Line::from(Span::styled(
+            "    signing in…",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else {
+        // A pasted URL is far wider than the box; show the tail, which is where
+        // the code sits, so the user can see something arrived.
+        let shown = tail(&flow.pasted, inner.width.saturating_sub(6) as usize);
+        lines.push(Line::from(vec![
+            Span::styled("    ", dim),
+            Span::styled(
+                if shown.is_empty() {
+                    "paste here…".to_string()
+                } else {
+                    shown
+                },
+                if flow.pasted.is_empty() {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            ),
+            Span::styled("▏", key),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    if let Some(status) = &flow.status {
+        lines.push(Line::from(Span::styled(
+            format!("    {status}"),
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("    [Enter]", key),
+        Span::styled(" sign in   ", dim),
+        Span::styled("[Ctrl-O]", key),
+        Span::styled(" reopen browser   ", dim),
+        Span::styled("[Ctrl-U]", key),
+        Span::styled(" clear", dim),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("    [Esc]", key),
+        Span::styled(" cancel", dim),
+    ]));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The last `width` characters, so a long URL shows its tail.
+fn tail(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count <= width {
+        return s.to_string();
+    }
+    s.chars().skip(count - width).collect()
 }
 
 /// Draw the consent screen. `status` is the line under the buttons: idle,
@@ -1573,5 +1681,76 @@ mod tests {
             let out = text(&mut sc.app, w, h);
             assert!(out.contains("client identity"), "{w}x{h}: {out}");
         }
+    }
+
+    /// An app mid sign-in, using the real credentials path so the flow builds.
+    fn signing_in(sc: &mut Screen) {
+        sc.app.set_paths_for_test(
+            "/nonexistent/priel/token.json".into(),
+            credentials_fixture(),
+        );
+        sc.app.start_login();
+    }
+
+    /// A throwaway credentials file, so the login screen can be built without
+    /// depending on whatever is configured on the machine.
+    fn credentials_fixture() -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "priel-login-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp");
+        let path = dir.join("credentials.json");
+        std::fs::write(&path, r#"{"client_id":"cid","client_secret":"sec"}"#).expect("write");
+        path.to_str().expect("path").to_string()
+    }
+
+    #[test]
+    fn the_sign_in_screen_explains_the_page_that_looks_broken() {
+        // Goal: the redirect lands on a page that reads as an error, and a user
+        // who is not warned will assume the sign-in failed and give up. Saying
+        // so up front is the single most valuable line on this screen.
+        let mut sc = screen();
+        signing_in(&mut sc);
+        let out = text(&mut sc.app, 88, 24);
+        assert!(out.contains("looks like an error"), "{out}");
+        assert!(out.contains("That is"), "and that it is expected: {out}");
+        assert!(out.contains("paste"), "{out}");
+        assert!(out.contains("[Enter]") && out.contains("[Esc]"), "{out}");
+    }
+
+    #[test]
+    fn a_pasted_url_shows_its_tail_rather_than_its_head() {
+        // Goal: the URL is far wider than the box, and the useful part - the
+        // code - is at the end. Showing the head would look identical for a
+        // successful paste and a wrong one.
+        let mut sc = screen();
+        signing_in(&mut sc);
+        sc.app.on_paste(&format!(
+            "https://tidal.com/android/login/auth?{}code=ENDCODE",
+            "x".repeat(200)
+        ));
+        let out = text(&mut sc.app, 88, 24);
+        assert!(out.contains("ENDCODE"), "the tail must be visible: {out}");
+    }
+
+    #[test]
+    fn a_bad_paste_is_explained_without_losing_the_screen() {
+        // Goal: the likeliest mistake is pasting the login page instead of the
+        // page it redirected to. That has to be recoverable in place.
+        let mut sc = screen();
+        signing_in(&mut sc);
+        sc.app.on_paste("https://login.tidal.com/authorize");
+        sc.app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let out = text(&mut sc.app, 88, 24);
+        assert!(out.contains("query string"), "the reason: {out}");
+        assert!(
+            out.contains("[Enter]"),
+            "still on the sign-in screen: {out}"
+        );
     }
 }
