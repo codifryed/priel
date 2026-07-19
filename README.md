@@ -46,7 +46,7 @@ water in and out of the flats twice a day, on the pull of the moon.*
 - **Built to survive the boring failures.** Zero `.unwrap()` calls in the
   workspace; poisoned locks are recovered rather than propagated, because mpv
   invokes our callbacks across an FFI boundary where unwinding is undefined
-  behaviour. 144 tests at ~96% line coverage, all of which run with no network,
+  behaviour. 159 tests at ~96% line coverage, all of which run with no network,
   no credentials, no audio device and no terminal.
 - **Packaged like a native tool.** A generated man page and bash, zsh and fish
   completions, plus a `Makefile` that honours `DESTDIR`/`PREFIX`, so a distro
