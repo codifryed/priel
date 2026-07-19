@@ -28,6 +28,7 @@ use serde::Deserialize;
 use ureq::http::Response;
 use ureq::{Agent, Body};
 
+pub mod auth;
 pub mod mpd;
 
 const API: &str = "https://api.tidal.com";
