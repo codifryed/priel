@@ -1,0 +1,17 @@
+# Strict, modern, no-surprises formatting. Stable options only, so `cargo fmt`
+# behaves identically on stable and nightly.
+edition = "2024"
+style_edition = "2024"
+
+max_width = 100
+tab_spaces = 4
+hard_tabs = false
+newline_style = "Unix"
+
+reorder_imports = true
+reorder_modules = true
+merge_derives = true
+remove_nested_parens = true
+force_explicit_abi = true
+use_field_init_shorthand = true
+use_try_shorthand = true

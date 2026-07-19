@@ -1,0 +1,22 @@
+[package]
+name = "priel-player"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embedded libmpv player with a stream_cb segment protocol (UI-agnostic)"
+
+[features]
+# libmpv on by default (a music player needs it). Disable for a UI-only build
+# (--no-default-features) that compiles without mpv-devel; playback becomes a no-op.
+default = ["libmpv"]
+libmpv = ["dep:libmpv2"]
+
+[dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+priel-core.workspace = true
+libmpv2 = { version = "6", optional = true }
+
+[lints]
+workspace = true

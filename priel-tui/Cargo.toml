@@ -1,0 +1,26 @@
+[package]
+name = "priel-tui"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unofficial hi-res terminal client for TIDAL (mouse + VIM)"
+
+[[bin]]
+name = "priel"
+path = "src/main.rs"
+
+[features]
+default = ["libmpv"]
+libmpv = ["priel-player/libmpv"]
+
+[dependencies]
+anyhow.workspace = true
+priel-core.workspace = true
+priel-player = { workspace = true }
+ratatui = "0.29"
+crossterm = "0.28"
+rand = "0.8"
+
+[lints]
+workspace = true

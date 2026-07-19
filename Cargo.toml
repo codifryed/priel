@@ -1,0 +1,41 @@
+# priel — a hi-res terminal client for the TIDAL streaming service.
+# Unofficial: not affiliated with, endorsed by, or sponsored by TIDAL/Aspiro.
+#
+#   priel-core    library: TIDAL API + stream resolution (UI-agnostic)
+#   priel-player  library: embedded libmpv player (UI-agnostic)
+#   priel-tui     binary `priel`: ratatui frontend (mouse + VIM, herdr/ncspot-inspired)
+#
+# The two libraries carry no UI code, so a GUI frontend (iced/libcosmic) can be
+# added later as a second binary sharing them.
+
+[workspace]
+resolver = "2"
+members = ["priel-core", "priel-player", "priel-tui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Edition 2024 requires 1.85; nothing here needs newer.
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = ""
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+regex = "1"
+# rustls (no OpenSSL) keeps packaging simple and cross-platform.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+priel-core = { path = "priel-core" }
+# default-features off here so priel-tui's own `libmpv` feature is the single
+# switch that pulls libmpv in (default on) or leaves it out (--no-default-features).
+priel-player = { path = "priel-player", default-features = false }
+
+[workspace.lints.clippy]
+# `priority = -1` so the group sits below the individual overrides that follow.
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 2
