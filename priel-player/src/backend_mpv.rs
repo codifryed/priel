@@ -84,10 +84,24 @@ const DOWNLOAD_AHEAD_MAX: u64 = 32 * 1024 * 1024;
 /// changes on a track boundary, so once a second is generous.
 const HW_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How much of a segment to publish at a time. Small enough that the first audio
-/// is decodable almost immediately, large enough not to wake the reader for
-/// every packet.
-const SEGMENT_CHUNK: usize = 64 * 1024;
+/// The first slice of a segment published to the reader.
+///
+/// Small on purpose: this is what decides how soon a track makes a sound. The
+/// per-chunk overhead is a lock and a condvar wake, measured at ~0.2 microseconds
+/// even with a reader parked, so a small first chunk costs nothing worth counting.
+const SEGMENT_CHUNK_MIN: usize = 16 * 1024;
+
+/// The ceiling the chunk size ramps up to once playback is under way, where
+/// fewer, larger reads are the cheaper shape and latency no longer matters.
+const SEGMENT_CHUNK_MAX: usize = 256 * 1024;
+
+/// Grow the publish size once audio is flowing.
+///
+/// Doubling rather than jumping keeps the first few chunks small, so a track
+/// starts promptly, and reaches the cheap steady state within a few reads.
+fn next_chunk(current: usize) -> usize {
+    current.saturating_mul(2).min(SEGMENT_CHUNK_MAX)
+}
 
 type Registry = Arc<Mutex<HashMap<u64, Arc<Shared>>>>;
 
@@ -531,7 +545,8 @@ fn spawn_downloader(urls: Vec<String>, shared: Arc<Shared>) {
 /// larger than the whole allowance.
 fn stream_body(resp: &mut Response<Body>, shared: &Arc<Shared>) -> Result<(), Stop> {
     let mut reader = resp.body_mut().as_reader();
-    let mut chunk = vec![0u8; SEGMENT_CHUNK];
+    let mut chunk = vec![0u8; SEGMENT_CHUNK_MAX];
+    let mut want = SEGMENT_CHUNK_MIN;
     loop {
         {
             let mut g = lock(&shared.inner);
@@ -542,17 +557,20 @@ fn stream_body(resp: &mut Response<Body>, shared: &Arc<Shared>) -> Result<(), St
                 return Err(Stop::Aborted);
             }
         }
-        match reader.read(&mut chunk) {
+        match reader.read(&mut chunk[..want]) {
             Ok(0) => return Ok(()),
             Ok(n) => {
-                let mut g = lock(&shared.inner);
-                if g.aborted {
-                    return Err(Stop::Aborted);
+                {
+                    let mut g = lock(&shared.inner);
+                    if g.aborted {
+                        return Err(Stop::Aborted);
+                    }
+                    g.data.extend_from_slice(&chunk[..n]);
+                    // Wake whoever is blocked in `read`: this is the
+                    // notification that turns a downloaded chunk into sound.
+                    shared.cv.notify_all();
                 }
-                g.data.extend_from_slice(&chunk[..n]);
-                // Wake whoever is blocked in `read`: this is the notification
-                // that turns a downloaded chunk into audible sound.
-                shared.cv.notify_all();
+                want = next_chunk(want);
             }
             Err(_) => return Err(Stop::Failed),
         }
@@ -1196,6 +1214,29 @@ mod tests {
         assert!(
             g.data.is_empty(),
             "the discarded buffer is released at once"
+        );
+    }
+
+    #[test]
+    fn the_publish_size_starts_small_and_settles_large() {
+        // Goal: the two ends of the trade. The first chunk decides how soon a
+        // track makes a sound; the steady state should not read in 16 KiB bites
+        // for the rest of a hi-res track.
+        assert_eq!(
+            next_chunk(SEGMENT_CHUNK_MIN),
+            32 * 1024,
+            "it should grow, not stay at the start size"
+        );
+        let mut size = SEGMENT_CHUNK_MIN;
+        for _ in 0..20 {
+            size = next_chunk(size);
+        }
+        assert_eq!(size, SEGMENT_CHUNK_MAX, "and settle at the ceiling");
+        assert_eq!(next_chunk(SEGMENT_CHUNK_MAX), SEGMENT_CHUNK_MAX);
+        assert_eq!(
+            next_chunk(usize::MAX),
+            SEGMENT_CHUNK_MAX,
+            "the doubling must not overflow"
         );
     }
 }
