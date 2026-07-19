@@ -20,7 +20,7 @@
 //! (herdr/ncspot-inspired). Unofficial; not affiliated with or endorsed by TIDAL.
 //!
 //!   --device <mpv-device>   e.g. pipewire/alsa_output.usb-SMSL...pro-output-0
-//!   --token-file <path>     hiresTI token (default: ~/.`config/hiresti/hiresti_token.json`)
+//!   --token-file <path>     saved session (default: `~/.config/priel/token.json`)
 
 mod app;
 mod cli;
@@ -205,7 +205,7 @@ mod tests {
             cli.device.is_none(),
             "no --device means the system default sink"
         );
-        assert!(cli.token_path().ends_with("hiresti_token.json"));
+        assert!(cli.token_path().ends_with("/priel/token.json"));
     }
 
     #[test]

@@ -45,9 +45,9 @@ pub struct Cli {
     #[arg(long, value_name = "MPV_DEVICE")]
     pub device: Option<String>,
 
-    /// hiresTI PKCE token file
+    /// Saved session file
     ///
-    /// Defaults to `$XDG_CONFIG_HOME/hiresti/hiresti_token.json`, falling back to
+    /// Defaults to `$XDG_CONFIG_HOME/priel/token.json`, falling back to
     /// `~/.config` when `XDG_CONFIG_HOME` is unset.
     #[arg(long, value_name = "PATH")]
     pub token_file: Option<String>,

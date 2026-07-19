@@ -88,6 +88,10 @@ on a page that looks like an error — that is expected. Copy its address, paste
 back into priel, and you are in. The session is renewed automatically from then
 on; if it ever lapses, `A` signs in again.
 
+Everything priel keeps lives under `~/.config/priel/`: `token.json` for the
+session and `credentials.json` for the client key. It never reads or writes
+another application's configuration.
+
 **priel ships no client credentials.** On first run it asks whether to download
 one from the open-source project the other native Linux players rely on, saying
 plainly what it fetches and where it saves it. Decline and priel still runs, just

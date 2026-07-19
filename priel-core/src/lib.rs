@@ -19,8 +19,8 @@
 //! priel-core — TIDAL API access + hi-res stream resolution.
 //!
 //! UI-agnostic: no printing, no globals. Blocking HTTP (reqwest) so callers run
-//! it on a worker thread. Auth currently reuses a hiresTI PKCE token file; a
-//! native PKCE flow is the obvious next addition (see `Client::from_token_file`).
+//! it on a worker thread. Sessions are OAuth PKCE and priel owns its own: see
+//! the `auth` module for signing in and renewing.
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -298,24 +298,24 @@ impl Client {
         })
     }
 
-    /// Load the bearer token from a hiresTI token file.
+    /// Load the bearer token from a saved session.
     ///
     /// # Errors
     /// If the file is unreadable (not logged in) or is not the expected JSON.
     pub fn from_token_file(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading token file {path} (is hiresTI logged in?)"))?;
+            .with_context(|| format!("reading token file {path} (not signed in?)"))?;
         let tf: TokenFile =
             serde_json::from_str(&raw).with_context(|| format!("parsing token file {path}"))?;
         Self::new(tf.access_token)
     }
 
-    /// Default hiresTI token location: `$XDG_CONFIG_HOME/hiresti/hiresti_token.json`.
+    /// Where priel keeps its session: `$XDG_CONFIG_HOME/priel/token.json`.
     #[must_use]
     pub fn default_token_path() -> String {
         let base = std::env::var("XDG_CONFIG_HOME")
             .unwrap_or_else(|_| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
-        format!("{base}/hiresti/hiresti_token.json")
+        format!("{base}/priel/token.json")
     }
 
     /// Point the client at a different API origin.
@@ -436,7 +436,7 @@ impl Client {
         let mut resp = self.get_authed(&url, &[])?;
         if !resp.status().is_success() {
             bail!(
-                "GET /v1/sessions -> HTTP {} (token expired? re-login in hiresTI)",
+                "GET /v1/sessions -> HTTP {} (session expired? log in again)",
                 resp.status()
             );
         }
@@ -751,8 +751,12 @@ mod tests {
         let err = client(&s).connect().unwrap_err().to_string();
         assert!(err.contains("401"), "should carry the status: {err}");
         assert!(
-            err.contains("token expired"),
+            err.contains("session expired"),
             "should suggest a cause: {err}"
+        );
+        assert!(
+            err.contains("log in again"),
+            "and what to do about it: {err}"
         );
     }
 
@@ -1038,16 +1042,25 @@ mod tests {
             .expect("a missing file must fail")
             .to_string();
         assert!(err.contains("reading token file"), "{err}");
-        assert!(err.contains("hiresTI"), "should say how to fix it: {err}");
+        assert!(
+            err.contains("not signed in"),
+            "should say how to fix it: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_default_token_path_is_xdg_shaped() {
-        // Goal: the location is part of the contract with hiresTI. Not asserted
-        // against a fixed prefix because it follows the caller's environment.
+        // Goal: priel keeps its session in its own directory. Writing into
+        // another application's config would mean mutating its state on every
+        // token refresh. Not asserted against a fixed prefix because the base
+        // follows the caller's environment.
         let p = Client::default_token_path();
-        assert!(p.ends_with("/hiresti/hiresti_token.json"), "{p}");
+        assert!(p.ends_with("/priel/token.json"), "{p}");
+        assert!(
+            !p.contains("hiresti"),
+            "must not reach into another app: {p}"
+        );
         assert!(p.starts_with('/'), "must be absolute: {p}");
     }
 

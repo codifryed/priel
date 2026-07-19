@@ -188,8 +188,8 @@ async would buy nothing at the one boundary where it would have to earn its keep
 ### Errors across layers
 
 - `anyhow` with `.context()` is the house error type. Context strings say what was being attempted
-  and, where useful, what the user can do: the existing "is hiresTI logged in?" and "token expired?
-  re-login in hiresTI" are the model.
+  and, where useful, what the user can do: the existing "not signed in?" and "session expired? log
+  in again" are the model.
 - **Do not stringify errors to pass them between layers** where the receiver needs to branch.
   `FromWorker::Error(String)` currently flattens everything into a notice line, so the UI cannot
   distinguish an expired token from a dropped network. When auth work lands, that becomes a typed

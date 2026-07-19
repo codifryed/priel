@@ -337,7 +337,7 @@ mod tests {
         match next(&w) {
             FromWorker::Error(e) => {
                 assert!(e.starts_with("token:"), "should name the stage: {e}");
-                assert!(e.contains("hiresTI"), "should say how to fix it: {e}");
+                assert!(e.contains("not signed in"), "should say how to fix it: {e}");
             }
             other => panic!("expected an error, got {}", variant(&other)),
         }

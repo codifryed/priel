@@ -405,10 +405,11 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
-/// A saved session, in the on-disk shape hiresTI already writes.
+/// A saved session.
 ///
-/// Deliberately compatible: an existing login keeps working, and a token this
-/// crate refreshes stays readable by that tool.
+/// The field names follow the convention other OAuth clients for this service
+/// use, so a session file is recognisable, but priel keeps its own under
+/// `~/.config/priel/` and never writes to another application's.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredToken {
     pub access_token: String,
@@ -982,8 +983,8 @@ mod tests {
 
     #[test]
     fn a_stored_session_survives_a_round_trip_through_the_file_format() {
-        // Goal: the on-disk shape is shared with hiresTI, so an existing login
-        // keeps working and a token priel refreshes stays readable there.
+        // Goal: the stored shape has to survive a round trip, since every
+        // refresh rewrites this file.
         let json = r#"{"access_token":"a","refresh_token":"r","token_type":"Bearer",
                        "expiry_time":"2026-01-01T00:00:00.000000","is_pkce":true}"#;
         let token: StoredToken = serde_json::from_str(json).expect("parse");
