@@ -81,8 +81,20 @@ roadmap below.
 ## Install
 
 Needs Rust ≥ 1.85, `libmpv` (`mpv-devel` / `libmpv-dev` to build), a working
-PipeWire or ALSA setup, and a hiresTI login — priel reuses its token at
-`~/.config/hiresti/hiresti_token.json` until native authentication lands.
+PipeWire or ALSA setup, and a login — priel reads the session at
+`~/.config/hiresti/hiresti_token.json`.
+
+**priel ships no client credentials**, so it cannot log in or renew a session
+until you provide a client identity of your own at
+`~/.config/priel/credentials.json` (mode 0600):
+
+```json
+{ "client_id": "...", "client_secret": "..." }
+```
+
+With that file present priel renews the access token by itself — before expiry,
+and again if a request is rejected early. Without it priel still runs, but only
+until the stored token expires.
 
 ```bash
 make check-deps        # verify cargo and libmpv are present
@@ -150,7 +162,9 @@ Roadmap, roughly in order:
   entirely and priel talking to ALSA directly (`hw:` device, exclusive access).
   Detect when a device is claimed by PipeWire, explain how to reserve it, and
   offer a direct-ALSA output path.
-- **Native PKCE authentication**, replacing the borrowed hiresTI token.
+- **A login screen.** The PKCE engine and automatic renewal are in place; what
+  remains is the first-login flow: open the browser, take the redirected URL
+  back, store the session. Until then the initial login comes from elsewhere.
 - **Per-track memory ceiling.** Buffers are bounded and downloads apply
   backpressure, but a fully played track is still retained; trimming it needs a
   segment offset index so a backward seek can refetch.
