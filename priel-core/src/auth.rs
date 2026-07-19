@@ -78,6 +78,44 @@ impl AuthConfig {
     }
 }
 
+/// The client identity, read from the user's own configuration.
+///
+/// Kept out of the repository deliberately: priel ships no credentials, so this
+/// is a file each user fills in for themselves. See the module documentation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Credentials {
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+}
+
+impl Credentials {
+    /// `$XDG_CONFIG_HOME/priel/credentials.json`, falling back to `~/.config`.
+    #[must_use]
+    pub fn default_path() -> String {
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .unwrap_or_else(|_| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
+        format!("{base}/priel/credentials.json")
+    }
+
+    /// Read the client identity from disk.
+    ///
+    /// # Errors
+    /// If the file is absent or malformed. Absence is a normal state - priel
+    /// runs without it, just without the ability to refresh or log in - so
+    /// callers should treat the error as informational rather than fatal.
+    pub fn load(path: &str) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {path} (no client credentials configured)"))?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing {path}"))
+    }
+
+    #[must_use]
+    pub fn into_config(self) -> AuthConfig {
+        AuthConfig::new(self.client_id, self.client_secret)
+    }
+}
+
 /// A PKCE verifier and its S256 challenge.
 ///
 /// The verifier must survive from building the authorize URL until the code is
@@ -327,6 +365,43 @@ pub fn refresh(
     let resp = post_form(agent, &cfg.token_url, &form)?;
     Ok(build(resp, refresh_token, now_epoch))
 }
+
+impl StoredToken {
+    /// Read a saved session.
+    ///
+    /// # Errors
+    /// If the file is unreadable or is not the expected JSON.
+    pub fn load(path: &str) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading token file {path} (not logged in?)"))?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing token file {path}"))
+    }
+
+    /// Write the session back, creating the directory if needed.
+    ///
+    /// # Errors
+    /// If the directory cannot be created or the file cannot be written.
+    pub fn save(&self, path: &str) -> Result<()> {
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let json = serde_json::to_string_pretty(self).context("serialising the token")?;
+        std::fs::write(path, json).with_context(|| format!("writing token file {path}"))?;
+        restrict_permissions(path);
+        Ok(())
+    }
+}
+
+/// Make a credential file readable only by its owner. Best effort: a failure
+/// here is not worth refusing to save a token the user just earned.
+#[cfg(unix)]
+fn restrict_permissions(path: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &str) {}
 
 /// Seconds since the Unix epoch.
 #[must_use]

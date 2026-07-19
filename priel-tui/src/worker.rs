@@ -22,6 +22,7 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use priel_core::auth::Credentials;
 use priel_core::{Client, Playlist, Quality, ResolvedStream, SearchResults, Track};
 
 pub enum ToWorker {
@@ -61,7 +62,14 @@ impl Worker {
 
 pub fn spawn(token_path: String) -> Worker {
     spawn_with(move || {
-        let mut client = Client::from_token_file(&token_path).map_err(|e| format!("token: {e}"))?;
+        // With credentials configured the client renews its own session, which
+        // is what stops the access token expiring mid-listen. Without them it
+        // still works from the stored token, until that token runs out.
+        let mut client = match Credentials::load(&Credentials::default_path()) {
+            Ok(creds) => Client::with_auth(&token_path, creds.into_config())
+                .map_err(|e| format!("token: {e}"))?,
+            Err(_) => Client::from_token_file(&token_path).map_err(|e| format!("token: {e}"))?,
+        };
         client.connect().map_err(|e| format!("connect: {e}"))?;
         Ok(client)
     })
@@ -80,7 +88,7 @@ where
     let (evt_tx, rx) = mpsc::channel::<FromWorker>();
 
     thread::spawn(move || {
-        let client = match build() {
+        let mut client = match build() {
             Ok(c) => c,
             Err(e) => {
                 let _ = evt_tx.send(FromWorker::Error(e));

@@ -125,11 +125,21 @@ pub struct Session {
     pub country_code: String,
 }
 
+/// Everything needed to keep a session alive on its own.
+struct AuthState {
+    cfg: auth::AuthConfig,
+    token_path: String,
+    stored: auth::StoredToken,
+}
+
 pub struct Client {
     http: Agent,
     token: String,
     session: Option<Session>,
     base: String,
+    /// Present only when credentials were configured. Without it the client
+    /// still works, it just cannot renew the session when it expires.
+    auth: Option<AuthState>,
 }
 
 // ---- wire types ----
@@ -269,6 +279,7 @@ impl Client {
             token,
             session: None,
             base: API.to_string(),
+            auth: None,
         })
     }
 
@@ -302,6 +313,87 @@ impl Client {
         self
     }
 
+    /// A client that can renew its own session.
+    ///
+    /// This is what stops the access token expiring mid-listen: the stored
+    /// expiry is checked before every request, and a rejected request is retried
+    /// once after a refresh.
+    ///
+    /// # Errors
+    /// If the token file cannot be read, or the HTTP client cannot be built.
+    pub fn with_auth(token_path: &str, cfg: auth::AuthConfig) -> Result<Self> {
+        let stored = auth::StoredToken::load(token_path)?;
+        let mut client = Self::new(stored.access_token.clone())?;
+        client.auth = Some(AuthState {
+            cfg,
+            token_path: token_path.to_string(),
+            stored,
+        });
+        Ok(client)
+    }
+
+    /// Seconds until the stored session expires, if it is known.
+    #[must_use]
+    pub fn session_expires_in(&self) -> Option<i64> {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.stored.seconds_remaining(auth::now_epoch()))
+    }
+
+    /// Renew the access token now and persist it.
+    ///
+    /// # Errors
+    /// If there are no credentials configured, or the service refuses the
+    /// refresh - which usually means the refresh token has expired too and a
+    /// full login is required.
+    pub fn refresh_session(&mut self) -> Result<()> {
+        let state = self
+            .auth
+            .as_mut()
+            .ok_or_else(|| anyhow!("no client credentials configured, cannot refresh"))?;
+        let renewed = auth::refresh(
+            &self.http,
+            &state.cfg,
+            &state.stored.refresh_token,
+            auth::now_epoch(),
+        )?;
+        // Persist before adopting: a token we failed to save would be lost on
+        // the next start, and the old one is still on disk and still valid.
+        renewed.save(&state.token_path)?;
+        self.token.clone_from(&renewed.access_token);
+        state.stored = renewed;
+        Ok(())
+    }
+
+    /// Refresh ahead of expiry, if a refresh is possible and due.
+    fn ensure_fresh(&mut self) -> Result<()> {
+        let due = self
+            .auth
+            .as_ref()
+            .is_some_and(|a| a.stored.needs_refresh(auth::now_epoch()));
+        if due {
+            self.refresh_session()?;
+        }
+        Ok(())
+    }
+
+    /// A GET that renews the session when it has to.
+    ///
+    /// Proactive refresh handles the common case; the retry covers a token the
+    /// service rejected earlier than its stated expiry, which happens when a
+    /// session is revoked elsewhere.
+    fn get_authed(&mut self, url: &str, query: &[(&str, &str)]) -> Result<Response<Body>> {
+        self.ensure_fresh()?;
+        let resp = self.get(url, query)?;
+        if resp.status() != 401 || self.auth.is_none() {
+            return Ok(resp);
+        }
+        drop(resp);
+        self.refresh_session()
+            .context("the session was rejected and could not be renewed; log in again")?;
+        self.get(url, query)
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
     }
@@ -323,7 +415,10 @@ impl Client {
     /// On a transport failure, or a non-success status - most often an expired
     /// token, which the message calls out.
     pub fn connect(&mut self) -> Result<Session> {
-        let mut resp = self.get(&self.url("/v1/sessions"), &[])?;
+        // The URL is built first so the borrow is released before the request
+        // path takes `&mut self` to renew the session.
+        let url = self.url("/v1/sessions");
+        let mut resp = self.get_authed(&url, &[])?;
         if !resp.status().is_success() {
             bail!(
                 "GET /v1/sessions -> HTTP {} (token expired? re-login in hiresTI)",
@@ -350,11 +445,11 @@ impl Client {
     /// # Errors
     /// If [`Self::connect`] has not run, on a transport failure, or on a
     /// non-success status.
-    pub fn favorite_tracks(&self, offset: u32, limit: u32) -> Result<Vec<Track>> {
-        let sess = self.session()?;
+    pub fn favorite_tracks(&mut self, offset: u32, limit: u32) -> Result<Vec<Track>> {
+        let sess = self.session()?.clone();
         let url = self.url(&format!("/v1/users/{}/favorites/tracks", sess.user_id));
         let (off, lim) = (offset.to_string(), limit.to_string());
-        let mut resp = self.get(
+        let mut resp = self.get_authed(
             &url,
             &[
                 ("countryCode", sess.country_code.as_str()),
@@ -376,17 +471,17 @@ impl Client {
     /// # Errors
     /// If [`Self::connect`] has not run, on a transport failure, or on a
     /// non-success status.
-    pub fn user_playlists(&self, offset: u32, limit: u32) -> Result<Vec<Playlist>> {
+    pub fn user_playlists(&mut self, offset: u32, limit: u32) -> Result<Vec<Playlist>> {
         #[derive(Deserialize)]
         struct R {
             #[serde(default)]
             items: Vec<PlaylistBrief>,
         }
 
-        let sess = self.session()?;
+        let sess = self.session()?.clone();
         let url = self.url(&format!("/v1/users/{}/playlists", sess.user_id));
         let (off, lim) = (offset.to_string(), limit.to_string());
-        let mut resp = self.get(
+        let mut resp = self.get_authed(
             &url,
             &[
                 ("countryCode", sess.country_code.as_str()),
@@ -409,17 +504,17 @@ impl Client {
     /// # Errors
     /// If [`Self::connect`] has not run, on a transport failure, or on a
     /// non-success status (an unknown or private `uuid` yields 404).
-    pub fn playlist_tracks(&self, uuid: &str, offset: u32, limit: u32) -> Result<Vec<Track>> {
+    pub fn playlist_tracks(&mut self, uuid: &str, offset: u32, limit: u32) -> Result<Vec<Track>> {
         #[derive(Deserialize)]
         struct R {
             #[serde(default)]
             items: Vec<TrackBrief>,
         }
 
-        let sess = self.session()?;
+        let sess = self.session()?.clone();
         let url = self.url(&format!("/v1/playlists/{uuid}/tracks"));
         let (off, lim) = (offset.to_string(), limit.to_string());
-        let mut resp = self.get(
+        let mut resp = self.get_authed(
             &url,
             &[
                 ("countryCode", sess.country_code.as_str()),
@@ -439,7 +534,7 @@ impl Client {
     /// # Errors
     /// If [`Self::connect`] has not run, on a transport failure, or on a
     /// non-success status. An empty result set is `Ok`, not an error.
-    pub fn search(&self, query: &str, limit: u32) -> Result<SearchResults> {
+    pub fn search(&mut self, query: &str, limit: u32) -> Result<SearchResults> {
         #[derive(Deserialize)]
         struct Wrap<T> {
             items: Vec<T>,
@@ -457,10 +552,10 @@ impl Client {
             playlists: Wrap<PlaylistBrief>,
         }
 
-        let sess = self.session()?;
+        let sess = self.session()?.clone();
         let url = self.url("/v1/search");
         let lim = limit.to_string();
-        let mut resp = self.get(
+        let mut resp = self.get_authed(
             &url,
             &[
                 ("query", query),
@@ -495,9 +590,9 @@ impl Client {
     /// On a transport failure, a non-success status (the response body is
     /// included, since it carries the reason a track is unplayable), or a
     /// manifest that is not valid base64, not a known mime type, or empty.
-    pub fn resolve_stream(&self, track_id: u64, quality: Quality) -> Result<ResolvedStream> {
+    pub fn resolve_stream(&mut self, track_id: u64, quality: Quality) -> Result<ResolvedStream> {
         let url = self.url(&format!("/v1/tracks/{track_id}/playbackinfopostpaywall"));
-        let mut resp = self.get(
+        let mut resp = self.get_authed(
             &url,
             &[
                 ("audioquality", quality.as_api_str()),
@@ -665,7 +760,7 @@ mod tests {
             "artists":[{"name":"A"},{"name":"B"}],"album":{"title":"Alb"},
             "audioQuality":"LOSSLESS","mediaMetadata":{"tags":["HIRES_LOSSLESS"]}}}]}"#;
         let s = stub(vec![ok(SESSION), ok(body)]);
-        let c = connected(&s);
+        let mut c = connected(&s);
         let tracks = c.favorite_tracks(20, 5).unwrap();
 
         assert_eq!(tracks.len(), 1);
@@ -702,7 +797,7 @@ mod tests {
             ok(r#"{"items":[{"uuid":"abc","title":"Mix","numberOfTracks":3,"duration":60}]}"#),
             ok(r#"{"items":[{"id":5,"title":"X"}]}"#),
         ]);
-        let c = connected(&s);
+        let mut c = connected(&s);
 
         let lists = c.user_playlists(0, 10).unwrap();
         assert_eq!(lists[0].uuid, "abc");
@@ -726,7 +821,7 @@ mod tests {
                   "playlists":{"items":[{"uuid":"u","title":"P"}]}}"#),
             ok("{}"),
         ]);
-        let c = connected(&s);
+        let mut c = connected(&s);
 
         let hits = c.search("blue", 50).unwrap();
         assert_eq!(hits.tracks.len(), 1);
@@ -939,5 +1034,149 @@ mod tests {
         let p = Client::default_token_path();
         assert!(p.ends_with("/hiresti/hiresti_token.json"), "{p}");
         assert!(p.starts_with('/'), "must be absolute: {p}");
+    }
+
+    // ---- self-renewing sessions ----
+
+    /// A token file and a client wired to refresh against `base`.
+    fn authed(base: &str, expiry_epoch: i64) -> (Client, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "priel-auth-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let path = dir.join("token.json").to_str().expect("path").to_string();
+        auth::StoredToken {
+            access_token: "stale".into(),
+            refresh_token: "rt".into(),
+            token_type: "Bearer".into(),
+            expiry_time: auth::format_expiry(expiry_epoch),
+            is_pkce: true,
+        }
+        .save(&path)
+        .expect("write token");
+
+        let mut cfg = auth::AuthConfig::new("cid".into(), Some("secret".into()));
+        cfg.token_url = format!("{base}/token");
+        let client = Client::with_auth(&path, cfg)
+            .expect("client")
+            .with_base_url(base.to_string());
+        (client, path)
+    }
+
+    #[test]
+    fn an_expired_session_is_renewed_before_the_request_goes_out() {
+        // Goal: the whole point of the feature. A token past its expiry must be
+        // refreshed *before* it is used, not after a failure.
+        let s = stub(vec![
+            ok(r#"{"access_token":"fresh","expires_in":3600}"#),
+            ok(SESSION),
+        ]);
+        let (mut c, path) = authed(&s.base, auth::now_epoch() - 10);
+
+        c.connect().expect("connect");
+
+        let first = s.seen.recv().expect("a request should have been made");
+        assert!(
+            first.starts_with("POST /token"),
+            "refresh comes first: {first}"
+        );
+        assert!(s.seen.recv().unwrap().starts_with("GET /v1/sessions"));
+
+        let saved = auth::StoredToken::load(&path).expect("reload");
+        assert_eq!(
+            saved.access_token, "fresh",
+            "the new token must be persisted"
+        );
+        assert_eq!(
+            saved.refresh_token, "rt",
+            "the refresh token is carried over"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_session_with_time_left_is_not_refreshed() {
+        // Goal: refreshing on every request would be a pointless round trip on
+        // the hot path, and would hammer the token endpoint.
+        let s = stub(vec![ok(SESSION)]);
+        let (mut c, path) = authed(&s.base, auth::now_epoch() + 3_600);
+
+        c.connect().expect("connect");
+        assert!(
+            s.seen.recv().unwrap().starts_with("GET /v1/sessions"),
+            "no refresh should have preceded it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_rejected_request_is_retried_once_after_a_refresh() {
+        // Goal: a token can be revoked before its stated expiry - a session
+        // ended on another device, say. The stored expiry says it is fine, so
+        // only the 401 reveals it.
+        let s = stub(vec![
+            (401, "expired".into()),
+            ok(r#"{"access_token":"fresh","expires_in":3600}"#),
+            ok(SESSION),
+        ]);
+        let (mut c, path) = authed(&s.base, auth::now_epoch() + 3_600);
+
+        let sess = c.connect().expect("the retry should have succeeded");
+        assert_eq!(sess.user_id, 7);
+
+        assert!(
+            s.seen.recv().unwrap().starts_with("GET /v1/sessions"),
+            "first attempt"
+        );
+        assert!(
+            s.seen.recv().unwrap().starts_with("POST /token"),
+            "then a refresh"
+        );
+        assert!(
+            s.seen.recv().unwrap().starts_with("GET /v1/sessions"),
+            "then a retry"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_dead_refresh_token_is_reported_as_needing_a_login() {
+        // Goal: refresh tokens expire too. The message has to say what the user
+        // must actually do, because no amount of retrying will fix it.
+        let s = stub(vec![
+            (401, "expired".into()),
+            (400, r#"{"error":"invalid_grant"}"#.into()),
+        ]);
+        let (mut c, path) = authed(&s.base, auth::now_epoch() + 3_600);
+
+        let err = c.connect().unwrap_err().to_string();
+        assert!(err.contains("log in again"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_client_without_credentials_still_works_but_cannot_renew() {
+        // Goal: credentials are optional. Without them priel runs from the
+        // stored token, and says plainly that it cannot refresh rather than
+        // failing in some confusing way.
+        let s = stub(vec![ok(SESSION)]);
+        let mut c = client(&s);
+        assert!(c.session_expires_in().is_none());
+        c.connect().expect("connect");
+
+        let err = c.refresh_session().unwrap_err().to_string();
+        assert!(err.contains("no client credentials"), "{err}");
+    }
+
+    #[test]
+    fn the_stored_expiry_is_visible_for_the_interface_to_show() {
+        // Goal: the UI wants to warn before a session dies rather than after.
+        let s = stub(vec![]);
+        let (c, path) = authed(&s.base, auth::now_epoch() + 1_800);
+        let left = c.session_expires_in().expect("a known expiry");
+        assert!((1_700..=1_800).contains(&left), "got {left}");
+        let _ = std::fs::remove_file(&path);
     }
 }
