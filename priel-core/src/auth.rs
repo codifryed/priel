@@ -111,6 +111,20 @@ impl Credentials {
         serde_json::from_str(&raw).with_context(|| format!("parsing {path}"))
     }
 
+    /// Write the identity out, owner-readable only.
+    ///
+    /// # Errors
+    /// If the directory cannot be created or the file cannot be written.
+    pub fn save(&self, path: &str) -> Result<()> {
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let json = serde_json::to_string_pretty(self).context("serialising the credentials")?;
+        std::fs::write(path, json).with_context(|| format!("writing {path}"))?;
+        restrict_permissions(path);
+        Ok(())
+    }
+
     #[must_use]
     pub fn into_config(self) -> AuthConfig {
         AuthConfig::new(self.client_id, self.client_secret)
@@ -119,10 +133,20 @@ impl Credentials {
 
 /// Where the upstream project publishes the source, tried in order.
 ///
-/// The branch is not knowable in advance, so both conventions are tried.
+/// The moving branches come first so a rotated client identity is picked up
+/// without waiting for priel to release. The pinned commit is last and is the
+/// safety net: it is immutable, it is verified to contain a usable identity, and
+/// it keeps first-time login working if the branches are renamed or the file is
+/// restructured. Its risk is staleness rather than failure - and if the service
+/// ever rotates the identity, every native client breaks together until the
+/// upstream package is updated, so a stale pin is no worse off than the rest.
+///
+/// The branch name is not knowable in advance, so both conventions are tried.
 pub const UPSTREAM_SOURCES: &[&str] = &[
     "https://raw.githubusercontent.com/EbbLabs/python-tidal/main/tidalapi/session.py",
     "https://raw.githubusercontent.com/EbbLabs/python-tidal/master/tidalapi/session.py",
+    // v0.8.11, verified to yield the same identity a working install carries.
+    "https://raw.githubusercontent.com/EbbLabs/python-tidal/899e6b3c9485559d5b0e1a5702a5912de0ce43cf/tidalapi/session.py",
 ];
 
 /// Where a client identity came from, so the interface can say so.
@@ -1104,5 +1128,26 @@ mod tests {
             }
         });
         url
+    }
+
+    #[test]
+    fn the_last_upstream_source_is_an_immutable_pin() {
+        // Goal: the moving branches can be renamed or restructured at any time.
+        // The final entry is the safety net for a first-time login, so it must
+        // be a commit hash rather than another branch that can move under us.
+        let last = UPSTREAM_SOURCES.last().expect("at least one source");
+        let sha = last
+            .strip_prefix("https://raw.githubusercontent.com/EbbLabs/python-tidal/")
+            .and_then(|rest| rest.split('/').next())
+            .expect("the ref sits after the repository");
+        assert_eq!(sha.len(), 40, "a full commit hash, not a tag: {sha}");
+        assert!(
+            sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "not a commit hash: {sha}"
+        );
+        assert!(
+            UPSTREAM_SOURCES.len() >= 2,
+            "the pin is a fallback, not the only source"
+        );
     }
 }

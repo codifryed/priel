@@ -259,6 +259,21 @@ struct BtsManifest {
     urls: Vec<String>,
 }
 
+/// An HTTP agent configured the way this crate expects.
+///
+/// Exposed so callers that need a one-off request - fetching a client identity
+/// before any `Client` exists, say - do not have to reinvent the settings.
+#[must_use]
+pub fn new_agent() -> Agent {
+    Agent::new_with_config(
+        Agent::config_builder()
+            .user_agent(UA)
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build(),
+    )
+}
+
 impl Client {
     /// # Errors
     /// Currently infallible; kept fallible so adding TLS/proxy configuration

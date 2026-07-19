@@ -44,7 +44,92 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.mode == Mode::Help {
         help_overlay(f, f.area());
     }
+    if app.mode == Mode::Credentials {
+        credentials_overlay(f, f.area(), app.credential_status());
+    }
 }
+
+/// Draw the consent screen. `status` is the line under the buttons: idle,
+/// in flight, or the reason a previous attempt failed.
+fn credentials_overlay(f: &mut Frame, area: Rect, status: Option<&str>) {
+    let rows = u16::try_from(CREDENTIALS_PROMPT.len()).unwrap_or(u16::MAX);
+    let width = area.width.min(78);
+    let height = rows.saturating_add(6).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" priel needs a client identity ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut lines: Vec<Line<'static>> = CREDENTIALS_PROMPT
+        .iter()
+        .map(|l| {
+            // The address and the destination path are the two facts a reader
+            // should be able to find without reading the prose.
+            let emphasised = l.contains("github.com") || l.contains("credentials.json");
+            let style = if emphasised {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(Span::styled((*l).to_string(), style))
+        })
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("    [f]", Style::default().fg(Color::Cyan)),
+        Span::styled(" download it   ", Style::default().fg(Color::Gray)),
+        Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
+        Span::styled(" not now   ", Style::default().fg(Color::Gray)),
+        Span::styled("[q]", Style::default().fg(Color::Cyan)),
+        Span::styled(" quit", Style::default().fg(Color::Gray)),
+    ]));
+    if let Some(status) = status {
+        lines.push(Line::from(Span::styled(
+            format!("    {status}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The first-run consent screen for obtaining a client identity.
+///
+/// Written to be read, not clicked through. priel is about to download a
+/// credential belonging to somebody else's application, and a user who later
+/// discovers that should find nothing here they were not told.
+const CREDENTIALS_PROMPT: &[&str] = &[
+    "priel ships no credentials of its own, so it cannot log in or renew a",
+    "session until it has a client identity.",
+    "",
+    "It can download one from the open-source Python project that the other",
+    "native Linux clients rely on:",
+    "",
+    "    github.com/EbbLabs/python-tidal  ·  tidalapi/session.py",
+    "",
+    "This is not priel's credential, and not one issued to priel. It is the",
+    "identity of the vendor's own mobile application, published in that",
+    "project and shared by every native client on Linux. It is how they all",
+    "work. It is not endorsed by the vendor.",
+    "",
+    "If you continue:",
+    "    · one HTTPS request is made to the address above",
+    "    · the identity is written to ~/.config/priel/credentials.json,",
+    "      readable only by you",
+    "    · nothing of yours is sent anywhere, and you are not asked again",
+    "",
+    "To do it yourself instead, put this in that file and restart:",
+    "    { \"client_id\": \"…\", \"client_secret\": \"…\" }",
+];
 
 /// The complete reference, in two columns. The bottom row carries only what is
 /// used constantly; everything else is discoverable from here, which is what
@@ -1451,5 +1536,43 @@ mod tests {
             "both ends of the conversion must be real: {out}"
         );
         assert!(out.contains("DAC S32_LE · 48 kHz"), "{out}");
+    }
+
+    #[test]
+    fn the_consent_screen_states_what_it_will_do_before_doing_it() {
+        // Goal: priel is about to download a credential belonging to someone
+        // else's application. A user who later discovers that must find nothing
+        // here they were not told: where it comes from, whose it is, what gets
+        // written where, and how to avoid the download entirely.
+        let mut sc = screen();
+        sc.app.set_mode_for_test(Mode::Credentials);
+        let out = text(&mut sc.app, 96, 34);
+
+        assert!(
+            out.contains("github.com/EbbLabs/python-tidal"),
+            "the source: {out}"
+        );
+        assert!(out.contains("credentials.json"), "the destination: {out}");
+        assert!(
+            out.contains("not endorsed"),
+            "whose credential it is: {out}"
+        );
+        assert!(out.contains("one HTTPS request"), "what it will do: {out}");
+        assert!(
+            out.contains("To do it yourself"),
+            "the manual alternative: {out}"
+        );
+        assert!(out.contains("[f]") && out.contains("[Esc]") && out.contains("[q]"));
+    }
+
+    #[test]
+    fn the_consent_screen_fits_a_modest_terminal() {
+        // Goal: a wall of text that overflows is a wall of text nobody reads.
+        for (w, h) in [(80u16, 30u16), (96, 34), (120, 40)] {
+            let mut sc = screen();
+            sc.app.set_mode_for_test(Mode::Credentials);
+            let out = text(&mut sc.app, w, h);
+            assert!(out.contains("client identity"), "{w}x{h}: {out}");
+        }
     }
 }

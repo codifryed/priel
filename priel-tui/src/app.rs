@@ -33,8 +33,9 @@ use priel_core::auth::Credentials;
 use priel_core::{Playlist, Track};
 use priel_player::{PlaybackStatus, Player};
 
+use std::sync::mpsc::Receiver;
 #[cfg(test)]
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Sender;
 
 use crate::worker::{self, FromWorker, ToWorker, Worker};
 
@@ -74,9 +75,10 @@ pub enum Hit {
 #[derive(PartialEq, Eq, Debug)]
 pub enum Mode {
     Normal,
-    Filter, // local filter of the current list
-    Search, // editing the global TIDAL search query
-    Help,   // the shortcut reference is up; it swallows input until dismissed
+    Filter,      // local filter of the current list
+    Search,      // editing the global TIDAL search query
+    Help,        // the shortcut reference is up; it swallows input until dismissed
+    Credentials, // first run with no client identity; asking before fetching one
 }
 
 /// Source-side metadata (from the TIDAL API — authoritative).
@@ -137,6 +139,11 @@ pub struct App {
     last_click: Option<(u16, Instant)>,
     dirty: bool,
     last_sig: RenderSig,
+    /// Where the credentials file should live, and the state of any attempt to
+    /// populate it. `None` once there is nothing left to ask about.
+    credentials_path: Option<String>,
+    credential_status: Option<String>,
+    fetching: Option<Receiver<Result<(), String>>>,
 }
 
 /// Snapshot of the render-relevant state that moves on its own.
@@ -162,8 +169,14 @@ struct RenderSig {
 impl App {
     pub fn new(device: Option<String>, token_path: String) -> anyhow::Result<Self> {
         let player = Player::new(device)?;
-        let worker = worker::spawn(token_path, Credentials::default_path());
-        Ok(Self::with(player, worker))
+        let creds_path = Credentials::default_path();
+        let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
+        let worker = worker::spawn(token_path, creds_path.clone());
+        let mut app = Self::with(player, worker);
+        if !has_credentials {
+            app.prompt_for_credentials(creds_path);
+        }
+        Ok(app)
     }
 
     /// An app with a silent player and a worker whose channels the caller holds.
@@ -216,6 +229,85 @@ impl App {
             last_click: None,
             dirty: true,
             last_sig: RenderSig::default(),
+            credentials_path: None,
+            credential_status: None,
+            fetching: None,
+        }
+    }
+
+    /// Ask the user before downloading a client identity.
+    ///
+    /// Only called when none could be found, and only from `new` - a rigged app
+    /// in a test is never put in this state.
+    fn prompt_for_credentials(&mut self, path: String) {
+        self.credentials_path = Some(path);
+        self.mode = Mode::Credentials;
+    }
+
+    /// Force a mode, for renderer tests.
+    #[cfg(test)]
+    pub fn set_mode_for_test(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+
+    /// The line under the consent screen's buttons.
+    #[must_use]
+    pub fn credential_status(&self) -> Option<&str> {
+        self.credential_status.as_deref()
+    }
+
+    /// Download a client identity, off the UI thread.
+    fn fetch_credentials(&mut self) {
+        let Some(path) = self.credentials_path.clone() else {
+            return;
+        };
+        if self.fetching.is_some() {
+            return; // already in flight
+        }
+        self.credential_status = Some("downloading…".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let agent = priel_core::new_agent();
+            let outcome =
+                priel_core::auth::fetch_credentials(&agent, priel_core::auth::UPSTREAM_SOURCES)
+                    .and_then(|creds| creds.save(&path))
+                    .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(outcome);
+        });
+        self.fetching = Some(rx);
+    }
+
+    /// Collect the result of an in-flight download.
+    fn drain_fetch(&mut self) {
+        let Some(rx) = &self.fetching else { return };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.fetching = None;
+                self.mode = Mode::Normal;
+                self.notice = Some("Client identity saved. Restart priel to use it.".into());
+                self.dirty = true;
+            }
+            Ok(Err(e)) => {
+                self.fetching = None;
+                self.credential_status = Some(e);
+                self.dirty = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.fetching = None;
+                self.credential_status = Some("the download did not finish".into());
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// The consent screen is modal: nothing reaches the list behind it.
+    fn on_key_credentials(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('f') => self.fetch_credentials(),
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
+            _ => {}
         }
     }
 
@@ -361,6 +453,7 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
+        self.drain_fetch();
         self.status = self.player.status();
         self.refresh_from_status();
     }
@@ -673,6 +766,7 @@ impl App {
             Mode::Filter => self.on_key_filter(key),
             Mode::Search => self.on_key_search(key),
             Mode::Help => self.on_key_help(key),
+            Mode::Credentials => self.on_key_credentials(key),
             Mode::Normal => self.on_key_normal(key),
         }
     }
@@ -779,6 +873,9 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.mode == Mode::Credentials {
+            return; // the consent screen takes no mouse input
+        }
         if self.mode == Mode::Help {
             // Any click dismisses; scrolling the list behind it would be odd.
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -1973,5 +2070,59 @@ mod tests {
                 .unwrap_or_default()
                 .contains("unity")
         );
+    }
+
+    #[test]
+    fn the_consent_screen_swallows_input_and_offers_a_way_out() {
+        // Goal: modal means modal. It appears before the user has asked for
+        // anything, so `Esc` must dismiss it without downloading, and no
+        // keystroke may leak through to the list behind it.
+        let mut r = rig();
+        r.app.favorites = (0..5).map(|i| track(i, "T", "A")).collect();
+        r.app.set_mode_for_test(Mode::Credentials);
+
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.selected, 0, "movement must not leak through");
+
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(
+            r.app.mode,
+            Mode::Normal,
+            "Esc continues without downloading"
+        );
+        assert!(!r.app.should_quit);
+    }
+
+    #[test]
+    fn the_consent_screen_can_be_declined_by_quitting() {
+        // Goal: a user who wants no part of this must be able to leave from the
+        // screen itself rather than hunting for a way out.
+        let mut r = rig();
+        r.app.set_mode_for_test(Mode::Credentials);
+        r.app.on_key(key('q'));
+        assert!(r.app.should_quit);
+    }
+
+    #[test]
+    fn nothing_is_downloaded_without_a_configured_destination() {
+        // Goal: the fetch writes a file. With no path decided there is nothing
+        // to write, and it must not reach the network to find that out.
+        let mut r = rig();
+        r.app.set_mode_for_test(Mode::Credentials);
+        r.app.on_key(key('f'));
+        assert!(
+            r.app.credential_status().is_none(),
+            "no attempt should have started"
+        );
+    }
+
+    #[test]
+    fn the_consent_screen_ignores_the_mouse() {
+        // Goal: every other overlay is dismissed by a click. This one is not:
+        // a stray click must not be read as consent to download a credential.
+        let mut r = rig();
+        r.app.set_mode_for_test(Mode::Credentials);
+        r.app.on_mouse(click(1, 1));
+        assert_eq!(r.app.mode, Mode::Credentials, "a click is not consent");
     }
 }
