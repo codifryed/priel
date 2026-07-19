@@ -26,8 +26,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 regex = "1"
-# rustls (no OpenSSL) keeps packaging simple and cross-platform.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# ureq: blocking, rustls, no async runtime. No tokio/hyper anywhere in the tree.
+ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 priel-core = { path = "priel-core" }
 # default-features off here so priel-tui's own `libmpv` feature is the single
 # switch that pulls libmpv in (default on) or leaves it out (--no-default-features).

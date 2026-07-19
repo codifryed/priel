@@ -25,6 +25,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
+use ureq::http::Response;
+use ureq::{Agent, Body};
 
 pub mod mpd;
 
@@ -123,7 +125,7 @@ pub struct Session {
 }
 
 pub struct Client {
-    http: reqwest::blocking::Client,
+    http: Agent,
     token: String,
     session: Option<Session>,
 }
@@ -247,12 +249,19 @@ struct BtsManifest {
 
 impl Client {
     /// # Errors
-    /// If the HTTP client cannot be built (TLS backend or system config).
+    /// Currently infallible; kept fallible so adding TLS/proxy configuration
+    /// later is not a breaking change.
     pub fn new(token: String) -> Result<Self> {
-        let http = reqwest::blocking::Client::builder()
-            .user_agent(UA)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+        // `http_status_as_error(false)` keeps ureq's behaviour the same as
+        // reqwest's: a non-2xx is a normal response, and each call site decides
+        // what to say about it.
+        let http = Agent::new_with_config(
+            Agent::config_builder()
+                .user_agent(UA)
+                .timeout_global(Some(std::time::Duration::from_secs(30)))
+                .http_status_as_error(false)
+                .build(),
+        );
         Ok(Self {
             http,
             token,
@@ -280,13 +289,15 @@ impl Client {
         format!("{base}/hiresti/hiresti_token.json")
     }
 
-    fn get(&self, url: &str, query: &[(&str, &str)]) -> Result<reqwest::blocking::Response> {
-        Ok(self
+    fn get(&self, url: &str, query: &[(&str, &str)]) -> Result<Response<Body>> {
+        let mut req = self
             .http
             .get(url)
-            .bearer_auth(&self.token)
-            .query(query)
-            .send()?)
+            .header("Authorization", format!("Bearer {}", self.token));
+        for (k, v) in query {
+            req = req.query(*k, *v);
+        }
+        Ok(req.call()?)
     }
 
     /// Validate the token and cache `userId`/`countryCode`.
@@ -295,14 +306,14 @@ impl Client {
     /// On a transport failure, or a non-success status - most often an expired
     /// token, which the message calls out.
     pub fn connect(&mut self) -> Result<Session> {
-        let resp = self.get(&format!("{API}/v1/sessions"), &[])?;
+        let mut resp = self.get(&format!("{API}/v1/sessions"), &[])?;
         if !resp.status().is_success() {
             bail!(
                 "GET /v1/sessions -> HTTP {} (token expired? re-login in hiresTI)",
                 resp.status()
             );
         }
-        let s: SessionResp = resp.json()?;
+        let s: SessionResp = resp.body_mut().read_json()?;
         let sess = Session {
             user_id: s.user_id,
             country_code: s.country_code,
@@ -326,7 +337,7 @@ impl Client {
         let sess = self.session()?;
         let url = format!("{API}/v1/users/{}/favorites/tracks", sess.user_id);
         let (off, lim) = (offset.to_string(), limit.to_string());
-        let resp = self.get(
+        let mut resp = self.get(
             &url,
             &[
                 ("countryCode", sess.country_code.as_str()),
@@ -339,7 +350,7 @@ impl Client {
         if !resp.status().is_success() {
             bail!("favorites/tracks -> HTTP {}", resp.status());
         }
-        let fr: FavTracksResp = resp.json()?;
+        let fr: FavTracksResp = resp.body_mut().read_json()?;
         Ok(fr.items.into_iter().map(|i| i.item.into_track()).collect())
     }
 
@@ -358,7 +369,7 @@ impl Client {
         let sess = self.session()?;
         let url = format!("{API}/v1/users/{}/playlists", sess.user_id);
         let (off, lim) = (offset.to_string(), limit.to_string());
-        let resp = self.get(
+        let mut resp = self.get(
             &url,
             &[
                 ("countryCode", sess.country_code.as_str()),
@@ -369,7 +380,7 @@ impl Client {
         if !resp.status().is_success() {
             bail!("playlists -> HTTP {}", resp.status());
         }
-        let r: R = resp.json()?;
+        let r: R = resp.body_mut().read_json()?;
         Ok(r.items
             .into_iter()
             .map(PlaylistBrief::into_playlist)
@@ -391,7 +402,7 @@ impl Client {
         let sess = self.session()?;
         let url = format!("{API}/v1/playlists/{uuid}/tracks");
         let (off, lim) = (offset.to_string(), limit.to_string());
-        let resp = self.get(
+        let mut resp = self.get(
             &url,
             &[
                 ("countryCode", sess.country_code.as_str()),
@@ -402,7 +413,7 @@ impl Client {
         if !resp.status().is_success() {
             bail!("playlist tracks -> HTTP {}", resp.status());
         }
-        let r: R = resp.json()?;
+        let r: R = resp.body_mut().read_json()?;
         Ok(r.items.into_iter().map(TrackBrief::into_track).collect())
     }
 
@@ -432,7 +443,7 @@ impl Client {
         let sess = self.session()?;
         let url = format!("{API}/v1/search");
         let lim = limit.to_string();
-        let resp = self.get(
+        let mut resp = self.get(
             &url,
             &[
                 ("query", query),
@@ -444,7 +455,7 @@ impl Client {
         if !resp.status().is_success() {
             bail!("search -> HTTP {}", resp.status());
         }
-        let r: R = resp.json()?;
+        let r: R = resp.body_mut().read_json()?;
         Ok(SearchResults {
             tracks: r
                 .tracks
@@ -469,7 +480,7 @@ impl Client {
     /// manifest that is not valid base64, not a known mime type, or empty.
     pub fn resolve_stream(&self, track_id: u64, quality: Quality) -> Result<ResolvedStream> {
         let url = format!("{API}/v1/tracks/{track_id}/playbackinfopostpaywall");
-        let resp = self.get(
+        let mut resp = self.get(
             &url,
             &[
                 ("audioquality", quality.as_api_str()),
@@ -481,10 +492,10 @@ impl Client {
             let code = resp.status();
             bail!(
                 "playbackinfo -> HTTP {code}: {}",
-                resp.text().unwrap_or_default()
+                resp.body_mut().read_to_string().unwrap_or_default()
             );
         }
-        let s: Stream = resp.json()?;
+        let s: Stream = resp.body_mut().read_json()?;
         decode_manifest(&s)
     }
 }

@@ -14,7 +14,7 @@ libmpv = ["dep:libmpv2"]
 
 [dependencies]
 anyhow.workspace = true
-reqwest.workspace = true
+ureq.workspace = true
 priel-core.workspace = true
 libmpv2 = { version = "6", optional = true }
 

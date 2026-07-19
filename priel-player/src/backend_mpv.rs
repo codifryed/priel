@@ -28,13 +28,15 @@
 //! tick, removes anything mpv has already moved past (freeing its buffer).
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use libmpv2::{Mpv, protocol::Protocol};
 use priel_core::PlayableSource;
+use ureq::{Agent, Body, http::Response};
 
 use crate::{Cmd, PlaybackStatus};
 
@@ -379,40 +381,51 @@ fn abort(sh: &Arc<Shared>) {
     sh.cv.notify_all();
 }
 
+/// One agent for every segment download, for the whole process.
+///
+/// An `Agent` owns the connection pool and the rustls config, so building one
+/// per track (as this did before) threw away keep-alive between tracks and
+/// redid the TLS setup each time. Cloning or sharing it costs nothing.
+static HTTP: LazyLock<Agent> = LazyLock::new(|| {
+    Agent::new_with_config(
+        Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(60)))
+            .build(),
+    )
+});
+
 fn spawn_downloader(urls: Vec<String>, shared: Arc<Shared>) {
     thread::spawn(move || {
-        let Ok(http) = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-        else {
-            return;
-        };
         for u in &urls {
             if lock(&shared.inner).aborted {
                 return;
             }
-            match http
-                .get(u)
-                .send()
-                .and_then(reqwest::blocking::Response::error_for_status)
-                .and_then(reqwest::blocking::Response::bytes)
-            {
-                Ok(bytes) => {
-                    let mut g = lock(&shared.inner);
-                    if g.aborted {
-                        return;
-                    }
-                    g.data.extend_from_slice(&bytes);
-                    shared.cv.notify_all();
-                }
-                Err(_) => break,
+            // A non-2xx is an `Err` here (the agent keeps ureq's default
+            // `http_status_as_error`), matching the old `error_for_status`.
+            let Some(bytes) = HTTP.get(u).call().ok().and_then(|mut r| read_body(&mut r)) else {
+                break;
+            };
+            let mut g = lock(&shared.inner);
+            if g.aborted {
+                return;
             }
+            g.data.extend_from_slice(&bytes);
+            shared.cv.notify_all();
         }
         let mut g = lock(&shared.inner);
         g.total = Some(g.data.len() as u64);
         g.complete = true;
         shared.cv.notify_all();
     });
+}
+
+/// Read a whole segment body. `as_reader` is used rather than `read_to_vec`
+/// because the latter applies ureq's body-size limit, and hi-res segments run
+/// to several megabytes.
+fn read_body(resp: &mut Response<Body>) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    resp.body_mut().as_reader().read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 #[allow(
