@@ -1267,11 +1267,27 @@ impl App {
     }
 }
 
+/// May priel spawn a browser right now?
+///
+/// Separated from the spawning so it can be asserted: without a test covering
+/// this, a refactor that drops the guard is invisible until someone's screen
+/// fills with tabs.
+fn should_open_browser() -> bool {
+    !cfg!(test) && std::env::var_os("PRIEL_NO_BROWSER").is_none()
+}
+
 /// Open a URL in the user's browser, best effort.
 ///
 /// A failure is not reported: the screen always shows the URL as well, so a
 /// user on a machine with no handler can still copy it.
+///
+/// Never during tests. Several tests drive the sign-in flow, and spawning a real
+/// browser tab for each of them on every `cargo test` is both useless and
+/// hostile to whoever is running the suite.
 fn open_in_browser(url: &str) {
+    if !should_open_browser() {
+        return;
+    }
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else if cfg!(target_os = "windows") {
@@ -2593,5 +2609,16 @@ mod tests {
             .set_paths_for_test("/nonexistent/token.json".into(), credentials_fixture());
         r.app.continue_after_credentials_for_test();
         assert_eq!(r.app.mode, Mode::Login, "no session means sign in");
+    }
+
+    #[test]
+    fn the_test_suite_never_spawns_a_browser() {
+        // Goal: several tests drive the sign-in flow, and each one spawning a
+        // real browser tab makes `cargo test` hostile to run. This is the guard
+        // that stops a refactor quietly reinstating that.
+        assert!(
+            !super::should_open_browser(),
+            "the suite must never reach the user's browser"
+        );
     }
 }
