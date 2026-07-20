@@ -865,6 +865,12 @@ fn read_status(mpv: &Mpv, entries: &[Entry], hw: Option<HwParams>) -> PlaybackSt
     let cache_secs = mpv
         .get_property::<f64>("demuxer-cache-duration")
         .unwrap_or(0.0);
+    // What the picker marks as in use. mpv's own default for this is the word
+    // `auto`, which is also the identifier of the entry it lists for it, so the
+    // two compare directly.
+    let audio_device = mpv
+        .get_property::<String>("audio-device")
+        .unwrap_or_else(|_| "auto".to_string());
     PlaybackStatus {
         loaded: duration > 0.0,
         playing: !idle && !paused,
@@ -883,6 +889,7 @@ fn read_status(mpv: &Mpv, entries: &[Entry], hw: Option<HwParams>) -> PlaybackSt
         has_next: entries.len() > 1,
         cache_secs,
         ao_volume,
+        audio_device,
         hw,
     }
 }

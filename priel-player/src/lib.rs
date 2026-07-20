@@ -89,6 +89,10 @@ pub struct PlaybackStatus {
     /// volume. `PipeWire` attenuates in software too, so a stream turned down in
     /// the system mixer is no more bit-perfect than one turned down in priel.
     pub ao_volume: Option<f64>,
+    /// The output device mpv is pointed at (`auto` unless one was chosen). This
+    /// is an identifier from [`AudioDevice::name`], so the picker can mark the
+    /// row that is in use by comparing the two.
+    pub audio_device: String,
     /// Live parameters of the ALSA device, when one could be read.
     ///
     /// This is the only unmediated view of the hardware. When present it decides

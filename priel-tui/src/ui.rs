@@ -47,6 +47,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.mode == Mode::Log {
         log_overlay(f, f.area(), app);
     }
+    if app.mode == Mode::Devices {
+        device_overlay(f, f.area(), app);
+    }
     if app.mode == Mode::Credentials {
         credentials_overlay(f, f.area(), app.credential_status());
     }
@@ -267,6 +270,7 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
     (
         "Output",
         &[
+            ("d", "choose the device"),
             ("DAC", "live from the device"),
             ("OUT", "what the server took"),
             ("bit-perfect", "nothing altered"),
@@ -392,6 +396,126 @@ fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
             },
         );
     }
+}
+
+/// How much of the overlay the identifier column may take.
+///
+/// Device identifiers run to sixty characters and the description is what makes
+/// one recognisable, so neither may crowd the other out entirely.
+const DEVICE_NAME_SHARE: u16 = 2;
+
+/// The output device picker.
+///
+/// Modal like the log overlay and scrolled with the same keys. Two things it
+/// must always say: which device is in use, and that a choice made here lasts
+/// for this session only - priel reads no configuration file, so `--device` is
+/// the only way to make one permanent.
+fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
+    let width = area.width.saturating_sub(4).min(110);
+    let height = area.height.saturating_sub(2);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Output device ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    // Rebuilt every frame, exactly as the header's hit boxes are.
+    app.device_rows.clear();
+    if inner.height <= 2 {
+        return;
+    }
+
+    // Two rows go to the footer: what choosing does, and how to leave. An
+    // overlay that says neither is a trap.
+    let body = Rect {
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    match app.device_notice() {
+        Some(notice) => f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                notice,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            body,
+        ),
+        None => device_rows(f, app, body),
+    }
+
+    let footer = Style::default().fg(Color::DarkGray);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "  this session only — --device makes a choice permanent",
+                footer,
+            )),
+            Line::from(Span::styled(
+                "  j k move · g G ends · Enter choose · click a row · d, Esc or q to close",
+                footer,
+            )),
+        ]),
+        Rect {
+            y: inner.y + inner.height.saturating_sub(2),
+            height: 2,
+            ..inner
+        },
+    );
+}
+
+/// The device rows themselves, windowed onto the selection.
+///
+/// Each row's hit box is registered in the same walk that draws it, so a click
+/// cannot land on a device other than the one under the pointer.
+fn device_rows(f: &mut Frame, app: &mut App, body: Rect) {
+    let devices = app.devices().len();
+    let h = body.height as usize;
+    let selected = app.device_selected();
+    if selected < app.device_offset {
+        app.device_offset = selected;
+    } else if selected >= app.device_offset + h {
+        app.device_offset = selected + 1 - h;
+    }
+    if app.device_offset >= devices {
+        app.device_offset = 0;
+    }
+
+    let name_width = usize::from(body.width / DEVICE_NAME_SHARE);
+    let in_use = app.status.audio_device.clone();
+    let mut rows = Vec::new();
+    for (i, index) in (app.device_offset..(app.device_offset + h).min(devices)).enumerate() {
+        let d = &app.devices()[index];
+        let here = d.name == in_use;
+        let mark = if here { "* " } else { "  " };
+        let text = format!(
+            "{mark}{:name_width$}  {}",
+            trunc(&d.name, name_width),
+            d.description
+        );
+        let style = if index == selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else if here {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        };
+        let rect = Rect {
+            x: body.x,
+            y: body.y + u16::try_from(i).unwrap_or(u16::MAX),
+            width: body.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(text).style(style), rect);
+        rows.push((rect, index));
+    }
+    app.device_rows = rows;
 }
 
 /// One log line, coloured by how much it wants to be noticed.
@@ -1471,6 +1595,98 @@ mod tests {
         assert!(out.contains("line 39"), "the newest line: {out}");
         assert!(out.contains("to close"), "{out}");
         assert!(!out.contains("Hidden Title"), "the list is covered: {out}");
+    }
+
+    /// Three devices, the middle one a plausible DAC.
+    fn devices() -> Vec<priel_player::AudioDevice> {
+        [
+            ("auto", "Autoselect device"),
+            ("pipewire/some.dac", "A Nice DAC Pro"),
+            ("alsa/hdmi:CARD=HDMI", "HDMI Audio Output"),
+        ]
+        .iter()
+        .map(|(n, d)| priel_player::AudioDevice {
+            name: (*n).to_string(),
+            description: (*d).to_string(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn the_device_picker_names_every_device_and_marks_the_one_in_use() {
+        // Goal: the whole issue in one frame. The identifier is what --device
+        // takes and the description is what makes it recognisable, so both have
+        // to be on screen, and the row already in use has to stand out.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Hidden Title")];
+        sc.app.set_devices_for_test(devices());
+        sc.app.status.audio_device = "pipewire/some.dac".into();
+        sc.app.mode = Mode::Devices;
+
+        let out = text(&mut sc.app, 100, 20);
+        assert!(out.contains("Output device"), "{out}");
+        assert!(out.contains("pipewire/some.dac"), "{out}");
+        assert!(out.contains("A Nice DAC Pro"), "{out}");
+        assert!(out.contains("HDMI Audio Output"), "{out}");
+        assert!(
+            out.contains("* pipewire/some.dac"),
+            "the device in use should be marked: {out}"
+        );
+        assert!(
+            !out.contains("* auto"),
+            "and only that one should be: {out}"
+        );
+        assert!(!out.contains("Hidden Title"), "the list is covered: {out}");
+    }
+
+    #[test]
+    fn the_device_picker_says_the_choice_lasts_for_this_session() {
+        // Goal: priel reads no configuration file, deliberately. A picker that
+        // did not say so would look broken on the next start.
+        let mut sc = screen();
+        sc.app.set_devices_for_test(devices());
+        sc.app.mode = Mode::Devices;
+        let out = text(&mut sc.app, 100, 20);
+        assert!(out.contains("this session only"), "{out}");
+        assert!(
+            out.contains("--device"),
+            "and it must say what does make it permanent: {out}"
+        );
+        assert!(out.contains("to close"), "{out}");
+    }
+
+    #[test]
+    fn every_device_row_on_screen_is_clickable_where_it_was_drawn() {
+        // Goal: the rows are the only clickable thing in this overlay, and a hit
+        // box that drifted from what was painted would switch the output to a
+        // device other than the one under the pointer.
+        let mut sc = screen();
+        sc.app.set_devices_for_test(devices());
+        sc.app.mode = Mode::Devices;
+        let lines = draw(&mut sc.app, 100, 20);
+
+        assert_eq!(sc.app.device_rows.len(), 3, "one hit box per drawn row");
+        for (rect, index) in sc.app.device_rows.clone() {
+            let painted = &lines[rect.y as usize];
+            assert!(
+                painted.contains(&sc.app.devices()[index].name),
+                "row {index} claims a line that does not show it: {painted}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_device_list_says_so_rather_than_showing_a_blank_box() {
+        // Goal: a build without libmpv has nothing to list, and an empty box
+        // reads as a bug rather than as an answer.
+        let mut sc = screen();
+        sc.app.mode = Mode::Devices;
+        let out = text(&mut sc.app, 100, 20);
+        assert!(
+            out.contains("No output devices were reported"),
+            "the empty case is itself the answer: {out}"
+        );
+        assert!(sc.app.device_rows.is_empty(), "nothing to click");
     }
 
     #[test]
