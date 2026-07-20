@@ -18,8 +18,10 @@ buffer. Everything below serves those two.
 - Refactor: with the test as a net. This is where the design improves, not an optional third step.
 - When fixing a bug, the regression test comes first and must fail against the unfixed code.
 
-The workspace sits at **96% line coverage** across 159 tests. That is the floor, not the target:
-`make coverage` reports it, and a change that drops it wants a reason. New code is held to TDD.
+**Line coverage stays above 80%**, which `make coverage` reports. That is a floor to notice, not a
+number to chase: a change that takes it under wants a reason, and the last few points are usually
+glue that needs a TTY or a real device to reach. New code is held to TDD regardless of what the
+figure says.
 
 ### The seams that exist
 
