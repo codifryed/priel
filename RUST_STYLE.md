@@ -147,9 +147,10 @@ async would buy nothing at the one boundary where it would have to earn its keep
   buffering more tracks ahead than the queue needs. The preload depth is one.
 - Give capacity hints when the size is known: `Vec::with_capacity(limit)` when building results
   from a listing whose limit you passed in.
-- `LazyLock` for anything compiled once and reused. The `Regex`es in `mpd::parse` are rebuilt on
-  every call and belong in `LazyLock` statics; that also removes a fallible path from a hot-ish
-  function.
+- `LazyLock` for anything compiled once and reused, as `mpd`'s `Regex`es are. Note the second
+  benefit there: with the patterns compiled once, the only way `parse` can fail is the one that
+  means something - a manifest with no media template - instead of also carrying "a literal regex
+  did not compile" that no caller could ever act on.
 - Per-tick allocation in the player loop or the render path is a red flag. Allocation in `fn new`
   or a one-shot resolve is fine.
 
@@ -185,10 +186,10 @@ and is lost. Diagnostics go to `$XDG_STATE_HOME/priel/priel.log` through the sin
 - `snake_case` for functions, variables, modules; `CamelCase` for types. Proper acronym casing:
   `MpdInfo`, `BtsManifest`, not `MPDInfo`.
 - **Include units in names**, most significant first: `cache_secs`, `sample_rate`, `bit_depth`,
-  `position` are right. `Track::duration: u32` carries its unit in a trailing comment instead of
-  the name; prefer `duration_secs` when that struct is next touched. Note that `Track::duration` is
-  seconds as `u32` while `PlaybackStatus::duration` is seconds as `f64` - exactly the confusion
-  units-in-names prevents.
+  `position`, `Track::duration_secs` and `Playlist::duration_secs`. The last two used to be
+  `duration` with the unit in a trailing comment, next to a `PlaybackStatus::duration` that is
+  seconds as `f64` rather than `u32` - two fields that read as the same thing and were not. The
+  wire DTOs keep the name the service sends; the rename happens where the domain type is built.
 - Do not abbreviate outside well-known domain terms (`mpd`, `dash`, `bts`, `flac`, `mpv`, `pcm`).
 - `index` (0-based), `count` (1-based) and `size` are distinct concepts; do not let them share a
   name. The visible-index vs backing-index distinction in `app.rs` is the live example - name those

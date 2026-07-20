@@ -20,6 +20,8 @@
 //! Concatenating those segments yields a plain FLAC stream. Segment-count logic
 //! mirrors tidalapi's `DashInfo.get_urls()` so it matches the live catalog.
 
+use std::sync::LazyLock;
+
 use anyhow::{Result, anyhow};
 use regex::Regex;
 
@@ -30,35 +32,55 @@ pub struct MpdInfo {
     pub segment_urls: Vec<String>,
 }
 
+/// The patterns this module matches with, compiled once.
+///
+/// `parse` runs for every track, and rebuilding five regexes each time is work
+/// nobody asked for. Compiling them here also removes a fallible path from
+/// `parse`: the only way it can fail now is the one that means something, a
+/// manifest with no media template.
+///
+/// The `expect`s cannot fire. Each pattern is a literal in this file, and the
+/// tests below exercise all five - a typo would fail the suite, not a user's
+/// playback.
+static RE_RATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"audioSamplingRate="(\d+)""#).expect("a literal pattern, covered by the tests")
+});
+static RE_CODEC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"codecs="([^"]+)""#).expect("a literal pattern, covered by the tests")
+});
+static RE_MEDIA: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"media="([^"]+)""#).expect("a literal pattern, covered by the tests")
+});
+static RE_S: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<S\b([^>]*?)/?>").expect("a literal pattern, covered by the tests")
+});
+static RE_R: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\br="(\d+)""#).expect("a literal pattern, covered by the tests")
+});
+
 /// # Errors
 /// If the MPD carries no `<SegmentTemplate media=...>` to build URLs from.
 pub fn parse(xml: &str) -> Result<MpdInfo> {
     let unescape = |s: &str| s.replace("&amp;", "&");
 
-    let re_rate = Regex::new(r#"audioSamplingRate="(\d+)""#)?;
-    let re_codec = Regex::new(r#"codecs="([^"]+)""#)?;
-    let re_media = Regex::new(r#"media="([^"]+)""#)?;
-    let re_s = Regex::new(r"<S\b([^>]*?)/?>")?;
-    let re_r = Regex::new(r#"\br="(\d+)""#)?;
-
-    let sample_rate = re_rate
+    let sample_rate = RE_RATE
         .captures(xml)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse().ok())
         .unwrap_or(0);
-    let codec = re_codec
+    let codec = RE_CODEC
         .captures(xml)
         .map(|c| c[1].to_string())
         .unwrap_or_default();
-    let media_tpl = re_media
+    let media_tpl = RE_MEDIA
         .captures(xml)
         .map(|c| unescape(&c[1]))
         .ok_or_else(|| anyhow!("no <SegmentTemplate media=...> in MPD"))?;
 
     // segments_count = 1 (init) + 1 (first media) + sum(r or 1 per <S>)
     let mut count: usize = 2;
-    for s in re_s.captures_iter(xml) {
-        count += re_r
+    for s in RE_S.captures_iter(xml) {
+        count += RE_R
             .captures(&s[1])
             .and_then(|c| c[1].parse::<usize>().ok())
             .unwrap_or(1);
@@ -77,7 +99,7 @@ pub fn parse(xml: &str) -> Result<MpdInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{RE_CODEC, RE_MEDIA, RE_R, RE_RATE, RE_S, parse};
 
     /// A minimal MPD shaped like the ones the catalogue returns.
     fn mpd(segments: &str) -> String {
@@ -89,6 +111,18 @@ mod tests {
                  <SegmentTimeline>{segments}</SegmentTimeline>
                </SegmentTemplate></Representation></AdaptationSet></Period></MPD>"#
         )
+    }
+
+    #[test]
+    fn every_pattern_compiles() {
+        // Goal: the patterns are built once in a `LazyLock`, where a typo is a
+        // panic on first use rather than an error a caller can report. Touching
+        // all five here means that typo fails the suite instead of somebody's
+        // playback. Not covered by the parse tests alone: `RE_R` only runs for a
+        // manifest that repeats segments.
+        for re in [&*RE_RATE, &*RE_CODEC, &*RE_MEDIA, &*RE_S, &*RE_R] {
+            assert!(!re.as_str().is_empty());
+        }
     }
 
     #[test]
