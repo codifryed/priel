@@ -78,9 +78,8 @@ water in and out of the flats twice a day, on the pull of the moon.*
   frontend can be added later as a second binary sharing both.
 
 Next up, and the reason this list has a gap: **PipeWire setup assistance** —
-detecting your `allowed-rates` configuration, explaining what a bit-perfect
-chain needs, and showing the sink's *live* bit depth and sample rate. See the
-roadmap below.
+the `allowed-rates` half is built, and what is left is naming the application
+holding the device when one is. See the roadmap below.
 
 ## Install
 
@@ -210,8 +209,10 @@ DAC badge and a bit-perfect indicator; the `?` reference overlay; a diagnostic
 log with an `M` overlay for reading it without leaving the player; a `D` overlay
 listing the PipeWire nodes between priel and the device with the rate and format
 each one negotiated, marking the node where the track's rate or width is first
-lost with a `⚠`; a `d` picker for moving the output between devices, with an `x`
-toggle for taking a device exclusively.
+lost with a `⚠`, and reporting the rates the sound server is permitted to clock
+at with the change to make when the track's rate is not one of them; a `d`
+picker for moving the output between devices, with an `x` toggle for taking a
+device exclusively.
 
 The `D` overlay names a node only when the chain accounts for what was measured.
 Where the device is clocked elsewhere and every node on the path still reports
@@ -220,12 +221,22 @@ between two of them — it says the change is unaccounted for rather than blamin
 the nearest candidate. A wrong name would send you to reconfigure something that
 was working.
 
+The same overlay then answers *why*. It reads the rates the sound server is
+permitted to clock at out of the same dump, next to the rate the playing track
+needs, and when the two do not meet it quotes the exact setting that would add
+the rate, the file it goes in, and the fact that the server has to be restarted
+for it to apply. That is the usual cause of a resample no node accounts for: the
+server was never allowed to run at that rate, so it resampled before any node on
+the path saw a sample. Where the setting cannot be read the overlay says
+`unknown` rather than guessing at one, and a device held directly has no server
+between priel and the DAC to have a setting at all.
+
 Roadmap, roughly in order:
 
 - **PipeWire configuration help.** The `D` overlay names the node that altered
-  the samples. What is left is the advice: detect and explain the
-  `allowed-rates` setup a bit-perfect chain needs, and say which application is
-  holding the device when one is.
+  the samples, and explains the `allowed-rates` setup when the server was not
+  permitted to run at the track's rate. What is left is saying which application
+  is holding the device when one is.
 - **ALSA setup helpers, for true bit-perfect.** The direct path itself is
   built — `--device alsa/hw:...` with `--exclusive`, or the `x` toggle in the
   picker. What is left is the guidance around it: detect when a device is

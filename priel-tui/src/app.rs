@@ -32,7 +32,9 @@ use ratatui::layout::Rect;
 use priel_core::auth::{Credentials, Pkce};
 use priel_core::{Fault, Playlist, Track};
 use priel_player::Alteration;
-use priel_player::graph::{Attribution, AudioGraph, GraphError, GraphNode, NodeRole};
+use priel_player::graph::{
+    Attribution, AudioGraph, ClockRates, GraphError, GraphNode, NodeRole, RateAdvice, SourceFormat,
+};
 use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig};
 
 #[cfg(test)]
@@ -1869,6 +1871,11 @@ impl App {
                 let blame = g.attribute(source, observed);
                 let mut rows = path_rows(g, blame);
                 rows.extend(blame_row(g, blame, observed));
+                // After the blame sentence, because it is the answer to it:
+                // a rate the server was never permitted to use is refused
+                // before any node on the path sees a sample, which is how the
+                // chain can diverge nowhere and something still move.
+                rows.extend(clock_rows(&g.clock, source));
                 rows
             }
         }
@@ -2504,6 +2511,78 @@ fn blame_row(g: &AudioGraph, blame: Attribution, observed: Option<Alteration>) -
         }
         // A clean chain accuses nobody, and an idle one is not asked to.
         Attribution::Clean | Attribution::NothingToCompare => None,
+    }
+}
+
+/// How many rates go on one row before the list is carried onto the next.
+///
+/// The overlay clips rather than wrapping, so a list long enough to run past
+/// the box would lose its tail silently - and the tail of a rate list is where
+/// the hi-res rates are.
+const RATES_PER_ROW: usize = 8;
+
+/// What the server may clock at, whether this track fits, and what to change.
+///
+/// Pure, like `path_rows`: the decision arrives already made from
+/// `ClockRates::advise` and this only lays it out.
+///
+/// Silent when the dump published no setting *and* nothing is playing, by the
+/// same rule the blame sentence follows - there is no question and no answer,
+/// and a section saying so twice on every idle reading is noise. One of the two
+/// is enough to be worth a row: what the server permits is a fact about the
+/// machine even between tracks, and an unreadable setting is worth admitting
+/// once there is a rate it would have been compared against.
+fn clock_rows(clock: &ClockRates, source: SourceFormat) -> Vec<GraphRow> {
+    let permitted_hz = clock.permitted_hz();
+    if permitted_hz.is_none() && source.rate_hz == 0 {
+        return Vec::new();
+    }
+    let advice = clock.advise(source.rate_hz);
+    let mut rows = vec![note(""), note("  Server clock")];
+
+    match permitted_hz.as_deref() {
+        None => rows.push(reading("    permitted", "unknown".to_string())),
+        Some(rates_hz) => {
+            for (chunk, rates) in rates_hz.chunks(RATES_PER_ROW).enumerate() {
+                let label = if chunk == 0 { "    permitted" } else { "" };
+                rows.push(reading(label, crate::ui::fmt_khz_list(rates)));
+            }
+        }
+    }
+
+    if source.rate_hz > 0 {
+        let refused = matches!(
+            advice,
+            RateAdvice::Missing { .. } | RateAdvice::Pinned { .. }
+        );
+        let mut detail = crate::ui::fmt_khz(source.rate_hz);
+        if refused {
+            detail.push_str("  not permitted");
+        }
+        rows.push(GraphRow {
+            label: "    this track".to_string(),
+            detail,
+            // The same red the badge and the accused node use: the server
+            // refusing this rate is what the badge is reporting, and a second
+            // colour for one answer would read as a second opinion.
+            kind: if refused {
+                GraphRowKind::Culprit
+            } else {
+                GraphRowKind::Note
+            },
+        });
+    }
+
+    rows.extend(advice.lines().iter().map(|line| note(&format!("  {line}"))));
+    rows
+}
+
+/// A labelled reading: what it is on the left, what it says on the right.
+fn reading(label: &str, detail: String) -> GraphRow {
+    GraphRow {
+        label: label.to_string(),
+        detail,
+        kind: GraphRowKind::Note,
     }
 }
 
@@ -3982,10 +4061,12 @@ mod tests {
         r
     }
 
+    /// Both columns, as the overlay draws them: a readout whose answer lives in
+    /// the right-hand column is not visible in the labels alone.
     fn overlay_text(app: &App) -> String {
         app.graph_rows()
             .iter()
-            .map(|row| row.label.clone())
+            .map(|row| format!("{}  {}", row.label, row.detail))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -4097,6 +4178,157 @@ mod tests {
             "two nodes and the connector, and nothing else: {}",
             overlay_text(&r.app)
         );
+    }
+
+    /// The same chain with the server's clock settings published alongside it,
+    /// as one `pw-dump` carries both. The stream carries 32-bit words so the
+    /// chain itself is clean for the 24-bit track `playing_hires` sets up, and
+    /// the only thing left to find is the setting.
+    fn chain_clocked(allowed_hz: &[u32], current_hz: u32) -> AudioGraph {
+        let mut g = chain();
+        g.path[0].format = Some("S32LE".into());
+        g.clock = ClockRates {
+            allowed_hz: Some(allowed_hz.to_vec()),
+            current_hz: Some(current_hz),
+            forced_hz: None,
+        };
+        g
+    }
+
+    #[test]
+    fn a_rate_the_server_may_not_use_is_named_with_the_change_that_would_add_it() {
+        // Goal: the missing half of the diagnosis. When the permitted list
+        // omits the track's rate the server has no choice but to resample, and
+        // the badge that follows looks like a priel problem when it is a
+        // one-line configuration problem. So: the list, the track's rate, that
+        // the two do not meet, and exactly what to write where.
+        let r = playing_hires(chain_clocked(&[48_000], 48_000));
+        let text = overlay_text(&r.app);
+        let rows = r.app.graph_rows();
+        let permitted = rows
+            .iter()
+            .find(|row| row.label.contains("permitted"))
+            .expect("the permitted rates are listed");
+        assert_eq!(permitted.detail, "48 kHz", "{text}");
+        let track = rows
+            .iter()
+            .find(|row| row.label.contains("this track"))
+            .expect("and the rate the track wants");
+        assert!(track.detail.starts_with("44.1 kHz"), "{}", track.detail);
+        assert!(track.detail.contains("not permitted"), "{}", track.detail);
+        assert!(
+            text.contains("default.clock.allowed-rates = [ 44100 48000 ]"),
+            "the whole setting, copyable: {text}"
+        );
+        assert!(
+            text.contains("~/.config/pipewire/pipewire.conf.d/"),
+            "and where it goes: {text}"
+        );
+        assert!(text.contains("Restart the sound server"), "{text}");
+    }
+
+    #[test]
+    fn a_rate_the_server_may_use_is_stated_and_then_left_alone() {
+        // Goal: advice printed over a working setup teaches the reader to
+        // ignore it. The two readouts still appear - they are what makes the
+        // silence meaningful - and nothing else does.
+        let r = playing_hires(chain_clocked(&[44_100, 48_000], 48_000));
+        let text = overlay_text(&r.app);
+        assert!(text.contains("44.1 / 48 kHz"), "{text}");
+        assert!(text.contains("this track"), "{text}");
+        assert!(
+            !text.contains("not permitted"),
+            "44.1 kHz is on the list: {text}"
+        );
+        assert!(
+            !text.contains("allowed-rates"),
+            "so there is nothing to change: {text}"
+        );
+        assert!(
+            r.app
+                .graph_rows()
+                .iter()
+                .all(|row| row.kind != GraphRowKind::Culprit),
+            "and nothing to accuse: {text}"
+        );
+    }
+
+    #[test]
+    fn a_clock_setting_that_could_not_be_read_is_reported_as_unknown() {
+        // Goal: the discipline the whole overlay turns on. A dump that named no
+        // permitted rates leaves priel with nothing to advise, and inventing a
+        // list to advise against would send the reader to change a setting on
+        // no evidence at all.
+        let r = playing_hires(chain());
+        let text = overlay_text(&r.app);
+        let rows = r.app.graph_rows();
+        let permitted = rows
+            .iter()
+            .find(|row| row.label.contains("permitted"))
+            .expect("the row is still there, saying what it does not know");
+        assert_eq!(permitted.detail, "unknown", "{text}");
+        assert!(
+            !text.contains("allowed-rates"),
+            "no advice from no data: {text}"
+        );
+        assert!(!text.contains("not permitted"), "{text}");
+    }
+
+    #[test]
+    fn an_idle_overlay_with_nothing_known_about_the_clock_says_nothing_about_it() {
+        // Goal: the same rule the blame sentence follows. With no track and no
+        // published setting there is no question and no answer, and a section
+        // saying so twice on every idle reading is noise.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Ok(chain())))
+            .expect("send");
+        r.app.drain_worker();
+        assert!(
+            !overlay_text(&r.app).contains("permitted"),
+            "{}",
+            overlay_text(&r.app)
+        );
+    }
+
+    #[test]
+    fn an_idle_overlay_still_lists_the_rates_the_server_published() {
+        // Goal: with nothing playing there is no comparison to make, but what
+        // the server may clock at is a fact about the machine and is worth
+        // reading before a track starts.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Ok(chain_clocked(&[44_100], 44_100))))
+            .expect("send");
+        r.app.drain_worker();
+        let text = overlay_text(&r.app);
+        assert!(text.contains("permitted"), "{text}");
+        assert!(
+            !text.contains("this track"),
+            "and no row about a track there is none of: {text}"
+        );
+    }
+
+    #[test]
+    fn the_gap_the_chain_left_is_answered_by_the_servers_own_setting() {
+        // Goal: the two halves of one diagnosis, in the order they are read.
+        // The chain diverges nowhere and the hardware still moved, because the
+        // server refused the rate before any node on the path saw a sample.
+        // "Nothing on this path did it" is where the reader used to stop.
+        let mut r = playing_hires(chain_clocked(&[48_000], 48_000));
+        r.app.status.hw = Some(HwParams {
+            card: "AUDIO".into(),
+            rate: 48_000,
+            format: "S32_LE".into(),
+            channels: 2,
+        });
+        let text = overlay_text(&r.app);
+        let gap = text.find("nothing on this path").expect("the admitted gap");
+        let why = text.find("not permitted").expect("and what explains it");
+        assert!(gap < why, "the answer follows the question: {text}");
+        assert!(text.contains("default.clock.allowed-rates"), "{text}");
     }
 
     #[test]

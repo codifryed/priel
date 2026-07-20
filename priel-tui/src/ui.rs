@@ -286,6 +286,7 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
             ("resampled", "rate changed"),
             ("truncated", "format too narrow"),
             ("⚠ in D", "the node that did it"),
+            ("permitted", "rates the server may use"),
             ("0", "restore unity gain"),
         ],
     ),
@@ -1426,10 +1427,28 @@ pub(crate) fn fmt_khz(hz: u32) -> String {
     if hz == 0 {
         return "?".to_string();
     }
+    format!("{} kHz", khz(hz))
+}
+
+/// Several rates the same way, with the unit said once at the end.
+///
+/// A permitted-rate list runs to ten entries, and repeating " kHz" after each
+/// of them pushes the row past the box it is drawn in without adding a thing.
+/// The decimal is what matters and it is kept.
+pub(crate) fn fmt_khz_list(rates_hz: &[u32]) -> String {
+    if rates_hz.is_empty() {
+        return String::new();
+    }
+    let joined: Vec<String> = rates_hz.iter().copied().map(khz).collect();
+    format!("{} kHz", joined.join(" / "))
+}
+
+/// The number by itself, so the single and the list cannot disagree about it.
+fn khz(hz: u32) -> String {
     if hz.is_multiple_of(1000) {
-        format!("{} kHz", hz / 1000)
+        (hz / 1000).to_string()
     } else {
-        format!("{:.1} kHz", f64::from(hz) / 1000.0)
+        format!("{:.1}", f64::from(hz) / 1000.0)
     }
 }
 
@@ -1454,7 +1473,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use priel_core::{Playlist, Track};
     use priel_player::OutputAccess;
-    use priel_player::graph::{AudioGraph, GraphError, GraphNode, NodeRole};
+    use priel_player::graph::{AudioGraph, ClockRates, GraphError, GraphNode, NodeRole};
     use ratatui::layout::Rect;
     use ratatui::style::Style;
     use ratatui::{Terminal, backend::TestBackend};
@@ -1890,6 +1909,43 @@ mod tests {
             format: Some(format.into()),
             channels: Some(2),
         }
+    }
+
+    #[test]
+    fn the_configuration_change_reaches_the_screen_whole() {
+        // Goal: the overlay clips rather than wrapping, and a setting whose
+        // tail is clipped is worse than no advice at all - it still looks like
+        // something that can be copied. Ten permitted rates is a real machine's
+        // list, and the line that adds one to it is the longest thing this
+        // overlay ever draws.
+        let mut sc = screen();
+        sc.app.status.loaded = true;
+        sc.app.status.playing = true;
+        sc.app.status.in_sample_rate = 352_800;
+        sc.app.status.in_format = "s32".into();
+        sc.app.now_meta.bit_depth = 24;
+        with_chain(
+            &mut sc,
+            AudioGraph {
+                path: vec![node("Studio DAC", NodeRole::Device, 352_800, "S32LE")],
+                clock: ClockRates {
+                    allowed_hz: Some(vec![
+                        44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 384_000, 705_600, 768_000,
+                    ]),
+                    current_hz: Some(48_000),
+                    forced_hz: None,
+                },
+            },
+        );
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 40);
+        assert!(out.contains("Server clock"), "{out}");
+        assert!(out.contains("352.8 kHz  not permitted"), "{out}");
+        assert!(out.contains("default.clock.allowed-rates = ["), "{out}");
+        assert!(out.contains("352800"), "the rate being added: {out}");
+        assert!(out.contains("768000"), "and the tail of the list: {out}");
+        assert!(out.contains("pipewire.conf.d"), "where it goes: {out}");
+        assert!(out.contains("Restart the sound server"), "{out}");
     }
 
     #[test]
