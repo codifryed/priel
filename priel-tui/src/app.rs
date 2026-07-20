@@ -1592,7 +1592,7 @@ mod tests {
             title: title.into(),
             artist: artist.into(),
             album: "Alb".into(),
-            duration: 100,
+            duration_secs: 100,
             quality: "HI-RES".into(),
         }
     }
@@ -1602,7 +1602,7 @@ mod tests {
             uuid: uuid.into(),
             title: title.into(),
             num_tracks: 2,
-            duration: 200,
+            duration_secs: 200,
         }
     }
 

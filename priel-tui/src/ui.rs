@@ -654,7 +654,7 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
                     "  {:<44} {:>4} tracks   {}",
                     trunc(&p.title, 44),
                     p.num_tracks,
-                    fmt_hms(p.duration)
+                    fmt_hms(p.duration_secs)
                 ),
                 false,
             );
@@ -671,7 +671,7 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
                 trunc(&t.title, 32),
                 trunc(&t.artist, 20),
                 trunc(&t.quality, 8),
-                fmt_dur(t.duration),
+                fmt_dur(t.duration_secs),
             ),
             is_now,
         )
@@ -1143,7 +1143,7 @@ mod tests {
             title: title.into(),
             artist: "Artist".into(),
             album: "Album".into(),
-            duration: 245,
+            duration_secs: 245,
             quality: "HI-RES".into(),
         }
     }
@@ -1305,7 +1305,7 @@ mod tests {
             uuid: "u".into(),
             title: "Evening".into(),
             num_tracks: 12,
-            duration: 3725,
+            duration_secs: 3725,
         }];
         sc.app.view = View::Playlists;
         let out = text(&mut sc.app, 120, 12);

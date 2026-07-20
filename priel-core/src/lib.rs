@@ -62,7 +62,7 @@ pub struct Track {
     pub title: String,
     pub artist: String,
     pub album: String,
-    pub duration: u32, // seconds
+    pub duration_secs: u32,
     /// Short quality tier from the listing (HI-RES / LOSSLESS / HIGH / …).
     /// Per-track sample rate is only known after `resolve_stream`.
     pub quality: String,
@@ -90,7 +90,7 @@ pub struct Playlist {
     pub uuid: String,
     pub title: String,
     pub num_tracks: u32,
-    pub duration: u32,
+    pub duration_secs: u32,
 }
 
 /// Multi-type search results.
@@ -198,7 +198,7 @@ impl TrackBrief {
                 .map(|a| a.name.clone())
                 .unwrap_or_default(),
             album: self.album.title,
-            duration: self.duration,
+            duration_secs: self.duration,
             quality: quality_label(&self.media_metadata.tags, &self.audio_quality),
         }
     }
@@ -221,7 +221,7 @@ impl PlaylistBrief {
             uuid: self.uuid,
             title: self.title,
             num_tracks: self.number_of_tracks,
-            duration: self.duration,
+            duration_secs: self.duration,
         }
     }
 }
@@ -893,7 +893,7 @@ mod tests {
 
         assert_eq!(tracks.len(), 1);
         let t = &tracks[0];
-        assert_eq!((t.id, t.duration), (1, 100));
+        assert_eq!((t.id, t.duration_secs), (1, 100));
         assert_eq!(t.artist, "A", "the first artist represents the track");
         assert_eq!(t.album, "Alb");
         assert_eq!(t.quality, "HI-RES", "the hi-res tag wins over audioQuality");
