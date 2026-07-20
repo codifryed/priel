@@ -126,7 +126,7 @@ where
         for cmd in cmd_rx {
             let msg = match cmd {
                 ToWorker::LoadFavorites => match client.favorite_tracks(0, 100) {
-                    Ok(t) => FromWorker::Favorites(t),
+                    Ok(page) => FromWorker::Favorites(page.items),
                     Err(e) => failed("favorites", &e),
                 },
                 ToWorker::LoadPlaylists => match client.user_playlists(0, 100) {
