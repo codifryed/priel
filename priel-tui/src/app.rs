@@ -78,6 +78,7 @@ pub enum Mode {
     Filter,      // local filter of the current list
     Search,      // editing the global TIDAL search query
     Help,        // the shortcut reference is up; it swallows input until dismissed
+    Log,         // the recent diagnostics are up; modal in the same way
     Credentials, // first run with no client identity; asking before fetching one
     Login,       // signing in: browser is open, waiting for the redirected URL
 }
@@ -156,6 +157,11 @@ pub struct App {
     /// The worker thread has gone, and has been reported. Latched so the
     /// report happens once rather than on every pass of the event loop.
     worker_lost: bool,
+    /// The diagnostics the log overlay shows, shared with the sink.
+    pub(crate) recent: crate::logging::Recent,
+    /// How many lines back from the newest the log overlay is scrolled. Counted
+    /// from the end because that is where the interesting line always is.
+    log_scroll: usize,
     pub frame: usize,
     pub should_quit: bool,
 
@@ -201,7 +207,11 @@ struct RenderSig {
 }
 
 impl App {
-    pub fn new(player: PlayerConfig, token_path: String) -> anyhow::Result<Self> {
+    pub fn new(
+        player: PlayerConfig,
+        token_path: String,
+        recent: crate::logging::Recent,
+    ) -> anyhow::Result<Self> {
         let player = Player::with_config(player)?;
         let creds_path = Credentials::default_path();
         let lookup = vec![Credentials::override_path(), creds_path.clone()];
@@ -210,6 +220,7 @@ impl App {
                 .is_some();
         let worker = worker::spawn(token_path.clone(), creds_path.clone());
         let mut app = Self::with(player, worker);
+        app.recent = recent;
         let has_session = priel_core::auth::StoredToken::load(&token_path).is_ok();
         app.credentials_path = Some(creds_path.clone());
         app.credentials_lookup = lookup;
@@ -275,6 +286,8 @@ impl App {
             last_click: None,
             dirty: true,
             worker_lost: false,
+            recent: crate::logging::Recent::default(),
+            log_scroll: 0,
             last_sig: RenderSig::default(),
             credentials_path: None,
             credentials_lookup: Vec::new(),
@@ -1098,6 +1111,7 @@ impl App {
             Mode::Filter => self.on_key_filter(key),
             Mode::Search => self.on_key_search(key),
             Mode::Help => self.on_key_help(key),
+            Mode::Log => self.on_key_log(key),
             Mode::Credentials => self.on_key_credentials(key),
             Mode::Login => self.on_key_login(key),
             Mode::Normal => self.on_key_normal(key),
@@ -1113,6 +1127,46 @@ impl App {
         ) {
             self.mode = Mode::Normal;
         }
+    }
+
+    /// The log overlay: modal like the help one, and scrolled like every list.
+    ///
+    /// A second scrolling idiom would be its own bug, so j/k and g/G mean here
+    /// what they mean everywhere else - except that "top" is the oldest line,
+    /// since the overlay opens on the newest.
+    fn on_key_log(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('M' | 'q' | ' ') => {
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.log_scroll = (self.log_scroll + 1).min(self.log_scroll_max());
+            }
+            KeyCode::Char('g') => self.log_scroll = self.log_scroll_max(),
+            KeyCode::Char('G') => self.log_scroll = 0,
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    /// How far back the overlay may be scrolled.
+    fn log_scroll_max(&self) -> usize {
+        self.recent.lines().len().saturating_sub(1)
+    }
+
+    /// The diagnostics to show, oldest first.
+    #[must_use]
+    pub fn log_lines(&self) -> Vec<String> {
+        self.recent.lines()
+    }
+
+    /// How far back the log overlay is scrolled, in lines from the newest.
+    #[must_use]
+    pub fn log_offset(&self) -> usize {
+        self.log_scroll
     }
 
     fn on_key_filter(&mut self, key: KeyEvent) {
@@ -1190,6 +1244,12 @@ impl App {
             KeyCode::Char('g') => self.goto_top(),
             KeyCode::Char('G') => self.goto_bottom(),
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('M') => {
+                self.mode = Mode::Log;
+                // Always open on the newest line: the reason for opening this is
+                // almost always something that just happened.
+                self.log_scroll = 0;
+            }
             KeyCode::Char('A') => self.start_login(),
             KeyCode::Enter => self.on_enter(),
             KeyCode::Char(' ') => self.player.toggle_pause(),
@@ -1209,6 +1269,24 @@ impl App {
     pub fn on_mouse(&mut self, m: MouseEvent) {
         if matches!(self.mode, Mode::Credentials | Mode::Login) {
             return; // these screens take no mouse input
+        }
+        if self.mode == Mode::Log {
+            match m.kind {
+                MouseEventKind::ScrollUp => {
+                    self.log_scroll = (self.log_scroll + 1).min(self.log_scroll_max());
+                    self.dirty = true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.log_scroll = self.log_scroll.saturating_sub(1);
+                    self.dirty = true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.mode = Mode::Normal;
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+            return;
         }
         if self.mode == Mode::Help {
             // Any click dismisses; scrolling the list behind it would be odd.
@@ -1524,6 +1602,53 @@ mod tests {
         r.app.drain_worker();
         assert!(r.app.notice.as_deref().unwrap().contains("expired"));
         assert!(!r.app.loading);
+    }
+
+    #[test]
+    fn the_log_overlay_opens_on_its_key_and_closes_again() {
+        // Goal: "logging for a TUI is odd" is answered by not making the user
+        // leave priel to read it. The key that opens it must also close it.
+        let mut r = rig();
+        r.app.on_key(key('M'));
+        assert_eq!(r.app.mode, Mode::Log);
+        r.app.on_key(key('M'));
+        assert_eq!(r.app.mode, Mode::Normal);
+        r.app.on_key(key('M'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal, "Esc closes it too");
+    }
+
+    #[test]
+    fn the_log_overlay_swallows_the_keys_behind_it() {
+        // Goal: modal like the help overlay. A view change happening underneath
+        // an overlay is how a user ends up somewhere they did not ask for.
+        let mut r = rig();
+        r.app.on_key(key('M'));
+        r.app.on_key(key('2'));
+        assert_eq!(r.app.view, View::Favorites, "the view must not change");
+        assert_eq!(r.app.mode, Mode::Log, "and it is still open");
+    }
+
+    #[test]
+    fn the_log_overlay_scrolls_with_the_same_keys_as_a_list() {
+        // Goal: every other list in priel moves on j/k and g/G, so this one
+        // must too - a second scrolling idiom would be its own bug.
+        let mut r = rig();
+        for i in 0..40 {
+            r.app.recent.push(format!("line {i}\n"));
+        }
+        r.app.on_key(key('M'));
+        assert_eq!(r.app.log_scroll, 0, "it opens at the newest lines");
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.log_scroll, 1, "k goes back through history");
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.log_scroll, 0);
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.log_scroll, 0, "and stops at the newest");
+        r.app.on_key(key('g'));
+        assert!(r.app.log_scroll > 1, "g reaches the oldest");
+        r.app.on_key(key('G'));
+        assert_eq!(r.app.log_scroll, 0, "G returns to the newest");
     }
 
     #[test]
@@ -2420,6 +2545,7 @@ mod tests {
                 ..PlayerConfig::default()
             },
             "/nonexistent/priel.json".into(),
+            crate::logging::Recent::default(),
         )
         .expect("an app should be constructible without a valid token");
         assert_eq!(app.view, View::Favorites);

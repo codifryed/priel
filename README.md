@@ -150,6 +150,7 @@ row of the interface is also clickable.
 | Action | Keyboard | Mouse |
 |---|---|---|
 | Full key reference | `?` | click `[?]` |
+| Recent log messages | `M` | scroll to page back |
 | Sign in again | `A` | — |
 | Switch view | `Tab` cycles, `1`/`2`/`3` | click a tab |
 | Move selection | `j`/`k`, `↑`/`↓` | scroll wheel |

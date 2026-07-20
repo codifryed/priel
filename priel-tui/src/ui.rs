@@ -44,6 +44,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.mode == Mode::Help {
         help_overlay(f, f.area());
     }
+    if app.mode == Mode::Log {
+        log_overlay(f, f.area(), app);
+    }
     if app.mode == Mode::Credentials {
         credentials_overlay(f, f.area(), app.credential_status());
     }
@@ -248,6 +251,7 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
             ("1 2 3", "jump to a view"),
             ("Enter", "open playlist"),
             ("Esc", "back to playlists"),
+            ("M", "recent log messages"),
         ],
     ),
     (
@@ -326,6 +330,81 @@ fn help_lines(sections: &[(&str, &[(&str, &str)])]) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// The recent diagnostics, newest last.
+///
+/// Modal and deliberately plain. This is the answer to "something just went
+/// wrong and I do not want to leave the player to find out what" - the same
+/// lines that are in the log file, without going to look for it.
+fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let width = area.width.saturating_sub(4).min(120);
+    let height = area.height.saturating_sub(2);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Recent log ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+
+    // One row goes to the way out, as in the help overlay: an overlay that does
+    // not say how to close it is a trap.
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let all = app.log_lines();
+    let lines: Vec<Line> = if all.is_empty() {
+        vec![Line::from(Span::styled(
+            "Nothing recorded yet.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        // Windowed from the end: the newest line is the one that is always on
+        // screen, and scrolling moves that window back through history.
+        let end = all.len().saturating_sub(app.log_offset()).max(1);
+        let start = end.saturating_sub(usize::from(body.height));
+        all[start..end].iter().map(|l| log_line(l)).collect()
+    };
+    f.render_widget(Paragraph::new(lines), body);
+
+    if inner.height > 0 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  j k scroll · g G oldest / newest · M, Esc or q to close",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Rect {
+                y: inner.y + inner.height.saturating_sub(1),
+                height: 1,
+                ..inner
+            },
+        );
+    }
+}
+
+/// One log line, coloured by how much it wants to be noticed.
+fn log_line(raw: &str) -> Line<'_> {
+    let text = raw.trim_end_matches('\n');
+    let colour = if text.contains(" ERROR ") {
+        Color::Red
+    } else if text.contains(" WARN ") {
+        Color::Yellow
+    } else {
+        Color::Gray
+    };
+    Line::from(Span::styled(text, Style::default().fg(colour)))
 }
 
 fn help_overlay(f: &mut Frame, area: Rect) {
@@ -1373,6 +1452,38 @@ mod tests {
     }
 
     #[test]
+    fn the_log_overlay_shows_the_newest_lines_and_the_way_out() {
+        // Goal: the answer to "logging in a TUI is odd" is that nobody has to
+        // leave priel to read it. The newest line is the one that matters, so it
+        // must be on screen without scrolling.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Hidden Title")];
+        for i in 0..40 {
+            // Both levels that get a colour of their own, so a change to that
+            // mapping shows up here rather than only on someone's screen.
+            let level = if i % 2 == 0 { "ERROR" } else { "WARN " };
+            sc.app
+                .recent
+                .push(format!("00:00:00.000Z {level} [worker] p: line {i}\n"));
+        }
+        sc.app.mode = Mode::Log;
+        let out = text(&mut sc.app, 100, 26);
+        assert!(out.contains("line 39"), "the newest line: {out}");
+        assert!(out.contains("to close"), "{out}");
+        assert!(!out.contains("Hidden Title"), "the list is covered: {out}");
+    }
+
+    #[test]
+    fn an_empty_log_says_so_rather_than_showing_a_blank_box() {
+        // Goal: an empty overlay reads as broken. Nothing recorded is itself
+        // the answer to "what went wrong", and worth saying in words.
+        let mut sc = screen();
+        sc.app.mode = Mode::Log;
+        let out = text(&mut sc.app, 100, 26);
+        assert!(out.contains("Nothing recorded yet"), "{out}");
+    }
+
+    #[test]
     fn the_overlay_stacks_into_one_column_on_a_narrow_terminal() {
         // Goal: two columns on a narrow screen clip every description in half.
         // Stacking keeps the text readable instead.
@@ -1394,6 +1505,9 @@ mod tests {
             sc.app.now_playing = Some(track(1, "T"));
             let _ = draw(&mut sc.app, w, h);
             sc.app.mode = Mode::Help;
+            let _ = draw(&mut sc.app, w, h);
+            sc.app.recent.push("a line that will not fit\n".to_string());
+            sc.app.mode = Mode::Log;
             let _ = draw(&mut sc.app, w, h);
         }
     }

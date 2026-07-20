@@ -31,9 +31,11 @@
 //! Nothing here may be called from mpv's `read`/`seek` callbacks: formatting
 //! allocates, and those callbacks may not.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -49,6 +51,44 @@ const QUEUE_DEPTH: usize = 1024;
 /// state directory. Rotation would be a dependency; a cap and a truncate at
 /// startup are the whole of what a single-user desktop client needs.
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How many lines the in-app view keeps. Bounded by what a person will scroll
+/// through, not by what the disk will hold - the file is the long record.
+const RECENT_MAX: usize = 500;
+
+/// The last few hundred lines, kept in memory as well as written out.
+///
+/// The file answers "what happened during that session"; this answers "what just
+/// went wrong", for the person still sitting in front of the terminal. Sharing
+/// one source means the overlay and a bug report cannot disagree.
+///
+/// Filled by the writer thread, so a producer pays nothing for it.
+#[derive(Clone, Default)]
+pub struct Recent(Arc<Mutex<VecDeque<String>>>);
+
+impl Recent {
+    pub(crate) fn push(&self, line: String) {
+        let mut ring = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if ring.len() == RECENT_MAX {
+            ring.pop_front();
+        }
+        ring.push_back(line);
+    }
+
+    /// A snapshot, oldest first.
+    ///
+    /// A copy rather than a borrow: the lock is also taken by the writer thread,
+    /// and the render path must not hold it for the length of a frame.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
 
 /// What the writer thread receives.
 enum Msg {
@@ -74,6 +114,7 @@ struct Sink<W: Write> {
     written: u64,
     limit: u64,
     capped: bool,
+    recent: Recent,
 }
 
 /// Install the global logger, writing to `path`.
@@ -85,7 +126,7 @@ struct Sink<W: Write> {
 ///
 /// If the log directory or the file itself cannot be created, or if a logger has
 /// already been installed.
-pub fn init(level: LevelFilter, path: &str) -> Result<()> {
+pub fn init(level: LevelFilter, path: &str, recent: &Recent) -> Result<()> {
     // Off means off: no file is created at all, rather than an empty one left
     // behind in the user's state directory.
     if level == LevelFilter::Off {
@@ -104,7 +145,7 @@ pub fn init(level: LevelFilter, path: &str) -> Result<()> {
     // sitting in the buffer when the process dies - is bought back by flushing
     // every warning, and by the panic hook flushing before it lets go.
     let out = std::io::BufWriter::new(file);
-    let (logger, _writer) = Logger::with_sink(level, out, MAX_BYTES);
+    let (logger, _writer) = Logger::with_sink(level, out, MAX_BYTES, recent.clone());
     // The handle is dropped on purpose: the writer thread lives as long as the
     // process, since the installed logger keeps its end of the queue forever.
     log::set_boxed_logger(Box::new(logger)).context("installing the logger")?;
@@ -137,9 +178,10 @@ impl Logger {
         level: LevelFilter,
         out: W,
         limit: u64,
+        recent: Recent,
     ) -> (Self, JoinHandle<()>) {
         let (tx, rx) = sync_channel(QUEUE_DEPTH);
-        let mut sink = Sink::new(out, limit);
+        let mut sink = Sink::new(out, limit, recent);
         let writer = std::thread::spawn(move || sink.run(&rx));
         (Self::with_channel(level, tx), writer)
     }
@@ -215,12 +257,13 @@ impl log::Log for Logger {
 }
 
 impl<W: Write> Sink<W> {
-    fn new(out: W, limit: u64) -> Self {
+    fn new(out: W, limit: u64, recent: Recent) -> Self {
         Self {
             out,
             written: 0,
             limit,
             capped: false,
+            recent,
         }
     }
 
@@ -229,6 +272,9 @@ impl<W: Write> Sink<W> {
     /// I/O errors are dropped on purpose: this *is* the error path, and there is
     /// nowhere left to report to.
     fn write_line(&mut self, text: &str) {
+        // Before the cap: the byte budget protects the disk, and blinding the
+        // overlay as well would help nobody.
+        self.recent.push(text.to_string());
         if self.capped {
             return;
         }
@@ -321,7 +367,8 @@ fn format_line(now: SystemTime, thread: &str, record: &Record) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Logger, MAX_BYTES, Msg, Sink, format_line, init, panic_report, record_panic, timestamp,
+        Logger, MAX_BYTES, Msg, RECENT_MAX, Recent, Sink, format_line, init, panic_report,
+        record_panic, timestamp,
     };
     use log::{Level, LevelFilter, Log, Record};
     use std::sync::mpsc::sync_channel;
@@ -512,7 +559,7 @@ mod tests {
         // note matters as much as the cap: a log that just stops reads as a
         // hang.
         let shared = Shared::default();
-        let mut sink = Sink::new(shared.clone(), 32);
+        let mut sink = Sink::new(shared.clone(), 32, Recent::default());
         sink.write_line("0123456789012345678901234567890123456789\n");
         sink.write_line("this must not be written\n");
         let text = shared.text();
@@ -526,12 +573,59 @@ mod tests {
         // Goal: the end-to-end path, and the one guarantee the panic hook needs
         // - that after flush() returns, the line is really in the sink.
         let shared = Shared::default();
-        let (logger, writer) = Logger::with_sink(LevelFilter::Info, shared.clone(), MAX_BYTES);
+        let (logger, writer) = Logger::with_sink(
+            LevelFilter::Info,
+            shared.clone(),
+            MAX_BYTES,
+            Recent::default(),
+        );
         logger.log(&record(Level::Error, &format_args!("boom")));
         logger.flush();
         assert!(shared.text().contains("boom"), "{}", shared.text());
         drop(logger);
         writer.join().expect("the writer thread should end cleanly");
+    }
+
+    #[test]
+    fn the_recent_ring_keeps_the_newest_and_forgets_the_rest() {
+        // Goal: this is read on screen, so it is bounded by what a person can
+        // scroll through - and what they want is the end, not the beginning.
+        let recent = Recent::default();
+        for i in 0..(RECENT_MAX + 10) {
+            recent.push(format!("line {i}\n"));
+        }
+        let lines = recent.lines();
+        assert_eq!(lines.len(), RECENT_MAX, "the ring is bounded");
+        assert!(lines[0].contains(&format!("line {}", 10)), "{}", lines[0]);
+        assert!(
+            lines[RECENT_MAX - 1].contains(&format!("line {}", RECENT_MAX + 9)),
+            "the newest line is the last one"
+        );
+    }
+
+    #[test]
+    fn a_line_reaches_the_screen_as_well_as_the_file() {
+        // Goal: the overlay and the file are fed from the same place, so what a
+        // user reads on screen is what a bug report will contain.
+        let shared = Shared::default();
+        let recent = Recent::default();
+        let (logger, _writer) =
+            Logger::with_sink(LevelFilter::Info, shared.clone(), MAX_BYTES, recent.clone());
+        logger.log(&record(Level::Error, &format_args!("boom")));
+        logger.flush();
+        assert!(shared.text().contains("boom"));
+        assert!(recent.lines().iter().any(|l| l.contains("boom")));
+    }
+
+    #[test]
+    fn the_screen_keeps_filling_after_the_file_is_full() {
+        // Goal: the byte cap protects the disk, not the person watching. A
+        // capped file must not also blind the overlay.
+        let recent = Recent::default();
+        let mut sink = Sink::new(Shared::default(), 4, recent.clone());
+        sink.write_line("over the budget already\n");
+        sink.write_line("and this one is refused\n");
+        assert_eq!(recent.lines().len(), 2, "{:?}", recent.lines());
     }
 
     #[test]
@@ -541,7 +635,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("priel-log-off-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let name = path.to_string_lossy().into_owned();
-        init(LevelFilter::Off, &name).expect("off is not an error");
+        init(LevelFilter::Off, &name, &Recent::default()).expect("off is not an error");
         assert!(!path.exists(), "nothing should have been created");
     }
 
@@ -554,8 +648,12 @@ mod tests {
             std::env::temp_dir().join(format!("priel-log-blocker-{}", std::process::id()));
         std::fs::write(&blocker, b"not a directory").expect("the temp file should be writable");
         let path = blocker.join("priel.log");
-        let err =
-            init(LevelFilter::Info, &path.to_string_lossy()).expect_err("a file is no parent");
+        let err = init(
+            LevelFilter::Info,
+            &path.to_string_lossy(),
+            &Recent::default(),
+        )
+        .expect_err("a file is no parent");
         assert!(format!("{err:#}").contains("log"), "{err:#}");
         let _ = std::fs::remove_file(&blocker);
     }

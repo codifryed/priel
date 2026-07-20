@@ -58,7 +58,10 @@ fn main() -> Result<()> {
     //
     // Done here rather than in `App::new` for the same reason as the migration
     // below - it writes to the user's home directory, and tests build an `App`.
-    if let Err(e) = logging::init(args.log_level(), &args.log_path()) {
+    // The in-memory ring is created here whether or not a file can be opened,
+    // so the `M` overlay works even when the log is off or unwritable.
+    let recent = logging::Recent::default();
+    if let Err(e) = logging::init(args.log_level(), &args.log_path(), &recent) {
         eprintln!("priel: no diagnostic log: {e:#}");
     }
     log::info!("priel {} starting", env!("CARGO_PKG_VERSION"));
@@ -72,7 +75,7 @@ fn main() -> Result<()> {
         logging::record_panic(&info.to_string());
         orig(info);
     }));
-    let outcome = session(args);
+    let outcome = session(args, recent);
     match &outcome {
         Ok(()) => log::info!("priel stopping"),
         Err(e) => log::error!("exiting: {e:?}"),
@@ -88,7 +91,7 @@ fn main() -> Result<()> {
 /// Split out so that no exit path can skip the record of why priel stopped: a
 /// terminal that cannot be prepared used to return straight out of `main`,
 /// leaving the one file that would have explained it empty.
-fn session(args: cli::Cli) -> Result<()> {
+fn session(args: cli::Cli, recent: logging::Recent) -> Result<()> {
     // Both files used to live in the config directory. Move them once rather
     // than silently logging the user out to make a spec point.
     //
@@ -101,7 +104,7 @@ fn session(args: cli::Cli) -> Result<()> {
         mpv_log_file: args.mpv_log_file(),
         audio_device: args.device,
     };
-    let res = App::new(player, priel_core::Client::default_token_path())
+    let res = App::new(player, priel_core::Client::default_token_path(), recent)
         .and_then(|mut app| run(&mut terminal, &mut app, &mut TerminalEvents));
     restore(&mut terminal)?;
     // Reported rather than returned: the terminal is back, and printing the
