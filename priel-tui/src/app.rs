@@ -231,6 +231,9 @@ pub struct App {
     /// When the list was last asked for. The picker says it is still looking
     /// until this is old enough to mean nothing is going to answer.
     devices_asked: Option<Instant>,
+    /// The device failure already shown. Latched so it is reported once rather
+    /// than on every tick for as long as the player carries it.
+    reported_device_error: Option<String>,
     pub frame: usize,
     pub should_quit: bool,
 
@@ -357,6 +360,7 @@ impl App {
             device_offset: 0,
             device_rows: Vec::new(),
             devices_asked: None,
+            reported_device_error: None,
             last_sig: RenderSig::default(),
             credentials_path: None,
             token_path: None,
@@ -971,6 +975,7 @@ impl App {
 
     fn refresh_from_status(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+        self.report_device_error();
 
         let sig = self.render_sig();
         if sig != self.last_sig {
@@ -1338,9 +1343,48 @@ impl App {
             KeyCode::Char('K') => self.device_up(self.full_page()),
             KeyCode::Char('g') => self.device_selected = 0,
             KeyCode::Char('G') => self.device_selected = self.devices.len().saturating_sub(1),
+            KeyCode::Enter => self.choose_device(self.device_selected),
             _ => {}
         }
         self.dirty = true;
+    }
+
+    /// Move the output to the device on this row, for this session.
+    ///
+    /// The one place that changes the output: the Enter key and a click on a
+    /// row both arrive here, so the two cannot drift apart. Nothing is written
+    /// anywhere - priel reads no configuration file, and `--device` is what
+    /// makes a choice outlive the session, which is what the overlay says.
+    fn choose_device(&mut self, index: usize) {
+        let Some(device) = self.devices.get(index) else {
+            return;
+        };
+        let name = device.name.clone();
+        let label = if device.description.is_empty() {
+            name.clone()
+        } else {
+            device.description.clone()
+        };
+        self.player.set_device(&name);
+        self.notice = Some(format!("Output: {label} — this session only"));
+        self.mode = Mode::Normal;
+        self.dirty = true;
+    }
+
+    /// Report a device change that did not take, once.
+    ///
+    /// The player carries the reason in its status until the next change is
+    /// accepted, so without the latch this would replace every other notice on
+    /// screen ten times a second.
+    fn report_device_error(&mut self) {
+        if self.status.device_error == self.reported_device_error {
+            return;
+        }
+        self.reported_device_error = self.status.device_error.clone();
+        if let Some(detail) = self.reported_device_error.clone() {
+            self.notice = Some(detail);
+            self.dirty = true;
+        }
     }
 
     fn device_down(&mut self, by: usize) {
@@ -1363,7 +1407,10 @@ impl App {
             .find(|(r, _)| hit(*r, col, row))
             .map(|(_, i)| *i)
         {
-            Some(i) => self.device_selected = i,
+            Some(i) => {
+                self.device_selected = i;
+                self.choose_device(i);
+            }
             None => self.mode = Mode::Normal,
         }
     }
@@ -2185,12 +2232,16 @@ mod tests {
         // Goal: a picker that changed the output as the selection moved would
         // be unusable. Only choosing changes anything, and Esc chooses nothing.
         let mut r = with_picker("pipewire/dac");
+        r.app.notice = None;
         r.app.on_key(key('j'));
+        r.app.on_key(key('k'));
+        r.app.on_key(key('G'));
         r.app.on_key(code(KeyCode::Esc));
         assert_eq!(r.app.mode, Mode::Normal);
-        assert_eq!(
-            r.app.status.audio_device, "pipewire/dac",
-            "cancelling must leave the output where it was"
+        assert!(
+            r.app.notice.is_none(),
+            "moving and cancelling chooses nothing: {:?}",
+            r.app.notice
         );
     }
 
@@ -2238,6 +2289,98 @@ mod tests {
         // open the list, not index past the end of it.
         let r = with_picker("pipewire/one-that-left");
         assert_eq!(r.app.device_selected(), 0);
+    }
+
+    #[test]
+    fn choosing_a_device_closes_the_picker_and_says_it_is_for_this_session() {
+        // Goal: the choice is not written anywhere - priel reads no
+        // configuration file - so the one moment it can be said is now.
+        let mut r = with_picker("auto");
+        r.app.on_key(key('j'));
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.mode, Mode::Normal, "choosing closes the picker");
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("pipewire/dac description"),
+            "the chosen device is named: {notice}"
+        );
+        assert!(
+            notice.contains("this session"),
+            "and the choice is temporary: {notice}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_device_row_does_what_the_enter_key_does() {
+        // Goal: the mouse is a first-class addition, never a second
+        // implementation. Both paths run `choose_device` and nothing else.
+        let mut r = with_picker("auto");
+        let row = Rect {
+            x: 2,
+            y: 5,
+            width: 60,
+            height: 1,
+        };
+        r.app.device_rows = vec![(row, 2)];
+        r.app.on_mouse(click(4, 5));
+        assert_eq!(r.app.device_selected(), 2, "the clicked row is taken");
+        assert_eq!(r.app.mode, Mode::Normal, "and choosing closes the picker");
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("alsa/hdmi description"), "{notice}");
+    }
+
+    #[test]
+    fn a_click_outside_the_rows_dismisses_the_picker_without_choosing() {
+        // Goal: the log overlay behaves this way and a second idiom would be
+        // its own bug. Missing a row must not move the output.
+        let mut r = with_picker("auto");
+        r.app.notice = None;
+        r.app.device_rows = vec![(
+            Rect {
+                x: 2,
+                y: 5,
+                width: 60,
+                height: 1,
+            },
+            1,
+        )];
+        r.app.on_mouse(click(4, 9));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(r.app.notice.is_none(), "nothing was chosen");
+    }
+
+    #[test]
+    fn a_device_that_will_not_open_is_reported_once_rather_than_every_tick() {
+        // Goal: the player carries the reason until the next change is
+        // accepted, so without the latch this would replace every other notice
+        // on screen ten times a second - and a failure the user has to act on
+        // has to survive long enough to be read.
+        let mut r = rig();
+        r.app.status.device_error = Some("alsa/hdmi would not open".into());
+        r.app.refresh_for_test();
+        assert_eq!(
+            r.app.notice.as_deref(),
+            Some("alsa/hdmi would not open"),
+            "the failure reaches the user"
+        );
+
+        r.app.notice = Some("something else".into());
+        r.app.refresh_for_test();
+        assert_eq!(
+            r.app.notice.as_deref(),
+            Some("something else"),
+            "and is not repeated over whatever came after it"
+        );
+
+        r.app.status.device_error = None;
+        r.app.refresh_for_test();
+        r.app.status.device_error = Some("alsa/hdmi would not open".into());
+        r.app.refresh_for_test();
+        assert_eq!(
+            r.app.notice.as_deref(),
+            Some("alsa/hdmi would not open"),
+            "a second failure is a new report"
+        );
     }
 
     #[test]

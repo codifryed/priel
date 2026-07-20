@@ -1570,6 +1570,10 @@ mod tests {
             "the mouse gestures are documented: {out}"
         );
         assert!(
+            out.contains("choose the device"),
+            "a binding that is not in here cannot be discovered: {out}"
+        );
+        assert!(
             !out.contains("Hidden Title"),
             "the list should be covered: {out}"
         );

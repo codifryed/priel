@@ -93,6 +93,13 @@ pub struct PlaybackStatus {
     /// is an identifier from [`AudioDevice::name`], so the picker can mark the
     /// row that is in use by comparing the two.
     pub audio_device: String,
+    /// Why the last device change did not take, if it did not.
+    ///
+    /// Display only, like the `detail` of a worker failure: there is nothing
+    /// here for a caller to branch on, and both causes - a device that is no
+    /// longer there and one that refused to open - leave the previous output in
+    /// use. Cleared by the next change that is accepted.
+    pub device_error: Option<String>,
     /// Live parameters of the ALSA device, when one could be read.
     ///
     /// This is the only unmediated view of the hardware. When present it decides
@@ -286,6 +293,9 @@ pub(crate) enum Cmd {
     /// Re-read the audio devices and publish them. Asked for when the picker
     /// opens, so a device plugged in mid-session shows up.
     RefreshDevices,
+    /// Move the output to this device, reopening it. The queue and the position
+    /// are untouched; the cost is the same short gap a sample-rate change makes.
+    SetDevice(String),
     Quit,
 }
 
@@ -401,6 +411,19 @@ impl Player {
     /// enumerating asks the audio system and the caller may be a UI thread.
     pub fn refresh_devices(&self) {
         self.send(Cmd::RefreshDevices);
+    }
+
+    /// Move the output to `device`, named as [`AudioDevice::name`] spells it.
+    ///
+    /// The output is reopened, which costs the same short gap a sample-rate
+    /// change already does; nothing else about the queue or the position
+    /// changes. A device that is gone or will not open leaves the previous one
+    /// in use and reports itself through [`PlaybackStatus::device_error`].
+    ///
+    /// The choice lasts for this session. priel reads no configuration file, so
+    /// `--device` is what makes one permanent.
+    pub fn set_device(&self, device: &str) {
+        self.send(Cmd::SetDevice(device.to_string()));
     }
 
     /// The audio devices the player last reported.
