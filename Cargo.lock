@@ -752,6 +752,7 @@ dependencies = [
  "libmpv2-sys",
  "log",
  "priel-core",
+ "serde_json",
  "ureq",
 ]
 

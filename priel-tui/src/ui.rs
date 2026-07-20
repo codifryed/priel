@@ -23,7 +23,7 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
 
 use priel_player::{Alteration, Fidelity};
 
-use crate::app::{App, Hit, Mode, View};
+use crate::app::{App, GraphRow, GraphRowKind, Hit, Mode, View};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([
@@ -46,6 +46,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     if app.mode == Mode::Log {
         log_overlay(f, f.area(), app);
+    }
+    if app.mode == Mode::Graph {
+        graph_overlay(f, f.area(), app);
     }
     if app.mode == Mode::Credentials {
         credentials_overlay(f, f.area(), app.credential_status());
@@ -267,6 +270,7 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
     (
         "Output",
         &[
+            ("D", "the chain to the device"),
             ("DAC", "live from the device"),
             ("OUT", "what the server took"),
             ("bit-perfect", "nothing altered"),
@@ -392,6 +396,108 @@ fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
             },
         );
     }
+}
+
+/// The chain between priel and the output device.
+///
+/// The DAC badge on the bottom row says whether the chain is clean, because it
+/// reads the device's own live parameters. It cannot say *what* made it that
+/// way. This is that answer: every node on the path, in order, with the format
+/// each one settled on.
+///
+/// Modal and scrolled like the log overlay, and for the same reason - a second
+/// idiom for the same gesture is its own bug.
+fn graph_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let rows = app.graph_rows();
+    let width = area.width.saturating_sub(4).min(76);
+    // Two for the border, one for the way out. Sized to the content rather than
+    // to the screen: this is a short list and a full-height box around three
+    // lines reads as something failing to load.
+    let wanted = u16::try_from(rows.len().saturating_add(3)).unwrap_or(u16::MAX);
+    let height = wanted.min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Audio graph ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+
+    // One row goes to the way out, as in the other overlays: an overlay that
+    // does not say how to close it is a trap.
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let start = app.graph_offset().min(rows.len().saturating_sub(1));
+    let end = start
+        .saturating_add(usize::from(body.height))
+        .min(rows.len());
+    let lines: Vec<Line> = rows[start..end]
+        .iter()
+        .map(|r| graph_line(r, body.width))
+        .collect();
+    f.render_widget(Paragraph::new(lines), body);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  j k scroll · g G top / bottom · D, Esc or q to close",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Rect {
+            y: inner.y + inner.height.saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+/// One row of the graph overlay: what the node is on the left, what it
+/// negotiated on the right.
+///
+/// The gap between them is measured with `Span::width`, the same unicode-width
+/// measurement ratatui draws with, so a description with wide glyphs in it does
+/// not push the format column off the edge.
+fn graph_line(row: &GraphRow, width: u16) -> Line<'static> {
+    let (label_style, detail_style) = match row.kind {
+        GraphRowKind::Node => (
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Cyan),
+        ),
+        GraphRowKind::Link => (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+        ),
+        GraphRowKind::Note => (
+            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::Gray),
+        ),
+    };
+    let label = Span::styled(row.label.clone(), label_style);
+    if row.detail.is_empty() {
+        return Line::from(label);
+    }
+    let detail = Span::styled(row.detail.clone(), detail_style);
+    // One cell short of the full width so the format column does not sit
+    // against the border, and at least one space even when the two do not fit,
+    // so they never run together into one unreadable word; the paragraph clips
+    // whatever overflows.
+    let gap = usize::from(width.saturating_sub(1))
+        .saturating_sub(label.width() + detail.width())
+        .max(1);
+    Line::from(vec![label, Span::raw(" ".repeat(gap)), detail])
 }
 
 /// One log line, coloured by how much it wants to be noticed.
@@ -810,6 +916,13 @@ const HINTS: &[Hint] = &[
         keys: &[("g", Hit::Top), ("G", Hit::Bottom)],
         label: "ends",
     },
+    // Last because it is the least everyday of these, which is also what makes
+    // it the first to be dropped when the row runs out of width. The full
+    // reference under `?` is where it is always findable.
+    Hint {
+        keys: &[("D", Hit::Graph)],
+        label: "graph",
+    },
 ];
 
 /// Never dropped, however narrow the row: `?` is how everything else is found,
@@ -1090,7 +1203,7 @@ fn trunc(s: &str, n: usize) -> String {
 /// 44100 is "44.1 kHz", not "44 kHz": the 44.1 and 48 kHz families are the whole
 /// distinction a bit-perfect chain turns on, and truncating the decimal away
 /// makes 44.1 and 48 look like neighbours rather than different worlds.
-fn fmt_khz(hz: u32) -> String {
+pub(crate) fn fmt_khz(hz: u32) -> String {
     if hz == 0 {
         return "?".to_string();
     }
@@ -1120,6 +1233,7 @@ mod tests {
     use crate::app::{App, Hit, Mode, View};
     use crate::worker::{FromWorker, ToWorker};
     use priel_core::{Playlist, Track};
+    use priel_player::graph::{AudioGraph, GraphError, GraphNode, NodeRole};
     use ratatui::layout::Rect;
     use ratatui::style::Style;
     use ratatui::{Terminal, backend::TestBackend};
@@ -1499,6 +1613,121 @@ mod tests {
         assert!(!out.contains("Hidden Title"), "the list is covered: {out}");
     }
 
+    /// Put a chain on screen the way the worker would, since that is the only
+    /// way in: the app's copy is private, and a test that reached around the
+    /// channel would not be testing the path the app actually uses.
+    fn with_chain(sc: &mut Screen, graph: AudioGraph) {
+        sc.to_app
+            .send(FromWorker::AudioGraph(Ok(graph)))
+            .expect("send");
+        sc.app.drain_worker();
+    }
+
+    fn node(description: &str, role: NodeRole, rate_hz: u32, format: &str) -> GraphNode {
+        GraphNode {
+            id: 1,
+            name: description.into(),
+            description: description.into(),
+            media_class: "Audio/Sink".into(),
+            role,
+            rate_hz: Some(rate_hz),
+            format: Some(format.into()),
+            channels: Some(2),
+        }
+    }
+
+    #[test]
+    fn the_graph_overlay_lists_every_node_with_what_it_negotiated() {
+        // Goal: the question the DAC badge cannot answer - which nodes sit in
+        // front of the device, and what each of them is doing to the audio. All
+        // of it has to survive onto the screen, not just into the model.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Hidden Title")];
+        with_chain(
+            &mut sc,
+            AudioGraph {
+                path: vec![
+                    node("mpv", NodeRole::Stream, 44_100, "S16LE"),
+                    node("Loopback", NodeRole::Intermediate, 48_000, "F32LE"),
+                    node("Studio DAC", NodeRole::Device, 48_000, "S32LE"),
+                ],
+            },
+        );
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 26);
+        assert!(out.contains("Audio graph"), "{out}");
+        assert!(out.contains("Loopback"), "the middle hop is shown: {out}");
+        assert!(out.contains("Studio DAC"), "{out}");
+        assert!(out.contains("44.1 kHz"), "the stream's rate: {out}");
+        assert!(out.contains("S32LE"), "the device's format: {out}");
+        assert!(out.contains("to close"), "{out}");
+        // Unlike the help and log overlays this one is sized to its content, so
+        // it is not expected to cover the whole list. Being modal is about the
+        // input it swallows, which `app` covers.
+    }
+
+    #[test]
+    fn a_graph_that_could_not_be_read_explains_itself_on_screen() {
+        // Goal: a machine with no PipeWire tools must get a sentence, not an
+        // empty box - an empty overlay reads as priel being broken.
+        let mut sc = screen();
+        sc.to_app
+            .send(FromWorker::AudioGraph(Err(GraphError::NotInstalled)))
+            .expect("send");
+        sc.app.drain_worker();
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 26);
+        assert!(out.contains("pw-dump"), "{out}");
+        assert!(out.contains("PipeWire"), "and what to install: {out}");
+    }
+
+    #[test]
+    fn the_reference_lists_the_key_that_opens_the_graph() {
+        // Goal: the bottom row drops optional hints on a narrow terminal, so
+        // `?` is the only place a binding is guaranteed to be findable. A key
+        // that is nowhere in there is a key nobody discovers.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 100, 30);
+        assert!(out.contains("the chain to the device"), "{out}");
+    }
+
+    #[test]
+    fn clicking_the_graph_hint_opens_the_same_overlay_the_key_does() {
+        // Goal: a key press and a click must run the same code. Going through
+        // the published hit box is what proves the two paths have not drifted.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 200, 20);
+        let (rect, _) = *sc
+            .app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == Hit::Graph)
+            .expect("the graph hint is clickable");
+        sc.app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(sc.app.mode, Mode::Graph);
+        assert!(
+            matches!(sc.from_app.try_recv(), Ok(ToWorker::ReadAudioGraph)),
+            "and asks the worker, exactly as the key press does"
+        );
+    }
+
+    #[test]
+    fn the_graph_overlay_says_it_is_reading_while_the_worker_is() {
+        // Goal: the read is a subprocess on another thread, so there is always a
+        // moment with no answer yet. That moment must say so rather than look
+        // like an empty result.
+        let mut sc = screen();
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 26);
+        assert!(out.contains("Reading"), "{out}");
+    }
+
     #[test]
     fn an_empty_log_says_so_rather_than_showing_a_blank_box() {
         // Goal: an empty overlay reads as broken. Nothing recorded is itself
@@ -1534,6 +1763,19 @@ mod tests {
             let _ = draw(&mut sc.app, w, h);
             sc.app.recent.push("a line that will not fit\n".to_string());
             sc.app.mode = Mode::Log;
+            let _ = draw(&mut sc.app, w, h);
+            with_chain(
+                &mut sc,
+                AudioGraph {
+                    path: vec![node(
+                        "a very long device description",
+                        NodeRole::Device,
+                        96_000,
+                        "S24_3LE",
+                    )],
+                },
+            );
+            sc.app.mode = Mode::Graph;
             let _ = draw(&mut sc.app, w, h);
         }
     }

@@ -144,6 +144,7 @@ row of the interface is also clickable.
 |---|---|---|
 | Full key reference | `?` | click `[?]` |
 | Recent log messages | `M` | scroll to page back |
+| Audio graph to the device | `D` | click `[D]` |
 | Sign in again | `A` | — |
 | Switch view | `Tab` cycles, `1`/`2`/`3` | click a tab |
 | Move selection | `j`/`k`, `↑`/`↓` | scroll wheel |
@@ -171,14 +172,15 @@ resolution and playback (24/192 via progressive segment streaming); a gapless
 play queue with a preloaded next track; shuffle with auto-advance; play, pause,
 seek, skip and volume; a now-playing bar with a scrubbable progress bar, a live
 DAC badge and a bit-perfect indicator; the `?` reference overlay; a diagnostic
-log with an `M` overlay for reading it without leaving the player.
+log with an `M` overlay for reading it without leaving the player; a `D` overlay
+listing the PipeWire nodes between priel and the device with the rate and format
+each one negotiated.
 
 Roadmap, roughly in order:
 
-- **PipeWire configuration help.** The live device readout tells you *whether*
-  the chain is clean; it does not yet tell you how to fix it. Detect and explain
-  the `allowed-rates` setup a bit-perfect chain needs, and read the graph with
-  `pw-dump` to name which node is doing the resampling.
+- **PipeWire configuration help.** The `D` overlay lists the graph; it does not
+  yet interpret it. Name which of those nodes is doing the resampling, and
+  detect and explain the `allowed-rates` setup a bit-perfect chain needs.
 - **ALSA setup helpers, for true bit-perfect.** PipeWire is the right default,
   but it is a mixer: even configured well it owns the device and the graph can
   change under you. Enthusiasts will want the DAC out of the PipeWire graph
