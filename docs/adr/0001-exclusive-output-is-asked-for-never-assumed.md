@@ -35,6 +35,33 @@ exclusivity it did not get.** A player that silently fell back to the mixer
 while the badge still implied a direct connection would be worse than not
 having the feature at all.
 
+## What "the shared path" resolves to
+
+"Reopen through the shared path" is not a single thing, and getting it wrong is
+silent. A hardware device has **no shared spelling**: `alsa/hw:CARD=AUDIO,DEV=0`
+*is* the card, it admits one opener, and clearing the exclusive flag changes
+nothing about it - the flag was never what made it exclusive. Reapplying the
+same device after a refusal therefore lands on the same held card again, which
+is exactly what hardware testing found.
+
+So the fallback resolves in this order:
+
+1. **A device the sound server owns** was refused *by* the sound server. The
+   same device shared is what was wanted, so the device does not move and
+   dropping the request is the whole of the fallback.
+2. **A hardware device** falls back to **the sound server's own entry for the
+   same card** - the same physical DAC, just shared. The two identifiers share
+   no substring, so they are paired through the card the server publishes on its
+   sink node (`alsa.id` and `alsa.card`), never by matching the strings.
+3. **No entry for that card, or no sound server at all**, leaves nothing to map
+   onto, so the output falls through to the system default sink.
+
+**The track is loaded again and plays from the start.** The player abandons the
+file when the output will not open, so restoring a working device recovers
+nothing on its own - without the reload the interface waits forever for a track
+that is no longer loaded. The position is lost and that is accepted; the bytes
+are still buffered, so this costs no refetch, only the seconds already heard.
+
 ## Consequences
 
 Requesting exclusivity and holding it are two different facts, and only the
@@ -49,6 +76,13 @@ machinery rather than growing a second, competing one. Only the arming differs:
 a change made while something is playing is judged on the short reinit grace,
 while a request made before anything has loaded stays unjudged until a track
 exercises the output.
+
+The direct path also puts priel **outside the sound server**, so there is no
+graph between it and the DAC to report on. That is a distinct answer from "priel
+has no stream in the graph", which means the graph exists and priel is not in it
+yet - it reads as "nothing is playing", the opposite of the truth here. The
+player knows which device it holds, so the overlay is told rather than left to
+infer an absence.
 
 The direct ALSA path itself needs no new mechanism: it is `--device alsa/...`,
 which the picker and `--list-devices` already offer. What `--exclusive` adds is

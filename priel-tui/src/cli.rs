@@ -55,9 +55,12 @@ pub struct Cli {
     ///
     /// If the device will not open exclusively - usually because something else
     /// already holds it - priel says so, records it in the log, and keeps
-    /// playing through the shared path. The output badge then reports shared
-    /// output; it never claims exclusivity it did not get. `x` in the device
-    /// picker toggles the same thing for one session.
+    /// playing: a hardware device falls back to the sound server's own entry
+    /// for the same card, which is the same DAC shared, and to the default sink
+    /// when there is no such entry. The track restarts from the beginning. The
+    /// output badge then reports shared output; it never claims exclusivity it
+    /// did not get. `x` in the device picker toggles the same thing for one
+    /// session.
     #[arg(long)]
     pub exclusive: bool,
 

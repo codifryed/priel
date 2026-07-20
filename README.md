@@ -144,10 +144,17 @@ reshape the chain underneath you. It is deliberately separate from `--device`:
 choosing a hardware device does not imply taking it, and **priel never selects
 the exclusive path on its own** — it silences every other application, and that
 is not a side effect of pressing play. `x` in the device picker toggles the same
-thing for one session. If the device will not open exclusively, usually because
-something else already holds it, priel says so, records it in the log, and keeps
-playing on the shared path; the badge then reads `⚠ shared · exclusive refused`
-rather than claiming a connection it does not have. See
+thing for one session. The `D` overlay then says there is no graph at all, which
+on this path is the ideal rather than a fault: nothing sits between priel and the
+DAC.
+
+If the device will not open exclusively, usually because something else already
+holds it, priel says so, records it in the log, and keeps playing. There is no
+shared spelling of a `hw:` device — the card is the whole of it — so the fallback
+is the sound server's own entry for **the same card**: the same physical DAC,
+just shared. Failing that, the system default sink. The track restarts from the
+beginning, and the badge reads `⚠ shared · exclusive refused` rather than
+claiming a connection it does not have. See
 [ADR-0001](docs/adr/0001-exclusive-output-is-asked-for-never-assumed.md).
 
 For UI work or a machine without mpv headers, `make build-nolibmpv` compiles the
