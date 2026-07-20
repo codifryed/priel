@@ -131,8 +131,13 @@ make run ARGS="--device pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-outp
 
 `--device` is optional; the default sink is used when it is omitted. `priel
 --list-devices` prints every device with the identifier `--device` takes, and
-`d` opens the same list inside the player. `--log-level` and `--log-file`
-control the diagnostic log. See `man priel` or `priel --help`.
+`d` opens the same list inside the player. Both include the direct hardware
+devices — `alsa/hw:CARD=AUDIO,DEV=0` and the like, marked *(direct hardware
+access)* — which ALSA advertises nowhere: it publishes only the plugin spellings
+of a card, so priel builds those entries from the kernel's own card listing.
+They are the outputs where `--exclusive` means something, so they are the last
+ones that should have needed looking up. `--log-level` and `--log-file` control
+the diagnostic log. See `man priel` or `priel --help`.
 
 ```bash
 make run ARGS="--device alsa/hw:CARD=AUDIO,DEV=0 --exclusive"

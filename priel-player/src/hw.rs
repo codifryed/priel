@@ -24,8 +24,21 @@
 //! visible without talking to `PipeWire` is the ALSA device itself, which
 //! publishes its live parameters while a substream is open.
 //!
+//! It also *constructs* the direct hardware devices, for the same reason and
+//! from the same directory: ALSA's discovery interface does not advertise raw
+//! hardware PCMs, so mpv cannot list one and the picker cannot offer one. The
+//! kernel does list them, and an identifier built from what it says is an
+//! identifier `--device` accepts.
+//!
 //! Linux-only by nature. Everywhere else this reports nothing, and the caller
 //! falls back to what the audio server said.
+
+use std::path::{Path, PathBuf};
+
+use crate::AudioDevice;
+
+/// Where the kernel publishes the sound cards.
+const ASOUND: &str = "/proc/asound";
 
 /// Live parameters of an open ALSA playback substream.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -169,8 +182,8 @@ fn hw_card_index(hint: &str) -> Option<u32> {
 #[must_use]
 pub fn probe(hint: Option<&str>) -> Option<HwParams> {
     let mut first = None;
-    for (card, index) in cards() {
-        let Some(id) = read_trimmed(&format!("{card}/id")) else {
+    for (card, index) in cards_in(Path::new(ASOUND)) {
+        let Some(id) = read_trimmed(&card.join("id")) else {
             continue;
         };
         for path in substreams(&card) {
@@ -194,50 +207,209 @@ pub fn probe(hint: Option<&str>) -> Option<HwParams> {
     first
 }
 
-fn read_trimmed(path: &str) -> Option<String> {
+/// How many hardware entries are ever constructed.
+///
+/// Bounded like everything else built from outside. A machine with an audio
+/// interface per channel still lands far inside this, and the HDMI card that
+/// motivated the per-device entries contributes six on its own.
+const CARD_DEVICES_MAX: usize = 64;
+
+/// The direct hardware devices, which no discovery interface advertises.
+///
+/// ALSA's device-name hints list the plugin spellings of a card - `sysdefault`,
+/// `front`, the `surround*` family, `iec958` - and never the raw `hw:` PCM
+/// underneath them, so mpv cannot report one and the picker cannot offer one.
+/// The kernel names every card and every PCM it has, which is exactly the
+/// information an identifier is built from, so these are *constructed* rather
+/// than discovered.
+///
+/// An empty list where there is no `/proc/asound` is the answer, not a failure:
+/// a platform without one has no hardware device to name.
+#[must_use]
+pub fn card_devices() -> Vec<AudioDevice> {
+    card_devices_in(Path::new(ASOUND))
+}
+
+/// Add the direct hardware devices to a list the player enumerated.
+///
+/// Called wherever that list is published, so the picker and `--list-devices`
+/// cannot disagree about what exists.
+#[must_use]
+pub fn with_card_devices(listed: Vec<AudioDevice>) -> Vec<AudioDevice> {
+    merge(listed, card_devices())
+}
+
+/// The merge itself, pure so both guards are a table of tests.
+///
+/// Two things it must not do. It must not offer an identifier the player would
+/// reject: `alsa/hw:...` is only accepted by a build with the ALSA output in
+/// it, and one that reports no ALSA device at all does not have it. And it must
+/// not list a card twice under one name - nothing advertises a raw `hw:` PCM
+/// today, but an `asoundrc` could, and the enumerated entry is the one to keep
+/// because its description came from the driver that will open the device.
+///
+/// The constructed entries go last rather than beside the card they belong to.
+/// The order the player reported is the order it prefers, the sound server's
+/// entry is still the right default, and a stable tail is easier to find twice
+/// than a position that moves with the card list.
+fn merge(listed: Vec<AudioDevice>, direct: Vec<AudioDevice>) -> Vec<AudioDevice> {
+    if !listed.iter().any(|d| d.name.starts_with("alsa/")) {
+        return listed;
+    }
+    let mut out = listed;
+    for device in direct {
+        if out.iter().any(|d| d.name == device.name) {
+            continue;
+        }
+        out.push(device);
+    }
+    out
+}
+
+/// [`card_devices`], against any directory, so it is testable against a fixture
+/// on a machine with no sound card at all.
+fn card_devices_in(root: &Path) -> Vec<AudioDevice> {
+    // The one file carrying human-readable card names. Absent on an older
+    // kernel and unreadable in a container, in which case the card id stands in
+    // for the name - the identifier is still right, only the row is terser.
+    let names = parse_card_names(&std::fs::read_to_string(root.join("cards")).unwrap_or_default());
+
+    let mut cards = cards_in(root);
+    // read_dir answers in whatever order the filesystem likes, and a device
+    // list that reshuffles itself between two openings of the picker would move
+    // the row under the pointer.
+    cards.sort_by_key(|&(_, index)| index);
+
+    let mut out = Vec::new();
+    for (dir, index) in cards {
+        // The id, not the index: `hw:CARD=<id>` survives a card being
+        // renumbered, and this machine has both `AUDIO` and `Audio`.
+        let Some(id) = read_trimmed(&dir.join("id")) else {
+            continue;
+        };
+        let card_name = names
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map_or(id.as_str(), |(_, name)| name.as_str());
+        // Every playback PCM gets its own entry, not just the first: they are
+        // separate outputs - the HDMI card's are one per connector - and their
+        // device numbers are not consecutive, so an absent one cannot be
+        // guessed from the one that is shown.
+        for device in playback_pcms(&dir) {
+            if out.len() == CARD_DEVICES_MAX {
+                return out;
+            }
+            let pcm_name = read_field(&dir.join(format!("pcm{device}p/info")), "name");
+            out.push(AudioDevice {
+                name: format!("alsa/hw:CARD={id},DEV={device}"),
+                description: describe(card_name, pcm_name.as_deref()),
+            });
+        }
+    }
+    out
+}
+
+/// What a hardware row says about itself.
+///
+/// Both names earn their place: the card name is what tells two USB cards
+/// apart, and the PCM name is what tells one card's HDMI connectors apart. The
+/// marker is the only thing in the list that says which spelling of a card
+/// reaches it directly, so it is not optional.
+fn describe(card_name: &str, pcm_name: Option<&str>) -> String {
+    match pcm_name {
+        Some(pcm) if !pcm.is_empty() => format!("{card_name}, {pcm} (direct hardware access)"),
+        _ => format!("{card_name} (direct hardware access)"),
+    }
+}
+
+/// Card index and human-readable name, from the body of `/proc/asound/cards`.
+///
+/// Each card takes two lines, of which only the first is wanted:
+///
+/// ```text
+///  2 [AUDIO          ]: USB-Audio - SMSL USB AUDIO
+///                       SMSL SMSL USB AUDIO at usb-0000:73:00.3-2.2, high speed
+/// ```
+///
+/// The name is what follows the driver, which is the same string ALSA's own
+/// tools print for the card. Splitting on `" - "` rather than `'-'` is what
+/// keeps `HDA-Intel` and `USB-Audio` from being cut in half.
+fn parse_card_names(body: &str) -> Vec<(u32, String)> {
+    body.lines()
+        .filter_map(|line| {
+            let (index, rest) = line.split_once('[')?;
+            let index: u32 = index.trim().parse().ok()?;
+            let (_, rest) = rest.split_once("]: ")?;
+            let (_, name) = rest.split_once(" - ")?;
+            let name = name.trim();
+            (!name.is_empty()).then(|| (index, name.to_string()))
+        })
+        .collect()
+}
+
+/// One `key: value` line out of a `/proc/asound` file.
+fn read_field(path: &Path, key: &str) -> Option<String> {
+    let body = std::fs::read_to_string(path).ok()?;
+    body.lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(k, _)| k.trim() == key)
+        .map(|(_, value)| value.trim().to_string())
+}
+
+fn read_trimmed(path: &Path) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
 }
 
-/// `/proc/asound/cardN` directories, each with the `N` that names it.
+/// `cardN` directories under `root`, each with the `N` that names it.
 ///
 /// The index is carried out rather than re-parsed later because it is half of
 /// what a device identifier can be matched against: `hw:2,0` names the card by
 /// number and never by id.
-fn cards() -> Vec<(String, u32)> {
-    let Ok(entries) = std::fs::read_dir("/proc/asound") else {
+fn cards_in(root: &Path) -> Vec<(PathBuf, u32)> {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
     entries
         .flatten()
         .filter_map(|e| {
             let path = e.path();
-            let name = path.file_name()?.to_str()?.to_string();
+            let name = path.file_name()?.to_str()?;
             // `card0`, not the `Generic -> card1` symlinks, which would double
             // every device up.
             let index = name.strip_prefix("card")?.parse::<u32>().ok()?;
-            Some((path.to_str()?.to_string(), index))
+            Some((path, index))
         })
         .collect()
 }
 
-/// `hw_params` paths under a card's playback PCMs.
-fn substreams(card: &str) -> Vec<String> {
+/// The device numbers of a card's playback PCMs, in order.
+///
+/// `pcm0p` is playback and `pcm0c` is capture, and the number between them is
+/// the `DEV=` of a hardware identifier. A card with none of the former plays
+/// nothing, whatever else the directory holds.
+fn playback_pcms(card: &Path) -> Vec<u32> {
     let Ok(pcms) = std::fs::read_dir(card) else {
         return Vec::new();
     };
+    let mut out: Vec<u32> = pcms
+        .flatten()
+        .filter_map(|pcm| {
+            let path = pcm.path();
+            let name = path.file_name()?.to_str()?;
+            name.strip_prefix("pcm")?.strip_suffix('p')?.parse().ok()
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// `hw_params` paths under a card's playback PCMs.
+fn substreams(card: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    for pcm in pcms.flatten() {
-        let path = pcm.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        // `pcm0p` is playback; `pcm0c` is capture and irrelevant here.
-        if !name.starts_with("pcm") || !name.ends_with('p') {
-            continue;
-        }
-        let Ok(subs) = std::fs::read_dir(&path) else {
+    for device in playback_pcms(card) {
+        let Ok(subs) = std::fs::read_dir(card.join(format!("pcm{device}p"))) else {
             continue;
         };
         for sub in subs.flatten() {
@@ -257,7 +429,215 @@ fn substreams(card: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{card_matches, is_direct_card_device, parse_hw_params, probe, refers_to_card};
+    use std::path::Path;
+
+    use super::{
+        card_devices, card_devices_in, card_matches, is_direct_card_device, parse_hw_params, probe,
+        refers_to_card,
+    };
+
+    /// A copy of a real `/proc/asound`, trimmed to the files this reads.
+    ///
+    /// Four cards, because the interesting cases all come from one machine: an
+    /// HDMI card with several playback devices, a card with no playback device
+    /// at all, and two USB cards whose ids differ only in case.
+    const ASOUND: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/asound");
+
+    /// The same directory stripped of everything optional: one card, no names
+    /// file, and a PCM whose `info` read back empty.
+    const BARE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/asound-bare");
+
+    fn fixture_devices() -> Vec<crate::AudioDevice> {
+        card_devices_in(Path::new(ASOUND))
+    }
+
+    fn fixture_names() -> Vec<String> {
+        fixture_devices().into_iter().map(|d| d.name).collect()
+    }
+
+    #[test]
+    fn every_playback_card_is_offered_as_a_device_named_by_its_id() {
+        // Goal: this is the whole issue - the enumeration advertises no raw
+        // hardware device, so the one path where exclusivity means anything
+        // cannot be discovered. The identifier is the card *id*, because an
+        // index does not survive a card being renumbered.
+        let names = fixture_names();
+        assert!(
+            names.contains(&"alsa/hw:CARD=AUDIO,DEV=0".to_string()),
+            "the USB DAC should be offered directly: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("alsa/hw:2")),
+            "named by id, never by index: {names:?}"
+        );
+    }
+
+    #[test]
+    fn two_cards_whose_ids_differ_only_in_case_stay_two_devices() {
+        // Goal: this machine has `AUDIO` and `Audio`. Folding the case, or
+        // naming either by index, would point the listener at the wrong DAC.
+        let names = fixture_names();
+        assert!(names.contains(&"alsa/hw:CARD=AUDIO,DEV=0".to_string()));
+        assert!(names.contains(&"alsa/hw:CARD=Audio,DEV=0".to_string()));
+    }
+
+    #[test]
+    fn a_card_with_several_playback_devices_offers_each_of_them() {
+        // Goal: the HDMI card's playback devices are separate connectors, so
+        // offering only the first would hide every screen but one - and the
+        // device number is not consecutive, so it cannot be guessed either.
+        let names = fixture_names();
+        assert!(names.contains(&"alsa/hw:CARD=HDMI,DEV=3".to_string()));
+        assert!(names.contains(&"alsa/hw:CARD=HDMI,DEV=7".to_string()));
+    }
+
+    #[test]
+    fn a_capture_device_is_never_offered_as_an_output() {
+        // Goal: `pcm1c` is a microphone. Offering it would be an identifier
+        // that resolves and then refuses to play, which is worse than absent.
+        let names = fixture_names();
+        assert!(
+            !names.contains(&"alsa/hw:CARD=Audio,DEV=1".to_string()),
+            "the capture-only device must not be listed: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_card_with_no_playback_device_is_not_offered_at_all() {
+        // Goal: a card that plays nothing has no identifier worth printing,
+        // and its bare presence in the directory is not evidence that it does.
+        let names = fixture_names();
+        assert!(
+            !names.iter().any(|n| n.contains("CARD=Generic")),
+            "a card with no playback PCM is not an output: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_hardware_entry_is_described_by_the_names_the_kernel_carries() {
+        // Goal: a row reading only `alsa/hw:CARD=AUDIO,DEV=0` is barely better
+        // than looking the identifier up. Both halves are needed: the card name
+        // tells two USB cards apart, and the device name tells one card's HDMI
+        // connectors apart. The marker is what says this row is the direct one.
+        let devices = fixture_devices();
+        let dac = devices
+            .iter()
+            .find(|d| d.name == "alsa/hw:CARD=AUDIO,DEV=0")
+            .expect("the fixture's USB DAC should be offered");
+        assert!(dac.description.contains("SMSL USB AUDIO"), "{dac:?}");
+        assert!(dac.description.contains("USB Audio"), "{dac:?}");
+        assert!(dac.description.contains("direct"), "{dac:?}");
+    }
+
+    #[test]
+    fn a_card_the_kernel_names_nowhere_is_still_offered_under_its_id() {
+        // Goal: `/proc/asound/cards` is absent on an older kernel and
+        // unreadable in some containers, and a PCM's `info` can be read while
+        // it is being written. Only the prose may depend on either - losing the
+        // identifier over a missing description would lose the device.
+        let devices = card_devices_in(Path::new(BARE));
+        assert_eq!(devices.len(), 1, "{devices:?}");
+        assert_eq!(devices[0].name, "alsa/hw:CARD=AUDIO,DEV=0");
+        assert_eq!(
+            devices[0].description, "AUDIO (direct hardware access)",
+            "the card id stands in for the name it does not have"
+        );
+    }
+
+    #[test]
+    fn the_devices_come_back_in_the_same_order_every_time() {
+        // Goal: read_dir answers in whatever order the filesystem likes. A list
+        // that reshuffled between two openings of the picker would move the row
+        // out from under the pointer.
+        assert_eq!(fixture_names(), fixture_names());
+        assert_eq!(
+            fixture_names(),
+            vec![
+                "alsa/hw:CARD=HDMI,DEV=3",
+                "alsa/hw:CARD=HDMI,DEV=7",
+                "alsa/hw:CARD=AUDIO,DEV=0",
+                "alsa/hw:CARD=Audio,DEV=0",
+            ],
+            "by card index, then by device number"
+        );
+    }
+
+    fn listed(names: &[&str]) -> Vec<crate::AudioDevice> {
+        names
+            .iter()
+            .map(|n| crate::AudioDevice {
+                name: (*n).to_string(),
+                description: format!("as the player described {n}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_hardware_devices_are_added_to_what_the_player_enumerated() {
+        // Goal: the constructed entries are an addition, not a replacement.
+        // Everything the player reported keeps its place and its order, because
+        // the sound server's entry for a card is still the right default.
+        let merged = super::merge(
+            listed(&[
+                "auto",
+                "alsa/sysdefault:CARD=AUDIO",
+                "pipewire/alsa_output.x",
+            ]),
+            listed(&["alsa/hw:CARD=AUDIO,DEV=0"]),
+        );
+        let names: Vec<&str> = merged.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "auto",
+                "alsa/sysdefault:CARD=AUDIO",
+                "pipewire/alsa_output.x",
+                "alsa/hw:CARD=AUDIO,DEV=0",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_device_the_player_already_reported_is_not_offered_twice() {
+        // Goal: nothing advertises a raw `hw:` PCM today, but an asoundrc or a
+        // later ALSA could. One card must not appear twice under one name, and
+        // the player's own description is the one to keep - it came from the
+        // driver that will open the device.
+        let merged = super::merge(
+            listed(&["auto", "alsa/hw:CARD=AUDIO,DEV=0"]),
+            vec![crate::AudioDevice {
+                name: "alsa/hw:CARD=AUDIO,DEV=0".to_string(),
+                description: "constructed".to_string(),
+            }],
+        );
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(
+            merged[1].description.contains("as the player described"),
+            "the enumerated entry stands: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_added_when_the_player_has_no_alsa_output_to_offer_them_to() {
+        // Goal: every identifier in this list is one `--device` accepts, and
+        // `alsa/hw:...` is only accepted by a player built with ALSA. A player
+        // that reports no ALSA device at all has none, so these would be rows
+        // that resolve to nothing.
+        let merged = super::merge(
+            listed(&["auto", "pipewire/alsa_output.x"]),
+            listed(&["alsa/hw:CARD=AUDIO,DEV=0"]),
+        );
+        assert_eq!(merged.len(), 2, "{merged:?}");
+    }
+
+    #[test]
+    fn no_kernel_sound_directory_means_nothing_extra_rather_than_a_failure() {
+        // Goal: this is Linux-only by nature, and the suite runs in containers
+        // with no sound card at all. Reporting nothing is the answer there.
+        assert!(card_devices_in(Path::new("/nonexistent/asound")).is_empty());
+        assert!(card_devices_in(Path::new(ASOUND).join("cards").as_path()).is_empty());
+        let _ = card_devices();
+    }
 
     const OPEN: &str = "access: MMAP_INTERLEAVED
 format: S32_LE

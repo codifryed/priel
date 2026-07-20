@@ -106,7 +106,11 @@ player knows which device it holds, so the overlay is told rather than left to
 infer an absence.
 
 The direct ALSA path itself needs no new mechanism: it is `--device alsa/...`,
-which the picker and `--list-devices` already offer. What `--exclusive` adds is
+which the picker and `--list-devices` accept. They did not, at first, *offer*
+one: ALSA's discovery interface advertises only the plugin spellings of a card
+and never the raw `hw:` PCM, so the devices where exclusivity means anything
+were the ones the picker could not show. Those entries are now constructed from
+the kernel's card listing rather than waited for. What `--exclusive` adds is
 the request for the device to be priel's alone. On ALSA that is inherent in a
 `hw:` device; on the sound server it is a request the server may refuse, which
 is the case the fallback above exists for.
