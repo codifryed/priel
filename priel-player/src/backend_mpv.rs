@@ -191,18 +191,23 @@ struct Switch {
 ///
 /// The reinit happens on mpv's own playloop, so the answer is not there the
 /// instant the property is set. Short, because until this passes the app can
-/// still advance the queue onto a device that is not working.
+/// still advance the queue onto a device that is not working - and shorter
+/// still in practice, since mpv giving up on the file settles the change the
+/// moment it does so.
 const SWITCH_GRACE: Duration = Duration::from_millis(400);
 
-/// How long a *newly loaded* track is given to open the output before an
-/// exclusive request is judged.
+/// The backstop deadline for an exclusive request made before anything played.
 ///
 /// Far longer than [`SWITCH_GRACE`], because there is nothing open yet: mpv
 /// opens the output once it has audio to decode, which waits on the first bytes
 /// of the track arriving. A verdict reached before then would be about the
-/// network. Erring long is the safe direction - the cost of waiting is a few
-/// seconds before a refusal is announced, while the cost of judging early is
-/// giving up an exclusivity that was there for the taking.
+/// network rather than the device.
+///
+/// It rarely decides anything now. mpv giving up on the file settles the
+/// request the moment it happens (see [`drain_events`]), and this only covers a
+/// failure that produces no event at all - in which case the output genuinely
+/// is not open and the verdict is right. Waiting this out *was* what the
+/// listener heard: eight seconds of silence before the fallback fired.
 const EXCLUSIVE_OPEN_GRACE: Duration = Duration::from_secs(8);
 
 /// How many devices are taken off mpv's list.
@@ -406,13 +411,21 @@ fn switch_failed(has_entries: bool, output_open: bool) -> bool {
     has_entries && !output_open
 }
 
-/// Judge a device change once mpv has had time to act on it.
+/// Is there an output open at all?
 ///
-/// Restoring the previous device is what keeps audio working: the track that
-/// was playing is already gone, but the queue plays on rather than the session
-/// being silent until priel is restarted. An exclusive request is judged the
-/// same way and by the same symptom, because a device that is already held by
-/// something else fails in exactly that manner.
+/// `current-ao` is unavailable rather than empty when there is not, which is
+/// the whole of how a device that would not open is told from an idle player.
+fn output_is_open(mpv: &Mpv) -> bool {
+    mpv.get_property::<String>("current-ao").is_ok()
+}
+
+/// The backstop: judge a change mpv has had long enough to have made.
+///
+/// A change is normally settled the moment mpv says it gave up on the file (see
+/// [`drain_events`]), which is deterministic and immediate. This covers the case
+/// where no such event arrives at all - a device that quietly never opens with
+/// nothing loaded to abandon - and is deliberately the slower of the two, since
+/// every second it waits is a second of silence.
 fn settle_switch(mpv: &Mpv, registry: &Registry, entries: &[Entry], output: &mut Output) {
     if output
         .pending
@@ -421,6 +434,31 @@ fn settle_switch(mpv: &Mpv, registry: &Registry, entries: &[Entry], output: &mut
     {
         return;
     }
+    settle_now(mpv, registry, entries, output, output_is_open(mpv));
+}
+
+/// Judge the pending change, and act on it.
+///
+/// Restoring the previous device is what keeps audio working: the track that
+/// was playing is already gone, but the queue plays on rather than the session
+/// being silent until priel is restarted. An exclusive request is judged the
+/// same way and by the same symptom, because a device already held by
+/// something else fails in exactly that manner.
+///
+/// **Taking the pending change is the whole of the runaway guard.** This is
+/// reached from a failure event, and the reload it performs may fail in turn
+/// and produce another one - which arrives here with nothing left to settle and
+/// therefore moves no device and reloads nothing. A failure with nothing
+/// pending is a track's own problem, which is also why `output_open` decides
+/// rather than the event itself: a bad file and a held device arrive
+/// identically, and only one of them leaves the player with no output.
+fn settle_now(
+    mpv: &Mpv,
+    registry: &Registry,
+    entries: &[Entry],
+    output: &mut Output,
+    output_open: bool,
+) {
     let Some(switch) = output.pending.take() else {
         return;
     };
@@ -431,8 +469,6 @@ fn settle_switch(mpv: &Mpv, registry: &Registry, entries: &[Entry], output: &mut
         output.judged = false;
         return;
     }
-    // `current-ao` is unavailable rather than empty when no output is open.
-    let output_open = mpv.get_property::<String>("current-ao").is_ok();
     if !switch_failed(true, output_open) {
         return;
     }
@@ -703,7 +739,7 @@ pub fn spawn(
             if drain_commands(&mpv, &registry, &mut entries, &mut seq, &mut output, &rx) {
                 break;
             }
-            drain_events(&mpv);
+            drain_events(&mpv, &registry, &entries, &mut output);
             cleanup_playlist(&mpv, &registry, &mut entries);
             if hw_checked.is_none_or(|t| t.elapsed() >= HW_PROBE_INTERVAL) {
                 hw = hw::probe(hw_hint(&mpv, &config).as_deref());
@@ -768,12 +804,26 @@ const EVENT_DRAIN_MAX: usize = 64;
 ///
 /// libmpv2 turns an end-of-file *carrying an error* into `Err` rather than an
 /// `EndFile` event, so that arm is the one that matters here.
-fn drain_events(mpv: &Mpv) {
+///
+/// It is also where a device change is settled. mpv giving up on a file is the
+/// deterministic signal that an output would not open, and waiting out a
+/// timeout instead cost eight seconds of silence with a buffering indicator
+/// over it - the indicator lying, because nothing was buffering and the load
+/// had already failed. The timeout in [`settle_switch`] stays as the backstop
+/// for a failure that produces no event at all.
+fn drain_events(mpv: &Mpv, registry: &Registry, entries: &[Entry], output: &mut Output) {
     for _ in 0..EVENT_DRAIN_MAX {
         // Zero timeout: this runs on the player tick and must not block it.
         match mpv.wait_event(0.0) {
             None => return,
-            Some(Err(e)) => log::warn!("mpv reported a failure: {e}"),
+            Some(Err(e)) => {
+                log::warn!("mpv reported a failure: {e}");
+                // Not necessarily the device: a bad file arrives identically.
+                // `settle_now` decides on whether an output is open, and
+                // consumes the pending change so a reload that fails again
+                // cannot settle a second time.
+                settle_now(mpv, registry, entries, output, output_is_open(mpv));
+            }
             Some(Ok(event)) => match event {
                 Event::EndFile(reason) => {
                     log::debug!("mpv ended a file: {}", end_file_reason(reason));
@@ -1876,7 +1926,7 @@ mod tests {
                 peak = peak.max(g.data.len());
                 reached = g.read_pos;
             }
-            drain_events(&mpv);
+            drain_events(&mpv, &registry, &[], &mut no_output());
             thread::sleep(Duration::from_millis(5));
         }
         command(&mpv, "stop", &[]);
@@ -2181,7 +2231,7 @@ mod tests {
                 &["/nonexistent/priel-not-a-file.flac", "replace"],
             );
             for _ in 0..200 {
-                drain_events(&mpv);
+                drain_events(&mpv, &registry(), &[], &mut no_output());
                 if lock(&LINES).iter().any(|l: &String| l.contains("mpv")) {
                     break;
                 }
@@ -2244,8 +2294,8 @@ mod tests {
         // must be a cheap no-op that does not fill the log with noise.
         let lines = captured(|| {
             let mpv = silent_mpv();
-            drain_events(&mpv);
-            drain_events(&mpv);
+            drain_events(&mpv, &registry(), &[], &mut no_output());
+            drain_events(&mpv, &registry(), &[], &mut no_output());
         });
         // Named exactly: the buffer is shared with whatever else is running,
         // and "mpv event" is the catch-all arm that the deprecated events used
@@ -2277,7 +2327,7 @@ mod tests {
                 &["/nonexistent/priel-not-a-file.flac", "replace"],
             );
             for _ in 0..200 {
-                drain_events(&mpv);
+                drain_events(&mpv, &registry(), &[], &mut no_output());
                 if lock(&LINES)
                     .iter()
                     .any(|l: &String| l.contains("priel::mpv"))
@@ -2786,6 +2836,145 @@ mod tests {
         );
     }
 
+    /// A pending exclusive request whose deadline is far enough away that only
+    /// an event can settle it.
+    fn awaiting_a_verdict(device: &str) -> Switch {
+        Switch {
+            previous: device.into(),
+            previous_exclusive: false,
+            requested: device.into(),
+            exclusive: true,
+            deadline: Instant::now() + Duration::from_secs(3600),
+        }
+    }
+
+    /// Drain mpv's events until `done`, or until patience runs out.
+    fn drain_until(
+        mpv: &Mpv,
+        registry: &Registry,
+        entries: &[Entry],
+        output: &mut Output,
+        done: impl Fn(&Output) -> bool,
+    ) {
+        for _ in 0..200 {
+            drain_events(mpv, registry, entries, output);
+            if done(output) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_failed_load_settles_a_refusal_without_waiting_for_the_deadline() {
+        // Goal: the deadline is eight seconds, and hardware testing heard every
+        // one of them as silence with a buffering indicator over it. mpv says
+        // outright that it gave up on the file - that arrives as an error from
+        // `wait_event` and is the only place a failed load is ever visible - so
+        // the recovery starts there and the deadline is only the backstop.
+        let mpv = silent_mpv();
+        let registry = registry();
+        let mut output = no_output();
+        let refused = "alsa/hw:CARD=NOSUCHCARD,DEV=0";
+        output.exclusive = true;
+        apply_device(&mpv, refused);
+        output.pending = Some(awaiting_a_verdict(refused));
+
+        let entries = vec![Entry {
+            id: 7,
+            seq: None,
+            source: "/nonexistent/priel-not-a-file.flac".into(),
+        }];
+        command(&mpv, "loadfile", &[&entries[0].source, "replace"]);
+        drain_until(&mpv, &registry, &entries, &mut output, |o| o.refused);
+
+        assert!(
+            output.refused,
+            "the event has to settle it; the deadline is an hour away"
+        );
+        assert_ne!(
+            mpv.get_property::<String>("audio-device")
+                .unwrap_or_default(),
+            refused,
+            "and the fallback has to have happened, not just been recorded"
+        );
+    }
+
+    #[test]
+    fn a_reload_that_fails_again_never_settles_a_second_time() {
+        // Goal: the reload loads a track that may fail again, which produces
+        // another failure event - and settling on that would reload again,
+        // forever. The guard is that judging a change consumes it: a failure
+        // arriving with nothing pending is a track's own problem and moves no
+        // device. Asserted by counting, because reasoning about it is exactly
+        // what the queue-advance fallback shows to be unreliable.
+        // The card is named uniquely so the count cannot pick up a line another
+        // test wrote: the capture buffer is global, and a test driving a live
+        // mpv logs into whichever capture happens to be open.
+        let refused = "alsa/hw:CARD=PRIELLOOPGUARD,DEV=0";
+        let mut left_pending = None;
+        let lines = captured(|| {
+            let mpv = silent_mpv();
+            let registry = registry();
+            let mut output = no_output();
+            output.exclusive = true;
+            output.pending = Some(awaiting_a_verdict(refused));
+            // A file that cannot load however often it is tried, so every
+            // reload produces another failure event to settle on.
+            let entries = vec![Entry {
+                id: 7,
+                seq: None,
+                source: "/nonexistent/priel-not-a-file.flac".into(),
+            }];
+            command(&mpv, "loadfile", &[&entries[0].source, "replace"]);
+            for _ in 0..100 {
+                drain_events(&mpv, &registry, &entries, &mut output);
+                thread::sleep(Duration::from_millis(5));
+            }
+            left_pending = Some(output.pending.is_some());
+        });
+
+        let settled = lines
+            .iter()
+            .filter(|l| l.contains("PRIELLOOPGUARD"))
+            .count();
+        assert_eq!(settled, 1, "one refusal, however many times it fails");
+        assert_eq!(
+            left_pending,
+            Some(false),
+            "a change left armed is a reload waiting to happen again"
+        );
+    }
+
+    #[test]
+    fn a_track_that_fails_with_the_output_open_leaves_the_device_alone() {
+        // Goal: a failed load is not proof that a device refused. A 404, a
+        // corrupt stream and an aborted buffer all arrive the same way, and
+        // what tells them apart is whether there is an output open - which is
+        // the same question a device change is already judged by. A bad track
+        // must cost nothing but itself.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        output.exclusive = true;
+        apply_device(&mpv, "pipewire/some.dac");
+        output.pending = Some(awaiting_a_verdict("pipewire/some.dac"));
+
+        settle_now(&mpv, &registry(), &[entry(3)], &mut output, true);
+
+        assert!(!output.refused, "the device did what it was asked");
+        assert!(output.exclusive, "so the request stands");
+        assert_eq!(
+            mpv.get_property::<String>("audio-device")
+                .unwrap_or_default(),
+            "pipewire/some.dac",
+            "and nothing moved"
+        );
+        assert!(
+            output.pending.is_none(),
+            "the change is judged and done with either way"
+        );
+    }
+
     #[test]
     fn a_plain_device_change_that_fails_leaves_exclusivity_where_it_was() {
         // Goal: the two are orthogonal. A device that will not open says
@@ -3219,7 +3408,7 @@ mod tests {
             if mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.5 {
                 break;
             }
-            drain_events(&mpv);
+            drain_events(&mpv, &registry, &[], &mut no_output());
             thread::sleep(Duration::from_millis(10));
         }
         assert!(
@@ -3235,7 +3424,7 @@ mod tests {
                 went_back = true;
                 break;
             }
-            drain_events(&mpv);
+            drain_events(&mpv, &registry, &[], &mut no_output());
             thread::sleep(Duration::from_millis(10));
         }
         command(&mpv, "stop", &[]);
