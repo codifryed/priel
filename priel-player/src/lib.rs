@@ -108,6 +108,32 @@ pub struct PlaybackStatus {
     /// the verdict; when absent the judgement falls back to what the audio
     /// server reported, which can hide a resample it performed itself.
     pub hw: Option<HwParams>,
+    /// How the output device is being held **now**, which is not the same thing
+    /// as what was asked for. See [`OutputAccess`].
+    pub access: OutputAccess,
+}
+
+/// How priel is holding the output device.
+///
+/// Asking for a device exclusively and having it are two different facts, and
+/// only the second may ever be shown: a player that quietly fell back to the
+/// mixer while still claiming a direct connection would be worse than not
+/// offering the path at all. So this describes what the player *achieved* -
+/// what the listener asked for lives in the interface, as the thing they can
+/// still change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputAccess {
+    /// The ordinary path: the device is shared with everything else on the
+    /// machine. Also what an idle player reports, because it is holding nothing.
+    #[default]
+    Shared,
+    /// The device is priel's alone.
+    Exclusive,
+    /// Exclusive access was asked for and refused, so priel is sharing the
+    /// device instead - which is the only reason this is distinct from
+    /// [`Self::Shared`]. The listener asked for something they did not get and
+    /// has to be told.
+    Refused,
 }
 
 /// How faithfully the decoded samples are reaching the output device.
@@ -298,6 +324,8 @@ pub(crate) enum Cmd {
     /// Move the output to this device, reopening it. The queue and the position
     /// are untouched; the cost is the same short gap a sample-rate change makes.
     SetDevice(String),
+    /// Ask for, or give up, exclusive use of the output device.
+    SetExclusive(bool),
     Quit,
 }
 
@@ -325,6 +353,16 @@ pub struct PlayerConfig {
     /// An mpv device string (e.g. `pipewire/alsa_output.usb-SMSL...pro-output-0`),
     /// `None` for the default sink, or `Some("null")` for a silent test.
     pub audio_device: Option<String>,
+    /// Ask for the output device to be priel's alone, taking it out of the
+    /// sound server's graph entirely.
+    ///
+    /// Never set by priel itself under any circumstance: exclusive access
+    /// silences every other application on the machine, so it is always the
+    /// listener's choice. Orthogonal to [`Self::audio_device`] - choosing a
+    /// hardware device does not imply this, and a device can be opened either
+    /// way. A device that will not open exclusively is reported through
+    /// [`PlaybackStatus::access`] and playback continues on the shared path.
+    pub exclusive: bool,
     /// How much of mpv's own log to ask for, as an mpv level name (`error`,
     /// `warn`, `info`, `v`, `debug`, `trace`), or `None` to ask for none.
     ///
@@ -426,6 +464,20 @@ impl Player {
     /// `--device` is what makes one permanent.
     pub fn set_device(&self, device: &str) {
         self.send(Cmd::SetDevice(device.to_string()));
+    }
+
+    /// Ask for the output device to be priel's alone, or give it back.
+    ///
+    /// The output is reopened either way, which costs the same short gap a
+    /// device change does. A device that will not open exclusively is not left
+    /// silent: priel goes back to sharing it, records why, and reports
+    /// [`OutputAccess::Refused`] rather than claiming a connection it does not
+    /// have.
+    ///
+    /// Like the device, the choice lasts for this session; `--exclusive` is
+    /// what makes it permanent.
+    pub fn set_exclusive(&self, exclusive: bool) {
+        self.send(Cmd::SetExclusive(exclusive));
     }
 
     /// The audio devices the player last reported.
@@ -589,6 +641,36 @@ mod tests {
             devices.iter().any(|d| d.name == "auto"),
             "the player thread should have published the list: {devices:?}"
         );
+    }
+
+    #[test]
+    fn a_player_nobody_asked_reports_a_shared_device() {
+        // Goal: the indicator may never claim a connection priel does not have,
+        // and the default is the ordinary shared path. An idle player holds
+        // nothing at all, which reads the same way.
+        let p = silent();
+        assert_eq!(p.status().access, OutputAccess::Shared);
+        assert_eq!(
+            PlaybackStatus::default().access,
+            OutputAccess::Shared,
+            "the default must be the modest answer, not the flattering one"
+        );
+    }
+
+    #[test]
+    fn asking_for_the_device_exclusively_does_not_block_the_caller() {
+        // Goal: this is reachable from the picker, which is drawn on the UI
+        // thread, so it has to be fire-and-forget like every other command. The
+        // answer comes back through the status a tick later.
+        let p = silent();
+        let before = Instant::now();
+        p.set_exclusive(true);
+        assert!(
+            before.elapsed() < Duration::from_millis(50),
+            "asking must not block the caller"
+        );
+        p.set_exclusive(false);
+        assert!(wait_for(&p, |_| true), "the thread is still answering");
     }
 
     #[test]

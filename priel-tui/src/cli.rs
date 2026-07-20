@@ -46,6 +46,21 @@ pub struct Cli {
     #[arg(long, value_name = "MPV_DEVICE")]
     pub device: Option<String>,
 
+    /// Open the output device exclusively, for priel alone
+    ///
+    /// Takes the device out of the sound server's graph, so nothing else on the
+    /// machine can play through it and no other application can reshape the
+    /// chain underneath you. Use it alongside `--device`; it is orthogonal to
+    /// which device is chosen, and priel never selects it on its own.
+    ///
+    /// If the device will not open exclusively - usually because something else
+    /// already holds it - priel says so, records it in the log, and keeps
+    /// playing through the shared path. The output badge then reports shared
+    /// output; it never claims exclusivity it did not get. `x` in the device
+    /// picker toggles the same thing for one session.
+    #[arg(long)]
+    pub exclusive: bool,
+
     /// List the audio output devices and exit
     ///
     /// Prints each device's identifier and description, one per line. The
