@@ -362,6 +362,17 @@ fn drain_events(mpv: &Mpv) {
                     log::debug!("mpv ended a file: {}", end_file_reason(reason));
                 }
                 Event::FileLoaded => log::debug!("mpv loaded a file"),
+                // mpv's own account of what it is doing, asked for by
+                // `request_log_messages` and recorded at the matching level so a
+                // reader can scan for severity across both halves of the log.
+                Event::LogMessage {
+                    prefix,
+                    level,
+                    text,
+                    ..
+                } => {
+                    log::log!(target: "priel::mpv", mpv_level(level), "[{prefix}] {}", text.trim_end());
+                }
                 // The audio output being rebuilt is the audible cost of a
                 // sample-rate change, so it is worth being able to see one.
                 Event::AudioReconfig => log::debug!("mpv reconfigured the audio output"),
@@ -374,6 +385,22 @@ fn drain_events(mpv: &Mpv) {
     log::debug!(
         "mpv had more than {EVENT_DRAIN_MAX} events waiting; the rest keep until next tick"
     );
+}
+
+/// mpv's log levels, mapped onto priel's.
+///
+/// mpv has two priel does not: `fatal`, which is an error either way, and `v`
+/// (verbose), which sits between info and debug. An unrecognised level is kept
+/// at info rather than dropped - a level priel has not heard of is not a reason
+/// to hide the message.
+fn mpv_level(level: &str) -> log::Level {
+    match level {
+        "fatal" | "error" => log::Level::Error,
+        "warn" => log::Level::Warn,
+        "v" | "debug" => log::Level::Debug,
+        "trace" => log::Level::Trace,
+        _ => log::Level::Info,
+    }
 }
 
 /// Name an end-of-file reason.
@@ -455,10 +482,30 @@ fn init_mpv(mpv: &Mpv, config: &PlayerConfig) {
         None => set_prop(mpv, "ao", "pipewire"),
     }
 
-    // mpv's own log, when the caller asked for one. It writes this itself and
-    // truncates on open, which is why it cannot share priel's file.
-    if let Some(path) = config.mpv_log_file.as_deref() {
-        set_prop(mpv, "log-file", path);
+    if let Some(level) = config.mpv_log_level.as_deref() {
+        request_log_messages(mpv, level);
+    }
+}
+
+/// Ask mpv to deliver its own log as events.
+///
+/// libmpv2 does not wrap `mpv_request_log_messages`, so this is the one call
+/// that reaches past it. The messages then arrive through [`drain_events`] and
+/// are recorded like anything else, which is what puts mpv's account of a track
+/// and priel's into one file, in order.
+fn request_log_messages(mpv: &Mpv, level: &str) {
+    let Ok(level) = std::ffi::CString::new(level) else {
+        log::warn!("mpv log level {level:?} is not a C string, so mpv was not asked for its log");
+        return;
+    };
+    // SAFETY: `mpv.ctx` is a live handle - `Mpv` owns it and outlives this call,
+    // which happens on the thread that owns it and before any other thread can
+    // reach it. `level` is NUL-terminated by `CString` and outlives the call;
+    // mpv copies what it needs rather than retaining the pointer. The call only
+    // sets the minimum level on the handle and returns an error code.
+    let rc = unsafe { libmpv2_sys::mpv_request_log_messages(mpv.ctx.as_ptr(), level.as_ptr()) };
+    if rc < 0 {
+        log::warn!("mpv would not give up its log: error {rc}");
     }
 }
 
@@ -1310,27 +1357,58 @@ mod tests {
     }
 
     #[test]
-    fn mpvs_own_log_is_a_setting_mpv_accepts() {
-        // Goal: the one property priel does not always apply, so it is the one
-        // that could sit misspelled and unnoticed. mpv opens the file itself.
-        let path = std::env::temp_dir().join(format!("priel-mpvlog-{}.log", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+    fn mpvs_own_log_arrives_in_priels() {
+        // Goal: what mpv makes of a track is half the story of a playback bug,
+        // and it used to be in a second file with its own timestamps. Asking
+        // mpv for its messages puts both halves in one place, in order.
         let lines = captured(|| {
             let mpv = Mpv::new().expect("mpv should initialise headlessly");
             init_mpv(
                 &mpv,
                 &PlayerConfig {
                     audio_device: Some("null".into()),
-                    mpv_log_file: Some(path.to_string_lossy().into_owned()),
+                    mpv_log_level: Some("info".into()),
                 },
             );
+            command(
+                &mpv,
+                "loadfile",
+                &["/nonexistent/priel-not-a-file.flac", "replace"],
+            );
+            for _ in 0..200 {
+                drain_events(&mpv);
+                if lock(&LINES)
+                    .iter()
+                    .any(|l: &String| l.contains("priel::mpv"))
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
         });
         assert!(
-            !lines.iter().any(|l| l.contains("rejected the property")),
-            "{lines:?}"
+            lines.iter().any(|l| l.contains("priel::mpv")),
+            "mpv's own messages should be recorded: {lines:?}"
         );
-        assert!(path.exists(), "mpv should have opened its own log");
-        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mpvs_levels_are_mapped_onto_priels() {
+        // Goal: mpv has two levels priel does not ("v", "fatal"), and an
+        // unmapped one would silently land at the wrong severity - the thing a
+        // reader scans the log by.
+        assert_eq!(mpv_level("fatal"), log::Level::Error);
+        assert_eq!(mpv_level("error"), log::Level::Error);
+        assert_eq!(mpv_level("warn"), log::Level::Warn);
+        assert_eq!(mpv_level("info"), log::Level::Info);
+        assert_eq!(mpv_level("v"), log::Level::Debug);
+        assert_eq!(mpv_level("debug"), log::Level::Debug);
+        assert_eq!(mpv_level("trace"), log::Level::Trace);
+        assert_eq!(
+            mpv_level("something new"),
+            log::Level::Info,
+            "an unknown level still shows"
+        );
     }
 
     #[test]

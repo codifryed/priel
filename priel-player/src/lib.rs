@@ -267,12 +267,15 @@ pub struct PlayerConfig {
     /// An mpv device string (e.g. `pipewire/alsa_output.usb-SMSL...pro-output-0`),
     /// `None` for the default sink, or `Some("null")` for a silent test.
     pub audio_device: Option<String>,
-    /// Where mpv should write its own log, if anywhere.
+    /// How much of mpv's own log to ask for, as an mpv level name (`error`,
+    /// `warn`, `info`, `v`, `debug`, `trace`), or `None` to ask for none.
     ///
-    /// Separate from the caller's own log because mpv writes this one itself, in
-    /// its own format, and two writers cannot share a file. It is verbose: set
-    /// it only when someone is looking.
-    pub mpv_log_file: Option<String>,
+    /// The messages arrive as events and are recorded through the `log` facade
+    /// like everything else, so they interleave with the caller's own lines
+    /// rather than living in a second file with its own clock. mpv formats every
+    /// message it is asked for, so asking for more than will be recorded is
+    /// wasted work.
+    pub mpv_log_level: Option<String>,
 }
 
 pub struct Player {

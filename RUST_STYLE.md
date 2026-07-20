@@ -109,8 +109,8 @@ synchronous C function invoked from mpv's own demuxer thread, and it must block 
 available - you cannot `.await` there. The buffer would stay `Mutex` + `Condvar` under any model, so
 async would buy nothing at the one boundary where it would have to earn its keep.
 
-- Three long-lived threads (UI, worker, player) plus one downloader per buffered track. Ownership
-  is strict: only the worker touches `Client`, only the player thread touches `Mpv`. Cross-thread
+- Four long-lived threads (UI, worker, player, log writer) plus one downloader per buffered track.
+  Ownership is strict: only the worker touches `Client`, only the player thread touches `Mpv`. Cross-thread
   communication is `mpsc` plus the `Arc<Mutex<PlaybackStatus>>` snapshot. Keep it that way; a second
   path to the same state is how the queue desynchronises.
 - **Never block the UI thread.** No HTTP, no file I/O, no waiting on a lock the player thread can
@@ -126,8 +126,10 @@ async would buy nothing at the one boundary where it would have to earn its keep
 
 ### `unsafe` and FFI
 
-- The only `unsafe` in the workspace is `Protocol::new` in `backend_mpv.rs`, inherent to the libmpv
-  custom-protocol API. It carries a `// SAFETY:` comment covering the three things that make it
+- There are two `unsafe` blocks in the workspace, both in `backend_mpv.rs` and both inherent to a
+  libmpv API that libmpv2 does not wrap safely. The second is `request_log_messages`, a single
+  `mpv_request_log_messages` call whose `// SAFETY:` comment covers the handle's lifetime and the
+  C string's. The first is `Protocol::new`, whose comment covers the three things that make it
   sound: the callbacks capture nothing and receive an `Arc` that outlives them, all shared state is
   behind mutexes so concurrent calls from mpv's threads are fine, and `protocol` is declared after
   `mpv` so it unregisters first. Keep that comment true if the code around it moves.
@@ -237,6 +239,10 @@ and is lost. Diagnostics go to `$XDG_STATE_HOME/priel/priel.log` through the sin
   because it is blocking and pulls in no executor, libmpv behind a default-on feature, `clap`
   because a generated man page and shell completions are worth more than a hand-rolled parser.
   Adding a crate needs a reason that beats writing the small version in-house.
+- `libmpv2-sys` is a direct dependency of `priel-player` only because libmpv2 leaves
+  `mpv_request_log_messages` unwrapped. It is not a new crate or a new system library - libmpv2 is a
+  thin wrapper over it and nothing else - but it is a version to keep in step with libmpv2's own.
+  A mismatch is a compile error, not a silent one.
 - Build-time-only crates belong behind a feature, as `clap_mangen` and `clap_complete` are behind
   `gen-assets`. A tool that produces packaging artefacts has no business in the shipped binary.
 - Anything new must not break: the `--no-default-features` build, the no-OpenSSL guarantee,

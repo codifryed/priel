@@ -10,13 +10,14 @@ description = "Embedded libmpv player with a stream_cb segment protocol (UI-agno
 # libmpv on by default (a music player needs it). Disable for a UI-only build
 # (--no-default-features) that compiles without mpv-devel; playback becomes a no-op.
 default = ["libmpv"]
-libmpv = ["dep:libmpv2"]
+libmpv = ["dep:libmpv2", "dep:libmpv2-sys"]
 
 [dependencies]
 anyhow.workspace = true
 ureq.workspace = true
 priel-core.workspace = true
 libmpv2 = { version = "6", optional = true }
+libmpv2-sys = { workspace = true, optional = true }
 log.workspace = true
 
 [lints]

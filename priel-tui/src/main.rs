@@ -101,7 +101,7 @@ fn session(args: cli::Cli, recent: logging::Recent) -> Result<()> {
     priel_core::auth::migrate_from_config("credentials.json");
     let mut terminal = setup().context("preparing the terminal")?;
     let player = priel_player::PlayerConfig {
-        mpv_log_file: args.mpv_log_file(),
+        mpv_log_level: args.mpv_log_level(),
         audio_device: args.device,
     };
     let res = App::new(player, priel_core::Client::default_token_path(), recent)
@@ -302,14 +302,24 @@ mod tests {
     }
 
     #[test]
-    fn mpv_keeps_its_own_log_only_when_someone_is_looking() {
-        // Goal: mpv's log is verbose and answers a different question from
-        // priel's, so it is tied to --log-level debug rather than kept always.
-        // It sits beside priel's own log so a bug report picks up both.
-        assert!(parse(&[]).mpv_log_file().is_none(), "not by default");
-        assert!(parse(&["--log-level", "info"]).mpv_log_file().is_none());
-        let cli = parse(&["--log-level", "debug", "--log-file", "/tmp/x/p.log"]);
-        assert_eq!(cli.mpv_log_file().as_deref(), Some("/tmp/x/priel-mpv.log"));
+    fn mpv_is_asked_for_the_detail_priel_was_asked_for() {
+        // Goal: one --log-level controls both halves of the log. Asking mpv for
+        // more than priel will record is wasted work; asking for less loses the
+        // half that explains a playback failure.
+        assert_eq!(parse(&[]).mpv_log_level().as_deref(), Some("warn"));
+        assert_eq!(
+            parse(&["--log-level", "info"]).mpv_log_level().as_deref(),
+            Some("info")
+        );
+        assert_eq!(
+            parse(&["--log-level", "debug"]).mpv_log_level().as_deref(),
+            Some("v"),
+            "mpv's own `debug` is far noisier than priel's"
+        );
+        assert!(
+            parse(&["--log-level", "off"]).mpv_log_level().is_none(),
+            "off means mpv is not asked at all"
+        );
     }
 
     #[test]

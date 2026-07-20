@@ -100,9 +100,9 @@ would rewrite it on every token refresh.
 `~/.local/state/priel/priel.log` is the diagnostic log, started fresh each run
 and holding warnings and errors by default. `--log-level debug` (or
 `PRIEL_LOG=debug`) is what to attach to a bug report; `--log-level off` keeps no
-file at all. At `debug` mpv also writes its own log beside it, as
-`priel-mpv.log` — that one answers what the decoder and the audio output made of
-a track, which is a different question.
+file at all. mpv's own messages are recorded in the same file, in order, so a
+failed track shows both halves together — `[file] Cannot open file ...` next to
+priel's own account of what it was trying to play.
 
 Set `PRIEL_NO_BROWSER=1` to stop priel launching a browser; the sign-in screen
 always shows the URL as well, so a headless or remote session still works.

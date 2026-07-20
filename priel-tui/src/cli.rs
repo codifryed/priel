@@ -112,22 +112,29 @@ impl Cli {
             .into()
     }
 
-    /// Where mpv should write its own log, if anywhere.
+    /// How much of its own log to ask mpv for, in mpv's level names.
     ///
-    /// mpv's log answers a different question from priel's - what the decoder
-    /// and the audio output made of a track - and it is verbose enough that it
-    /// is only kept when someone is deliberately looking, so it follows
-    /// `--log-level debug`. It is a separate file because mpv writes it itself,
-    /// in its own format; two writers cannot share one file. It sits beside
-    /// priel's own log so that attaching one to a bug report picks up both.
+    /// mpv answers the other half of a playback question - what the decoder and
+    /// the audio output made of a track - and its messages are recorded in the
+    /// same file, in order, rather than in one of their own. One `--log-level`
+    /// therefore sets both: asking mpv for more than priel will record is work
+    /// mpv does for nothing, and asking for less loses the half that explains a
+    /// failure.
+    ///
+    /// The names are not quite priel's. mpv's `v` (verbose) sits between info
+    /// and debug and is what priel's `debug` maps onto; mpv's own `debug` and
+    /// `trace` go down to individual packets, which would bury everything else.
     #[must_use]
-    pub fn mpv_log_file(&self) -> Option<String> {
-        if self.log_level() < LevelFilter::Debug {
-            return None;
-        }
-        let own = self.log_path();
-        let beside = std::path::Path::new(&own).with_file_name("priel-mpv.log");
-        Some(beside.to_string_lossy().into_owned())
+    pub fn mpv_log_level(&self) -> Option<String> {
+        let level = match self.log_level() {
+            LevelFilter::Off => return None,
+            LevelFilter::Error => "error",
+            LevelFilter::Warn => "warn",
+            LevelFilter::Info => "info",
+            LevelFilter::Debug => "v",
+            LevelFilter::Trace => "debug",
+        };
+        Some(level.to_string())
     }
 
     /// The log path to use, resolving the default only when none was given.

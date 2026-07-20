@@ -35,6 +35,11 @@ regex = "1"
 # all when the level is off. The sink is written in-house in priel-tui, so a
 # future GUI frontend installs its own and the libraries stay UI-free.
 log = { version = "0.4", features = ["std"] }
+# Already in the tree: libmpv2 is a thin wrapper over it and nothing else, so
+# naming it directly costs no new crate and no new system library. It is here
+# for `mpv_request_log_messages`, which libmpv2 does not wrap. Its default
+# features leave bindgen out, so no clang at build time either.
+libmpv2-sys = "4"
 # ureq: blocking, rustls, no async runtime. No tokio/hyper anywhere in the tree.
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 clap = { version = "4", features = ["derive"] }
