@@ -23,26 +23,77 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use priel_core::auth::Credentials;
-use priel_core::{Client, Fault, Playlist, Quality, ResolvedStream, SearchResults, Track};
+use priel_core::{Client, Fault, Page, Playlist, Quality, ResolvedStream, SearchResults, Track};
+
+/// Rows one favorites request asks for.
+///
+/// Every listing call takes an explicit limit and this is the favorites one:
+/// large enough that a screenful never waits on a round trip, small enough that
+/// the first page is on screen quickly.
+pub const FAVORITES_PAGE: u32 = 100;
 
 pub enum ToWorker {
-    LoadFavorites,
+    /// One page of favorites. The offset comes back on the reply, so a page for
+    /// a listing the view has since thrown away can be recognised and dropped
+    /// instead of appended in the wrong place.
+    LoadFavorites {
+        offset: u32,
+        limit: u32,
+    },
     LoadPlaylists,
     LoadPlaylistTracks(String), // uuid
     Search(String),
     Resolve(u64),
 }
 
+/// Which request a reply belongs to.
+///
+/// Successes have always carried their identity - a playlist reply names its
+/// uuid, a resolve names its track - and a failure has to as well. A view
+/// waiting on a page that died cannot otherwise tell that the death was its
+/// own, so it waits for a reply that is never coming.
+///
+/// The display name lives here too, so the words on screen and the identity the
+/// interface branches on cannot drift apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Task {
+    Startup,
+    Favorites { offset: u32 },
+    Playlists,
+    PlaylistTracks,
+    Search,
+    Resolve,
+}
+
+impl std::fmt::Display for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Startup => "startup",
+            Self::Favorites { .. } => "favorites",
+            Self::Playlists => "playlists",
+            Self::PlaylistTracks => "playlist tracks",
+            Self::Search => "search",
+            Self::Resolve => "resolve",
+        })
+    }
+}
+
 pub enum FromWorker {
-    Favorites(Vec<Track>),
+    /// A page of favorites and the offset it answers.
+    Favorites {
+        offset: u32,
+        page: Page<Track>,
+    },
     Playlists(Vec<Playlist>),
     PlaylistTracks(String, Vec<Track>), // uuid, tracks
     SearchResults(SearchResults),
     Resolved(u64, ResolvedStream),
-    /// A request failed. `fault` is what the interface branches on; `detail` is
-    /// the sentence it shows. Nothing may match on `detail` - that is the whole
-    /// point of `fault` existing.
+    /// A request failed. `task` says which one, so the view that was waiting can
+    /// stop; `fault` is what the interface branches on; `detail` is the sentence
+    /// it shows. Nothing may match on `detail` - that is the whole point of
+    /// `fault` existing.
     Failed {
+        task: Task,
         fault: Fault,
         detail: String,
     },
@@ -71,9 +122,10 @@ impl Worker {
 /// The classification comes from the core, the only layer that can tell a
 /// refused session from a dropped connection. `detail` is one line for the
 /// screen; the full chain goes to the log, which has room for it.
-fn failed(task: &str, e: &anyhow::Error) -> FromWorker {
+fn failed(task: Task, e: &anyhow::Error) -> FromWorker {
     log::warn!("{task}: {e:#}");
     FromWorker::Failed {
+        task,
         fault: Fault::of(e),
         detail: format!("{task}: {e}"),
     }
@@ -118,32 +170,34 @@ where
             Ok(c) => c,
             Err(e) => {
                 log::error!("the worker could not start: {e:#}");
-                let _ = evt_tx.send(failed("startup", &e));
+                let _ = evt_tx.send(failed(Task::Startup, &e));
                 return;
             }
         };
 
         for cmd in cmd_rx {
             let msg = match cmd {
-                ToWorker::LoadFavorites => match client.favorite_tracks(0, 100) {
-                    Ok(t) => FromWorker::Favorites(t),
-                    Err(e) => failed("favorites", &e),
-                },
+                ToWorker::LoadFavorites { offset, limit } => {
+                    match client.favorite_tracks(offset, limit) {
+                        Ok(page) => FromWorker::Favorites { offset, page },
+                        Err(e) => failed(Task::Favorites { offset }, &e),
+                    }
+                }
                 ToWorker::LoadPlaylists => match client.user_playlists(0, 100) {
                     Ok(p) => FromWorker::Playlists(p),
-                    Err(e) => failed("playlists", &e),
+                    Err(e) => failed(Task::Playlists, &e),
                 },
                 ToWorker::LoadPlaylistTracks(uuid) => match client.playlist_tracks(&uuid, 0, 200) {
                     Ok(t) => FromWorker::PlaylistTracks(uuid, t),
-                    Err(e) => failed("playlist tracks", &e),
+                    Err(e) => failed(Task::PlaylistTracks, &e),
                 },
                 ToWorker::Search(q) => match client.search(&q, 50) {
                     Ok(r) => FromWorker::SearchResults(r),
-                    Err(e) => failed("search", &e),
+                    Err(e) => failed(Task::Search, &e),
                 },
                 ToWorker::Resolve(id) => match client.resolve_stream(id, Quality::HiRes) {
                     Ok(r) => FromWorker::Resolved(id, r),
-                    Err(e) => failed("resolve", &e),
+                    Err(e) => failed(Task::Resolve, &e),
                 },
             };
             // Recorded here rather than at each call site: one place covers
@@ -167,7 +221,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Fault, FromWorker, ToWorker, Worker, spawn_with};
+    use super::{Fault, FromWorker, Task, ToWorker, Worker, spawn_with};
     use priel_core::Client;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -195,6 +249,12 @@ mod tests {
                 }
                 let body = if line.contains("/v1/sessions") {
                     r#"{"userId":1,"countryCode":"DE"}"#.to_string()
+                } else if line.contains("/favorites/tracks") {
+                    // Varied by offset so a paging test can tell one page from
+                    // the next; a stub that answered the same thing twice would
+                    // pass whether or not the offset reached the URL.
+                    let id = if line.contains("offset=0") { 1 } else { 2 };
+                    format!(r#"{{"totalNumberOfItems":2,"items":[{{"item":{{"id":{id}}}}}]}}"#)
                 } else if line.contains("playbackinfo") {
                     let inner = r#"{"codecs":"flac","urls":["http://127.0.0.1:1/a"]}"#;
                     let b64 = {
@@ -233,14 +293,76 @@ mod tests {
     }
 
     #[test]
+    fn a_favorites_reply_names_the_page_it_is_for() {
+        // Goal: two pages of the same listing are told apart by the offset they
+        // were asked for, never by the order they come back in. Without that
+        // identity a slow first page would be appended after the second.
+        let w = worker_on(origin());
+
+        w.tx.send(ToWorker::LoadFavorites {
+            offset: 0,
+            limit: 1,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::Favorites { offset, page } => {
+                assert_eq!(offset, 0, "the reply names the page it answers");
+                assert_eq!(page.items[0].id, 1);
+                assert_eq!(page.total, 2, "and carries the length of the listing");
+            }
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+
+        w.tx.send(ToWorker::LoadFavorites {
+            offset: 1,
+            limit: 1,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::Favorites { offset, page } => {
+                assert_eq!(offset, 1);
+                assert_eq!(page.items[0].id, 2, "the offset has to reach the URL");
+            }
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_failed_page_says_which_page_it_was() {
+        // Goal: a view waiting on a page has to recognise its own failure, or it
+        // waits forever for a reply that is never coming.
+        let base = origin();
+        let w = spawn_with(move || {
+            let mut c = Client::new("tok".into())?.with_base_url(base);
+            c.connect()?;
+            Ok(c.with_base_url("http://127.0.0.1:1"))
+        });
+        w.tx.send(ToWorker::LoadFavorites {
+            offset: 40,
+            limit: 20,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::Failed { task, .. } => {
+                assert_eq!(task, Task::Favorites { offset: 40 });
+            }
+            other => panic!("expected an error, got {}", variant(&other)),
+        }
+    }
+
+    #[test]
     fn every_request_kind_comes_back_as_its_own_reply() {
         // Goal: the worker is the only thing between the UI and the network, and
         // it must keep replies typed. A reply of the wrong variant would silently
         // populate the wrong view.
         let w = worker_on(origin());
 
-        w.tx.send(ToWorker::LoadFavorites).unwrap();
-        assert!(matches!(next(&w), FromWorker::Favorites(_)));
+        w.tx.send(ToWorker::LoadFavorites {
+            offset: 0,
+            limit: 10,
+        })
+        .unwrap();
+        assert!(matches!(next(&w), FromWorker::Favorites { .. }));
 
         w.tx.send(ToWorker::LoadPlaylists).unwrap();
         assert!(matches!(next(&w), FromWorker::Playlists(_)));
@@ -265,7 +387,7 @@ mod tests {
 
     fn variant(m: &FromWorker) -> &'static str {
         match m {
-            FromWorker::Favorites(_) => "Favorites",
+            FromWorker::Favorites { .. } => "Favorites",
             FromWorker::Playlists(_) => "Playlists",
             FromWorker::PlaylistTracks(..) => "PlaylistTracks",
             FromWorker::SearchResults(_) => "SearchResults",
@@ -299,7 +421,11 @@ mod tests {
             // that follows does not.
             Ok(c.with_base_url("http://127.0.0.1:1"))
         });
-        w.tx.send(ToWorker::LoadFavorites).unwrap();
+        w.tx.send(ToWorker::LoadFavorites {
+            offset: 0,
+            limit: 10,
+        })
+        .unwrap();
         match next(&w) {
             FromWorker::Failed { detail, .. } => assert!(detail.contains("favorites"), "{detail}"),
             other => panic!("expected an error, got {}", variant(&other)),
@@ -366,7 +492,12 @@ mod tests {
             "/nonexistent/priel/credentials.json".into(),
         );
         match next(&w) {
-            FromWorker::Failed { fault, detail } => {
+            FromWorker::Failed {
+                task,
+                fault,
+                detail,
+            } => {
+                assert_eq!(task, Task::Startup, "the startup handshake is its own task");
                 assert_eq!(
                     fault,
                     Fault::SignedOut,
