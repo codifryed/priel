@@ -31,7 +31,8 @@ use ratatui::layout::Rect;
 
 use priel_core::auth::{Credentials, Pkce};
 use priel_core::{Fault, Playlist, Track};
-use priel_player::graph::{AudioGraph, GraphError, GraphNode, NodeRole};
+use priel_player::Alteration;
+use priel_player::graph::{Attribution, AudioGraph, GraphError, GraphNode, NodeRole};
 use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig};
 
 #[cfg(test)]
@@ -92,6 +93,10 @@ pub enum Mode {
 pub enum GraphRowKind {
     /// A node on the path from priel to the device.
     Node,
+    /// The node the chain says is altering the samples, or the sentence naming
+    /// it. Drawn the colour the fidelity badge uses for the same finding, so
+    /// the two read as one answer rather than two opinions.
+    Culprit,
     /// The connector drawn between two nodes.
     Link,
     /// Prose: what is being waited for, or why there is nothing to show.
@@ -1617,7 +1622,16 @@ impl App {
                 rows.extend(e.hint().map(note));
                 rows
             }
-            Some(Ok(g)) => path_rows(g),
+            Some(Ok(g)) => {
+                // The same two readings the badge is built from, so the row and
+                // the overlay cannot disagree about one track.
+                let source = self.status.decoded_format(self.now_meta.bit_depth);
+                let observed = self.status.fidelity(self.now_meta.bit_depth).alteration();
+                let blame = g.attribute(source, observed);
+                let mut rows = path_rows(g, blame);
+                rows.extend(blame_row(g, blame, observed));
+                rows
+            }
         }
     }
 
@@ -2159,8 +2173,14 @@ fn note(text: &str) -> GraphRow {
 /// The chain, one row per node with a connector between them.
 ///
 /// Pure so the overlay's content is a table of tests rather than something only
-/// a rendered frame can show.
-fn path_rows(g: &AudioGraph) -> Vec<GraphRow> {
+/// a rendered frame can show. The accusation arrives already decided, from
+/// `AudioGraph::attribute` in the player crate: the grading is the player's and
+/// this only draws it.
+fn path_rows(g: &AudioGraph, blame: Attribution) -> Vec<GraphRow> {
+    let accused = match blame {
+        Attribution::Node { index, .. } => Some(index),
+        _ => None,
+    };
     let mut rows = Vec::with_capacity(g.path.len() * 2);
     for (hop, node) in g.path.iter().enumerate() {
         if hop > 0 {
@@ -2170,29 +2190,85 @@ fn path_rows(g: &AudioGraph) -> Vec<GraphRow> {
                 kind: GraphRowKind::Link,
             });
         }
+        let marked = accused == Some(hop);
         rows.push(GraphRow {
-            label: node_label(node),
+            label: node_label(node, marked),
             detail: negotiated(node),
-            kind: GraphRowKind::Node,
+            kind: if marked {
+                GraphRowKind::Culprit
+            } else {
+                GraphRowKind::Node
+            },
         });
     }
     rows
+}
+
+/// What the chain has to say about the samples being altered, in a sentence.
+///
+/// Empty for a chain that alters nothing, and empty for an idle player: an
+/// accusation on a clean chain teaches the reader to ignore the marker, and a
+/// disclaimer on every idle reading is noise over rows that already say they
+/// have settled on nothing.
+///
+/// The two admissions are deliberately different sentences. "Nothing on this
+/// path did it" is a finding - every node was compared and none of them
+/// diverged. "Not enough was negotiated" is the absence of one, and reporting
+/// it as the first would claim a comparison that never happened.
+fn blame_row(g: &AudioGraph, blame: Attribution, observed: Option<Alteration>) -> Option<GraphRow> {
+    match blame {
+        Attribution::Node { index, alteration } => {
+            let node = g.path.get(index)?;
+            let verb = match alteration {
+                Alteration::Truncated => "truncating the samples",
+                _ => "resampling",
+            };
+            Some(GraphRow {
+                label: format!("  {} is {verb}.", display_name(node)),
+                detail: String::new(),
+                kind: GraphRowKind::Culprit,
+            })
+        }
+        Attribution::Unexplained(Alteration::Truncated) => Some(note(
+            "  The width narrowed, and nothing on this path did it.",
+        )),
+        Attribution::Unexplained(_) => {
+            Some(note("  The rate changed, and nothing on this path did it."))
+        }
+        // Something was measured and there was nothing here to check it
+        // against, which is not the same admission as the one above.
+        Attribution::NothingToCompare if observed.is_some() => {
+            Some(note("  Not enough was negotiated here to say what did it."))
+        }
+        // A clean chain accuses nobody, and an idle one is not asked to.
+        Attribution::Clean | Attribution::NothingToCompare => None,
+    }
 }
 
 /// How a node introduces itself.
 ///
 /// The stream is libmpv's and `PipeWire` calls it `mpv`, which is a puzzle on
 /// screen until it is labelled - so it is labelled.
-fn node_label(node: &GraphNode) -> String {
-    let name = if node.description.is_empty() {
+///
+/// The marker replaces the indent rather than sitting inside it, so the names
+/// still line up under one another and the accused row is the only one that
+/// breaks the left edge.
+fn node_label(node: &GraphNode, marked: bool) -> String {
+    let name = display_name(node);
+    let indent = if marked { "⚠ " } else { "  " };
+    match node.role {
+        NodeRole::Stream => format!("{indent}{name}  (priel)"),
+        NodeRole::Intermediate => format!("{indent}{name}"),
+        NodeRole::Device => format!("{indent}{name}  (device)"),
+    }
+}
+
+/// The name a reader would recognise the node by.
+fn display_name(node: &GraphNode) -> &str {
+    if node.description.is_empty() {
         &node.name
     } else {
         &node.description
-    };
-    match node.role {
-        NodeRole::Stream => format!("  {name}  (priel)"),
-        NodeRole::Intermediate => format!("  {name}"),
-        NodeRole::Device => format!("  {name}  (device)"),
     }
 }
 
@@ -2232,6 +2308,7 @@ fn row_matches(primary: &str, secondary: &str, filter_lower: &str) -> bool {
 mod tests {
     use super::*;
     use priel_core::{PlayableSource, ResolvedStream};
+    use priel_player::hw::HwParams;
 
     struct Rig {
         app: App,
@@ -3068,6 +3145,217 @@ mod tests {
         let rows = r.app.graph_rows();
         let last = rows.last().expect("a row");
         assert_eq!(last.detail, "no format yet");
+    }
+
+    /// A three-node chain with a loopback wedged in that moves the rate to
+    /// 48 kHz and a device that narrows to 16 bits behind it.
+    fn altered_chain() -> AudioGraph {
+        let mut g = chain();
+        g.path[0].format = Some("S32LE".into());
+        g.path.insert(
+            1,
+            GraphNode {
+                id: 71,
+                name: "studio-loopback".into(),
+                description: "Studio loopback".into(),
+                media_class: "Audio/Sink".into(),
+                role: NodeRole::Intermediate,
+                rate_hz: Some(48_000),
+                format: Some("F32LE".into()),
+                channels: Some(2),
+            },
+        );
+        g.path[2].rate_hz = Some(48_000);
+        g
+    }
+
+    /// An app playing a 44.1 kHz 24-bit track, with the graph overlay open.
+    fn playing_hires(graph: AudioGraph) -> Rig {
+        let mut r = rig();
+        r.app.status.loaded = true;
+        r.app.status.playing = true;
+        r.app.status.volume = 100.0;
+        r.app.status.in_sample_rate = 44_100;
+        r.app.status.in_format = "s32".into();
+        r.app.status.sample_rate = 44_100;
+        r.app.status.out_format = "s32".into();
+        r.app.now_meta.bit_depth = 24;
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Ok(graph)))
+            .expect("send");
+        r.app.drain_worker();
+        r
+    }
+
+    fn overlay_text(app: &App) -> String {
+        app.graph_rows()
+            .iter()
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_node_that_changed_the_rate_is_marked_and_named() {
+        // Goal: the badge already says the samples were resampled. This is the
+        // half it cannot answer - which of the nodes did it - and the answer is
+        // useless unless the reader can see which row is accused, so the row is
+        // marked and the sentence names it.
+        let r = playing_hires(altered_chain());
+        let rows = r.app.graph_rows();
+        let marked: Vec<&GraphRow> = rows
+            .iter()
+            .filter(|row| row.kind == GraphRowKind::Culprit)
+            .collect();
+        assert_eq!(marked.len(), 2, "the row and the sentence about it");
+        assert!(
+            marked[0].label.contains("Studio loopback"),
+            "the loopback moved the rate, not the DAC behind it: {}",
+            marked[0].label
+        );
+        assert!(
+            marked[1].label.contains("Studio loopback"),
+            "{}",
+            marked[1].label
+        );
+        assert!(
+            marked[1].label.contains("resampling"),
+            "{}",
+            marked[1].label
+        );
+    }
+
+    #[test]
+    fn a_narrowing_node_is_named_the_same_way_a_resampling_one_is() {
+        // Goal: a sink that takes 24-bit content as S16LE throws eight bits
+        // away, which is the other half of the same question and gets the same
+        // treatment rather than a second idiom.
+        let mut g = chain();
+        g.path[0].format = Some("S32LE".into());
+        g.path[1].format = Some("S16LE".into());
+        let r = playing_hires(g);
+        let text = overlay_text(&r.app);
+        assert!(text.contains("Studio DAC is truncating"), "{text}");
+    }
+
+    #[test]
+    fn a_clean_chain_accuses_nobody() {
+        // Goal: the overlay is read most often when nothing is wrong, and a
+        // marker on a chain that is fine would teach the reader to ignore it.
+        let mut g = chain();
+        g.path[0].format = Some("S32LE".into());
+        let r = playing_hires(g);
+        assert!(
+            r.app
+                .graph_rows()
+                .iter()
+                .all(|row| row.kind != GraphRowKind::Culprit),
+            "{}",
+            overlay_text(&r.app)
+        );
+    }
+
+    #[test]
+    fn a_chain_that_explains_nothing_admits_it_rather_than_blaming_the_nearest_node() {
+        // Goal: the device is clocked at 48 kHz and every node on the path says
+        // 44.1 kHz - a resample the server did inside a node rather than
+        // between two of them. The DAC is the nearest candidate and naming it
+        // would send the reader to change a setting that was never wrong.
+        let mut g = chain();
+        g.path[0].format = Some("S32LE".into());
+        let mut r = playing_hires(g);
+        r.app.status.hw = Some(HwParams {
+            card: "AUDIO".into(),
+            rate: 48_000,
+            format: "S32_LE".into(),
+            channels: 2,
+        });
+        let text = overlay_text(&r.app);
+        assert!(
+            r.app
+                .graph_rows()
+                .iter()
+                .all(|row| row.kind != GraphRowKind::Culprit),
+            "{text}"
+        );
+        assert!(text.contains("nothing on this path"), "{text}");
+        assert!(
+            !text.contains("Studio DAC is"),
+            "the nearest candidate must not be blamed: {text}"
+        );
+    }
+
+    #[test]
+    fn an_idle_overlay_says_nothing_about_a_track_there_is_none_of() {
+        // Goal: with nothing playing there is no track format to compare
+        // against, and a sentence about it on every idle reading would be noise
+        // over a chain the reader can already see has settled on nothing.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Ok(chain())))
+            .expect("send");
+        r.app.drain_worker();
+        assert_eq!(
+            r.app.graph_rows().len(),
+            3,
+            "two nodes and the connector, and nothing else: {}",
+            overlay_text(&r.app)
+        );
+    }
+
+    #[test]
+    fn a_measurement_that_could_not_be_checked_is_admitted_too() {
+        // Goal: the chain published no formats at all and the hardware says the
+        // rate moved. "Nothing on this path did it" would claim a comparison
+        // that never happened, so this case gets its own sentence.
+        let mut g = chain();
+        for node in &mut g.path {
+            node.rate_hz = None;
+            node.format = None;
+        }
+        let mut r = playing_hires(g);
+        r.app.status.hw = Some(HwParams {
+            card: "AUDIO".into(),
+            rate: 48_000,
+            format: "S32_LE".into(),
+            channels: 2,
+        });
+        let text = overlay_text(&r.app);
+        assert!(text.contains("Not enough"), "{text}");
+        assert!(
+            !text.contains("nothing on this path"),
+            "nothing was compared, so nothing was ruled out: {text}"
+        );
+    }
+
+    #[test]
+    fn every_sentence_the_overlay_adds_fits_the_box_it_is_drawn_in() {
+        // Goal: the overlay draws one row per line and does not rewrap, so a
+        // sentence longer than the box loses its tail - and in an accusation
+        // the tail is the verb.
+        let mut r = playing_hires(altered_chain());
+        for row in r.app.graph_rows() {
+            assert!(
+                row.label.chars().count() <= 60,
+                "too long to draw: {}",
+                row.label
+            );
+        }
+        r.app.status.hw = Some(HwParams {
+            card: "AUDIO".into(),
+            rate: 96_000,
+            format: "S16_LE".into(),
+            channels: 2,
+        });
+        for row in r.app.graph_rows() {
+            assert!(
+                row.label.chars().count() <= 60,
+                "too long to draw: {}",
+                row.label
+            );
+        }
     }
 
     #[test]

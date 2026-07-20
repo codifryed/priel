@@ -1,0 +1,128 @@
+[
+  {
+    "id": 100,
+    "type": "PipeWire:Interface:Client",
+    "version": 3,
+    "info": {
+      "props": {
+        "application.name": "mpv",
+        "application.process.id": 4242
+      }
+    }
+  },
+  {
+    "id": 101,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "info": {
+      "state": "running",
+      "props": {
+        "application.name": "mpv",
+        "client.id": 100,
+        "media.class": "Stream/Output/Audio",
+        "media.name": "5 - mpv",
+        "node.description": "mpv",
+        "node.name": "mpv",
+        "node.rate": "1/44100"
+      },
+      "params": {
+        "Format": [
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "raw",
+            "format": "S32LE",
+            "rate": 44100,
+            "channels": 2,
+            "position": ["FL", "FR"]
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 102,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "info": {
+      "state": "running",
+      "props": {
+        "factory.name": "support.null-audio-sink",
+        "media.class": "Audio/Sink",
+        "node.description": "Studio loopback",
+        "node.name": "studio-loopback",
+        "node.virtual": true
+      },
+      "params": {
+        "Format": [
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "raw",
+            "format": "F32LE",
+            "rate": 48000,
+            "channels": 2,
+            "position": ["FL", "FR"]
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 103,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "info": {
+      "state": "running",
+      "props": {
+        "alsa.card": 3,
+        "alsa.card_name": "Example DAC",
+        "alsa.id": "DAC",
+        "api.alsa.path": "hw:3,0",
+        "audio.format": "S16LE",
+        "device.api": "alsa",
+        "media.class": "Audio/Sink",
+        "node.description": "Example DAC Analog Stereo",
+        "node.name": "alsa_output.usb-Example_DAC-00.analog-stereo"
+      },
+      "params": {
+        "Format": [
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "raw",
+            "format": "S16LE",
+            "rate": {
+              "default": 48000,
+              "min": 44100,
+              "max": 192000
+            },
+            "channels": 2,
+            "position": ["FL", "FR"]
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 104,
+    "type": "PipeWire:Interface:Link",
+    "version": 3,
+    "info": {
+      "output-node-id": 101,
+      "output-port-id": 1,
+      "input-node-id": 102,
+      "input-port-id": 2,
+      "state": "active"
+    }
+  },
+  {
+    "id": 105,
+    "type": "PipeWire:Interface:Link",
+    "version": 3,
+    "info": {
+      "output-node-id": 102,
+      "output-port-id": 3,
+      "input-node-id": 103,
+      "input-port-id": 4,
+      "state": "active"
+    }
+  }
+]

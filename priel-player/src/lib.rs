@@ -31,6 +31,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use priel_core::PlayableSource;
 
+use crate::graph::SourceFormat;
 use crate::hw::HwParams;
 
 pub mod graph;
@@ -159,6 +160,23 @@ pub enum Fidelity {
     Altered(Alteration),
 }
 
+impl Fidelity {
+    /// The rebuilt sample stream the graph could be asked to account for, if
+    /// there is one.
+    ///
+    /// Only [`Altered`](Self::Altered) qualifies, and only ever with a cause the
+    /// graph publishes: a volume control is not a node on the path, so handing
+    /// one to [`AudioGraph::attribute`](graph::AudioGraph::attribute) would ask
+    /// the chain to explain something it never shows.
+    #[must_use]
+    pub fn alteration(self) -> Option<Alteration> {
+        match self {
+            Self::Altered(a @ (Alteration::Resampled | Alteration::Truncated)) => Some(a),
+            _ => None,
+        }
+    }
+}
+
 /// Why playback is not bit-perfect, most damaging first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Alteration {
@@ -178,36 +196,49 @@ pub enum Alteration {
     ServerVolumeScaled,
 }
 
-/// Bits of resolution an mpv sample format can carry.
+/// Bits of resolution a sample format name carries, endianness already removed.
 ///
 /// `float` is 32-bit with a 24-bit mantissa, which represents any integer source
-/// up to 24 bits exactly - so it counts as 24, not 32.
+/// up to 24 bits exactly - so it counts as 24, not 32. `s24_32` and `s24_3` are
+/// both 24 bits, differing only in how many bytes they are carried in.
 #[allow(
     clippy::match_same_arms,
     reason = "s24 and float coincide numerically for unrelated reasons; merging them would hide why"
 )]
-fn format_bits(fmt: &str) -> Option<u32> {
-    // Two vocabularies reach this: mpv's (`s32`, `floatp`) and ALSA's from
-    // /proc/asound (`S32_LE`, `S24_3LE`). Normalise both.
-    let lower = fmt.to_ascii_lowercase();
-    // `S24_3LE` is 24 bits packed into 3 bytes and has no underscore before the
-    // endianness, so it has to be stripped before the plain `_le` case - which
-    // is precisely the device format a packed-24 DAC reports.
-    let f = lower
-        .trim_end_matches("_3le")
-        .trim_end_matches("_3be")
-        .trim_end_matches("_le")
-        .trim_end_matches("_be")
-        .trim_end_matches('p');
+fn base_format_bits(f: &str) -> Option<u32> {
     match f {
         "u8" | "s8" => Some(8),
         "s16" => Some(16),
-        "s24" => Some(24),
+        "s24" | "s24_3" | "s24_32" => Some(24),
         "s32" => Some(32),
-        "float" => Some(24),
-        "float64" | "double" => Some(53),
+        "float" | "f32" => Some(24),
+        "float64" | "double" | "f64" => Some(53),
         _ => None,
     }
+}
+
+/// Bits of resolution a sample format can carry, in any of the spellings priel
+/// meets.
+///
+/// Three vocabularies reach this: mpv's (`s32`, `floatp`), ALSA's from
+/// /proc/asound (`S32_LE`, `S24_3LE`) and the sound server's from the graph
+/// (`S16LE`, `S24_32LE`, `F32P`), which writes the endianness with no separator
+/// at all.
+///
+/// The endianness is only stripped when what is left is a width this knows,
+/// rather than trimmed off unconditionally: `double` ends in the same two
+/// letters a little-endian suffix does, and blind trimming turned it into
+/// nothing.
+pub(crate) fn format_bits(fmt: &str) -> Option<u32> {
+    let lower = fmt.to_ascii_lowercase();
+    // The planar marker, on both mpv's `floatp` and the server's `F32P`.
+    let f = lower.strip_suffix('p').unwrap_or(&lower);
+    if let Some(bits) = base_format_bits(f) {
+        return Some(bits);
+    }
+    ["_le", "_be", "le", "be"]
+        .iter()
+        .find_map(|suffix| f.strip_suffix(suffix).and_then(base_format_bits))
 }
 
 impl PlaybackStatus {
@@ -251,6 +282,26 @@ impl PlaybackStatus {
         self.hw.is_some()
     }
 
+    /// The track as the decoder produced it, for comparing a graph's nodes
+    /// against.
+    ///
+    /// Shares the source rule with [`fidelity`](Self::fidelity) rather than
+    /// restating it: a declared depth wins, and only where the service declared
+    /// none does the container width stand in as an upper bound. Two readings
+    /// of the same track that disagreed about how wide it was would put the
+    /// badge and the graph overlay at odds.
+    #[must_use]
+    pub fn decoded_format(&self, source_bits: u32) -> SourceFormat {
+        SourceFormat {
+            rate_hz: self.in_sample_rate,
+            bits: if source_bits > 0 {
+                source_bits
+            } else {
+                format_bits(&self.in_format).unwrap_or(0)
+            },
+        }
+    }
+
     #[must_use]
     pub fn fidelity(&self, source_bits: u32) -> Fidelity {
         if !self.loaded || self.in_sample_rate == 0 {
@@ -263,14 +314,12 @@ impl PlaybackStatus {
         let Some(out_bits) = format_bits(out_format) else {
             return Fidelity::Unknown;
         };
-        let source_bits = if source_bits > 0 {
-            source_bits
-        } else {
-            match format_bits(&self.in_format) {
-                Some(b) => b,
-                None => return Fidelity::Unknown,
-            }
-        };
+        // Zero means the width is not known from either end, which is not a
+        // verdict about anything.
+        let source_bits = self.decoded_format(source_bits).bits;
+        if source_bits == 0 {
+            return Fidelity::Unknown;
+        }
 
         if out_rate != self.in_sample_rate {
             return Fidelity::Altered(Alteration::Resampled);
@@ -970,6 +1019,105 @@ mod tests {
                 channels: 2,
             });
             assert_eq!(s.fidelity(24), verdict, "format {fmt}");
+        }
+    }
+
+    #[test]
+    fn the_track_the_graph_is_compared_against_falls_back_to_the_container() {
+        // Goal: the graph's nodes are judged against the same source the badge
+        // is, or the two would disagree about the same track. That includes the
+        // rule that makes the badge honest - a declared depth wins, and only
+        // when there is none does the container width stand in for it.
+        let s = playing(44_100, 44_100, "s32", "s32");
+        assert_eq!(
+            s.decoded_format(24),
+            SourceFormat {
+                rate_hz: 44_100,
+                bits: 24
+            }
+        );
+        assert_eq!(
+            s.decoded_format(0),
+            SourceFormat {
+                rate_hz: 44_100,
+                bits: 32
+            },
+            "with nothing declared the container is the only upper bound there is"
+        );
+
+        let s = playing(44_100, 44_100, "unknowable", "s32");
+        assert_eq!(
+            s.decoded_format(0),
+            SourceFormat {
+                rate_hz: 44_100,
+                bits: 0
+            },
+            "zero means do not compare, not zero bits"
+        );
+    }
+
+    #[test]
+    fn only_a_rebuilt_sample_stream_is_something_the_graph_can_be_asked_about() {
+        // Goal: the attribution takes what was graded and looks for the node
+        // that did it. A volume control is not a node, and handing one over
+        // would have the chain asked to account for something it never
+        // publishes.
+        assert_eq!(Fidelity::Unknown.alteration(), None);
+        assert_eq!(Fidelity::BitPerfect.alteration(), None);
+        assert_eq!(
+            Fidelity::NearBitPerfect(Alteration::VolumeScaled).alteration(),
+            None
+        );
+        assert_eq!(
+            Fidelity::Altered(Alteration::Resampled).alteration(),
+            Some(Alteration::Resampled)
+        );
+        assert_eq!(
+            Fidelity::Altered(Alteration::Truncated).alteration(),
+            Some(Alteration::Truncated)
+        );
+    }
+
+    #[test]
+    fn the_sound_servers_format_names_are_understood_too() {
+        // Goal: a third vocabulary reaches this. /proc writes `S16_LE`, mpv
+        // writes `s16`, and the graph writes `S16LE` with no underscore at all -
+        // plus `S24_32LE` for 24 bits carried in a 32-bit word. A width that
+        // reads as unknown would leave a node on the path unjudged, which is
+        // exactly the node the reader opened the overlay to find.
+        for (fmt, bits) in [
+            ("S16LE", Some(16)),
+            ("S24LE", Some(24)),
+            ("S24_32LE", Some(24)),
+            ("S32LE", Some(32)),
+            ("F32LE", Some(24)),
+            ("F32P", Some(24)),
+            ("F64LE", Some(53)),
+            ("S16BE", Some(16)),
+            ("U8", Some(8)),
+            ("nonsense", None),
+        ] {
+            assert_eq!(format_bits(fmt), bits, "format {fmt}");
+        }
+    }
+
+    #[test]
+    fn the_older_format_names_still_map_to_the_same_widths() {
+        // Goal: the two vocabularies that were already understood must not
+        // regress while a third is added - `double` ends in the same two
+        // letters an endianness suffix does, and trimming blindly would turn
+        // 53 bits into nothing.
+        for (fmt, bits) in [
+            ("s16", Some(16)),
+            ("s32", Some(32)),
+            ("float", Some(24)),
+            ("floatp", Some(24)),
+            ("double", Some(53)),
+            ("S24_3LE", Some(24)),
+            ("FLOAT_LE", Some(24)),
+            ("S32_LE", Some(32)),
+        ] {
+            assert_eq!(format_bits(fmt), bits, "format {fmt}");
         }
     }
 

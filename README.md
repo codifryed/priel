@@ -206,14 +206,23 @@ seek, skip and volume; a now-playing bar with a scrubbable progress bar, a live
 DAC badge and a bit-perfect indicator; the `?` reference overlay; a diagnostic
 log with an `M` overlay for reading it without leaving the player; a `D` overlay
 listing the PipeWire nodes between priel and the device with the rate and format
-each one negotiated; a `d` picker for moving the output between devices, with an
-`x` toggle for taking a device exclusively.
+each one negotiated, marking the node where the track's rate or width is first
+lost with a `⚠`; a `d` picker for moving the output between devices, with an `x`
+toggle for taking a device exclusively.
+
+The `D` overlay names a node only when the chain accounts for what was measured.
+Where the device is clocked elsewhere and every node on the path still reports
+the track's own rate — a resample the sound server did inside a node rather than
+between two of them — it says the change is unaccounted for rather than blaming
+the nearest candidate. A wrong name would send you to reconfigure something that
+was working.
 
 Roadmap, roughly in order:
 
-- **PipeWire configuration help.** The `D` overlay lists the graph; it does not
-  yet interpret it. Name which of those nodes is doing the resampling, and
-  detect and explain the `allowed-rates` setup a bit-perfect chain needs.
+- **PipeWire configuration help.** The `D` overlay names the node that altered
+  the samples. What is left is the advice: detect and explain the
+  `allowed-rates` setup a bit-perfect chain needs, and say which application is
+  holding the device when one is.
 - **ALSA setup helpers, for true bit-perfect.** The direct path itself is
   built — `--device alsa/hw:...` with `--exclusive`, or the `x` toggle in the
   picker. What is left is the guidance around it: detect when a device is
