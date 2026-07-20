@@ -23,7 +23,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use priel_core::auth::Credentials;
-use priel_core::{Client, Fault, Page, Playlist, Quality, ResolvedStream, SearchResults, Track};
+use priel_core::{Client, Fault, Page, Playlist, Quality, ResolvedStream, Track};
 use priel_player::graph::{self, AudioGraph, GraphError};
 
 /// Rows one favorites request asks for.
@@ -90,7 +90,7 @@ pub enum FromWorker {
     },
     Playlists(Vec<Playlist>),
     PlaylistTracks(String, Vec<Track>), // uuid, tracks
-    SearchResults(SearchResults),
+    SearchResults(Vec<Track>),
     Resolved(u64, ResolvedStream),
     /// The chain to the output device, or the reason there is none to show.
     ///
@@ -194,15 +194,15 @@ where
                     }
                 }
                 ToWorker::LoadPlaylists => match client.user_playlists(0, 100) {
-                    Ok(p) => FromWorker::Playlists(p),
+                    Ok(p) => FromWorker::Playlists(p.items),
                     Err(e) => failed(Task::Playlists, &e),
                 },
                 ToWorker::LoadPlaylistTracks(uuid) => match client.playlist_tracks(&uuid, 0, 200) {
-                    Ok(t) => FromWorker::PlaylistTracks(uuid, t),
+                    Ok(t) => FromWorker::PlaylistTracks(uuid, t.items),
                     Err(e) => failed(Task::PlaylistTracks, &e),
                 },
-                ToWorker::Search(q) => match client.search(&q, 50) {
-                    Ok(r) => FromWorker::SearchResults(r),
+                ToWorker::Search(q) => match client.search_tracks(&q, 0, 50) {
+                    Ok(r) => FromWorker::SearchResults(r.items),
                     Err(e) => failed(Task::Search, &e),
                 },
                 ToWorker::Resolve(id) => match client.resolve_stream(id, Quality::HiRes) {

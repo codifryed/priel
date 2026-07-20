@@ -1073,8 +1073,8 @@ impl App {
                         self.clamp_selection();
                     }
                 }
-                FromWorker::SearchResults(r) => {
-                    self.search_tracks = r.tracks;
+                FromWorker::SearchResults(tracks) => {
+                    self.search_tracks = tracks;
                     self.loading = false;
                     self.selected = 0;
                     self.notice = Some(format!("{} results", self.search_tracks.len()));
@@ -3691,10 +3691,11 @@ mod tests {
         ));
 
         r.to_app
-            .send(FromWorker::SearchResults(priel_core::SearchResults {
-                tracks: vec![track(3, "Milestones", "Miles")],
-                playlists: vec![],
-            }))
+            .send(FromWorker::SearchResults(vec![track(
+                3,
+                "Milestones",
+                "Miles",
+            )]))
             .unwrap();
         r.app.drain_worker();
         assert_eq!(r.app.search_tracks.len(), 1);
