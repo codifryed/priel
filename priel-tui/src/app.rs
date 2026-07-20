@@ -68,6 +68,7 @@ pub enum Hit {
     VolDown,
     VolUnity,
     Filter,
+    Reload,
     CycleView,
     Help,
     Graph,
@@ -862,6 +863,54 @@ impl App {
         });
     }
 
+    /// Ask for the first page of a playlist's tracks, discarding any loaded.
+    ///
+    /// `num_tracks` is the count the playlist row carried, which is what lets
+    /// this view know its own length before its first page of tracks arrives.
+    fn load_playlist_tracks_from_the_top(&mut self, uuid: String, num_tracks: u32) {
+        self.playlist_tracks.clear();
+        self.playlist_tracks_paging.restart(num_tracks);
+        self.loading = true;
+        self.ask(ToWorker::LoadPlaylistTracks {
+            uuid,
+            offset: 0,
+            limit: worker::PLAYLIST_TRACKS_PAGE,
+        });
+    }
+
+    /// Fetch the list on screen again, from its first page.
+    ///
+    /// The only way to retry a page that failed used to be to leave the view and
+    /// come back, because that is what cleared the anti-spin latch - which is
+    /// not something a user has any reason to think of. Restarting a listing
+    /// clears the latch, so this is that retry made deliberate. It is also the
+    /// only way to pick up rows added to a listing since it was loaded.
+    ///
+    /// A view with nothing behind it - no playlist open, no query run - has no
+    /// first page to ask for, and asks for nothing.
+    fn reload_view(&mut self) {
+        match self.view {
+            View::Favorites => self.load_favorites_from_the_top(),
+            View::Playlists => self.load_playlists_from_the_top(),
+            View::PlaylistTracks => {
+                if let Some((uuid, _)) = self.open_playlist.clone() {
+                    // The playlist's own track count has not changed with the
+                    // rows, so the view keeps knowing how long it is.
+                    let known = self.playlist_tracks_paging.total;
+                    self.load_playlist_tracks_from_the_top(uuid, known);
+                }
+            }
+            View::Search => {
+                // The query the rows answer, not the text in the box: the box
+                // may be halfway through an edit the user has not run yet.
+                let query = self.search_asked.clone();
+                if !query.is_empty() {
+                    self.run_search(query);
+                }
+            }
+        }
+    }
+
     /// Ask for the first page of the user's playlists, discarding any loaded.
     fn load_playlists_from_the_top(&mut self) {
         self.playlists_paging.restart(0);
@@ -1481,20 +1530,13 @@ impl App {
         {
             self.open_playlist = Some((p.uuid.clone(), p.title.clone()));
             self.view = View::PlaylistTracks;
-            self.playlist_tracks.clear();
-            // The playlist row already says how many tracks there are, so this
-            // view knows where its end is before a single track has arrived -
-            // and does not depend on a total the tracks response may not carry.
-            self.playlist_tracks_paging.restart(p.num_tracks);
             self.selected = 0;
             self.list_offset = 0;
             self.filter.clear();
-            self.loading = true;
-            self.ask(ToWorker::LoadPlaylistTracks {
-                uuid: p.uuid,
-                offset: 0,
-                limit: worker::PLAYLIST_TRACKS_PAGE,
-            });
+            // The playlist row already says how many tracks there are, so this
+            // view knows where its end is before a single track has arrived -
+            // and does not depend on a total the tracks response may not carry.
+            self.load_playlist_tracks_from_the_top(p.uuid, p.num_tracks);
         }
     }
 
@@ -2089,6 +2131,11 @@ impl App {
         if query.is_empty() {
             return; // an accidental Enter on an empty box is not a request
         }
+        self.run_search(query);
+    }
+
+    /// Run `query` from its first page, discarding whatever was on screen.
+    fn run_search(&mut self, query: String) {
         self.search_asked.clone_from(&query);
         self.search_tracks.clear();
         self.search_paging.restart(0);
@@ -2151,6 +2198,7 @@ impl App {
             KeyCode::Char('-') => self.volume_step(-5.0),
             KeyCode::Char('0') => self.volume_unity(),
             KeyCode::Char('/') => self.start_filter(),
+            KeyCode::Char('r') => self.reload_view(),
             _ => {}
         }
     }
@@ -2245,6 +2293,7 @@ impl App {
             Hit::VolDown => self.volume_step(-5.0),
             Hit::VolUnity => self.volume_unity(),
             Hit::Filter => self.start_filter(),
+            Hit::Reload => self.reload_view(),
             Hit::CycleView => self.cycle_view(),
             Hit::Help => self.mode = Mode::Help,
             Hit::Graph => self.open_graph(),
@@ -3271,6 +3320,126 @@ mod tests {
             r.app.refresh();
         }
         assert!(requests(&r).is_empty(), "the listing has run out");
+    }
+
+    #[test]
+    fn reload_asks_whichever_list_is_on_screen_for_its_first_page_again() {
+        // Goal: one binding, four listings. Reload has to act on the list the
+        // user is looking at, and start it from the top - a listing reloaded
+        // from halfway is a listing with a hole in it.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..3, 9)).unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+        r.app.on_key(key('r'));
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadFavorites { offset: 0, .. }]
+        ));
+
+        let mut r = rig();
+        playlists_loaded(&mut r, &["a", "b"], 9);
+        r.app.on_key(key('r'));
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadPlaylists { offset: 0, .. }]
+        ));
+
+        let mut r = rig();
+        playlist_open(&mut r, "mix", 9, 0..3);
+        r.app.on_key(key('r'));
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadPlaylistTracks { uuid: ref u, offset: 0, .. }] if u == "mix"
+        ));
+        assert_eq!(
+            r.app.rows_available(),
+            Some(9),
+            "and the playlist's own track count survives the reload"
+        );
+
+        let mut r = rig();
+        searched(&mut r, "blue", 0..3, 9);
+        r.app.on_key(key('r'));
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::Search { query: ref q, offset: 0, .. }] if q == "blue"
+        ));
+    }
+
+    #[test]
+    fn reload_is_how_a_page_that_failed_is_retried_without_leaving_the_view() {
+        // Goal: the gap this closes. The anti-spin latch used to be clearable
+        // only by switching away and back, which is not something a user has any
+        // reason to think of.
+        let mut r = rig();
+        playlist_open(&mut r, "mix", 9, 0..3);
+        r.app.refresh();
+        let _ = requests(&r);
+        r.to_app
+            .send(unreachable(Task::PlaylistTracks {
+                uuid: "mix".into(),
+                offset: 3,
+            }))
+            .unwrap();
+        r.app.drain_worker();
+        r.app.refresh();
+        assert!(requests(&r).is_empty(), "latched, as it should be");
+
+        r.app.on_key(key('r'));
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadPlaylistTracks { offset: 0, .. }]
+        ));
+        r.to_app
+            .send(playlist_tracks_page("mix", 0, 0..3, 9))
+            .unwrap();
+        r.app.drain_worker();
+        r.app.refresh();
+        assert!(
+            !requests(&r).is_empty(),
+            "and the view is willing to page again"
+        );
+    }
+
+    #[test]
+    fn reload_answers_to_a_click_and_to_its_key_alike() {
+        // Goal: parity runs both ways - every action reachable by mouse and by
+        // keyboard - and the only way to keep the two from drifting is for both
+        // to run the same method.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..3, 9)).unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+
+        r.app.dispatch(Hit::Reload);
+        let by_click = requests(&r);
+        r.app.on_key(key('r'));
+        let by_key = requests(&r);
+        assert!(matches!(
+            by_click[..],
+            [ToWorker::LoadFavorites { offset: 0, .. }]
+        ));
+        assert_eq!(by_click.len(), by_key.len());
+    }
+
+    #[test]
+    fn reload_with_nothing_to_reload_costs_nothing() {
+        // Goal: the negative space. A search view that has never run a query,
+        // and a playlist view with no playlist open, have no first page to ask
+        // for again.
+        let mut r = rig();
+        r.app.on_key(key('3'));
+        r.app.set_mode_for_test(Mode::Normal);
+        let _ = requests(&r);
+        r.app.on_key(key('r'));
+        assert!(requests(&r).is_empty());
+
+        r.app.view = View::PlaylistTracks;
+        r.app.on_key(key('r'));
+        assert!(requests(&r).is_empty());
     }
 
     #[test]

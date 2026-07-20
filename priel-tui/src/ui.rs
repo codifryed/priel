@@ -257,6 +257,7 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
             ("1 2 3", "jump to a view"),
             ("Enter", "open playlist"),
             ("Esc", "back to playlists"),
+            ("r", "reload this list"),
             ("M", "recent log messages"),
         ],
     ),
@@ -794,7 +795,12 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
         bar.button(format!(" {label} "), Hit::View(view), tab_style(active));
     }
 
-    bar.label("   ", Style::default());
+    bar.label(" ", Style::default());
+    // Next to the tabs because it acts on the list, not on the playback: it
+    // fetches whichever list is on screen again, from its first page.
+    bar.button(" ↻ ", Hit::Reload, button_style());
+
+    bar.label("  ", Style::default());
     bar.button(" |◁ ", Hit::Prev, button_style());
     // A control shows the action it performs, not the state it is in.
     bar.button(
@@ -2132,6 +2138,23 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert_eq!(sc.app.view, View::Search);
+    }
+
+    #[test]
+    fn the_reload_control_is_painted_where_a_click_on_it_lands() {
+        // Goal: every action has to be reachable with the mouse as well as from
+        // the keyboard, and a control whose hit box has drifted from what was
+        // drawn is reachable from neither.
+        let mut sc = screen();
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains('↻'), "the control has to be visible: {out}");
+        let (rect, _) = *sc
+            .app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == Hit::Reload)
+            .expect("reload should be clickable");
+        assert!(rect.width > 0, "and have somewhere to click");
     }
 
     #[test]
