@@ -1345,13 +1345,16 @@ fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
 /// How the output device is being held.
 ///
 /// A separate arm per state rather than a condition inside [`dac_badge`],
-/// because the judgement is the player's and this only names it. The ordinary
-/// shared path says nothing at all: it is the default, and a badge that
-/// announced it would be noise on every session that never asked for anything
-/// else. Only what was asked for and not granted has to be spelled out.
+/// because the judgement is the player's and this only names it.
+///
+/// **Every state is named, including the ordinary shared one.** Leaving the
+/// default silent made the badge a thing you had to know the absence of: a
+/// listener who saw no word for it could not tell a shared device from a
+/// version that did not report access at all. The shared arm is drawn dim
+/// rather than green, so the row still reads at a glance as the plain case.
 fn access_badge(access: OutputAccess) -> (String, Color) {
     match access {
-        OutputAccess::Shared => (String::new(), Color::DarkGray),
+        OutputAccess::Shared => ("  · shared".to_string(), Color::DarkGray),
         OutputAccess::Exclusive => ("  · exclusive".to_string(), Color::Green),
         OutputAccess::Refused => ("  ⚠ shared · exclusive refused".to_string(), Color::Yellow),
     }
@@ -2224,17 +2227,24 @@ mod tests {
     }
 
     #[test]
-    fn the_badge_reports_exclusive_output_apart_from_the_ordinary_path() {
+    fn the_badge_always_says_how_the_device_is_held() {
         // Goal: the whole reason for taking a device is that the chain is then
         // priel's alone, and an indicator that could not say so would leave the
-        // listener no way to tell they got what they asked for.
+        // listener no way to tell they got what they asked for. The shared case
+        // is named too, so the state is read off the badge rather than inferred
+        // from a word being absent.
         let mut sc = screen();
         chain(&mut sc, 24, 96_000, 96_000, "s32");
 
         let shared = text(&mut sc.app, 140, 12);
         assert!(
+            shared.contains("shared"),
+            "how the device is held is always on screen, not only when it is \
+             exclusive: {shared}"
+        );
+        assert!(
             !shared.contains("exclusive"),
-            "the ordinary path says nothing: {shared}"
+            "and the shared path must not read as the exclusive one: {shared}"
         );
 
         sc.app.status.access = OutputAccess::Exclusive;
