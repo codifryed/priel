@@ -2487,6 +2487,44 @@ mod tests {
     }
 
     #[test]
+    fn the_first_track_to_play_is_what_puts_a_standing_request_to_the_test() {
+        // Goal: --exclusive is given before there is anything to play, so the
+        // only thing that ever opens the device is a track. Arming it there is
+        // what stops the session going silent when the device is already held -
+        // and arming it only once is what stops a slow-starting later track
+        // condemning an exclusivity that is working.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        output.exclusive = true;
+
+        arm_exclusive_check(&mpv, &mut output);
+        assert!(
+            output.pending.is_some(),
+            "the first load arms the judgement"
+        );
+        assert!(output.judged);
+        let deadline = output.pending.as_ref().map(|s| s.deadline);
+        assert!(
+            deadline.is_some_and(|d| d > Instant::now() + SWITCH_GRACE),
+            "and gives the track longer than a reinit, because nothing is open yet"
+        );
+
+        output.pending = None;
+        arm_exclusive_check(&mpv, &mut output);
+        assert!(
+            output.pending.is_none(),
+            "a later track must not re-arm what has already been tested"
+        );
+
+        let mut shared = no_output();
+        arm_exclusive_check(&mpv, &mut shared);
+        assert!(
+            shared.pending.is_none(),
+            "and nothing is armed when nothing was asked for"
+        );
+    }
+
+    #[test]
     fn a_plain_device_change_that_fails_leaves_exclusivity_where_it_was() {
         // Goal: the two are orthogonal. A device that will not open says
         // nothing about whether exclusivity was available, so restoring the
