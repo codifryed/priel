@@ -226,6 +226,21 @@ fn apply_device(mpv: &Mpv, device: &str) {
     set_prop(mpv, "audio-device", device);
 }
 
+/// Which device the hardware readout should be matched against.
+///
+/// mpv's own `audio-device` rather than the one priel started with, because the
+/// picker can move the output mid-session: a hint that stays on the startup
+/// device sends the readout to whichever card happened to be open first, and
+/// the badge would then report another application's card as priel's. `auto`
+/// names no device at all, so it is no hint - it would only ever match a card
+/// by accident.
+fn hw_hint(mpv: &Mpv, config: &PlayerConfig) -> Option<String> {
+    match mpv.get_property::<String>("audio-device") {
+        Ok(device) if device != "auto" && !device.is_empty() => Some(device),
+        _ => config.audio_device.clone(),
+    }
+}
+
 /// Did a device change leave the player with no output at all?
 ///
 /// mpv does not fall back when the device it was given will not open: it
@@ -481,7 +496,7 @@ pub fn spawn(
             drain_events(&mpv);
             cleanup_playlist(&mpv, &registry, &mut entries);
             if hw_checked.is_none_or(|t| t.elapsed() >= HW_PROBE_INTERVAL) {
-                hw = hw::probe(config.audio_device.as_deref());
+                hw = hw::probe(hw_hint(&mpv, &config).as_deref());
                 hw_checked = Some(Instant::now());
             }
             settle_switch(&mpv, &entries, &mut output);
@@ -2073,6 +2088,36 @@ mod tests {
             lines.iter().any(|l| l.contains("one-that-left")),
             "and it is in the log too: {lines:?}"
         );
+    }
+
+    #[test]
+    fn the_hardware_readout_follows_the_device_in_use_not_the_one_priel_started_with() {
+        // Goal: the readout finds the card by matching the device identifier
+        // against it, and the picker can move the output mid-session. Matching
+        // against the startup device sends the readout to whichever card
+        // happened to be open first - and the badge would then report another
+        // application's card as priel's own.
+        let mpv = silent_mpv();
+        assert_eq!(
+            hw_hint(&mpv, &silent_config()).as_deref(),
+            Some("null"),
+            "with no choice made, the device priel started with is the hint"
+        );
+        apply_device(&mpv, "alsa/hw:CARD=X,DEV=0");
+        assert_eq!(
+            hw_hint(&mpv, &silent_config()).as_deref(),
+            Some("alsa/hw:CARD=X,DEV=0"),
+            "once the output has moved, the hint moves with it"
+        );
+    }
+
+    #[test]
+    fn an_automatic_device_is_no_hint_at_all() {
+        // Goal: `auto` names no device, so it must not be matched against a card
+        // id - it would only ever match by accident.
+        let mpv = Mpv::new().expect("mpv should initialise headlessly");
+        apply_device(&mpv, "auto");
+        assert_eq!(hw_hint(&mpv, &PlayerConfig::default()), None);
     }
 
     #[test]
