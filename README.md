@@ -48,15 +48,15 @@ water in and out of the flats twice a day, on the pull of the moon.*
   and every key shown in the bottom hint row is itself a button. There is no
   control that only the mouse can reach, and none that only the keyboard can.
 - **A dependency list you can actually audit.** No async runtime anywhere in the
-  tree — no tokio, no hyper. No OpenSSL: TLS is rustls. 41 crates for the API
-  library, 105 for the whole binary. **libmpv is the only non-Rust runtime
-  dependency**, and it is the one doing the work that matters.
+  tree — no tokio, no hyper. No OpenSSL: TLS is rustls. Under 40 crates for the
+  API library and around 100 for the whole binary. **libmpv is the only non-Rust
+  runtime dependency**, and it is the one doing the work that matters.
 - **Starts playing quickly.** Segment bytes reach the decoder as they arrive
   rather than a segment at a time, so a track begins when the first chunk lands
   instead of after several megabytes. On a slow link mpv pauses on underrun and
   resumes with a couple of seconds in hand, which adapts to the connection
   instead of taxing every fast one with a fixed pre-buffer.
-- **Small and quiet at rest.** A ~4 MiB binary that redraws only when something
+- **Small and quiet at rest.** A ~5 MiB binary that redraws only when something
   on screen actually changed, backs its player thread off when nothing is
   playing, and applies backpressure to downloads so a preloaded hi-res track
   cannot quietly consume hundreds of megabytes.
@@ -90,12 +90,10 @@ on; if it ever lapses, `A` signs in again.
 
 priel follows the XDG layout. Your session and the client key it obtained are
 runtime state, closer to a persisted cookie than to a setting, so they live in
-`~/.local/state/priel/`. The only thing in `~/.config/priel/` is a
-`credentials.json` you write yourself, which overrides the obtained one. priel
-never reads or writes another application's files, and it moves its own out of
-the old config location once, so an existing session is not lost. There is no
-flag for the session path: pointing priel at a file another application owns
-would rewrite it on every token refresh.
+`~/.local/state/priel/`. priel never reads or writes another application's
+files, and it moves its own out of the old location once, so an existing session
+is not lost. There is no flag for the session path: pointing priel at a file
+another application owns would rewrite it on every token refresh.
 
 `~/.local/state/priel/priel.log` is the diagnostic log, started fresh each run
 and holding warnings and errors by default. `--log-level debug` (or
@@ -110,17 +108,9 @@ always shows the URL as well, so a headless or remote session still works.
 **priel ships no client credentials.** On first run it asks whether to download
 one from the open-source project the other native Linux players rely on, saying
 plainly what it fetches and where it saves it. Decline and priel still runs, just
-without the ability to renew a session.
-
-To configure one yourself instead, write `~/.config/priel/credentials.json`
-(mode 0600) and priel will not ask:
-
-```json
-{ "client_id": "...", "client_secret": "..." }
-```
-
-With a client identity present priel renews the access token by itself — before
-expiry, and again if a request is rejected early.
+without the ability to renew a session. With a client identity present priel
+renews the access token by itself — before expiry, and again if a request is
+rejected early.
 
 ```bash
 make check-deps        # verify cargo and libmpv are present
@@ -177,7 +167,8 @@ Working: favorites, playlists and catalogue search; local filtering; hi-res
 resolution and playback (24/192 via progressive segment streaming); a gapless
 play queue with a preloaded next track; shuffle with auto-advance; play, pause,
 seek, skip and volume; a now-playing bar with a scrubbable progress bar, a live
-DAC badge and a bit-perfect indicator; the `?` reference overlay.
+DAC badge and a bit-perfect indicator; the `?` reference overlay; a diagnostic
+log with an `M` overlay for reading it without leaving the player.
 
 Roadmap, roughly in order:
 
@@ -199,7 +190,7 @@ Roadmap, roughly in order:
   backpressure, but a fully played track is still retained; trimming it needs a
   segment offset index so a backward seek can refetch.
 - **Incremental paging** — listings currently fetch a first page only.
-- MPRIS, a configuration file for keybindings, cover art (kitty/sixel).
+- MPRIS, cover art (kitty/sixel).
 - **Spectrum visualiser**, if it can coexist with bit-perfect output.
 
 ## Workspace
