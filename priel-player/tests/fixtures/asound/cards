@@ -1,0 +1,8 @@
+ 0 [HDMI           ]: HDA-Intel - HDA ATI HDMI
+                      HDA ATI HDMI at 0xdd720000 irq 164
+ 1 [Generic        ]: HDA-Intel - HD-Audio Generic
+                      HD-Audio Generic at 0xdd500000 irq 165
+ 2 [AUDIO          ]: USB-Audio - SMSL USB AUDIO
+                      SMSL SMSL USB AUDIO at usb-0000:73:00.3-2.2, high speed
+ 3 [Audio          ]: USB-Audio - USB Audio
+                      Generic USB Audio at usb-0000:0d:00.0-5, high speed
