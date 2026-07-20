@@ -41,8 +41,9 @@ is required; priel neither circumvents access controls nor exports content for o
 pub struct Cli {
     /// Audio output device, passed through to mpv
     ///
-    /// For example `pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0`.
-    /// Omit to use the system default sink.
+    /// For example `pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0`
+    /// for the sound server's entry for a card, or `alsa/hw:CARD=AUDIO,DEV=0`
+    /// for the card itself. Omit to use the system default sink.
     #[arg(long, value_name = "MPV_DEVICE")]
     pub device: Option<String>,
 
@@ -68,6 +69,12 @@ pub struct Cli {
     ///
     /// Prints each device's identifier and description, one per line. The
     /// identifier is exactly what `--device` takes.
+    ///
+    /// The direct hardware devices are in the listing too, marked `(direct
+    /// hardware access)`. ALSA advertises only the plugin spellings of a card,
+    /// so nothing enumerates those; priel builds them from the kernel's own
+    /// card listing instead. They are the ones `--exclusive` is worth asking
+    /// for, and the picker (`d`) offers exactly the same set.
     #[arg(long)]
     pub list_devices: bool,
 

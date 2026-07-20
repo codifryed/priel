@@ -277,6 +277,7 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
             ("d", "choose the device"),
             ("x", "exclusive, in the picker"),
             ("exclusive", "the device is priel's"),
+            ("direct", "the card itself, no mixer"),
             ("DAC", "live from the device"),
             ("OUT", "what the server took"),
             ("bit-perfect", "nothing altered"),
