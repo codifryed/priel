@@ -611,6 +611,9 @@ mod tests {
         assert_eq!(s.current_id, 0);
     }
 
+    // Drives the player thread, which only the real backend runs: the stub has
+    // no loop to apply a command or to keep the snapshot moving.
+    #[cfg(feature = "libmpv")]
     #[test]
     fn commands_are_non_blocking_and_reach_the_thread() {
         // Goal: every command is fire-and-forget by design - the UI thread must
@@ -629,6 +632,9 @@ mod tests {
         );
     }
 
+    // Drives the player thread, which only the real backend runs: the stub has
+    // no loop to apply a command or to keep the snapshot moving.
+    #[cfg(feature = "libmpv")]
     #[test]
     fn the_device_list_is_published_rather_than_waited_for() {
         // Goal: the picker opens on the UI thread, which may not block, so the
@@ -757,6 +763,9 @@ mod tests {
         );
     }
 
+    // Drives the player thread, which only the real backend runs: the stub has
+    // no loop to apply a command or to keep the snapshot moving.
+    #[cfg(feature = "libmpv")]
     #[test]
     fn an_idle_player_keeps_ticking_without_commands() {
         // Goal: with nothing playing the thread waits on a longer timeout and
