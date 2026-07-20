@@ -169,22 +169,46 @@ pub enum CredentialSource {
     Upstream,
 }
 
+/// Resolve an XDG base directory.
+///
+/// The specification says a variable that is unset, **empty, or not an absolute
+/// path** is invalid and the default must be used - not just an unset one, which
+/// is the easy mistake. Taken as an argument rather than read here so it can be
+/// tested without mutating process environment, which would race every other
+/// test in the binary.
+fn xdg_base(configured: Option<&str>, home: &str, default_suffix: &str) -> String {
+    match configured {
+        Some(dir) if dir.starts_with('/') => dir.trim_end_matches('/').to_string(),
+        _ => format!("{home}{default_suffix}"),
+    }
+}
+
+fn home() -> String {
+    std::env::var("HOME").unwrap_or_default()
+}
+
 /// `$XDG_STATE_HOME/priel`, falling back to `~/.local/state/priel`.
 ///
 /// Session tokens and an obtained client identity live here rather than in the
 /// config directory: they are runtime state, not settings a user wrote.
 #[must_use]
 pub fn state_dir() -> String {
-    let base = std::env::var("XDG_STATE_HOME")
-        .unwrap_or_else(|_| format!("{}/.local/state", std::env::var("HOME").unwrap_or_default()));
+    let base = xdg_base(
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        &home(),
+        "/.local/state",
+    );
     format!("{base}/priel")
 }
 
 /// `$XDG_CONFIG_HOME/priel`, falling back to `~/.config/priel`.
 #[must_use]
 pub fn config_dir() -> String {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .unwrap_or_else(|_| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
+    let base = xdg_base(
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        &home(),
+        "/.config",
+    );
     format!("{base}/priel")
 }
 
@@ -1272,5 +1296,37 @@ mod tests {
             "new"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn xdg_variables_are_honoured_and_invalid_ones_ignored() {
+        // Goal: the specification treats an empty or relative value as invalid,
+        // not merely an unset one. Honouring a relative path would put priel's
+        // session somewhere relative to the working directory, which moves.
+        assert_eq!(
+            xdg_base(Some("/custom/state"), "/home/u", "/.local/state"),
+            "/custom/state",
+            "an absolute value is used as given"
+        );
+        assert_eq!(
+            xdg_base(Some("/custom/state/"), "/home/u", "/.local/state"),
+            "/custom/state",
+            "a trailing slash is normalised away"
+        );
+        assert_eq!(
+            xdg_base(None, "/home/u", "/.local/state"),
+            "/home/u/.local/state",
+            "unset falls back"
+        );
+        assert_eq!(
+            xdg_base(Some(""), "/home/u", "/.config"),
+            "/home/u/.config",
+            "empty is invalid, not a path to the filesystem root"
+        );
+        assert_eq!(
+            xdg_base(Some("relative/dir"), "/home/u", "/.config"),
+            "/home/u/.config",
+            "a relative value is invalid and must be ignored"
+        );
     }
 }
