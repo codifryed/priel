@@ -23,7 +23,7 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
 
 use priel_player::{Alteration, Fidelity};
 
-use crate::app::{App, Hit, Mode, View};
+use crate::app::{App, GraphRow, GraphRowKind, Hit, Mode, View};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([
@@ -46,6 +46,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     if app.mode == Mode::Log {
         log_overlay(f, f.area(), app);
+    }
+    if app.mode == Mode::Graph {
+        graph_overlay(f, f.area(), app);
+    }
+    if app.mode == Mode::Devices {
+        device_overlay(f, f.area(), app);
     }
     if app.mode == Mode::Credentials {
         credentials_overlay(f, f.area(), app.credential_status());
@@ -267,6 +273,8 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
     (
         "Output",
         &[
+            ("D", "the chain to the device"),
+            ("d", "choose the device"),
             ("DAC", "live from the device"),
             ("OUT", "what the server took"),
             ("bit-perfect", "nothing altered"),
@@ -392,6 +400,228 @@ fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
             },
         );
     }
+}
+
+/// The chain between priel and the output device.
+///
+/// The DAC badge on the bottom row says whether the chain is clean, because it
+/// reads the device's own live parameters. It cannot say *what* made it that
+/// way. This is that answer: every node on the path, in order, with the format
+/// each one settled on.
+///
+/// Modal and scrolled like the log overlay, and for the same reason - a second
+/// idiom for the same gesture is its own bug.
+fn graph_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let rows = app.graph_rows();
+    let width = area.width.saturating_sub(4).min(76);
+    // Two for the border, one for the way out. Sized to the content rather than
+    // to the screen: this is a short list and a full-height box around three
+    // lines reads as something failing to load.
+    let wanted = u16::try_from(rows.len().saturating_add(3)).unwrap_or(u16::MAX);
+    let height = wanted.min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Audio graph ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+
+    // One row goes to the way out, as in the other overlays: an overlay that
+    // does not say how to close it is a trap.
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let start = app.graph_offset().min(rows.len().saturating_sub(1));
+    let end = start
+        .saturating_add(usize::from(body.height))
+        .min(rows.len());
+    let lines: Vec<Line> = rows[start..end]
+        .iter()
+        .map(|r| graph_line(r, body.width))
+        .collect();
+    f.render_widget(Paragraph::new(lines), body);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  j k scroll · g G top / bottom · D, Esc or q to close",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Rect {
+            y: inner.y + inner.height.saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+/// One row of the graph overlay: what the node is on the left, what it
+/// negotiated on the right.
+///
+/// The gap between them is measured with `Span::width`, the same unicode-width
+/// measurement ratatui draws with, so a description with wide glyphs in it does
+/// not push the format column off the edge.
+fn graph_line(row: &GraphRow, width: u16) -> Line<'static> {
+    let (label_style, detail_style) = match row.kind {
+        GraphRowKind::Node => (
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Cyan),
+        ),
+        GraphRowKind::Link => (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+        ),
+        GraphRowKind::Note => (
+            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::Gray),
+        ),
+    };
+    let label = Span::styled(row.label.clone(), label_style);
+    if row.detail.is_empty() {
+        return Line::from(label);
+    }
+    let detail = Span::styled(row.detail.clone(), detail_style);
+    // One cell short of the full width so the format column does not sit
+    // against the border, and at least one space even when the two do not fit,
+    // so they never run together into one unreadable word; the paragraph clips
+    // whatever overflows.
+    let gap = usize::from(width.saturating_sub(1))
+        .saturating_sub(label.width() + detail.width())
+        .max(1);
+    Line::from(vec![label, Span::raw(" ".repeat(gap)), detail])
+}
+
+/// How much of the overlay the identifier column may take.
+///
+/// Device identifiers run to sixty characters and the description is what makes
+/// one recognisable, so neither may crowd the other out entirely.
+const DEVICE_NAME_SHARE: u16 = 2;
+
+/// The output device picker.
+///
+/// Modal like the log overlay and scrolled with the same keys. Two things it
+/// must always say: which device is in use, and that a choice made here lasts
+/// for this session only - priel reads no configuration file, so `--device` is
+/// the only way to make one permanent.
+fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
+    let width = area.width.saturating_sub(4).min(110);
+    let height = area.height.saturating_sub(2);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Output device ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    // Rebuilt every frame, exactly as the header's hit boxes are.
+    app.device_rows.clear();
+    if inner.height <= 2 {
+        return;
+    }
+
+    // Two rows go to the footer: what choosing does, and how to leave. An
+    // overlay that says neither is a trap.
+    let body = Rect {
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    match app.device_notice() {
+        Some(notice) => f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                notice,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            body,
+        ),
+        None => device_rows(f, app, body),
+    }
+
+    let footer = Style::default().fg(Color::DarkGray);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "  this session only — --device makes a choice permanent",
+                footer,
+            )),
+            Line::from(Span::styled(
+                "  j k move · g G ends · Enter choose · click a row · d, Esc or q to close",
+                footer,
+            )),
+        ]),
+        Rect {
+            y: inner.y + inner.height.saturating_sub(2),
+            height: 2,
+            ..inner
+        },
+    );
+}
+
+/// The device rows themselves, windowed onto the selection.
+///
+/// Each row's hit box is registered in the same walk that draws it, so a click
+/// cannot land on a device other than the one under the pointer.
+fn device_rows(f: &mut Frame, app: &mut App, body: Rect) {
+    let devices = app.devices().len();
+    let h = body.height as usize;
+    let selected = app.device_selected();
+    if selected < app.device_offset {
+        app.device_offset = selected;
+    } else if selected >= app.device_offset + h {
+        app.device_offset = selected + 1 - h;
+    }
+    if app.device_offset >= devices {
+        app.device_offset = 0;
+    }
+
+    let name_width = usize::from(body.width / DEVICE_NAME_SHARE);
+    let in_use = app.status.audio_device.clone();
+    let mut rows = Vec::new();
+    for (i, index) in (app.device_offset..(app.device_offset + h).min(devices)).enumerate() {
+        let d = &app.devices()[index];
+        let here = d.name == in_use;
+        let mark = if here { "* " } else { "  " };
+        let text = format!(
+            "{mark}{:name_width$}  {}",
+            trunc(&d.name, name_width),
+            d.description
+        );
+        let style = if index == selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else if here {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        };
+        let rect = Rect {
+            x: body.x,
+            y: body.y + u16::try_from(i).unwrap_or(u16::MAX),
+            width: body.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(text).style(style), rect);
+        rows.push((rect, index));
+    }
+    app.device_rows = rows;
 }
 
 /// One log line, coloured by how much it wants to be noticed.
@@ -615,9 +845,18 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn list_title(app: &App, count: usize) -> String {
     match app.view {
-        View::Favorites => format!(
-            "Favorites — {count} tracks   (Tab views · j/k move · Enter play · / filter · s shuffle)"
-        ),
+        View::Favorites => {
+            // Rows loaded against rows there are, while those differ. Without
+            // it a list that has only paged in its first hundred reads as the
+            // whole library, and the user has no reason to keep scrolling.
+            let of_total = app
+                .favorites_available()
+                .map_or(String::new(), |total| format!(" of {total}"));
+            format!(
+                "Favorites — {count}{of_total} tracks   \
+                 (Tab views · j/k move · Enter play · / filter · s shuffle)"
+            )
+        }
         View::Playlists => format!("Playlists — {count}   (Enter to open · j/k move)"),
         View::PlaylistTracks => {
             let name = app.open_playlist.as_ref().map_or("", |(_, t)| t.as_str());
@@ -800,6 +1039,13 @@ const HINTS: &[Hint] = &[
     Hint {
         keys: &[("g", Hit::Top), ("G", Hit::Bottom)],
         label: "ends",
+    },
+    // Last because it is the least everyday of these, which is also what makes
+    // it the first to be dropped when the row runs out of width. The full
+    // reference under `?` is where it is always findable.
+    Hint {
+        keys: &[("D", Hit::Graph)],
+        label: "graph",
     },
 ];
 
@@ -1081,7 +1327,7 @@ fn trunc(s: &str, n: usize) -> String {
 /// 44100 is "44.1 kHz", not "44 kHz": the 44.1 and 48 kHz families are the whole
 /// distinction a bit-perfect chain turns on, and truncating the decimal away
 /// makes 44.1 and 48 look like neighbours rather than different worlds.
-fn fmt_khz(hz: u32) -> String {
+pub(crate) fn fmt_khz(hz: u32) -> String {
     if hz == 0 {
         return "?".to_string();
     }
@@ -1111,6 +1357,7 @@ mod tests {
     use crate::app::{App, Hit, Mode, View};
     use crate::worker::{FromWorker, ToWorker};
     use priel_core::{Playlist, Track};
+    use priel_player::graph::{AudioGraph, GraphError, GraphNode, NodeRole};
     use ratatui::layout::Rect;
     use ratatui::style::Style;
     use ratatui::{Terminal, backend::TestBackend};
@@ -1315,6 +1562,23 @@ mod tests {
     }
 
     #[test]
+    fn the_favorites_heading_separates_rows_loaded_from_rows_there_are() {
+        // Goal: a list that has paged in its first hundred must not read as the
+        // whole library, or the user has no reason to keep scrolling. Once
+        // everything is loaded the second number says nothing, so it goes.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "One"), track(2, "Two")];
+        sc.app.favorites_paging.total = 417;
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains("2 of 417 tracks"), "{out}");
+
+        sc.app.favorites_paging.total = 2;
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains("2 tracks"), "{out}");
+        assert!(!out.contains(" of "), "nothing left to page in: {out}");
+    }
+
+    #[test]
     fn an_open_playlist_is_titled_by_its_name() {
         // Goal: the drill-down has to say which playlist you are inside.
         let mut sc = screen();
@@ -1446,6 +1710,10 @@ mod tests {
             "the mouse gestures are documented: {out}"
         );
         assert!(
+            out.contains("choose the device"),
+            "a binding that is not in here cannot be discovered: {out}"
+        );
+        assert!(
             !out.contains("Hidden Title"),
             "the list should be covered: {out}"
         );
@@ -1471,6 +1739,213 @@ mod tests {
         assert!(out.contains("line 39"), "the newest line: {out}");
         assert!(out.contains("to close"), "{out}");
         assert!(!out.contains("Hidden Title"), "the list is covered: {out}");
+    }
+
+    /// Put a chain on screen the way the worker would, since that is the only
+    /// way in: the app's copy is private, and a test that reached around the
+    /// channel would not be testing the path the app actually uses.
+    fn with_chain(sc: &mut Screen, graph: AudioGraph) {
+        sc.to_app
+            .send(FromWorker::AudioGraph(Ok(graph)))
+            .expect("send");
+        sc.app.drain_worker();
+    }
+
+    fn node(description: &str, role: NodeRole, rate_hz: u32, format: &str) -> GraphNode {
+        GraphNode {
+            id: 1,
+            name: description.into(),
+            description: description.into(),
+            media_class: "Audio/Sink".into(),
+            role,
+            rate_hz: Some(rate_hz),
+            format: Some(format.into()),
+            channels: Some(2),
+        }
+    }
+
+    #[test]
+    fn the_graph_overlay_lists_every_node_with_what_it_negotiated() {
+        // Goal: the question the DAC badge cannot answer - which nodes sit in
+        // front of the device, and what each of them is doing to the audio. All
+        // of it has to survive onto the screen, not just into the model.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Hidden Title")];
+        with_chain(
+            &mut sc,
+            AudioGraph {
+                path: vec![
+                    node("mpv", NodeRole::Stream, 44_100, "S16LE"),
+                    node("Loopback", NodeRole::Intermediate, 48_000, "F32LE"),
+                    node("Studio DAC", NodeRole::Device, 48_000, "S32LE"),
+                ],
+            },
+        );
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 26);
+        assert!(out.contains("Audio graph"), "{out}");
+        assert!(out.contains("Loopback"), "the middle hop is shown: {out}");
+        assert!(out.contains("Studio DAC"), "{out}");
+        assert!(out.contains("44.1 kHz"), "the stream's rate: {out}");
+        assert!(out.contains("S32LE"), "the device's format: {out}");
+        assert!(out.contains("to close"), "{out}");
+        // Unlike the help and log overlays this one is sized to its content, so
+        // it is not expected to cover the whole list. Being modal is about the
+        // input it swallows, which `app` covers.
+    }
+
+    #[test]
+    fn a_graph_that_could_not_be_read_explains_itself_on_screen() {
+        // Goal: a machine with no PipeWire tools must get a sentence, not an
+        // empty box - an empty overlay reads as priel being broken.
+        let mut sc = screen();
+        sc.to_app
+            .send(FromWorker::AudioGraph(Err(GraphError::NotInstalled)))
+            .expect("send");
+        sc.app.drain_worker();
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 26);
+        assert!(out.contains("pw-dump"), "{out}");
+        assert!(out.contains("PipeWire"), "and what to install: {out}");
+    }
+
+    #[test]
+    fn the_reference_lists_the_key_that_opens_the_graph() {
+        // Goal: the bottom row drops optional hints on a narrow terminal, so
+        // `?` is the only place a binding is guaranteed to be findable. A key
+        // that is nowhere in there is a key nobody discovers.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 100, 30);
+        assert!(out.contains("the chain to the device"), "{out}");
+    }
+
+    #[test]
+    fn clicking_the_graph_hint_opens_the_same_overlay_the_key_does() {
+        // Goal: a key press and a click must run the same code. Going through
+        // the published hit box is what proves the two paths have not drifted.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 200, 20);
+        let (rect, _) = *sc
+            .app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == Hit::Graph)
+            .expect("the graph hint is clickable");
+        sc.app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(sc.app.mode, Mode::Graph);
+        assert!(
+            matches!(sc.from_app.try_recv(), Ok(ToWorker::ReadAudioGraph)),
+            "and asks the worker, exactly as the key press does"
+        );
+    }
+
+    #[test]
+    fn the_graph_overlay_says_it_is_reading_while_the_worker_is() {
+        // Goal: the read is a subprocess on another thread, so there is always a
+        // moment with no answer yet. That moment must say so rather than look
+        // like an empty result.
+        let mut sc = screen();
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 26);
+        assert!(out.contains("Reading"), "{out}");
+    }
+
+    /// Three devices, the middle one a plausible DAC.
+    fn devices() -> Vec<priel_player::AudioDevice> {
+        [
+            ("auto", "Autoselect device"),
+            ("pipewire/some.dac", "A Nice DAC Pro"),
+            ("alsa/hdmi:CARD=HDMI", "HDMI Audio Output"),
+        ]
+        .iter()
+        .map(|(n, d)| priel_player::AudioDevice {
+            name: (*n).to_string(),
+            description: (*d).to_string(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn the_device_picker_names_every_device_and_marks_the_one_in_use() {
+        // Goal: the whole issue in one frame. The identifier is what --device
+        // takes and the description is what makes it recognisable, so both have
+        // to be on screen, and the row already in use has to stand out.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Hidden Title")];
+        sc.app.set_devices_for_test(devices());
+        sc.app.status.audio_device = "pipewire/some.dac".into();
+        sc.app.mode = Mode::Devices;
+
+        let out = text(&mut sc.app, 100, 20);
+        assert!(out.contains("Output device"), "{out}");
+        assert!(out.contains("pipewire/some.dac"), "{out}");
+        assert!(out.contains("A Nice DAC Pro"), "{out}");
+        assert!(out.contains("HDMI Audio Output"), "{out}");
+        assert!(
+            out.contains("* pipewire/some.dac"),
+            "the device in use should be marked: {out}"
+        );
+        assert!(
+            !out.contains("* auto"),
+            "and only that one should be: {out}"
+        );
+        assert!(!out.contains("Hidden Title"), "the list is covered: {out}");
+    }
+
+    #[test]
+    fn the_device_picker_says_the_choice_lasts_for_this_session() {
+        // Goal: priel reads no configuration file, deliberately. A picker that
+        // did not say so would look broken on the next start.
+        let mut sc = screen();
+        sc.app.set_devices_for_test(devices());
+        sc.app.mode = Mode::Devices;
+        let out = text(&mut sc.app, 100, 20);
+        assert!(out.contains("this session only"), "{out}");
+        assert!(
+            out.contains("--device"),
+            "and it must say what does make it permanent: {out}"
+        );
+        assert!(out.contains("to close"), "{out}");
+    }
+
+    #[test]
+    fn every_device_row_on_screen_is_clickable_where_it_was_drawn() {
+        // Goal: the rows are the only clickable thing in this overlay, and a hit
+        // box that drifted from what was painted would switch the output to a
+        // device other than the one under the pointer.
+        let mut sc = screen();
+        sc.app.set_devices_for_test(devices());
+        sc.app.mode = Mode::Devices;
+        let lines = draw(&mut sc.app, 100, 20);
+
+        assert_eq!(sc.app.device_rows.len(), 3, "one hit box per drawn row");
+        for (rect, index) in sc.app.device_rows.clone() {
+            let painted = &lines[rect.y as usize];
+            assert!(
+                painted.contains(&sc.app.devices()[index].name),
+                "row {index} claims a line that does not show it: {painted}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_device_list_says_so_rather_than_showing_a_blank_box() {
+        // Goal: a build without libmpv has nothing to list, and an empty box
+        // reads as a bug rather than as an answer.
+        let mut sc = screen();
+        sc.app.mode = Mode::Devices;
+        let out = text(&mut sc.app, 100, 20);
+        assert!(
+            out.contains("No output devices were reported"),
+            "the empty case is itself the answer: {out}"
+        );
+        assert!(sc.app.device_rows.is_empty(), "nothing to click");
     }
 
     #[test]
@@ -1508,6 +1983,19 @@ mod tests {
             let _ = draw(&mut sc.app, w, h);
             sc.app.recent.push("a line that will not fit\n".to_string());
             sc.app.mode = Mode::Log;
+            let _ = draw(&mut sc.app, w, h);
+            with_chain(
+                &mut sc,
+                AudioGraph {
+                    path: vec![node(
+                        "a very long device description",
+                        NodeRole::Device,
+                        96_000,
+                        "S24_3LE",
+                    )],
+                },
+            );
+            sc.app.mode = Mode::Graph;
             let _ = draw(&mut sc.app, w, h);
         }
     }

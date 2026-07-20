@@ -31,13 +31,14 @@ use ratatui::layout::Rect;
 
 use priel_core::auth::{Credentials, Pkce};
 use priel_core::{Fault, Playlist, Track};
-use priel_player::{PlaybackStatus, Player, PlayerConfig};
+use priel_player::graph::{AudioGraph, GraphError, GraphNode, NodeRole};
+use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig};
 
 #[cfg(test)]
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use crate::worker::{self, FromWorker, ToWorker, Worker};
+use crate::worker::{self, FromWorker, Task, ToWorker, Worker};
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum View {
@@ -69,6 +70,7 @@ pub enum Hit {
     Filter,
     CycleView,
     Help,
+    Graph,
     Quit,
 }
 
@@ -79,8 +81,35 @@ pub enum Mode {
     Search,      // editing the global TIDAL search query
     Help,        // the shortcut reference is up; it swallows input until dismissed
     Log,         // the recent diagnostics are up; modal in the same way
+    Graph,       // the chain to the output device is up; modal in the same way
+    Devices,     // the output picker is up; modal in the same way
     Credentials, // first run with no client identity; asking before fetching one
     Login,       // signing in: browser is open, waiting for the redirected URL
+}
+
+/// What one line of the audio-graph overlay says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GraphRowKind {
+    /// A node on the path from priel to the device.
+    Node,
+    /// The connector drawn between two nodes.
+    Link,
+    /// Prose: what is being waited for, or why there is nothing to show.
+    Note,
+}
+
+/// One line of the audio-graph overlay, ready to draw.
+///
+/// Built in `App` rather than in the renderer so the overlay's scroll bounds and
+/// what it paints count the same lines. A renderer that laid the rows out itself
+/// would be the only thing that knew how many there were, and the scroll would
+/// drift the moment either changed.
+pub struct GraphRow {
+    /// The left column: a node, or a whole sentence.
+    pub label: String,
+    /// The right column: what that node negotiated. Empty for prose.
+    pub detail: String,
+    pub kind: GraphRowKind,
 }
 
 /// What a status tick reads. See [`App::tick`].
@@ -131,6 +160,13 @@ struct Plan {
     advance_fresh: bool,
 }
 
+/// How long the picker says it is still looking before it says there is
+/// nothing to look at.
+///
+/// The list is asked for as the overlay opens and answered a tick later, so
+/// without this the first frame of every open would claim there are no devices.
+const DEVICE_WAIT: Duration = Duration::from_secs(2);
+
 /// State of a sign-in in progress.
 ///
 /// The verifier has to survive from building the authorize URL until the code
@@ -154,6 +190,47 @@ impl LoginFlow {
     }
 }
 
+/// How far through a paged listing one view has got.
+///
+/// A flat `Vec` per view has nowhere to record how much of the listing it is,
+/// which is why a listing used to stop at whatever the first request returned.
+/// Kept as a struct rather than three more fields on `App` so that giving the
+/// other views the same treatment is one field each, not three.
+#[derive(Default)]
+pub struct Paging {
+    /// Rows the service says the whole listing has. Zero until a page lands.
+    pub total: u32,
+    /// The offset of the request in flight, if any.
+    ///
+    /// One at a time, and the identity a reply is matched against: a page for
+    /// an offset nobody is waiting on belongs to a listing that has since been
+    /// thrown away, and appending it would interleave two different lists.
+    wanted: Option<u32>,
+    /// A page request failed. Latched, because the trigger runs on every tick:
+    /// without this a service that is refusing would be asked ten times a
+    /// second for as long as priel stayed open. Cleared by a deliberate user
+    /// action - reloading, or coming back to the view.
+    stalled: bool,
+}
+
+impl Paging {
+    /// Rows are missing, and nothing is stopping us asking for them.
+    fn wants_more(&self, loaded: usize) -> bool {
+        if self.wanted.is_some() || self.stalled {
+            return false;
+        }
+        usize::try_from(self.total).is_ok_and(|total| loaded < total)
+    }
+
+    /// Start the listing again from the top, waiting on its first page.
+    fn restart(&mut self) {
+        *self = Self {
+            wanted: Some(0),
+            ..Self::default()
+        };
+    }
+}
+
 /// Source-side metadata (from the TIDAL API — authoritative).
 #[derive(Default, Clone)]
 pub struct StreamMeta {
@@ -174,6 +251,9 @@ pub struct App {
     // View data.
     pub view: View,
     pub favorites: Vec<Track>,
+    /// How much of the favorites listing has been fetched. The other three
+    /// views are still single-page.
+    pub favorites_paging: Paging,
     pub playlists: Vec<Playlist>,
     pub playlist_tracks: Vec<Track>,
     pub open_playlist: Option<(String, String)>, // (uuid, title)
@@ -210,6 +290,27 @@ pub struct App {
     /// How many lines back from the newest the log overlay is scrolled. Counted
     /// from the end because that is where the interesting line always is.
     log_scroll: usize,
+    /// The last chain the worker read, or the reason it could not. `None` while
+    /// a read is in flight, which is what the overlay says it is doing.
+    audio_graph: Option<Result<AudioGraph, GraphError>>,
+    /// How far down the audio-graph overlay is scrolled, from the top.
+    graph_scroll: usize,
+    /// The output devices the player last published. Kept only while the picker
+    /// is up; nothing else on screen shows them.
+    devices: Vec<AudioDevice>,
+    device_selected: usize,
+    /// The first device row on screen, maintained by the renderer exactly as
+    /// `list_offset` is.
+    pub device_offset: usize,
+    /// Clickable device rows and the index each stands for, rebuilt by the
+    /// renderer while the picker is up.
+    pub device_rows: Vec<(Rect, usize)>,
+    /// When the list was last asked for. The picker says it is still looking
+    /// until this is old enough to mean nothing is going to answer.
+    devices_asked: Option<Instant>,
+    /// The device failure already shown. Latched so it is reported once rather
+    /// than on every tick for as long as the player carries it.
+    reported_device_error: Option<String>,
     pub frame: usize,
     pub should_quit: bool,
 
@@ -299,6 +400,7 @@ impl App {
             worker,
             view: View::Favorites,
             favorites: Vec::new(),
+            favorites_paging: Paging::default(),
             playlists: Vec::new(),
             playlist_tracks: Vec::new(),
             open_playlist: None,
@@ -331,6 +433,14 @@ impl App {
             worker_lost: false,
             recent: crate::logging::Recent::default(),
             log_scroll: 0,
+            audio_graph: None,
+            graph_scroll: 0,
+            devices: Vec::new(),
+            device_selected: 0,
+            device_offset: 0,
+            device_rows: Vec::new(),
+            devices_asked: None,
+            reported_device_error: None,
             last_sig: RenderSig::default(),
             credentials_path: None,
             token_path: None,
@@ -387,8 +497,7 @@ impl App {
         };
         self.worker = worker::spawn(token, creds);
         self.worker_lost = false;
-        self.loading = true;
-        self.ask(ToWorker::LoadFavorites);
+        self.load_favorites_from_the_top();
     }
 
     /// The sign-in in progress, if any.
@@ -664,7 +773,107 @@ impl App {
     }
 
     pub fn start(&mut self) {
-        self.ask(ToWorker::LoadFavorites);
+        self.load_favorites_from_the_top();
+    }
+
+    /// Ask for the first page of favorites, discarding whatever was loaded.
+    ///
+    /// Also the retry after a page failed: restarting clears the stall latch, so
+    /// nothing can leave the view permanently unable to load.
+    fn load_favorites_from_the_top(&mut self) {
+        self.favorites_paging.restart();
+        self.loading = true;
+        self.ask(ToWorker::LoadFavorites {
+            offset: 0,
+            limit: worker::FAVORITES_PAGE,
+        });
+    }
+
+    /// Ask for the next page when the selection nears the end of what is loaded.
+    ///
+    /// Driven from the status tick rather than from a key, so scrolling by
+    /// keyboard, by wheel and by click all reach it down one path. The guards
+    /// are what keep that cheap: the ordinary cases - a list fully loaded, a
+    /// page already in flight, a view that gave up - all answer before anything
+    /// is walked.
+    fn page_in_more_favorites(&mut self) {
+        if self.view != View::Favorites {
+            return;
+        }
+        // The renderer is what publishes the list geometry, so before the first
+        // frame "near the bottom" is a question with no answer. Acting on a
+        // zero-height list would page the whole library in before anything had
+        // been drawn.
+        if self.list_inner.height == 0 {
+            return;
+        }
+        if !self.favorites_paging.wants_more(self.favorites.len()) {
+            return;
+        }
+        // A screenful of lookahead: the next page has to be there before the
+        // user scrolls into the gap, and one screen is as far as a single
+        // keystroke can take them.
+        if self.selected + self.full_page() < self.visible_len() {
+            return;
+        }
+        let Ok(offset) = u32::try_from(self.favorites.len()) else {
+            return; // more rows than an offset can name; there is nothing to ask
+        };
+        self.favorites_paging.wanted = Some(offset);
+        self.ask(ToWorker::LoadFavorites {
+            offset,
+            limit: worker::FAVORITES_PAGE,
+        });
+    }
+
+    /// A page of favorites arrived.
+    ///
+    /// The offset it was asked for is its identity, exactly as a resolve is
+    /// matched by track id: a page for an offset the view is no longer waiting
+    /// on belongs to a listing that has since been thrown away.
+    fn on_favorites_page(&mut self, offset: u32, page: priel_core::Page<Track>) {
+        if self.favorites_paging.wanted != Some(offset) {
+            log::debug!("dropping a favorites page at offset {offset}: nothing is waiting for it");
+            return;
+        }
+        self.favorites_paging.wanted = None;
+        debug_assert!(
+            offset == 0 || usize::try_from(offset).is_ok_and(|o| o == self.favorites.len()),
+            "a page either restarts the list or continues where it ended"
+        );
+        // The first page replaces and every later one appends. Appending is
+        // what keeps the user's row under their cursor: selection is an index
+        // into the filtered rows, and rows that only ever arrive after the ones
+        // already there cannot shift it.
+        if offset == 0 {
+            self.favorites = page.items;
+        } else {
+            self.favorites.extend(page.items);
+        }
+        let loaded = u32::try_from(self.favorites.len()).unwrap_or(u32::MAX);
+        // An answer carrying no count would otherwise read as "0 available"
+        // beside rows that are plainly on screen.
+        self.favorites_paging.total = page.total.max(loaded);
+        self.loading = false;
+        self.notice = Some(match self.favorites_available() {
+            Some(total) => format!("{loaded} of {total} favorites"),
+            None => format!("{loaded} favorites"),
+        });
+        self.clamp_selection();
+    }
+
+    /// How many favorites the service says exist, while some are still missing.
+    ///
+    /// `None` once everything is loaded, so the heading and the notice mention a
+    /// total only while it still tells the user something.
+    #[must_use]
+    pub fn favorites_available(&self) -> Option<u32> {
+        let total = usize::try_from(self.favorites_paging.total).ok()?;
+        if self.favorites.len() < total {
+            Some(self.favorites_paging.total)
+        } else {
+            None
+        }
     }
 
     /// Track slice backing the current view (empty for the Playlists list).
@@ -677,28 +886,56 @@ impl App {
         }
     }
 
+    /// Walk the rows of the current view that pass the local filter.
+    ///
+    /// The one place the filter is applied. `visible` and `visible_len` both go
+    /// through here so they cannot come to disagree about which rows exist -
+    /// one collects the indices, the other only counts them.
+    fn each_visible(&self, mut row: impl FnMut(usize)) {
+        let f = self.filter.to_lowercase();
+        if self.view == View::Playlists {
+            for (i, p) in self.playlists.iter().enumerate() {
+                if row_matches(&p.title, "", &f) {
+                    row(i);
+                }
+            }
+        } else {
+            for (i, t) in self.current_tracks().iter().enumerate() {
+                if row_matches(&t.title, &t.artist, &f) {
+                    row(i);
+                }
+            }
+        }
+    }
+
     /// Indices into the current view's items matching the local filter.
     ///
     /// Callers on the render path must call this **once per frame** and reuse
     /// the result: it allocates and walks the whole list, so calling it per row
     /// is quadratic.
     pub fn visible(&self) -> Vec<usize> {
-        let f = self.filter.to_lowercase();
-        if self.view == View::Playlists {
-            self.playlists
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| row_matches(&p.title, "", &f))
-                .map(|(i, _)| i)
-                .collect()
-        } else {
-            self.current_tracks()
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| row_matches(&t.title, &t.artist, &f))
-                .map(|(i, _)| i)
-                .collect()
+        let mut indices = Vec::with_capacity(self.visible_len());
+        self.each_visible(|i| indices.push(i));
+        indices
+    }
+
+    /// How many rows the current view shows, without building the index list.
+    ///
+    /// `visible()` allocates, and the paging trigger reads this on every tick.
+    /// With no filter - which is nearly always - every row is visible, and the
+    /// answer needs no walk at all.
+    #[must_use]
+    pub fn visible_len(&self) -> usize {
+        if self.filter.is_empty() {
+            return if self.view == View::Playlists {
+                self.playlists.len()
+            } else {
+                self.current_tracks().len()
+            };
         }
+        let mut count = 0;
+        self.each_visible(|_| count += 1);
+        count
     }
 
     fn clamp_selection(&mut self) {
@@ -761,6 +998,35 @@ impl App {
         }
     }
 
+    /// A request came back as a failure.
+    ///
+    /// `task` says which one, so the view that was waiting stops waiting. The
+    /// rows already loaded are left exactly as they are: a page that did not
+    /// arrive is a page missing from the end, not a reason to empty the list.
+    fn on_failed(&mut self, task: Task, fault: Fault, detail: &str) {
+        self.loading = false;
+        if let Task::Favorites { offset } = task
+            && self.favorites_paging.wanted == Some(offset)
+        {
+            self.favorites_paging.wanted = None;
+            // Latched rather than retried. The trigger runs on every tick, so a
+            // service that is down would otherwise be asked ten times a second
+            // until priel was closed.
+            self.favorites_paging.stalled = true;
+        }
+        // Branching on the classification, never on the words. This was
+        // `e.contains("log in again")`, which made the core's wording
+        // load-bearing: rewording that sentence would have quietly stopped the
+        // login screen from being offered.
+        match fault {
+            Fault::SignedOut => self.offer_relogin(detail),
+            Fault::Unreachable => {
+                self.notice = Some(format!("⚠ could not reach the service: {detail}"));
+            }
+            Fault::Refused => self.notice = Some(format!("⚠ {detail}")),
+        }
+    }
+
     pub fn drain_worker(&mut self) {
         loop {
             let msg = match self.worker.rx.try_recv() {
@@ -775,12 +1041,7 @@ impl App {
             };
             self.dirty = true;
             match msg {
-                FromWorker::Favorites(t) => {
-                    self.favorites = t;
-                    self.loading = false;
-                    self.notice = Some(format!("{} favorites", self.favorites.len()));
-                    self.clamp_selection();
-                }
+                FromWorker::Favorites { offset, page } => self.on_favorites_page(offset, page),
                 FromWorker::Playlists(p) => {
                     self.playlists = p;
                     self.loading = false;
@@ -802,20 +1063,18 @@ impl App {
                     self.notice = Some(format!("{} results", self.search_tracks.len()));
                 }
                 FromWorker::Resolved(id, r) => self.on_resolved(id, &r),
-                FromWorker::Failed { fault, detail } => {
-                    self.loading = false;
-                    // Branching on the classification, never on the words. This
-                    // was `e.contains("log in again")`, which made the core's
-                    // wording load-bearing: rewording that sentence would have
-                    // quietly stopped the login screen from being offered.
-                    match fault {
-                        Fault::SignedOut => self.offer_relogin(&detail),
-                        Fault::Unreachable => {
-                            self.notice = Some(format!("⚠ could not reach the service: {detail}"));
-                        }
-                        Fault::Refused => self.notice = Some(format!("⚠ {detail}")),
-                    }
+                FromWorker::AudioGraph(read) => {
+                    self.audio_graph = Some(read);
+                    // The reply can be longer than the request that opened the
+                    // overlay left room for, so the scroll starts again rather
+                    // than pointing past the end of the new reading.
+                    self.graph_scroll = 0;
                 }
+                FromWorker::Failed {
+                    task,
+                    fault,
+                    detail,
+                } => self.on_failed(task, fault, &detail),
             }
         }
     }
@@ -866,6 +1125,8 @@ impl App {
         self.drain_login();
         self.status = self.player.status();
         self.refresh_from_status();
+        self.page_in_more_favorites();
+        self.refresh_devices();
     }
 
     /// The half of `refresh` that reacts to `self.status`, split out so tests can
@@ -944,6 +1205,7 @@ impl App {
 
     fn refresh_from_status(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+        self.report_device_error();
 
         let sig = self.render_sig();
         if sig != self.last_sig {
@@ -989,6 +1251,10 @@ impl App {
             View::Search if self.search_tracks.is_empty() => {
                 self.mode = Mode::Search; // start typing a query
             }
+            // Coming back to the list is the retry. A page that failed left the
+            // view unwilling to ask again; this is the deliberate user action
+            // that clears that, and it is worth at most one more request.
+            View::Favorites => self.favorites_paging.stalled = false,
             _ => {}
         }
     }
@@ -1045,6 +1311,14 @@ impl App {
 
     // ---- queue + gapless playback ----
 
+    /// Build the play queue from the rows on screen and start at one of them.
+    ///
+    /// The queue is a snapshot, and a page of favorites that lands later does
+    /// **not** join it. The listener chose a set of tracks; extending it behind
+    /// their back would change what plays next without being asked, and the
+    /// track that follows the last one they saw would no longer be the one they
+    /// picked. Pressing Enter again rebuilds the queue from the larger list,
+    /// which is the deliberate way to take the new rows.
     fn start_queue_at(&mut self, vis_index: usize) {
         let vis = self.visible();
         if vis.is_empty() {
@@ -1217,6 +1491,8 @@ impl App {
             Mode::Search => self.on_key_search(key),
             Mode::Help => self.on_key_help(key),
             Mode::Log => self.on_key_log(key),
+            Mode::Graph => self.on_key_graph(key),
+            Mode::Devices => self.on_key_devices(key),
             Mode::Credentials => self.on_key_credentials(key),
             Mode::Login => self.on_key_login(key),
             Mode::Normal => self.on_key_normal(key),
@@ -1262,6 +1538,64 @@ impl App {
         self.recent.lines().len().saturating_sub(1)
     }
 
+    /// Open the audio-graph overlay and ask the worker to read the chain.
+    ///
+    /// Shared by the key press and the click so the two paths cannot drift.
+    /// Reading it means running `pw-dump` and waiting for it, so the request
+    /// goes to the worker and the overlay opens straight away with nothing in
+    /// it - the render loop waits for nothing.
+    fn open_graph(&mut self) {
+        self.mode = Mode::Graph;
+        self.graph_scroll = 0;
+        // Cleared rather than kept: the last reading shown as if it were
+        // current is exactly the lie this overlay exists to stop.
+        self.audio_graph = None;
+        let _ = self.worker.tx.send(ToWorker::ReadAudioGraph);
+    }
+
+    /// The audio-graph overlay: modal like the log one, scrolled like every list.
+    fn on_key_graph(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('D' | 'q' | ' ') => {
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.graph_scroll = (self.graph_scroll + 1).min(self.graph_scroll_max());
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.graph_scroll = self.graph_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('g') => self.graph_scroll = 0,
+            KeyCode::Char('G') => self.graph_scroll = self.graph_scroll_max(),
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    fn graph_scroll_max(&self) -> usize {
+        self.graph_rows().len().saturating_sub(1)
+    }
+
+    /// How far down the audio-graph overlay is scrolled.
+    #[must_use]
+    pub fn graph_offset(&self) -> usize {
+        self.graph_scroll
+    }
+
+    /// The lines of the audio-graph overlay, top to bottom.
+    #[must_use]
+    pub fn graph_rows(&self) -> Vec<GraphRow> {
+        match &self.audio_graph {
+            None => vec![note("Reading the graph…")],
+            Some(Err(e)) => {
+                let mut rows = vec![note(&e.to_string())];
+                rows.extend(e.hint().map(note));
+                rows
+            }
+            Some(Ok(g)) => path_rows(g),
+        }
+    }
+
     /// The diagnostics to show, oldest first.
     #[must_use]
     pub fn log_lines(&self) -> Vec<String> {
@@ -1272,6 +1606,180 @@ impl App {
     #[must_use]
     pub fn log_offset(&self) -> usize {
         self.log_scroll
+    }
+
+    // ---- the output device picker ----
+
+    /// Open the output picker, asking for a fresh list as it opens.
+    ///
+    /// The one way in: the key and the hint click both come through here, so the
+    /// two cannot drift apart.
+    fn open_devices(&mut self) {
+        self.mode = Mode::Devices;
+        self.device_offset = 0;
+        self.devices_asked = Some(Instant::now());
+        // Devices come and go while priel runs. What is on screen should be
+        // what is true now, not what was true at startup.
+        self.player.refresh_devices();
+        self.select_current_device();
+    }
+
+    /// Start the picker on the device already in use, the way a list opens on
+    /// the row that was last touched.
+    fn select_current_device(&mut self) {
+        self.device_selected = self
+            .devices
+            .iter()
+            .position(|d| d.name == self.status.audio_device)
+            .unwrap_or(0);
+    }
+
+    /// The picker: modal like the log overlay, and scrolled with the same keys.
+    fn on_key_devices(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('d' | 'q') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => self.device_down(1),
+            KeyCode::Char('k') | KeyCode::Up => self.device_up(1),
+            KeyCode::Char('J') => self.device_down(self.full_page()),
+            KeyCode::Char('K') => self.device_up(self.full_page()),
+            KeyCode::Char('g') => self.device_selected = 0,
+            KeyCode::Char('G') => self.device_selected = self.devices.len().saturating_sub(1),
+            KeyCode::Enter => self.choose_device(self.device_selected),
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Move the output to the device on this row, for this session.
+    ///
+    /// The one place that changes the output: the Enter key and a click on a
+    /// row both arrive here, so the two cannot drift apart. Nothing is written
+    /// anywhere - priel reads no configuration file, and `--device` is what
+    /// makes a choice outlive the session, which is what the overlay says.
+    fn choose_device(&mut self, index: usize) {
+        let Some(device) = self.devices.get(index) else {
+            return;
+        };
+        let name = device.name.clone();
+        let label = if device.description.is_empty() {
+            name.clone()
+        } else {
+            device.description.clone()
+        };
+        self.player.set_device(&name);
+        self.notice = Some(format!("Output: {label} — this session only"));
+        self.mode = Mode::Normal;
+        self.dirty = true;
+    }
+
+    /// Report a device change that did not take, once.
+    ///
+    /// The player carries the reason in its status until the next change is
+    /// accepted, so without the latch this would replace every other notice on
+    /// screen ten times a second.
+    fn report_device_error(&mut self) {
+        if self.status.device_error == self.reported_device_error {
+            return;
+        }
+        self.reported_device_error = self.status.device_error.clone();
+        if let Some(detail) = self.reported_device_error.clone() {
+            self.notice = Some(detail);
+            self.dirty = true;
+        }
+    }
+
+    fn device_down(&mut self, by: usize) {
+        let n = self.devices.len();
+        if n > 0 {
+            self.device_selected = (self.device_selected + by).min(n - 1);
+        }
+    }
+
+    fn device_up(&mut self, by: usize) {
+        self.device_selected = self.device_selected.saturating_sub(by);
+    }
+
+    /// A click inside the picker. On a row it takes that row; anywhere else it
+    /// dismisses, as a click on the log overlay does.
+    fn click_device(&mut self, col: u16, row: u16) {
+        match self
+            .device_rows
+            .iter()
+            .find(|(r, _)| hit(*r, col, row))
+            .map(|(_, i)| *i)
+        {
+            Some(i) => {
+                self.device_selected = i;
+                self.choose_device(i);
+            }
+            None => self.mode = Mode::Normal,
+        }
+    }
+
+    /// Take up a device list the player has published.
+    ///
+    /// Only while the picker is up: the list is a handful of allocations and
+    /// nothing else on screen shows it, so polling it the rest of the time
+    /// would be work done for nobody.
+    fn refresh_devices(&mut self) {
+        if self.mode != Mode::Devices {
+            return;
+        }
+        let devices = self.player.devices();
+        if devices == self.devices {
+            return;
+        }
+        let was_empty = self.devices.is_empty();
+        self.devices = devices;
+        if was_empty {
+            // The first list to arrive decides where the picker opens.
+            self.select_current_device();
+        }
+        self.device_selected = self
+            .device_selected
+            .min(self.devices.len().saturating_sub(1));
+        self.dirty = true;
+    }
+
+    /// The devices the picker is showing.
+    #[must_use]
+    pub fn devices(&self) -> &[AudioDevice] {
+        &self.devices
+    }
+
+    /// Hand the picker a list without an audio system to ask.
+    #[cfg(test)]
+    pub fn set_devices_for_test(&mut self, devices: Vec<AudioDevice>) {
+        self.devices = devices;
+    }
+
+    /// Which row the picker is on.
+    #[must_use]
+    pub fn device_selected(&self) -> usize {
+        self.device_selected
+    }
+
+    /// What the picker shows instead of a list, when there is no list.
+    #[must_use]
+    pub fn device_notice(&self) -> Option<&'static str> {
+        Self::devices_message(
+            self.devices.is_empty(),
+            self.devices_asked.map(|t| t.elapsed()),
+        )
+    }
+
+    /// Pure, so the two empty cases can be told apart in a test without waiting
+    /// for a clock: the answer is still on its way, or nothing is going to
+    /// answer. The second is what a build without libmpv looks like, and saying
+    /// so beats an empty box that reads as a bug.
+    fn devices_message(empty: bool, since_asked: Option<Duration>) -> Option<&'static str> {
+        if !empty {
+            return None;
+        }
+        match since_asked {
+            Some(waited) if waited < DEVICE_WAIT => Some("Looking for output devices…"),
+            _ => Some("No output devices were reported."),
+        }
     }
 
     fn on_key_filter(&mut self, key: KeyEvent) {
@@ -1355,6 +1863,8 @@ impl App {
                 // almost always something that just happened.
                 self.log_scroll = 0;
             }
+            KeyCode::Char('D') => self.open_graph(),
+            KeyCode::Char('d') => self.open_devices(),
             KeyCode::Char('A') => self.start_login(),
             KeyCode::Enter => self.on_enter(),
             KeyCode::Char(' ') => self.player.toggle_pause(),
@@ -1391,6 +1901,34 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+        if self.mode == Mode::Graph {
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    self.graph_scroll = (self.graph_scroll + 1).min(self.graph_scroll_max());
+                    self.dirty = true;
+                }
+                MouseEventKind::ScrollUp => {
+                    self.graph_scroll = self.graph_scroll.saturating_sub(1);
+                    self.dirty = true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.mode = Mode::Normal;
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.mode == Mode::Devices {
+            match m.kind {
+                MouseEventKind::ScrollDown => self.device_down(1),
+                MouseEventKind::ScrollUp => self.device_up(1),
+                MouseEventKind::Down(MouseButton::Left) => self.click_device(m.column, m.row),
+                _ => return,
+            }
+            self.dirty = true;
             return;
         }
         if self.mode == Mode::Help {
@@ -1435,6 +1973,7 @@ impl App {
             Hit::Filter => self.start_filter(),
             Hit::CycleView => self.cycle_view(),
             Hit::Help => self.mode = Mode::Help,
+            Hit::Graph => self.open_graph(),
             Hit::Quit => self.should_quit = true,
         }
     }
@@ -1545,6 +2084,77 @@ fn open_in_browser(url: &str) {
 
 fn hit(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+}
+
+/// A line of prose in the audio-graph overlay.
+fn note(text: &str) -> GraphRow {
+    GraphRow {
+        label: text.to_string(),
+        detail: String::new(),
+        kind: GraphRowKind::Note,
+    }
+}
+
+/// The chain, one row per node with a connector between them.
+///
+/// Pure so the overlay's content is a table of tests rather than something only
+/// a rendered frame can show.
+fn path_rows(g: &AudioGraph) -> Vec<GraphRow> {
+    let mut rows = Vec::with_capacity(g.path.len() * 2);
+    for (hop, node) in g.path.iter().enumerate() {
+        if hop > 0 {
+            rows.push(GraphRow {
+                label: "  │".into(),
+                detail: String::new(),
+                kind: GraphRowKind::Link,
+            });
+        }
+        rows.push(GraphRow {
+            label: node_label(node),
+            detail: negotiated(node),
+            kind: GraphRowKind::Node,
+        });
+    }
+    rows
+}
+
+/// How a node introduces itself.
+///
+/// The stream is libmpv's and `PipeWire` calls it `mpv`, which is a puzzle on
+/// screen until it is labelled - so it is labelled.
+fn node_label(node: &GraphNode) -> String {
+    let name = if node.description.is_empty() {
+        &node.name
+    } else {
+        &node.description
+    };
+    match node.role {
+        NodeRole::Stream => format!("  {name}  (priel)"),
+        NodeRole::Intermediate => format!("  {name}"),
+        NodeRole::Device => format!("  {name}  (device)"),
+    }
+}
+
+/// What a node settled on, or a plain statement that it has not settled yet.
+///
+/// Rates are written the way the badge writes them - `crate::ui::fmt_khz` is
+/// shared rather than reimplemented, so 44.1 kHz cannot appear as "44 kHz" in
+/// one place and "44.1 kHz" in the other.
+fn negotiated(node: &GraphNode) -> String {
+    let Some(rate) = node.rate_hz else {
+        return "no format yet".into();
+    };
+    let mut out = crate::ui::fmt_khz(rate);
+    if let Some(format) = &node.format {
+        out.push_str("  ");
+        out.push_str(format);
+    }
+    if let Some(channels) = node.channels {
+        out.push_str("  ");
+        out.push_str(&channels.to_string());
+        out.push_str(" ch");
+    }
+    out
 }
 
 /// Does a row match the local filter? `filter_lower` must already be lowercased
@@ -1673,12 +2283,47 @@ mod tests {
 
     // ---- startup and worker traffic ----
 
+    // ---- paging the favorites list ----
+
+    /// A page of favorites as the worker would deliver it: rows `ids`, starting
+    /// at `offset`, out of a listing `total` long.
+    fn favorites_page(offset: u32, ids: std::ops::Range<u64>, total: u32) -> FromWorker {
+        FromWorker::Favorites {
+            offset,
+            page: priel_core::Page {
+                items: ids.map(|i| track(i, "T", "A")).collect(),
+                total,
+            },
+        }
+    }
+
+    fn ids(tracks: &[Track]) -> Vec<u64> {
+        tracks.iter().map(|t| t.id).collect()
+    }
+
+    /// Put the list in the state the paging trigger looks for: drawn, with the
+    /// selection on the last loaded row. Existing tests set `list_inner` by hand
+    /// for the same reason - the renderer is what normally writes it.
+    fn scrolled_to_the_end(app: &mut App) {
+        app.list_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+        app.selected = app.visible_len().saturating_sub(1);
+    }
+
     #[test]
-    fn startup_asks_for_favorites_and_says_it_is_loading() {
-        // Goal: the first frame must not look like an empty library.
+    fn startup_asks_for_the_first_page_and_says_it_is_loading() {
+        // Goal: the first frame must not look like an empty library, and the
+        // request has to name the page it wants or nothing can be paged.
         let mut r = rig();
         r.app.start();
-        assert!(matches!(requests(&r)[..], [ToWorker::LoadFavorites]));
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadFavorites { offset: 0, limit }] if limit > 0
+        ));
         assert!(r.app.loading);
     }
 
@@ -1686,13 +2331,281 @@ mod tests {
     fn arriving_favorites_replace_the_list_and_clear_loading() {
         // Goal: the worker reply is the only thing that ends the loading state.
         let mut r = rig();
-        r.to_app
-            .send(FromWorker::Favorites(vec![track(1, "A", "X")]))
-            .unwrap();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 1..2, 1)).unwrap();
         r.app.drain_worker();
         assert_eq!(r.app.favorites.len(), 1);
         assert!(!r.app.loading);
-        assert!(r.app.notice.as_deref().unwrap().contains('1'));
+        assert!(r.app.notice.as_deref().unwrap_or_default().contains('1'));
+    }
+
+    #[test]
+    fn scrolling_near_the_end_asks_for_the_next_page_and_appends_it() {
+        // Goal: the whole point. The list has to grow past its first page as the
+        // user reaches the bottom of it, and grow at the end - the only place
+        // that leaves the rows above where they were.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..3, 6)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.favorites), vec![0, 1, 2]);
+        let _ = requests(&r);
+
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh();
+        assert!(
+            matches!(
+                requests(&r)[..],
+                [ToWorker::LoadFavorites { offset: 3, .. }]
+            ),
+            "the next page starts where the loaded rows end"
+        );
+
+        r.to_app.send(favorites_page(3, 3..6, 6)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.favorites), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_page_arriving_leaves_the_selected_row_alone() {
+        // Goal: selection is an index into the filtered rows. Anything that
+        // reorders or replaces moves the row out from under the cursor, which is
+        // the bug this design exists to avoid.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..10, 20)).unwrap();
+        r.app.drain_worker();
+        scrolled_to_the_end(&mut r.app);
+        let (row, under_cursor) = (r.app.selected, r.app.favorites[r.app.selected].id);
+        r.app.refresh();
+
+        r.to_app.send(favorites_page(10, 10..20, 20)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(r.app.selected, row, "the cursor must not jump");
+        assert_eq!(
+            r.app.favorites[r.app.selected].id, under_cursor,
+            "and the same track must still be under it"
+        );
+    }
+
+    #[test]
+    fn only_one_page_request_is_in_flight_at_a_time() {
+        // Goal: the trigger runs on every tick, and the tick runs ten times a
+        // second. Without the in-flight marker one scroll to the bottom would
+        // ask for the same page over and over.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..5, 500)).unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+
+        scrolled_to_the_end(&mut r.app);
+        for _ in 0..5 {
+            r.app.refresh();
+        }
+        assert_eq!(
+            requests(&r).len(),
+            1,
+            "the tick repeats; the request must not"
+        );
+    }
+
+    #[test]
+    fn a_page_nobody_is_waiting_for_is_discarded() {
+        // Goal: a page that arrives after the list moved on belongs to a listing
+        // that no longer exists. Appending it would interleave two lists, which
+        // is exactly what matching on arrival order gets you.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..5, 500)).unwrap();
+        r.app.drain_worker();
+
+        // Nothing asked for offset 5, so this page is nobody's.
+        r.to_app.send(favorites_page(5, 5..10, 500)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.favorites), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_page_from_before_a_reload_is_discarded() {
+        // Goal: the same rule under the case that actually produces a stale
+        // reply - a second page still in flight when the list restarts.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..5, 500)).unwrap();
+        r.app.drain_worker();
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh(); // asks for offset 5
+        let _ = requests(&r);
+
+        r.app.start(); // the list restarts; offset 5 is no longer wanted
+        r.to_app.send(favorites_page(5, 5..10, 500)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(
+            ids(&r.app.favorites),
+            vec![0, 1, 2, 3, 4],
+            "the page for the abandoned listing must not be appended"
+        );
+    }
+
+    #[test]
+    fn reaching_the_total_the_service_reports_stops_the_requests() {
+        // Goal: the end of the list comes from the service's own count. A page
+        // shorter than the limit is not the end, and a full one is not proof
+        // that there is more.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..4, 4)).unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+
+        scrolled_to_the_end(&mut r.app);
+        for _ in 0..3 {
+            r.app.refresh();
+        }
+        assert!(requests(&r).is_empty(), "everything is already loaded");
+        assert_eq!(
+            r.app.favorites_available(),
+            None,
+            "and the heading should stop mentioning a total"
+        );
+    }
+
+    #[test]
+    fn no_page_is_fetched_before_the_first_frame_is_drawn() {
+        // Goal: the list geometry is written by the renderer, so before a draw
+        // it is a zero-height rect that the selection is trivially at the end
+        // of. Acting on that would page the whole library in at startup. One
+        // row out of many, so only the geometry guard can hold the request
+        // back - the distance to the bottom is zero.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..1, 500)).unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+
+        assert_eq!(r.app.list_inner.height, 0, "nothing has been rendered yet");
+        r.app.refresh();
+        assert!(requests(&r).is_empty());
+    }
+
+    #[test]
+    fn a_failed_page_keeps_the_rows_reports_itself_and_does_not_spin() {
+        // Goal: a page that never arrived is a page missing from the end, not a
+        // reason to empty the list - and the trigger runs every tick, so a dead
+        // link must not turn into a request storm.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..5, 500)).unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh();
+        assert_eq!(requests(&r).len(), 1);
+
+        r.to_app
+            .send(FromWorker::Failed {
+                task: Task::Favorites { offset: 5 },
+                fault: Fault::Unreachable,
+                detail: "favorites: no route to host".into(),
+            })
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(
+            ids(&r.app.favorites),
+            vec![0, 1, 2, 3, 4],
+            "rows stay usable"
+        );
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("no route to host"), "{notice}");
+
+        for _ in 0..5 {
+            r.app.refresh();
+        }
+        assert!(
+            requests(&r).is_empty(),
+            "a failed page must not be retried on a timer"
+        );
+    }
+
+    #[test]
+    fn coming_back_to_the_list_retries_a_page_that_failed() {
+        // Goal: the stall latch stops a spin, not the user. Returning to the
+        // view is a deliberate action and is worth one more attempt.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..5, 500)).unwrap();
+        r.app.drain_worker();
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh();
+        r.to_app
+            .send(FromWorker::Failed {
+                task: Task::Favorites { offset: 5 },
+                fault: Fault::Unreachable,
+                detail: "favorites: no route to host".into(),
+            })
+            .unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+
+        r.app.on_key(key('2')); // away to the playlists
+        r.app.on_key(key('1')); // and back
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh();
+        assert!(
+            requests(&r)
+                .iter()
+                .any(|c| matches!(c, ToWorker::LoadFavorites { offset: 5, .. })),
+            "the view should be willing to ask again"
+        );
+    }
+
+    #[test]
+    fn a_failure_elsewhere_does_not_free_the_favorites_slot() {
+        // Goal: `Failed` says which request died precisely so one view's failure
+        // cannot be mistaken for another's. A resolve that failed must not let a
+        // second copy of the same page go out.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..5, 500)).unwrap();
+        r.app.drain_worker();
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh();
+        let _ = requests(&r);
+
+        r.to_app
+            .send(FromWorker::Failed {
+                task: Task::Resolve,
+                fault: Fault::Refused,
+                detail: "resolve: no".into(),
+            })
+            .unwrap();
+        r.app.drain_worker();
+        r.app.refresh();
+        assert!(
+            requests(&r).is_empty(),
+            "the favorites page is still in flight"
+        );
+    }
+
+    #[test]
+    fn the_queue_does_not_grow_when_a_page_lands() {
+        // Goal: the documented decision in `start_queue_at`. The listener chose
+        // a set of tracks; a page arriving must not silently change what plays
+        // after the last one they saw.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..5, 500)).unwrap();
+        r.app.drain_worker();
+        r.app.selected = 0;
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.queue.len(), 5);
+
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh();
+        r.to_app.send(favorites_page(5, 5..10, 500)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(r.app.queue.len(), 5, "the queue is a snapshot, not a view");
     }
 
     /// A tick where nothing is happening: no track, no audio, nothing queued.
@@ -1882,6 +2795,7 @@ mod tests {
             .set_paths_for_test("/nonexistent/token.json".into(), credentials_fixture());
         r.to_app
             .send(FromWorker::Failed {
+                task: Task::Favorites { offset: 0 },
                 fault: Fault::SignedOut,
                 detail: "something nobody thought to grep for".into(),
             })
@@ -1899,6 +2813,7 @@ mod tests {
         r.app.loading = true;
         r.to_app
             .send(FromWorker::Failed {
+                task: Task::Favorites { offset: 0 },
                 fault: Fault::Unreachable,
                 detail: "favorites".into(),
             })
@@ -1918,6 +2833,7 @@ mod tests {
         r.app.loading = true;
         r.to_app
             .send(FromWorker::Failed {
+                task: Task::Startup,
                 fault: Fault::Refused,
                 detail: "token: expired".into(),
             })
@@ -1925,6 +2841,192 @@ mod tests {
         r.app.drain_worker();
         assert!(r.app.notice.as_deref().unwrap().contains("expired"));
         assert!(!r.app.loading);
+    }
+
+    /// A two-node chain: priel's stream straight into a DAC, no resample.
+    fn chain() -> AudioGraph {
+        AudioGraph {
+            path: vec![
+                GraphNode {
+                    id: 58,
+                    name: "mpv".into(),
+                    description: "mpv".into(),
+                    media_class: "Stream/Output/Audio".into(),
+                    role: NodeRole::Stream,
+                    rate_hz: Some(44_100),
+                    format: Some("S16LE".into()),
+                    channels: Some(2),
+                },
+                GraphNode {
+                    id: 48,
+                    name: "alsa_output.usb-DAC".into(),
+                    description: "Studio DAC".into(),
+                    media_class: "Audio/Sink".into(),
+                    role: NodeRole::Device,
+                    rate_hz: Some(44_100),
+                    format: Some("S32LE".into()),
+                    channels: Some(2),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn the_graph_key_opens_the_overlay_and_asks_the_worker_to_read_it() {
+        // Goal: reading the graph runs a subprocess, so the request must leave
+        // the UI thread. The overlay opens on the key press and says it is
+        // reading, rather than the key press waiting for pw-dump.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        assert_eq!(r.app.mode, Mode::Graph);
+        assert!(
+            matches!(r.from_app.try_recv(), Ok(ToWorker::ReadAudioGraph)),
+            "the read has to go to the worker"
+        );
+        let rows = r.app.graph_rows();
+        assert_eq!(rows.len(), 1, "nothing to show until the reply arrives");
+        assert_eq!(rows[0].kind, GraphRowKind::Note);
+    }
+
+    #[test]
+    fn the_graph_overlay_opens_on_its_key_and_closes_again() {
+        // Goal: dismissed the way the help and log overlays are, so there is
+        // one way out of an overlay rather than three.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.app.on_key(key('D'));
+        assert_eq!(r.app.mode, Mode::Normal);
+        r.app.on_key(key('D'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal, "Esc closes it too");
+        r.app.on_key(key('D'));
+        r.app.on_key(key('q'));
+        assert_eq!(r.app.mode, Mode::Normal, "q closes it rather than quitting");
+        assert!(!r.app.should_quit);
+    }
+
+    #[test]
+    fn the_graph_overlay_swallows_the_keys_and_clicks_behind_it() {
+        // Goal: modal like the other overlays. A view change or a track
+        // starting underneath one is how a user ends up somewhere they did not
+        // ask to be.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.on_key(key('D'));
+        r.app.on_key(key('2'));
+        assert_eq!(r.app.view, View::Favorites, "the view must not change");
+        assert_eq!(r.app.mode, Mode::Graph, "and it is still open");
+        r.app.on_mouse(click(2, 2));
+        assert_eq!(r.app.mode, Mode::Normal, "a click dismisses it");
+        assert_eq!(r.app.selected, 0, "and does not land on a row underneath");
+    }
+
+    #[test]
+    fn the_chain_the_worker_read_is_what_the_overlay_lists() {
+        // Goal: the whole point - every node between priel and the device, in
+        // order, with what each one negotiated.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Ok(chain())))
+            .expect("send");
+        r.app.drain_worker();
+        let rows = r.app.graph_rows();
+        let nodes: Vec<&GraphRow> = rows
+            .iter()
+            .filter(|r| r.kind == GraphRowKind::Node)
+            .collect();
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes[0].label.contains("priel"), "{}", nodes[0].label);
+        assert_eq!(nodes[0].detail, "44.1 kHz  S16LE  2 ch");
+        assert!(nodes[1].label.contains("Studio DAC"), "{}", nodes[1].label);
+        assert_eq!(nodes[1].detail, "44.1 kHz  S32LE  2 ch");
+        assert!(
+            rows.iter().any(|r| r.kind == GraphRowKind::Link),
+            "the two nodes are drawn as a chain, not a list"
+        );
+    }
+
+    #[test]
+    fn a_graph_that_could_not_be_read_explains_itself_rather_than_showing_a_box() {
+        // Goal: the machine with no PipeWire tools is the common case, and an
+        // empty overlay there reads as a bug in priel.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Err(GraphError::NotInstalled)))
+            .expect("send");
+        r.app.drain_worker();
+        let rows = r.app.graph_rows();
+        assert!(rows.iter().all(|r| r.kind == GraphRowKind::Note));
+        assert!(rows[0].label.contains("pw-dump"), "{}", rows[0].label);
+        assert_eq!(rows.len(), 2, "the sentence and what to do about it");
+    }
+
+    #[test]
+    fn a_node_with_no_negotiated_format_says_so_rather_than_showing_nothing() {
+        // Goal: a suspended device has no format yet. A blank right-hand column
+        // reads as "bit-perfect" to the eye scanning it.
+        let mut r = rig();
+        let mut g = chain();
+        g.path[1].rate_hz = None;
+        g.path[1].format = None;
+        r.app.on_key(key('D'));
+        r.to_app.send(FromWorker::AudioGraph(Ok(g))).expect("send");
+        r.app.drain_worker();
+        let rows = r.app.graph_rows();
+        let last = rows.last().expect("a row");
+        assert_eq!(last.detail, "no format yet");
+    }
+
+    #[test]
+    fn the_graph_overlay_scrolls_with_the_same_keys_as_a_list() {
+        // Goal: every other list in priel moves on j/k and g/G, so this one
+        // must too - a second scrolling idiom would be its own bug.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Ok(chain())))
+            .expect("send");
+        r.app.drain_worker();
+        assert_eq!(r.app.graph_offset(), 0, "it opens at the top");
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.graph_offset(), 1, "j goes down");
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.graph_offset(), 0);
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.graph_offset(), 0, "and stops at the top");
+        r.app.on_key(key('G'));
+        assert_eq!(r.app.graph_offset(), 2, "G reaches the last line");
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.graph_offset(), 2, "and stops there");
+        r.app.on_key(key('g'));
+        assert_eq!(r.app.graph_offset(), 0, "g returns to the top");
+    }
+
+    #[test]
+    fn reopening_the_overlay_reads_the_graph_again_rather_than_reusing_it() {
+        // Goal: the chain changes when the device or the track rate does, and a
+        // stale reading presented as current is the one thing this overlay must
+        // never do.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Ok(chain())))
+            .expect("send");
+        r.app.drain_worker();
+        while r.from_app.try_recv().is_ok() {}
+        r.app.on_key(key('D'));
+        r.app.on_key(key('D'));
+        assert!(
+            matches!(r.from_app.try_recv(), Ok(ToWorker::ReadAudioGraph)),
+            "opening it again asks again"
+        );
+        assert_eq!(
+            r.app.graph_rows().len(),
+            1,
+            "and shows nothing until the new answer lands"
+        );
     }
 
     #[test]
@@ -1972,6 +3074,223 @@ mod tests {
         assert!(r.app.log_scroll > 1, "g reaches the oldest");
         r.app.on_key(key('G'));
         assert_eq!(r.app.log_scroll, 0, "G returns to the newest");
+    }
+
+    /// Three devices with the middle one in use, so a test can tell the
+    /// selected row from the marked one.
+    fn devices() -> Vec<AudioDevice> {
+        ["auto", "pipewire/dac", "alsa/hdmi"]
+            .iter()
+            .map(|n| AudioDevice {
+                name: (*n).to_string(),
+                description: format!("{n} description"),
+            })
+            .collect()
+    }
+
+    /// A rigged app with the picker open on a known list.
+    fn with_picker(in_use: &str) -> Rig {
+        let mut r = rig();
+        r.app.status.audio_device = in_use.to_string();
+        r.app.set_devices_for_test(devices());
+        r.app.on_key(key('d'));
+        r
+    }
+
+    #[test]
+    fn the_device_picker_opens_on_its_key_and_closes_again() {
+        // Goal: the whole point of the issue is not having to leave the player
+        // to find out what a device is called. The key that opens it closes it,
+        // as every other overlay here does.
+        let mut r = with_picker("auto");
+        assert_eq!(r.app.mode, Mode::Devices);
+        r.app.on_key(key('d'));
+        assert_eq!(r.app.mode, Mode::Normal);
+        r.app.on_key(key('d'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal, "Esc closes it too");
+    }
+
+    #[test]
+    fn escape_leaves_the_picker_without_touching_the_output() {
+        // Goal: a picker that changed the output as the selection moved would
+        // be unusable. Only choosing changes anything, and Esc chooses nothing.
+        let mut r = with_picker("pipewire/dac");
+        r.app.notice = None;
+        r.app.on_key(key('j'));
+        r.app.on_key(key('k'));
+        r.app.on_key(key('G'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(
+            r.app.notice.is_none(),
+            "moving and cancelling chooses nothing: {:?}",
+            r.app.notice
+        );
+    }
+
+    #[test]
+    fn the_device_picker_swallows_the_keys_behind_it() {
+        // Goal: modal like the other overlays. Changing view underneath one is
+        // how a user ends up somewhere they did not ask to be.
+        let mut r = with_picker("auto");
+        r.app.on_key(key('2'));
+        assert_eq!(r.app.view, View::Favorites, "the view must not change");
+        assert_eq!(r.app.mode, Mode::Devices, "and it is still open");
+    }
+
+    #[test]
+    fn the_device_picker_scrolls_with_the_same_keys_as_a_list() {
+        // Goal: j/k and g/G mean here what they mean everywhere else in priel.
+        // A second scrolling idiom would be its own bug.
+        let mut r = with_picker("auto");
+        assert_eq!(r.app.device_selected(), 0);
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.device_selected(), 1);
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.device_selected(), 0);
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.device_selected(), 0, "and stops at the first");
+        r.app.on_key(key('G'));
+        assert_eq!(r.app.device_selected(), 2, "G reaches the last");
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.device_selected(), 2, "and stops there");
+        r.app.on_key(key('g'));
+        assert_eq!(r.app.device_selected(), 0);
+    }
+
+    #[test]
+    fn the_picker_opens_on_the_device_already_in_use() {
+        // Goal: the list is long - forty-odd entries on a normal desktop - so
+        // opening at the top would leave the user hunting for where they are.
+        let r = with_picker("alsa/hdmi");
+        assert_eq!(r.app.device_selected(), 2);
+    }
+
+    #[test]
+    fn a_device_that_is_gone_leaves_the_picker_at_the_top() {
+        // Goal: the device priel was started with can be unplugged. That must
+        // open the list, not index past the end of it.
+        let r = with_picker("pipewire/one-that-left");
+        assert_eq!(r.app.device_selected(), 0);
+    }
+
+    #[test]
+    fn choosing_a_device_closes_the_picker_and_says_it_is_for_this_session() {
+        // Goal: the choice is not written anywhere - priel reads no
+        // configuration file - so the one moment it can be said is now.
+        let mut r = with_picker("auto");
+        r.app.on_key(key('j'));
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.mode, Mode::Normal, "choosing closes the picker");
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("pipewire/dac description"),
+            "the chosen device is named: {notice}"
+        );
+        assert!(
+            notice.contains("this session"),
+            "and the choice is temporary: {notice}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_device_row_does_what_the_enter_key_does() {
+        // Goal: the mouse is a first-class addition, never a second
+        // implementation. Both paths run `choose_device` and nothing else.
+        let mut r = with_picker("auto");
+        let row = Rect {
+            x: 2,
+            y: 5,
+            width: 60,
+            height: 1,
+        };
+        r.app.device_rows = vec![(row, 2)];
+        r.app.on_mouse(click(4, 5));
+        assert_eq!(r.app.device_selected(), 2, "the clicked row is taken");
+        assert_eq!(r.app.mode, Mode::Normal, "and choosing closes the picker");
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("alsa/hdmi description"), "{notice}");
+    }
+
+    #[test]
+    fn a_click_outside_the_rows_dismisses_the_picker_without_choosing() {
+        // Goal: the log overlay behaves this way and a second idiom would be
+        // its own bug. Missing a row must not move the output.
+        let mut r = with_picker("auto");
+        r.app.notice = None;
+        r.app.device_rows = vec![(
+            Rect {
+                x: 2,
+                y: 5,
+                width: 60,
+                height: 1,
+            },
+            1,
+        )];
+        r.app.on_mouse(click(4, 9));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(r.app.notice.is_none(), "nothing was chosen");
+    }
+
+    #[test]
+    fn a_device_that_will_not_open_is_reported_once_rather_than_every_tick() {
+        // Goal: the player carries the reason until the next change is
+        // accepted, so without the latch this would replace every other notice
+        // on screen ten times a second - and a failure the user has to act on
+        // has to survive long enough to be read.
+        let mut r = rig();
+        r.app.status.device_error = Some("alsa/hdmi would not open".into());
+        r.app.refresh_for_test();
+        assert_eq!(
+            r.app.notice.as_deref(),
+            Some("alsa/hdmi would not open"),
+            "the failure reaches the user"
+        );
+
+        r.app.notice = Some("something else".into());
+        r.app.refresh_for_test();
+        assert_eq!(
+            r.app.notice.as_deref(),
+            Some("something else"),
+            "and is not repeated over whatever came after it"
+        );
+
+        r.app.status.device_error = None;
+        r.app.refresh_for_test();
+        r.app.status.device_error = Some("alsa/hdmi would not open".into());
+        r.app.refresh_for_test();
+        assert_eq!(
+            r.app.notice.as_deref(),
+            Some("alsa/hdmi would not open"),
+            "a second failure is a new report"
+        );
+    }
+
+    #[test]
+    fn an_empty_picker_says_which_kind_of_empty_it_is() {
+        // Goal: the list is asked for as the overlay opens and answered a tick
+        // later, so the first frame is always empty - and a build without
+        // libmpv never answers at all. Showing an empty box for either reads as
+        // a bug; the two have to be told apart.
+        assert_eq!(
+            App::devices_message(false, None),
+            None,
+            "a list needs no note"
+        );
+        assert_eq!(
+            App::devices_message(true, Some(Duration::from_millis(50))),
+            Some("Looking for output devices…")
+        );
+        assert_eq!(
+            App::devices_message(true, Some(Duration::from_secs(30))),
+            Some("No output devices were reported."),
+            "nothing answered, and saying so beats an empty box"
+        );
+        assert_eq!(
+            App::devices_message(true, None),
+            Some("No output devices were reported.")
+        );
     }
 
     #[test]
@@ -2835,6 +4154,9 @@ mod tests {
         r.app.on_key(key('?'));
         assert_eq!(r.app.mode, Mode::Help);
         r.app.on_key(code(KeyCode::Esc));
+        r.app.on_key(key('d'));
+        assert_eq!(r.app.mode, Mode::Devices);
+        r.app.on_key(code(KeyCode::Esc));
         r.app.on_key(key('/'));
         assert_eq!(r.app.mode, Mode::Filter);
     }
@@ -3023,7 +4345,7 @@ mod tests {
         r.app.restart_worker_for_test();
         r.app.start();
         assert!(
-            matches!(requests(&r)[..], [ToWorker::LoadFavorites]),
+            matches!(requests(&r)[..], [ToWorker::LoadFavorites { .. }]),
             "the original worker should still be the one listening"
         );
     }
@@ -3146,6 +4468,7 @@ mod tests {
             .set_paths_for_test("/nonexistent/token.json".into(), credentials_fixture());
         r.to_app
             .send(FromWorker::Failed {
+                task: Task::Resolve,
                 fault: Fault::SignedOut,
                 detail: "resolve: refused".into(),
             })

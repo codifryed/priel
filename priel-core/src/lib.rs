@@ -93,6 +93,21 @@ pub struct Playlist {
     pub duration_secs: u32,
 }
 
+/// One page of a listing, plus how long the whole listing is.
+///
+/// The total is the only honest end-of-list signal. A page shorter than the
+/// limit asked for looks like the end and is not: the service caps some
+/// listings below whatever limit it was given, and a caller that stopped there
+/// would silently hide the rest of the library.
+#[derive(Clone, Debug, Default)]
+pub struct Page<T> {
+    /// The rows in this page, in the order the service returned them.
+    pub items: Vec<T>,
+    /// Rows in the whole listing, as the service reports it. Zero when the
+    /// answer carried no count - a guess would be worse than none.
+    pub total: u32,
+}
+
 /// Multi-type search results.
 #[derive(Clone, Debug, Default)]
 pub struct SearchResults {
@@ -160,6 +175,11 @@ struct SessionResp {
 #[derive(Deserialize)]
 struct FavTracksResp {
     items: Vec<FavItem>,
+    /// Sent by the service on every listing, and discarded here until paging
+    /// needed it. Defaulted rather than required: an answer without it is still
+    /// a usable page.
+    #[serde(rename = "totalNumberOfItems", default)]
+    total_number_of_items: u32,
 }
 #[derive(Deserialize)]
 struct FavItem {
@@ -524,10 +544,14 @@ impl Client {
 
     /// A page of the user's favorite tracks, newest first.
     ///
+    /// The reply carries the length of the whole listing as well as the rows,
+    /// so a caller paging through it knows when to stop without having to guess
+    /// from a short page.
+    ///
     /// # Errors
     /// If [`Self::connect`] has not run, on a transport failure, or on a
     /// non-success status.
-    pub fn favorite_tracks(&mut self, offset: u32, limit: u32) -> Result<Vec<Track>> {
+    pub fn favorite_tracks(&mut self, offset: u32, limit: u32) -> Result<Page<Track>> {
         let sess = self.session()?.clone();
         let url = self.url(&format!("/v1/users/{}/favorites/tracks", sess.user_id));
         let (off, lim) = (offset.to_string(), limit.to_string());
@@ -545,7 +569,14 @@ impl Client {
             bail!("favorites/tracks -> HTTP {}", resp.status());
         }
         let fr: FavTracksResp = resp.body_mut().read_json()?;
-        Ok(fr.items.into_iter().map(|i| i.item.into_track()).collect())
+        let mut items = Vec::with_capacity(fr.items.len());
+        for row in fr.items {
+            items.push(row.item.into_track());
+        }
+        Ok(Page {
+            items,
+            total: fr.total_number_of_items,
+        })
     }
 
     /// The user's own playlists.
@@ -889,10 +920,10 @@ mod tests {
             "audioQuality":"LOSSLESS","mediaMetadata":{"tags":["HIRES_LOSSLESS"]}}}]}"#;
         let s = stub(vec![ok(SESSION), ok(body)]);
         let mut c = connected(&s);
-        let tracks = c.favorite_tracks(20, 5).unwrap();
+        let page = c.favorite_tracks(20, 5).unwrap();
 
-        assert_eq!(tracks.len(), 1);
-        let t = &tracks[0];
+        assert_eq!(page.items.len(), 1);
+        let t = &page.items[0];
         assert_eq!((t.id, t.duration_secs), (1, 100));
         assert_eq!(t.artist, "A", "the first artist represents the track");
         assert_eq!(t.album, "Alb");
@@ -906,14 +937,37 @@ mod tests {
     }
 
     #[test]
+    fn a_page_carries_how_many_rows_the_whole_listing_has() {
+        // Goal: the end of a listing has to come from the service. Inferring it
+        // from a short page is wrong the moment the service caps a page below
+        // the limit that was asked for, and the count is already on the wire.
+        let body = r#"{"totalNumberOfItems":417,"items":[{"item":{"id":1}}]}"#;
+        let s = stub(vec![ok(SESSION), ok(body)]);
+        let page = connected(&s).favorite_tracks(0, 1).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.total, 417, "the count is the end-of-list signal");
+    }
+
+    #[test]
+    fn a_listing_with_no_count_reports_zero_rather_than_guessing() {
+        // Goal: the field is absent from some answers. Defaulting to zero keeps
+        // the caller from paging past the end on a made-up number; the caller
+        // can still see the rows it was given.
+        let s = stub(vec![ok(SESSION), ok(r#"{"items":[{"item":{"id":1}}]}"#)]);
+        let page = connected(&s).favorite_tracks(0, 1).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.total, 0);
+    }
+
+    #[test]
     fn absent_optional_track_fields_do_not_fail_the_page() {
         // Goal: the catalogue omits fields freely. One sparse row must not throw
         // away the whole listing.
         let s = stub(vec![ok(SESSION), ok(r#"{"items":[{"item":{"id":9}}]}"#)]);
-        let tracks = connected(&s).favorite_tracks(0, 1).unwrap();
-        assert_eq!(tracks[0].id, 9);
-        assert_eq!(tracks[0].artist, "");
-        assert_eq!(tracks[0].quality, "");
+        let rows = connected(&s).favorite_tracks(0, 1).unwrap().items;
+        assert_eq!(rows[0].id, 9);
+        assert_eq!(rows[0].artist, "");
+        assert_eq!(rows[0].quality, "");
     }
 
     #[test]

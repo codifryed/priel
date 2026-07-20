@@ -33,7 +33,9 @@ use priel_core::PlayableSource;
 
 use crate::hw::HwParams;
 
+pub mod graph;
 pub mod hw;
+mod run;
 
 #[cfg(feature = "libmpv")]
 mod backend_mpv;
@@ -89,6 +91,17 @@ pub struct PlaybackStatus {
     /// volume. `PipeWire` attenuates in software too, so a stream turned down in
     /// the system mixer is no more bit-perfect than one turned down in priel.
     pub ao_volume: Option<f64>,
+    /// The output device mpv is pointed at (`auto` unless one was chosen). This
+    /// is an identifier from [`AudioDevice::name`], so the picker can mark the
+    /// row that is in use by comparing the two.
+    pub audio_device: String,
+    /// Why the last device change did not take, if it did not.
+    ///
+    /// Display only, like the `detail` of a worker failure: there is nothing
+    /// here for a caller to branch on, and both causes - a device that is no
+    /// longer there and one that refused to open - leave the previous output in
+    /// use. Cleared by the next change that is accepted.
+    pub device_error: Option<String>,
     /// Live parameters of the ALSA device, when one could be read.
     ///
     /// This is the only unmediated view of the hardware. When present it decides
@@ -241,6 +254,30 @@ impl PlaybackStatus {
     }
 }
 
+/// An audio output device the player can be pointed at.
+///
+/// `name` is mpv's own identifier and is exactly what `--device` accepts, so a
+/// choice made in the interface can be made permanent by copying it onto the
+/// command line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioDevice {
+    /// mpv's identifier, e.g. `pipewire/alsa_output.usb-...pro-output-0`. It
+    /// carries the driver before the slash; `auto` means "let mpv choose".
+    pub name: String,
+    /// What the audio system calls the device, for a human to recognise.
+    pub description: String,
+}
+
+/// The audio devices the player can see, without starting one.
+///
+/// For callers that only want the list - `--list-devices` runs before there is
+/// a player at all. Enumeration reads what the audio system advertises and
+/// opens no output. Empty in a build without libmpv, which has nothing to ask.
+#[must_use]
+pub fn audio_devices() -> Vec<AudioDevice> {
+    backend::audio_devices()
+}
+
 /// Commands sent to the player thread.
 #[allow(dead_code)] // fields go unread in the stub (no-libmpv) backend
 pub(crate) enum Cmd {
@@ -255,7 +292,28 @@ pub(crate) enum Cmd {
     SeekRelative(f64), // +/- seconds
     SetVolume(f64),
     Stop,
+    /// Re-read the audio devices and publish them. Asked for when the picker
+    /// opens, so a device plugged in mid-session shows up.
+    RefreshDevices,
+    /// Move the output to this device, reopening it. The queue and the position
+    /// are untouched; the cost is the same short gap a sample-rate change makes.
+    SetDevice(String),
     Quit,
+}
+
+/// What the player thread publishes back to its owner.
+///
+/// Two snapshots rather than one: the status changes ten times a second and is
+/// read on every render, while the device list changes only when hardware does
+/// and is read only while the picker is open. Putting the devices in the status
+/// would clone them on every tick for a reader that almost never wants them.
+#[allow(
+    dead_code,
+    reason = "the stub (no-libmpv) backend has nothing to publish into either slot"
+)]
+pub(crate) struct Published {
+    pub status: Arc<Mutex<PlaybackStatus>>,
+    pub devices: Arc<Mutex<Vec<AudioDevice>>>,
 }
 
 /// How to start the player.
@@ -281,6 +339,7 @@ pub struct PlayerConfig {
 pub struct Player {
     tx: Sender<Cmd>,
     status: Arc<Mutex<PlaybackStatus>>,
+    devices: Arc<Mutex<Vec<AudioDevice>>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -306,11 +365,16 @@ impl Player {
     pub fn with_config(config: PlayerConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let status = Arc::new(Mutex::new(PlaybackStatus::default()));
-        let handle =
-            backend::spawn(config, rx, status.clone()).context("starting the player thread")?;
+        let devices = Arc::new(Mutex::new(Vec::new()));
+        let published = Published {
+            status: status.clone(),
+            devices: devices.clone(),
+        };
+        let handle = backend::spawn(config, rx, published).context("starting the player thread")?;
         Ok(Self {
             tx,
             status,
+            devices,
             handle: Some(handle),
         })
     }
@@ -341,6 +405,41 @@ impl Player {
     }
     pub fn stop(&self) {
         self.send(Cmd::Stop);
+    }
+    /// Ask the player thread to re-read the audio devices.
+    ///
+    /// Fire-and-forget like every other command: the answer appears in
+    /// [`Self::devices`] a tick later rather than being waited for here, because
+    /// enumerating asks the audio system and the caller may be a UI thread.
+    pub fn refresh_devices(&self) {
+        self.send(Cmd::RefreshDevices);
+    }
+
+    /// Move the output to `device`, named as [`AudioDevice::name`] spells it.
+    ///
+    /// The output is reopened, which costs the same short gap a sample-rate
+    /// change already does; nothing else about the queue or the position
+    /// changes. A device that is gone or will not open leaves the previous one
+    /// in use and reports itself through [`PlaybackStatus::device_error`].
+    ///
+    /// The choice lasts for this session. priel reads no configuration file, so
+    /// `--device` is what makes one permanent.
+    pub fn set_device(&self, device: &str) {
+        self.send(Cmd::SetDevice(device.to_string()));
+    }
+
+    /// The audio devices the player last reported.
+    ///
+    /// Empty until the first [`Self::refresh_devices`] has been answered, and in
+    /// a build without libmpv.
+    #[must_use]
+    pub fn devices(&self) -> Vec<AudioDevice> {
+        // Poison-tolerant for the same reason as `status`: a plain snapshot with
+        // no cross-field invariant, and the UI must keep rendering regardless.
+        self.devices
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Post a command to the player thread.
@@ -459,6 +558,36 @@ mod tests {
         assert!(
             wait_for(&p, |s| (s.volume - 55.0).abs() < f64::EPSILON),
             "the player thread should have applied it"
+        );
+    }
+
+    #[test]
+    fn the_device_list_is_published_rather_than_waited_for() {
+        // Goal: the picker opens on the UI thread, which may not block, so the
+        // devices arrive the same way the playback status does - asked for with
+        // a fire-and-forget command and read back from a snapshot. Nothing is
+        // enumerated until something asks, because it questions every audio
+        // driver on the machine.
+        let p = silent();
+        assert!(
+            p.devices().is_empty(),
+            "a player that was never asked has nothing to report"
+        );
+        let before = Instant::now();
+        p.refresh_devices();
+        assert!(
+            before.elapsed() < Duration::from_millis(50),
+            "asking must not block the caller"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && p.devices().is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let devices = p.devices();
+        assert!(
+            devices.iter().any(|d| d.name == "auto"),
+            "the player thread should have published the list: {devices:?}"
         );
     }
 

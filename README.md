@@ -58,8 +58,11 @@ water in and out of the flats twice a day, on the pull of the moon.*
   instead of taxing every fast one with a fixed pre-buffer.
 - **Small and quiet at rest.** A ~5 MiB binary that redraws only when something
   on screen actually changed, backs its player thread off when nothing is
-  playing, and applies backpressure to downloads so a preloaded hi-res track
-  cannot quietly consume hundreds of megabytes.
+  playing, and holds a bounded window of each track rather than all of it: the
+  download parks when it runs too far ahead of the decoder, and bytes that have
+  been played are released as playback moves past them. A hi-res track costs
+  about 40 MiB while it plays however long it is, rather than hundreds of
+  megabytes by the end of it.
 - **Built to survive the boring failures.** Zero `.unwrap()` calls in the
   workspace; poisoned locks are recovered rather than propagated, because mpv
   invokes our callbacks across an FFI boundary where unwinding is undefined
@@ -125,9 +128,10 @@ sudo make install      # binary, man page, completions, licence
 make run ARGS="--device pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0"
 ```
 
-`--device` is optional; the default sink is used when it is omitted.
-`--log-level` and `--log-file` control the diagnostic log. See `man priel` or
-`priel --help`.
+`--device` is optional; the default sink is used when it is omitted. `priel
+--list-devices` prints every device with the identifier `--device` takes, and
+`d` opens the same list inside the player. `--log-level` and `--log-file`
+control the diagnostic log. See `man priel` or `priel --help`.
 
 For UI work or a machine without mpv headers, `make build-nolibmpv` compiles the
 interface with playback stubbed out.
@@ -141,6 +145,7 @@ row of the interface is also clickable.
 |---|---|---|
 | Full key reference | `?` | click `[?]` |
 | Recent log messages | `M` | scroll to page back |
+| Audio graph to the device | `D` | click `[D]` |
 | Sign in again | `A` | — |
 | Switch view | `Tab` cycles, `1`/`2`/`3` | click a tab |
 | Move selection | `j`/`k`, `↑`/`↓` | scroll wheel |
@@ -168,14 +173,15 @@ resolution and playback (24/192 via progressive segment streaming); a gapless
 play queue with a preloaded next track; shuffle with auto-advance; play, pause,
 seek, skip and volume; a now-playing bar with a scrubbable progress bar, a live
 DAC badge and a bit-perfect indicator; the `?` reference overlay; a diagnostic
-log with an `M` overlay for reading it without leaving the player.
+log with an `M` overlay for reading it without leaving the player; a `D` overlay
+listing the PipeWire nodes between priel and the device with the rate and format
+each one negotiated.
 
 Roadmap, roughly in order:
 
-- **PipeWire configuration help.** The live device readout tells you *whether*
-  the chain is clean; it does not yet tell you how to fix it. Detect and explain
-  the `allowed-rates` setup a bit-perfect chain needs, and read the graph with
-  `pw-dump` to name which node is doing the resampling.
+- **PipeWire configuration help.** The `D` overlay lists the graph; it does not
+  yet interpret it. Name which of those nodes is doing the resampling, and
+  detect and explain the `allowed-rates` setup a bit-perfect chain needs.
 - **ALSA setup helpers, for true bit-perfect.** PipeWire is the right default,
   but it is a mixer: even configured well it owns the device and the graph can
   change under you. Enthusiasts will want the DAC out of the PipeWire graph
@@ -186,9 +192,6 @@ Roadmap, roughly in order:
   cannot listen on, so the flow ends with a paste. A client registered with a
   loopback redirect would remove that step; the developer terms do not currently
   permit a native player, so it stands.
-- **Per-track memory ceiling.** Buffers are bounded and downloads apply
-  backpressure, but a fully played track is still retained; trimming it needs a
-  segment offset index so a backward seek can refetch.
 - **Incremental paging** — listings currently fetch a first page only.
 - MPRIS, cover art (kitty/sixel).
 - **Spectrum visualiser**, if it can coexist with bit-perfect output.

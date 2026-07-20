@@ -143,8 +143,10 @@ async would buy nothing at the one boundary where it would have to earn its keep
 
 ### Memory
 
-- A full track currently lives in RAM per play. This is a known limitation; do not make it worse by
-  buffering more tracks ahead than the queue needs. The preload depth is one.
+- A track costs a bounded window of RAM per play, not all of itself: the downloader parks when it
+  is `DOWNLOAD_AHEAD_MAX` ahead of the reader and `trim` releases everything but `KEEP_BEHIND_MAX`
+  behind it. Do not make it worse by buffering more tracks ahead than the queue needs. The preload
+  depth is one.
 - Give capacity hints when the size is known: `Vec::with_capacity(limit)` when building results
   from a listing whose limit you passed in.
 - `LazyLock` for anything compiled once and reused, as `mpd`'s `Regex`es are. Note the second

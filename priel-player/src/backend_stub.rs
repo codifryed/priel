@@ -20,11 +20,18 @@
 //! (`--no-default-features`). Playback commands are no-ops.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::{Cmd, PlaybackStatus, PlayerConfig};
+use crate::{AudioDevice, Cmd, PlayerConfig, Published};
+
+/// The devices this build can see: none, because there is no player to ask.
+///
+/// The interface treats an empty list as "nothing was reported" and says so,
+/// rather than showing an empty box.
+pub fn audio_devices() -> Vec<AudioDevice> {
+    Vec::new()
+}
 
 /// Start the (no-op) player thread.
 ///
@@ -35,7 +42,7 @@ use crate::{Cmd, PlaybackStatus, PlayerConfig};
 pub fn spawn(
     _config: PlayerConfig,
     rx: Receiver<Cmd>,
-    _status: Arc<Mutex<PlaybackStatus>>,
+    _published: Published,
 ) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new().name("player".into()).spawn(move || {
         loop {

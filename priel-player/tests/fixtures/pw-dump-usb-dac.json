@@ -1,0 +1,640 @@
+[
+  {
+    "id": 102,
+    "type": "PipeWire:Interface:Client",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "change-mask": [
+        "props"
+      ],
+      "props": {
+        "application.language": "en_US.UTF-8",
+        "application.name": "priel",
+        "application.process.binary": "priel",
+        "application.process.host": "host",
+        "application.process.id": 3124085,
+        "application.process.session-id": 3,
+        "application.process.user": "user",
+        "clock.power-of-two-quantum": true,
+        "core.name": "pipewire-user-3124085",
+        "core.version": "1.6.8",
+        "cpu.max-align": 64,
+        "default.clock.max-quantum": 2048,
+        "default.clock.min-quantum": 32,
+        "default.clock.quantum": 1024,
+        "default.clock.quantum-floor": 4,
+        "default.clock.quantum-limit": 8192,
+        "default.clock.rate": 48000,
+        "default.video.height": 480,
+        "default.video.rate.denom": 1,
+        "default.video.rate.num": 25,
+        "default.video.width": 640,
+        "link.max-buffers": 64,
+        "log.level": 0,
+        "mem.allow-mlock": true,
+        "mem.warn-mlock": false,
+        "module.id": 2,
+        "object.id": 102,
+        "object.serial": 4976,
+        "pipewire.access": "unrestricted",
+        "pipewire.protocol": "protocol-native",
+        "pipewire.sec.gid": 1000,
+        "pipewire.sec.label": "unconfined",
+        "pipewire.sec.pid": 3124085,
+        "pipewire.sec.socket": "pipewire-0",
+        "pipewire.sec.uid": 1000,
+        "settings.check-quantum": false,
+        "settings.check-rate": false,
+        "window.x11.display": ":0"
+      }
+    }
+  },
+  {
+    "id": 58,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 0,
+      "max-output-ports": 129,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 0,
+      "n-output-ports": 2,
+      "state": "running",
+      "error": null,
+      "props": {
+        "adapt.follower.spa-node": "",
+        "application.icon-name": "mpv",
+        "application.id": "mpv",
+        "application.name": "mpv",
+        "client.id": 102,
+        "clock.quantum-limit": 8192,
+        "factory.id": 9,
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.category": "Playback",
+        "media.class": "Stream/Output/Audio",
+        "media.name": "5 - mpv",
+        "media.type": "Audio",
+        "node.always-process": true,
+        "node.autoconnect": true,
+        "node.description": "mpv",
+        "node.driver-id": 48,
+        "node.loop.name": "data-loop.0",
+        "node.name": "mpv",
+        "node.rate": "1/44100",
+        "node.want-driver": true,
+        "object.id": 58,
+        "object.register": false,
+        "object.serial": 4977,
+        "port.group": "stream.0",
+        "stream.is-live": true
+      },
+      "params": {
+        "EnumFormat": [
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "raw",
+            "format": "S16LE",
+            "rate": 44100,
+            "channels": 2,
+            "position": [
+              "FL",
+              "FR"
+            ]
+          }
+        ],
+        "Format": [
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "raw",
+            "format": "S16LE",
+            "rate": 44100,
+            "channels": 2,
+            "position": [
+              "FL",
+              "FR"
+            ]
+          }
+        ],
+        "EnumPortConfig": [
+          {
+            "direction": "Output",
+            "mode": {
+              "default": "none",
+              "alt1": "none",
+              "alt2": "dsp",
+              "alt3": "convert"
+            },
+            "monitor": {
+              "default": false,
+              "alt1": false,
+              "alt2": true
+            },
+            "control": {
+              "default": false,
+              "alt1": false,
+              "alt2": true
+            }
+          }
+        ],
+        "PortConfig": [
+          {
+            "direction": "Output",
+            "mode": "dsp",
+            "monitor": true,
+            "control": false,
+            "format": {
+              "mediaType": "audio",
+              "mediaSubtype": "raw",
+              "format": "F32P",
+              "channels": 2,
+              "position": [
+                "FL",
+                "FR"
+              ]
+            }
+          }
+        ],
+        "Latency": [
+          {
+            "direction": "Input",
+            "minQuantum": 1.0,
+            "maxQuantum": 1.0,
+            "minRate": 256,
+            "maxRate": 256,
+            "minNs": 0,
+            "maxNs": 0
+          }
+        ],
+        "ProcessLatency": [],
+        "Tag": [
+          {
+            "direction": "Input"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 75,
+    "type": "PipeWire:Interface:Link",
+    "version": 3,
+    "permissions": [
+      "r",
+      "x"
+    ],
+    "info": {
+      "output-node-id": 58,
+      "output-port-id": 89,
+      "input-node-id": 48,
+      "input-port-id": 93,
+      "change-mask": [
+        "state",
+        "format",
+        "props"
+      ],
+      "state": "active",
+      "error": null,
+      "format": {
+        "mediaType": "audio",
+        "mediaSubtype": "dsp",
+        "format": "F32P"
+      },
+      "props": {
+        "client.id": 52,
+        "factory.id": 21,
+        "link.input.node": 48,
+        "link.input.port": 93,
+        "link.output.node": 58,
+        "link.output.port": 89,
+        "object.id": 75,
+        "object.serial": 4980
+      }
+    }
+  },
+  {
+    "id": 110,
+    "type": "PipeWire:Interface:Link",
+    "version": 3,
+    "permissions": [
+      "r",
+      "x"
+    ],
+    "info": {
+      "output-node-id": 58,
+      "output-port-id": 92,
+      "input-node-id": 48,
+      "input-port-id": 63,
+      "change-mask": [
+        "state",
+        "format",
+        "props"
+      ],
+      "state": "active",
+      "error": null,
+      "format": {
+        "mediaType": "audio",
+        "mediaSubtype": "dsp",
+        "format": "F32P"
+      },
+      "props": {
+        "client.id": 52,
+        "factory.id": 21,
+        "link.input.node": 48,
+        "link.input.port": 63,
+        "link.output.node": 58,
+        "link.output.port": 92,
+        "object.id": 110,
+        "object.serial": 4981
+      }
+    }
+  },
+  {
+    "id": 48,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 129,
+      "max-output-ports": 0,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 2,
+      "n-output-ports": 2,
+      "state": "running",
+      "error": null,
+      "props": {
+        "alsa.card": 2,
+        "alsa.card_name": "SMSL USB AUDIO",
+        "alsa.class": "generic",
+        "alsa.components": "USB152a:85dd",
+        "alsa.device": 0,
+        "alsa.driver_name": "snd_usb_audio",
+        "alsa.id": "AUDIO",
+        "alsa.long_card_name": "SMSL SMSL USB AUDIO at usb-0000:00:00.0-1, high speed",
+        "alsa.mixer_name": "USB Mixer",
+        "alsa.name": "USB Audio",
+        "alsa.resolution_bits": 32,
+        "alsa.subclass": "generic-mix",
+        "alsa.subdevice": 0,
+        "alsa.subdevice_name": "subdevice #0",
+        "alsa.sync.id": "00000000:00000000:00000000:00000000",
+        "api.alsa.card.longname": "SMSL SMSL USB AUDIO at usb-0000:00:00.0-1, high speed",
+        "api.alsa.card.name": "SMSL USB AUDIO",
+        "api.alsa.headroom": 256,
+        "api.alsa.path": "hw:2,0",
+        "api.alsa.pcm.card": 2,
+        "api.alsa.pcm.stream": "playback",
+        "api.alsa.period-num": 128,
+        "api.alsa.period-size": 256,
+        "audio.channels": 2,
+        "audio.format": "S32LE",
+        "audio.position": "[ AUX0, AUX1 ]",
+        "card.profile.device": 0,
+        "client.id": 73,
+        "clock.name": "api.alsa.2",
+        "clock.quantum-limit": 8192,
+        "device.api": "alsa",
+        "device.bus": "usb",
+        "device.class": "sound",
+        "device.icon-name": "audio-card-analog",
+        "device.id": 47,
+        "device.profile.description": "Pro",
+        "device.profile.name": "pro-output-0",
+        "device.profile.pro": true,
+        "device.routes": 0,
+        "factory.id": 19,
+        "factory.name": "api.alsa.pcm.sink",
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Sink",
+        "node.description": "SMSL USB AUDIO Pro",
+        "node.driver": true,
+        "node.loop.name": "data-loop.0",
+        "node.max-latency": "16384/44100",
+        "node.name": "alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0",
+        "node.nick": "SMSL USB AUDIO",
+        "node.pause-on-idle": false,
+        "object.id": 48,
+        "object.path": "alsa:acp:AUDIO:0:playback",
+        "object.serial": 2919,
+        "port.group": "playback",
+        "priority.driver": 1600,
+        "priority.session": 1600
+      },
+      "params": {
+        "EnumFormat": [
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "raw",
+            "format": "S32LE",
+            "rate": {
+              "default": 48000,
+              "min": 44100,
+              "max": 768000
+            },
+            "channels": 2,
+            "position": [
+              "AUX0",
+              "AUX1"
+            ]
+          },
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "dsd",
+            "bitorder": "msb",
+            "interleave": 4,
+            "rate": {
+              "default": 384000,
+              "min": 352800,
+              "max": 3072000
+            },
+            "channels": 2,
+            "position": [
+              "AUX0",
+              "AUX1"
+            ]
+          }
+        ],
+        "Format": [
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "raw",
+            "format": "S32LE",
+            "rate": 44100,
+            "channels": 2,
+            "position": [
+              "AUX0",
+              "AUX1"
+            ]
+          }
+        ],
+        "EnumPortConfig": [
+          {
+            "direction": "Input",
+            "mode": {
+              "default": "none",
+              "alt1": "none",
+              "alt2": "dsp",
+              "alt3": "convert"
+            },
+            "monitor": {
+              "default": false,
+              "alt1": false,
+              "alt2": true
+            },
+            "control": {
+              "default": false,
+              "alt1": false,
+              "alt2": true
+            }
+          }
+        ],
+        "PortConfig": [
+          {
+            "direction": "Input",
+            "mode": "dsp",
+            "monitor": true,
+            "control": false,
+            "format": {
+              "mediaType": "audio",
+              "mediaSubtype": "raw",
+              "format": "F32P",
+              "channels": 2,
+              "position": [
+                "AUX0",
+                "AUX1"
+              ]
+            }
+          }
+        ],
+        "Latency": [
+          {
+            "direction": "Input",
+            "minQuantum": 1.0,
+            "maxQuantum": 1.0,
+            "minRate": 256,
+            "maxRate": 256,
+            "minNs": 0,
+            "maxNs": 0
+          },
+          {
+            "direction": "Output",
+            "minQuantum": 0.0,
+            "maxQuantum": 0.0,
+            "minRate": 0,
+            "maxRate": 0,
+            "minNs": 0,
+            "maxNs": 0
+          }
+        ],
+        "ProcessLatency": [
+          {
+            "quantum": 0.0,
+            "rate": 0,
+            "ns": 0
+          }
+        ],
+        "Tag": [
+          {
+            "direction": "Output"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 55,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 129,
+      "max-output-ports": 0,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 2,
+      "n-output-ports": 2,
+      "state": "suspended",
+      "error": null,
+      "props": {
+        "alsa.card": 3,
+        "alsa.card_name": "USB Audio",
+        "alsa.class": "generic",
+        "alsa.components": "USB0db0:cd0e",
+        "alsa.device": 0,
+        "alsa.driver_name": "snd_usb_audio",
+        "alsa.id": "Audio",
+        "alsa.long_card_name": "SMSL SMSL USB AUDIO at usb-0000:00:00.0-1, high speed",
+        "alsa.mixer_device": "_ucm0003.hw:Audio",
+        "alsa.mixer_name": "USB Mixer",
+        "alsa.name": "USB Audio",
+        "alsa.resolution_bits": 16,
+        "alsa.subclass": "generic-mix",
+        "alsa.subdevice": 0,
+        "alsa.subdevice_name": "subdevice #0",
+        "alsa.sync.id": "00000000:00000000:00000000:00000000",
+        "api.alsa.card.longname": "SMSL SMSL USB AUDIO at usb-0000:00:00.0-1, high speed",
+        "api.alsa.card.name": "USB Audio",
+        "api.alsa.open.ucm": true,
+        "api.alsa.path": "hw:Audio,0",
+        "api.alsa.pcm.card": 3,
+        "api.alsa.pcm.stream": "playback",
+        "audio.channels": 2,
+        "audio.format": "S32LE",
+        "audio.position": "[ FL, FR ]",
+        "card.profile.device": 11,
+        "client.id": 73,
+        "clock.quantum-limit": 8192,
+        "device.api": "alsa",
+        "device.bus": "usb",
+        "device.class": "sound",
+        "device.icon-name": "audio-card-analog",
+        "device.icon_name": "audio-speakers",
+        "device.id": 71,
+        "device.profile.description": "Speakers",
+        "device.profile.name": "HiFi: Speaker: sink",
+        "device.routes": 1,
+        "factory.id": 19,
+        "factory.name": "api.alsa.pcm.sink",
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Sink",
+        "node.description": "USB Audio Speakers",
+        "node.driver": true,
+        "node.loop.name": "data-loop.0",
+        "node.name": "alsa_output.usb-Generic_USB_Audio-00.HiFi__Speaker__sink",
+        "node.nick": "USB Audio",
+        "node.pause-on-idle": false,
+        "object.id": 55,
+        "object.path": "alsa:acp:Audio:11:playback",
+        "object.serial": 353,
+        "port.group": "playback",
+        "priority.driver": 1100,
+        "priority.session": 1100
+      },
+      "params": {
+        "EnumFormat": [
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "raw",
+            "format": "S32LE",
+            "rate": {
+              "default": 48000,
+              "min": 44100,
+              "max": 192000
+            },
+            "channels": 2,
+            "position": [
+              "FL",
+              "FR"
+            ]
+          }
+        ],
+        "Format": [],
+        "EnumPortConfig": [
+          {
+            "direction": "Input",
+            "mode": {
+              "default": "none",
+              "alt1": "none",
+              "alt2": "dsp",
+              "alt3": "convert"
+            },
+            "monitor": {
+              "default": false,
+              "alt1": false,
+              "alt2": true
+            },
+            "control": {
+              "default": false,
+              "alt1": false,
+              "alt2": true
+            }
+          }
+        ],
+        "PortConfig": [
+          {
+            "direction": "Input",
+            "mode": "dsp",
+            "monitor": true,
+            "control": false,
+            "format": {
+              "mediaType": "audio",
+              "mediaSubtype": "raw",
+              "format": "F32P",
+              "channels": 2,
+              "position": [
+                "FL",
+                "FR"
+              ]
+            }
+          }
+        ],
+        "Latency": [
+          {
+            "direction": "Input",
+            "minQuantum": 1.0,
+            "maxQuantum": 1.0,
+            "minRate": 0,
+            "maxRate": 0,
+            "minNs": 0,
+            "maxNs": 0
+          },
+          {
+            "direction": "Output",
+            "minQuantum": 0.0,
+            "maxQuantum": 0.0,
+            "minRate": 0,
+            "maxRate": 0,
+            "minNs": 0,
+            "maxNs": 0
+          }
+        ],
+        "ProcessLatency": [
+          {
+            "quantum": 0.0,
+            "rate": 0,
+            "ns": 0
+          }
+        ],
+        "Tag": []
+      }
+    }
+  }
+]

@@ -17,6 +17,7 @@ libmpv = ["dep:libmpv2", "dep:libmpv2-sys"]
 anyhow.workspace = true
 ureq.workspace = true
 priel-core.workspace = true
+serde_json.workspace = true
 libmpv2 = { version = "6", optional = true }
 libmpv2-sys = { workspace = true, optional = true }
 log.workspace = true

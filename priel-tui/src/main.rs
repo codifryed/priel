@@ -20,6 +20,7 @@
 //! (herdr/ncspot-inspired). Unofficial; not affiliated with or endorsed by TIDAL.
 //!
 //!   --device <mpv-device>   e.g. pipewire/alsa_output.usb-SMSL...pro-output-0
+//!   --list-devices          print the output devices and exit
 //!   --log-level <level>     diagnostics detail (default: warn; `$PRIEL_LOG` too)
 //!   --log-file <path>       default: `~/.local/state/priel/priel.log`
 
@@ -75,7 +76,14 @@ fn main() -> Result<()> {
         logging::record_panic(&info.to_string());
         orig(info);
     }));
-    let outcome = session(args, recent);
+    // Answered before the terminal is taken. This exists for launchers, scripts
+    // and bug reports, and the alternate screen would swallow every line of it.
+    let outcome = if args.list_devices {
+        print_devices();
+        Ok(())
+    } else {
+        session(args, recent)
+    };
     match &outcome {
         Ok(()) => log::info!("priel stopping"),
         Err(e) => log::error!("exiting: {e:?}"),
@@ -84,6 +92,44 @@ fn main() -> Result<()> {
     // log has to be asked for.
     log::logger().flush();
     outcome
+}
+
+/// The widest identifier column `--list-devices` will pad to.
+///
+/// One absurd device name should not push every description off the right of
+/// the terminal.
+const DEVICE_NAME_COLUMN_MAX: usize = 60;
+
+/// The listing `--list-devices` prints, one line per device.
+///
+/// Pure, so the shape can be asserted without an audio device: the caller does
+/// the printing. The identifier leads and is unadorned, because it is what gets
+/// pasted after `--device`.
+fn device_lines(devices: &[priel_player::AudioDevice]) -> Vec<String> {
+    let width = devices
+        .iter()
+        .map(|d| d.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(DEVICE_NAME_COLUMN_MAX);
+    devices
+        .iter()
+        .map(|d| format!("{:width$}  {}", d.name, d.description))
+        .collect()
+}
+
+/// Print the output devices and stop.
+fn print_devices() {
+    let devices = priel_player::audio_devices();
+    if devices.is_empty() {
+        // Not on stdout: a caller parsing the listing wants an empty listing,
+        // not a sentence to filter out.
+        eprintln!("priel: no output devices were reported");
+        return;
+    }
+    for line in device_lines(&devices) {
+        println!("{line}");
+    }
 }
 
 /// Everything between the log being up and the log being flushed.
@@ -271,6 +317,54 @@ mod tests {
         // Goal: --device is how a user reaches their DAC.
         let cli = parse(&["--device", "pipewire/dac"]);
         assert_eq!(cli.device.as_deref(), Some("pipewire/dac"));
+    }
+
+    #[test]
+    fn the_device_listing_flag_is_read_and_is_off_by_default() {
+        // Goal: --list-devices is the answer to "what strings does --device
+        // accept", and it must not fire on a normal start.
+        assert!(!parse(&[]).list_devices);
+        assert!(parse(&["--list-devices"]).list_devices);
+    }
+
+    #[test]
+    fn a_listed_device_shows_its_identifier_first_and_lines_the_rest_up() {
+        // Goal: the identifier is what gets pasted after --device, so it leads
+        // and is printed unadorned. The descriptions line up behind it because
+        // this listing is read in bug reports.
+        let devices = vec![
+            priel_player::AudioDevice {
+                name: "auto".into(),
+                description: "Autoselect device".into(),
+            },
+            priel_player::AudioDevice {
+                name: "pipewire/some.dac".into(),
+                description: "A DAC".into(),
+            },
+        ];
+        let lines = super::device_lines(&devices);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("auto "), "{:?}", lines[0]);
+        assert!(lines[0].ends_with("Autoselect device"), "{:?}", lines[0]);
+        assert!(
+            lines[1].starts_with("pipewire/some.dac  A DAC"),
+            "the widest identifier sets the column: {:?}",
+            lines[1]
+        );
+        let column = |l: &str| l.find("A ").or_else(|| l.find("Autoselect"));
+        assert_eq!(
+            column(&lines[0]),
+            column(&lines[1]),
+            "the descriptions should share a column"
+        );
+    }
+
+    #[test]
+    fn listing_devices_with_none_to_list_prints_nothing() {
+        // Goal: a script reading this gets an empty listing rather than a line
+        // of prose it would have to filter out. The note about it goes to
+        // stderr, where the caller printing it decides.
+        assert!(super::device_lines(&[]).is_empty());
     }
 
     #[test]

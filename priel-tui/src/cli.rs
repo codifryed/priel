@@ -46,6 +46,13 @@ pub struct Cli {
     #[arg(long, value_name = "MPV_DEVICE")]
     pub device: Option<String>,
 
+    /// List the audio output devices and exit
+    ///
+    /// Prints each device's identifier and description, one per line. The
+    /// identifier is exactly what `--device` takes.
+    #[arg(long)]
+    pub list_devices: bool,
+
     /// Detail recorded in the diagnostic log
     ///
     /// Defaults to `warn`. `$PRIEL_LOG` sets it too, for launching from a
