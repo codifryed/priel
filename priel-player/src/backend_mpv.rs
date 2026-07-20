@@ -38,8 +38,9 @@ use libmpv2::{Mpv, SetData, events::Event, protocol::Protocol};
 use priel_core::PlayableSource;
 use ureq::{Agent, Body, http::Response};
 
+use crate::graph::{self, ServerSink};
 use crate::hw::{self, HwParams};
-use crate::{AudioDevice, Cmd, PlaybackStatus, PlayerConfig, Published};
+use crate::{AudioDevice, Cmd, OutputAccess, PlaybackStatus, PlayerConfig, Published};
 
 /// Lock a mutex, tolerating poisoning.
 ///
@@ -143,6 +144,13 @@ type Registry = Arc<Mutex<HashMap<u64, Arc<Shared>>>>;
 struct Entry {
     id: u64,          // TIDAL track id
     seq: Option<u64>, // registry key (None for Direct/http sources)
+    /// The argument `loadfile` was given for this entry.
+    ///
+    /// Kept so the playlist can be rebuilt from `entries` alone. mpv abandons a
+    /// file when the output will not open, and the only thing that resumes it
+    /// is loading it again - which needs the string it was loaded with, since a
+    /// direct source has no registry key to rebuild one from.
+    source: String,
 }
 
 /// The output-device state the player thread carries between ticks.
@@ -153,13 +161,28 @@ struct Output {
     pending: Option<Switch>,
     /// Why the last change did not take. Published in the status; display only.
     error: Option<String>,
+    /// Exclusive access is asked for and has not been refused.
+    exclusive: bool,
+    /// The last exclusive open was refused, so priel is sharing instead. Held
+    /// until the next request, because the badge has to keep saying so.
+    refused: bool,
+    /// The exclusivity now in force has already been put to the test by a
+    /// track. Without this every subsequent load would re-arm the judgement and
+    /// a slow-starting track could condemn a working exclusive output.
+    judged: bool,
 }
 
 /// A device change waiting to be judged.
 struct Switch {
     /// What to go back to if the new device will not open.
     previous: String,
+    /// The exclusivity to go back to with it. Restored together, because a
+    /// device only counts as known-good on the terms it was opened under.
+    previous_exclusive: bool,
     requested: String,
+    /// Exclusive access was asked for as part of this change. What makes a
+    /// refusal tellable from an ordinary device failure.
+    exclusive: bool,
     /// When mpv has had long enough to have reopened the output.
     deadline: Instant,
 }
@@ -168,8 +191,24 @@ struct Switch {
 ///
 /// The reinit happens on mpv's own playloop, so the answer is not there the
 /// instant the property is set. Short, because until this passes the app can
-/// still advance the queue onto a device that is not working.
+/// still advance the queue onto a device that is not working - and shorter
+/// still in practice, since mpv giving up on the file settles the change the
+/// moment it does so.
 const SWITCH_GRACE: Duration = Duration::from_millis(400);
+
+/// The backstop deadline for an exclusive request made before anything played.
+///
+/// Far longer than [`SWITCH_GRACE`], because there is nothing open yet: mpv
+/// opens the output once it has audio to decode, which waits on the first bytes
+/// of the track arriving. A verdict reached before then would be about the
+/// network rather than the device.
+///
+/// It rarely decides anything now. mpv giving up on the file settles the
+/// request the moment it happens (see [`drain_events`]), and this only covers a
+/// failure that produces no event at all - in which case the output genuinely
+/// is not open and the verdict is right. Waiting this out *was* what the
+/// listener heard: eight seconds of silence before the fallback fired.
+const EXCLUSIVE_OPEN_GRACE: Duration = Duration::from_secs(8);
 
 /// How many devices are taken off mpv's list.
 ///
@@ -226,6 +265,142 @@ fn apply_device(mpv: &Mpv, device: &str) {
     set_prop(mpv, "audio-device", device);
 }
 
+/// Can this device actually be had exclusively?
+///
+/// mpv's `audio-exclusive` is honoured by pipewire, wasapi, coreaudio and
+/// audiounit, and **silently ignored** by every other driver - it says so in its
+/// own manual. Reporting exclusivity after asking a driver that ignores the
+/// request would be exactly the overstatement the indicator exists to avoid.
+///
+/// ALSA is the case that needs the device as well as the driver, because it has
+/// no exclusive flag at all: a card device *is* exclusive, admitting one opener
+/// and reaching the hardware with nothing in between, while `alsa/pipewire` and
+/// `alsa/default` are routed back into the sound server and are shared however
+/// they are opened. A card device is one that names a card, either as
+/// `CARD=<id>` or as the index in `hw:<n>`; that is the same distinction the
+/// hardware readout draws, and for the same reason.
+fn honours_exclusive(device: &str) -> bool {
+    match device_driver(device) {
+        "pipewire" | "wasapi" | "coreaudio" | "audiounit" => true,
+        "alsa" => device.contains("CARD=") || device.contains("hw:"),
+        _ => false,
+    }
+}
+
+/// mpv's "no preference", which is also the identifier it lists for it.
+const AUTO_DEVICE: &str = "auto";
+
+/// Where to keep playing when `refused` would not open exclusively.
+///
+/// Pure, and a table of four cases rather than reasoning buried in the switch
+/// handler, because getting it wrong is silent: the audio simply goes somewhere
+/// nobody asked for, or nowhere at all.
+///
+/// - A device the sound server owns was refused *by* the sound server, so the
+///   same device shared is what was wanted. Clearing the exclusive flag is the
+///   whole of the fallback and the device does not move.
+/// - A hardware device has no shared spelling: `hw:` **is** the card, it admits
+///   one opener, and reapplying it after clearing a flag mpv never sent to ALSA
+///   lands on the same held card again. That was the bug. The server's own
+///   entry for the same card is the nearest thing to what the listener asked
+///   for - the same physical DAC, just shared.
+/// - No entry for that card, or no sound server at all, leaves nothing to map
+///   onto, and the honest answer is whatever the system would have played
+///   through anyway.
+///
+/// The server's node name is prefixed rather than looked up in the player's own
+/// device list, because that list is only ever populated when the picker has
+/// been opened - which, for a request made on the command line, it has not. A
+/// dump that answered at all is a sound server that is running, so the
+/// identifier is good.
+fn shared_fallback(refused: &str, sinks: &[ServerSink]) -> String {
+    if !hw::is_direct_card_device(refused) {
+        return refused.to_string();
+    }
+    sinks
+        .iter()
+        .find(|s| hw::refers_to_card(refused, s.card_id.as_deref(), s.card_index))
+        .map_or_else(
+            || AUTO_DEVICE.to_string(),
+            |s| format!("pipewire/{}", s.node_name),
+        )
+}
+
+/// Make a buffer servable from its beginning again.
+///
+/// Reloading a track plays it from the start, and `trim` releases what the
+/// reader has already gone past - so this answers whether there is still a
+/// beginning to serve. `read_pos` is wound back with it, or the first read of
+/// the replay would trim away the bytes it is in the middle of serving.
+fn rewind(shared: &Arc<Shared>) -> bool {
+    let mut buf = lock(&shared.inner);
+    if buf.base > 0 || buf.aborted {
+        return false;
+    }
+    buf.read_pos = 0;
+    true
+}
+
+/// Load the queue into mpv's playlist again after the output was rebuilt.
+///
+/// mpv abandons the file when the output will not open, so restoring a working
+/// device is only half of a recovery: without this the interface waits forever
+/// for a track that is no longer loaded, which is exactly what hardware testing
+/// found. The playlist is rebuilt from `entries` wholesale rather than patched,
+/// which keeps the two in lockstep by construction - afterwards mpv's playlist
+/// *is* the entries vector, in order, and `entries` itself is untouched.
+///
+/// The position is lost and the track starts again. The bytes are already
+/// buffered, so this costs no refetch, only the seconds already heard.
+fn reload_entries(mpv: &Mpv, registry: &Registry, entries: &[Entry]) {
+    for (position, entry) in entries.iter().enumerate() {
+        if let Some(seq) = entry.seq {
+            let buffered = lock(registry).get(&seq).cloned();
+            // A buffer that has released its own beginning cannot be replayed
+            // from one, and loading it would fail again for a new reason.
+            if !buffered.is_some_and(|sh| rewind(&sh)) {
+                log::error!(
+                    "track {} cannot be played again from what is buffered",
+                    entry.id
+                );
+                continue;
+            }
+        }
+        let mode = if position == 0 { "replace" } else { "append" };
+        command(mpv, "loadfile", &[&entry.source, mode]);
+    }
+}
+
+/// What to report about how the output device is being held.
+///
+/// Three inputs and no state: a request, a refusal, and whether there is an
+/// output open at all to be held. Pure so that "priel never claims exclusivity
+/// it did not get" is a table of cases rather than a promise.
+fn output_access(exclusive: bool, refused: bool, device: &str, output_open: bool) -> OutputAccess {
+    if refused {
+        return OutputAccess::Refused;
+    }
+    if exclusive && output_open && honours_exclusive(device) {
+        return OutputAccess::Exclusive;
+    }
+    OutputAccess::Shared
+}
+
+/// Which device the hardware readout should be matched against.
+///
+/// mpv's own `audio-device` rather than the one priel started with, because the
+/// picker can move the output mid-session: a hint that stays on the startup
+/// device sends the readout to whichever card happened to be open first, and
+/// the badge would then report another application's card as priel's. `auto`
+/// names no device at all, so it is no hint - it would only ever match a card
+/// by accident.
+fn hw_hint(mpv: &Mpv, config: &PlayerConfig) -> Option<String> {
+    match mpv.get_property::<String>("audio-device") {
+        Ok(device) if device != "auto" && !device.is_empty() => Some(device),
+        _ => config.audio_device.clone(),
+    }
+}
+
 /// Did a device change leave the player with no output at all?
 ///
 /// mpv does not fall back when the device it was given will not open: it
@@ -236,12 +411,22 @@ fn switch_failed(has_entries: bool, output_open: bool) -> bool {
     has_entries && !output_open
 }
 
-/// Judge a device change once mpv has had time to act on it.
+/// Is there an output open at all?
 ///
-/// Restoring the previous device is what keeps audio working: the track that
-/// was playing is already gone, but the queue plays on rather than the session
-/// being silent until priel is restarted.
-fn settle_switch(mpv: &Mpv, entries: &[Entry], output: &mut Output) {
+/// `current-ao` is unavailable rather than empty when there is not, which is
+/// the whole of how a device that would not open is told from an idle player.
+fn output_is_open(mpv: &Mpv) -> bool {
+    mpv.get_property::<String>("current-ao").is_ok()
+}
+
+/// The backstop: judge a change mpv has had long enough to have made.
+///
+/// A change is normally settled the moment mpv says it gave up on the file (see
+/// [`drain_events`]), which is deterministic and immediate. This covers the case
+/// where no such event arrives at all - a device that quietly never opens with
+/// nothing loaded to abandon - and is deliberately the slower of the two, since
+/// every second it waits is a second of silence.
+fn settle_switch(mpv: &Mpv, registry: &Registry, entries: &[Entry], output: &mut Output) {
     if output
         .pending
         .as_ref()
@@ -249,23 +434,97 @@ fn settle_switch(mpv: &Mpv, entries: &[Entry], output: &mut Output) {
     {
         return;
     }
+    settle_now(mpv, registry, entries, output, output_is_open(mpv));
+}
+
+/// Judge the pending change, and act on it.
+///
+/// Restoring a working device is what keeps audio going, and reloading is what
+/// makes that mean anything: mpv abandons the file when an output will not
+/// open, so the device alone recovers nothing and the interface waits forever
+/// for a track that is no longer loaded. An exclusive request is judged the
+/// same way and by the same symptom, because a device already held by
+/// something else fails in exactly that manner.
+///
+/// **Taking the pending change is the whole of the runaway guard.** This is
+/// reached from a failure event, and the reload it performs may fail in turn
+/// and produce another one - which arrives here with nothing left to settle and
+/// therefore moves no device and reloads nothing. A failure with nothing
+/// pending is a track's own problem, which is also why `output_open` decides
+/// rather than the event itself: a bad file and a held device arrive
+/// identically, and only one of them leaves the player with no output.
+fn settle_now(
+    mpv: &Mpv,
+    registry: &Registry,
+    entries: &[Entry],
+    output: &mut Output,
+    output_open: bool,
+) {
     let Some(switch) = output.pending.take() else {
         return;
     };
-    // `current-ao` is unavailable rather than empty when no output is open.
-    let output_open = mpv.get_property::<String>("current-ao").is_ok();
-    if switch_failed(!entries.is_empty(), output_open) {
-        log::error!(
-            "the output {} would not open; going back to {}",
-            switch.requested,
-            switch.previous
-        );
-        output.error = Some(format!(
-            "{} would not open, so the previous output was restored",
-            switch.requested
-        ));
-        apply_device(mpv, &switch.previous);
+    if entries.is_empty() {
+        // An idle player has no output open, which is indistinguishable from a
+        // device that would not open. There is nothing to judge, so an
+        // exclusive request goes back to waiting for a track to test it.
+        output.judged = false;
+        return;
     }
+    if !switch_failed(true, output_open) {
+        return;
+    }
+    // An exclusive request is the likelier culprit when one was made, and it is
+    // the one priel can do something about: give the device back and play on.
+    if switch.exclusive && !switch.previous_exclusive {
+        refuse_exclusive(mpv, registry, entries, &switch, output);
+        return;
+    }
+    log::error!(
+        "the output {} would not open; going back to {}",
+        switch.requested,
+        switch.previous
+    );
+    output.error = Some(format!(
+        "{} would not open, so the previous output was restored",
+        switch.requested
+    ));
+    output.exclusive = switch.previous_exclusive;
+    set_prop(mpv, "audio-exclusive", switch.previous_exclusive);
+    apply_device(mpv, &switch.previous);
+    // The track mpv abandoned when the output failed. Without this the device
+    // is working again and nothing is playing through it.
+    reload_entries(mpv, registry, entries);
+}
+
+/// Give the device back, move somewhere it can still be heard, and resume.
+///
+/// Three things, and leaving any of them out is a session that stops making a
+/// sound. Reading the sound server's sinks runs a subprocess on this thread,
+/// which is affordable exactly here: it happens once, on a failure, and the
+/// output it would otherwise be holding up is not open anyway.
+fn refuse_exclusive(
+    mpv: &Mpv,
+    registry: &Registry,
+    entries: &[Entry],
+    switch: &Switch,
+    output: &mut Output,
+) {
+    let fallback = shared_fallback(&switch.requested, &graph::sinks());
+    log::error!(
+        "{} would not open exclusively; playing through {fallback} instead",
+        switch.requested
+    );
+    output.error = Some(format!(
+        "{} would not open exclusively; priel is sharing {fallback} instead",
+        switch.requested
+    ));
+    output.refused = true;
+    output.exclusive = false;
+    set_prop(mpv, "audio-exclusive", false);
+    apply_device(mpv, &fallback);
+    // mpv abandoned the track when the output failed, so the device alone
+    // restores nothing. The position is lost; the bytes are not.
+    reload_entries(mpv, registry, entries);
 }
 
 /// The devices mpv can see, without a player thread. See
@@ -467,6 +726,12 @@ pub fn spawn(
             devices,
             pending: None,
             error: None,
+            // Applied by `init_mpv`; carried here so the first track to play can
+            // put it to the test. priel never sets this itself - it is only ever
+            // here because the listener asked.
+            exclusive: config.exclusive,
+            refused: false,
+            judged: false,
         };
         // The ALSA readout costs a handful of /proc reads, so it is refreshed on
         // its own slower cadence rather than on every status tick.
@@ -478,14 +743,14 @@ pub fn spawn(
             if drain_commands(&mpv, &registry, &mut entries, &mut seq, &mut output, &rx) {
                 break;
             }
-            drain_events(&mpv);
+            drain_events(&mpv, &registry, &entries, &mut output);
             cleanup_playlist(&mpv, &registry, &mut entries);
             if hw_checked.is_none_or(|t| t.elapsed() >= HW_PROBE_INTERVAL) {
-                hw = hw::probe(config.audio_device.as_deref());
+                hw = hw::probe(hw_hint(&mpv, &config).as_deref());
                 hw_checked = Some(Instant::now());
             }
-            settle_switch(&mpv, &entries, &mut output);
-            let st = read_status(&mpv, &entries, hw.clone(), output.error.clone());
+            settle_switch(&mpv, &registry, &entries, &mut output);
+            let st = read_status(&mpv, &entries, hw.clone(), &output);
             let idle_backoff = poll_interval(st.playing);
             *lock(&status) = st;
             match rx.recv_timeout(idle_backoff) {
@@ -543,12 +808,26 @@ const EVENT_DRAIN_MAX: usize = 64;
 ///
 /// libmpv2 turns an end-of-file *carrying an error* into `Err` rather than an
 /// `EndFile` event, so that arm is the one that matters here.
-fn drain_events(mpv: &Mpv) {
+///
+/// It is also where a device change is settled. mpv giving up on a file is the
+/// deterministic signal that an output would not open, and waiting out a
+/// timeout instead cost eight seconds of silence with a buffering indicator
+/// over it - the indicator lying, because nothing was buffering and the load
+/// had already failed. The timeout in [`settle_switch`] stays as the backstop
+/// for a failure that produces no event at all.
+fn drain_events(mpv: &Mpv, registry: &Registry, entries: &[Entry], output: &mut Output) {
     for _ in 0..EVENT_DRAIN_MAX {
         // Zero timeout: this runs on the player tick and must not block it.
         match mpv.wait_event(0.0) {
             None => return,
-            Some(Err(e)) => log::warn!("mpv reported a failure: {e}"),
+            Some(Err(e)) => {
+                log::warn!("mpv reported a failure: {e}");
+                // Not necessarily the device: a bad file arrives identically.
+                // `settle_now` decides on whether an output is open, and
+                // consumes the pending change so a reload that fails again
+                // cannot settle a second time.
+                settle_now(mpv, registry, entries, output, output_is_open(mpv));
+            }
             Some(Ok(event)) => match event {
                 Event::EndFile(reason) => {
                     log::debug!("mpv ended a file: {}", end_file_reason(reason));
@@ -673,6 +952,11 @@ fn init_mpv(mpv: &Mpv, config: &PlayerConfig) {
         Some(dev) => set_prop(mpv, "audio-device", dev),
         None => set_prop(mpv, "ao", "pipewire"),
     }
+    // Only ever true because the listener asked for it: taking a device
+    // exclusively silences every other application on the machine, so priel
+    // never selects this path on its own. Set unconditionally rather than only
+    // when true, so the property always says what priel means.
+    set_prop(mpv, "audio-exclusive", config.exclusive);
 
     if let Some(level) = config.mpv_log_level.as_deref() {
         request_log_messages(mpv, level);
@@ -756,12 +1040,21 @@ fn handle_cmd(
             clear_all(registry, entries);
             let (arg, s) = register_source(registry, seq, src);
             command(mpv, "loadfile", &[&arg, "replace"]);
-            entries.push(Entry { id, seq: s });
+            entries.push(Entry {
+                id,
+                seq: s,
+                source: arg,
+            });
+            arm_exclusive_check(mpv, output);
         }
         Cmd::Append(id, src) => {
             let (arg, s) = register_source(registry, seq, src);
             command(mpv, "loadfile", &[&arg, "append"]);
-            entries.push(Entry { id, seq: s });
+            entries.push(Entry {
+                id,
+                seq: s,
+                source: arg,
+            });
         }
         Cmd::Next => {
             command(mpv, "playlist-next", &["force"]);
@@ -788,6 +1081,7 @@ fn handle_cmd(
             *lock(&output.devices) = read_devices(mpv);
         }
         Cmd::SetDevice(device) => set_device(mpv, output, device),
+        Cmd::SetExclusive(exclusive) => set_exclusive(mpv, output, exclusive),
     }
     false
 }
@@ -819,8 +1113,73 @@ fn set_device(mpv: &Mpv, output: &mut Output, device: String) {
     apply_device(mpv, &device);
     output.pending = Some(Switch {
         previous,
+        previous_exclusive: output.exclusive,
         requested: device,
+        exclusive: output.exclusive,
         deadline: Instant::now() + SWITCH_GRACE,
+    });
+}
+
+/// Ask for, or give up, exclusive use of the device now in use.
+///
+/// The device is reapplied rather than only the property set, for two reasons:
+/// it is what makes mpv rebuild the output now instead of at the next track,
+/// and it puts the request through the very same judgement a device change goes
+/// through. There is deliberately no second mechanism for deciding whether an
+/// exclusive open worked - the symptom is identical, so the machinery is too.
+fn set_exclusive(mpv: &Mpv, output: &mut Output, exclusive: bool) {
+    let previous_exclusive = output.exclusive;
+    let device = mpv
+        .get_property::<String>("audio-device")
+        .unwrap_or_else(|_| "auto".to_string());
+    log::info!("asking for {device} to be {}", held_as(exclusive));
+    output.exclusive = exclusive;
+    // A fresh request; whatever was refused before was refused of something
+    // else, or long enough ago that it is worth asking again.
+    output.refused = false;
+    output.error = None;
+    set_prop(mpv, "audio-exclusive", exclusive);
+    apply_device(mpv, &device);
+    output.pending = Some(Switch {
+        previous: device.clone(),
+        previous_exclusive,
+        requested: device,
+        exclusive,
+        deadline: Instant::now() + SWITCH_GRACE,
+    });
+    // Nothing may be playing, in which case this proves nothing and the first
+    // track to load has to re-arm it.
+    output.judged = true;
+}
+
+/// How a device is being held, for a log line.
+fn held_as(exclusive: bool) -> &'static str {
+    if exclusive { "exclusive" } else { "shared" }
+}
+
+/// Put a standing exclusive request to the test against a track that is
+/// starting.
+///
+/// `--exclusive` is given before there is anything to play, and a request made
+/// in the picker while the queue is empty is no different: an idle player has
+/// no output open, so neither can be judged where it was made. The first track
+/// to load is the first thing that actually opens the device, so that is where
+/// the judgement is armed - once, because a later track re-arming it would let
+/// a slow start condemn an exclusivity that is working.
+fn arm_exclusive_check(mpv: &Mpv, output: &mut Output) {
+    if !output.exclusive || output.judged || output.pending.is_some() {
+        return;
+    }
+    let device = mpv
+        .get_property::<String>("audio-device")
+        .unwrap_or_else(|_| "auto".to_string());
+    output.judged = true;
+    output.pending = Some(Switch {
+        previous: device.clone(),
+        previous_exclusive: false,
+        requested: device,
+        exclusive: true,
+        deadline: Instant::now() + EXCLUSIVE_OPEN_GRACE,
     });
 }
 
@@ -1030,7 +1389,7 @@ fn read_status(
     mpv: &Mpv,
     entries: &[Entry],
     hw: Option<HwParams>,
-    device_error: Option<String>,
+    output: &Output,
 ) -> PlaybackStatus {
     let position = mpv.get_property::<f64>("time-pos").unwrap_or(0.0);
     let duration = mpv.get_property::<f64>("duration").unwrap_or(0.0);
@@ -1072,6 +1431,11 @@ fn read_status(
     let audio_device = mpv
         .get_property::<String>("audio-device")
         .unwrap_or_else(|_| "auto".to_string());
+    // `current-ao` is unavailable rather than empty when no output is open, so
+    // this is also how "priel is holding nothing at all" is told apart from
+    // "priel is holding this device exclusively".
+    let output_open = mpv.get_property::<String>("current-ao").is_ok();
+    let access = output_access(output.exclusive, output.refused, &audio_device, output_open);
     PlaybackStatus {
         loaded: duration > 0.0,
         playing: !idle && !paused,
@@ -1091,8 +1455,9 @@ fn read_status(
         cache_secs,
         ao_volume,
         audio_device,
-        device_error,
+        device_error: output.error.clone(),
         hw,
+        access,
     }
 }
 
@@ -1156,12 +1521,29 @@ mod tests {
         lock(&LINES).clone()
     }
 
+    /// A playlist entry with nothing buffered behind it.
+    fn entry(id: u64) -> Entry {
+        Entry {
+            id,
+            seq: None,
+            source: format!("http://127.0.0.1:1/{id}"),
+        }
+    }
+
+    /// An empty stream registry, for the tests that need one to pass along.
+    fn registry() -> Registry {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
     /// Device state nobody is watching, for the command tests.
     fn no_output() -> Output {
         Output {
             devices: Arc::new(Mutex::new(Vec::new())),
             pending: None,
             error: None,
+            exclusive: false,
+            refused: false,
+            judged: false,
         }
     }
 
@@ -1548,7 +1930,7 @@ mod tests {
                 peak = peak.max(g.data.len());
                 reached = g.read_pos;
             }
-            drain_events(&mpv);
+            drain_events(&mpv, &registry, &[], &mut no_output());
             thread::sleep(Duration::from_millis(5));
         }
         command(&mpv, "stop", &[]);
@@ -1684,6 +2066,7 @@ mod tests {
         let mut entries = vec![Entry {
             id: 10,
             seq: Some(1),
+            source: "prielseg://1".into(),
         }];
 
         clear_all(&reg, &mut entries);
@@ -1763,6 +2146,34 @@ mod tests {
     }
 
     #[test]
+    fn the_startup_flag_reaches_mpv_and_is_off_without_it() {
+        // Goal: --exclusive is the half of this that has no interactive
+        // feedback until a track plays, so a request that never reached mpv
+        // would look identical to one that was refused. And the default has to
+        // be off: priel never takes a device on its own.
+        let mpv = Mpv::new().expect("mpv should initialise headlessly");
+        init_mpv(&mpv, &silent_config());
+        assert!(
+            !mpv.get_property::<bool>("audio-exclusive").unwrap_or(true),
+            "no flag, no exclusivity"
+        );
+
+        let mpv = Mpv::new().expect("mpv should initialise headlessly");
+        init_mpv(
+            &mpv,
+            &PlayerConfig {
+                audio_device: Some("null".into()),
+                exclusive: true,
+                ..PlayerConfig::default()
+            },
+        );
+        assert!(
+            mpv.get_property::<bool>("audio-exclusive").unwrap_or(false),
+            "the flag has to reach mpv, not just priel's own state"
+        );
+    }
+
+    #[test]
     fn a_property_mpv_rejects_is_recorded_by_name() {
         // Goal: the failure has no other symptom - the setting simply does not
         // apply - so the log line is the only way anyone finds out.
@@ -1824,7 +2235,7 @@ mod tests {
                 &["/nonexistent/priel-not-a-file.flac", "replace"],
             );
             for _ in 0..200 {
-                drain_events(&mpv);
+                drain_events(&mpv, &registry(), &[], &mut no_output());
                 if lock(&LINES).iter().any(|l: &String| l.contains("mpv")) {
                     break;
                 }
@@ -1887,8 +2298,8 @@ mod tests {
         // must be a cheap no-op that does not fill the log with noise.
         let lines = captured(|| {
             let mpv = silent_mpv();
-            drain_events(&mpv);
-            drain_events(&mpv);
+            drain_events(&mpv, &registry(), &[], &mut no_output());
+            drain_events(&mpv, &registry(), &[], &mut no_output());
         });
         // Named exactly: the buffer is shared with whatever else is running,
         // and "mpv event" is the catch-all arm that the deprecated events used
@@ -1911,6 +2322,7 @@ mod tests {
                 &PlayerConfig {
                     audio_device: Some("null".into()),
                     mpv_log_level: Some("info".into()),
+                    ..PlayerConfig::default()
                 },
             );
             command(
@@ -1919,7 +2331,7 @@ mod tests {
                 &["/nonexistent/priel-not-a-file.flac", "replace"],
             );
             for _ in 0..200 {
-                drain_events(&mpv);
+                drain_events(&mpv, &registry(), &[], &mut no_output());
                 if lock(&LINES)
                     .iter()
                     .any(|l: &String| l.contains("priel::mpv"))
@@ -2076,6 +2488,36 @@ mod tests {
     }
 
     #[test]
+    fn the_hardware_readout_follows_the_device_in_use_not_the_one_priel_started_with() {
+        // Goal: the readout finds the card by matching the device identifier
+        // against it, and the picker can move the output mid-session. Matching
+        // against the startup device sends the readout to whichever card
+        // happened to be open first - and the badge would then report another
+        // application's card as priel's own.
+        let mpv = silent_mpv();
+        assert_eq!(
+            hw_hint(&mpv, &silent_config()).as_deref(),
+            Some("null"),
+            "with no choice made, the device priel started with is the hint"
+        );
+        apply_device(&mpv, "alsa/hw:CARD=X,DEV=0");
+        assert_eq!(
+            hw_hint(&mpv, &silent_config()).as_deref(),
+            Some("alsa/hw:CARD=X,DEV=0"),
+            "once the output has moved, the hint moves with it"
+        );
+    }
+
+    #[test]
+    fn an_automatic_device_is_no_hint_at_all() {
+        // Goal: `auto` names no device, so it must not be matched against a card
+        // id - it would only ever match by accident.
+        let mpv = Mpv::new().expect("mpv should initialise headlessly");
+        apply_device(&mpv, "auto");
+        assert_eq!(hw_hint(&mpv, &PlayerConfig::default()), None);
+    }
+
+    #[test]
     fn a_device_that_will_not_open_is_told_apart_from_an_idle_player() {
         // Goal: mpv does not fall back when the device it was given refuses to
         // open - it abandons the file and leaves no output open. A player with
@@ -2093,6 +2535,512 @@ mod tests {
     }
 
     #[test]
+    fn exclusivity_is_only_claimed_of_a_driver_that_can_give_it() {
+        // Goal: mpv's audio-exclusive is honoured by a handful of drivers and
+        // *silently ignored* by the rest, and ALSA has no such flag at all -
+        // there the exclusivity is the device, because a card device admits one
+        // opener while the server's own plugin is shared by construction.
+        // Asking a driver that ignores the request and then reporting success
+        // is the overstatement this indicator exists to avoid.
+        assert!(honours_exclusive("pipewire/some.dac"));
+        assert!(honours_exclusive("pipewire"));
+        assert!(honours_exclusive("alsa/hw:CARD=AUDIO,DEV=0"));
+        assert!(honours_exclusive("alsa/front:CARD=AUDIO,DEV=0"));
+        assert!(honours_exclusive("alsa/hw:2,0"));
+        assert!(
+            !honours_exclusive("alsa/pipewire"),
+            "the server's own ALSA device is shared however it is opened"
+        );
+        assert!(
+            !honours_exclusive("pulse/alsa_output.usb-x"),
+            "pulse ignores the request without saying so"
+        );
+        assert!(!honours_exclusive("auto"), "and so does an unmade choice");
+    }
+
+    #[test]
+    fn nothing_is_claimed_until_the_output_is_actually_open() {
+        // Goal: between asking and the device opening there is nothing being
+        // held, and a refusal must read as shared however it came about. The
+        // three answers are what the badge renders, so each has to be reachable.
+        let dac = "alsa/hw:CARD=AUDIO,DEV=0";
+        assert_eq!(
+            output_access(true, false, dac, true),
+            OutputAccess::Exclusive
+        );
+        assert_eq!(
+            output_access(true, false, dac, false),
+            OutputAccess::Shared,
+            "asked for, not yet open: priel is holding nothing"
+        );
+        assert_eq!(
+            output_access(false, false, dac, true),
+            OutputAccess::Shared,
+            "a hardware device on its own is not exclusive access"
+        );
+        assert_eq!(
+            output_access(false, true, dac, true),
+            OutputAccess::Refused,
+            "a refusal outranks everything: the listener asked and did not get"
+        );
+    }
+
+    #[test]
+    fn mpv_accepts_being_asked_for_the_device_exclusively() {
+        // Goal: a misspelled property is silently ignored, so the whole feature
+        // would be a no-op with no symptom. Nothing is loaded, so this opens no
+        // output.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        let lines = captured(|| {
+            set_exclusive(&mpv, &mut output, true);
+        });
+        assert!(
+            !lines.iter().any(|l| l.contains("rejected the property")),
+            "mpv rejected something: {lines:?}"
+        );
+        assert!(
+            mpv.get_property::<bool>("audio-exclusive").unwrap_or(false),
+            "the request has to reach mpv, not just priel's own state"
+        );
+        assert!(output.exclusive, "and priel has to remember it asked");
+    }
+
+    #[test]
+    fn a_refused_exclusive_open_goes_back_to_sharing_and_says_so() {
+        // Goal: mpv does not fall back when a device will not open - it
+        // abandons the file - so priel gives the exclusivity back itself and
+        // keeps the music playing. Nothing is loaded here and the output is
+        // therefore not open, which is exactly the symptom of a refusal.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        output.exclusive = true;
+        output.pending = Some(Switch {
+            previous: "alsa/hw:CARD=AUDIO,DEV=0".into(),
+            previous_exclusive: false,
+            requested: "alsa/hw:CARD=AUDIO,DEV=0".into(),
+            exclusive: true,
+            deadline: Instant::now(),
+        });
+
+        let entries = vec![entry(7)];
+        let lines = captured(|| settle_switch(&mpv, &registry(), &entries, &mut output));
+
+        assert!(!output.exclusive, "the request is dropped, not retried");
+        assert!(output.refused, "and remembered, so the badge can say so");
+        assert!(
+            !mpv.get_property::<bool>("audio-exclusive").unwrap_or(true),
+            "mpv has to be told too, or the next track fails the same way"
+        );
+        let reported = output.error.clone().unwrap_or_default();
+        assert!(
+            reported.contains("exclusive"),
+            "the notice names what was refused: {reported}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("exclusive")),
+            "and it is in the diagnostic log too: {lines:?}"
+        );
+        assert_eq!(
+            output_access(output.exclusive, output.refused, "alsa/hw:2,0", true),
+            OutputAccess::Refused,
+            "the badge must report shared output, never the exclusivity asked for"
+        );
+    }
+
+    #[test]
+    fn a_request_made_before_anything_plays_waits_for_a_track_to_judge_it() {
+        // Goal: --exclusive is given before there is anything to play, and an
+        // idle player has no output open - which looks exactly like a refusal.
+        // Judging it there would drop the request before it was ever tested.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        output.exclusive = true;
+        output.judged = true;
+        output.pending = Some(Switch {
+            previous: "auto".into(),
+            previous_exclusive: false,
+            requested: "auto".into(),
+            exclusive: true,
+            deadline: Instant::now(),
+        });
+
+        settle_switch(&mpv, &registry(), &[], &mut output);
+
+        assert!(
+            output.exclusive,
+            "nothing was tested, so nothing is given up"
+        );
+        assert!(!output.refused);
+        assert!(
+            !output.judged,
+            "the first track to play has to put it to the test"
+        );
+    }
+
+    /// The sinks the recorded dump carries, so the mapping is exercised against
+    /// a real one rather than a hand-written pair of strings.
+    fn fixture_sinks() -> Vec<ServerSink> {
+        graph::parse_sinks(include_str!("../tests/fixtures/pw-dump-usb-dac.json"))
+    }
+
+    #[test]
+    fn a_refused_hardware_device_falls_back_to_the_same_card_through_the_server() {
+        // Goal: the listener asked for one physical DAC, so the nearest thing
+        // to what they wanted is that same DAC shared rather than some other
+        // device. The two identifiers share no substring, so the card the
+        // server publishes is the only thing that can pair them.
+        let sinks = fixture_sinks();
+        assert_eq!(
+            shared_fallback("alsa/hw:CARD=AUDIO,DEV=0", &sinks),
+            "pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0"
+        );
+        assert_eq!(
+            shared_fallback("alsa/hw:2,0", &sinks),
+            "pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0",
+            "named by index or by id, it is the same card"
+        );
+    }
+
+    #[test]
+    fn a_hardware_device_the_server_does_not_front_falls_through_to_the_default() {
+        // Goal: there is no shared spelling of a `hw:` device - the card is the
+        // whole of it - so with nothing to map onto, the only honest answer is
+        // whatever the system would have played through anyway.
+        assert_eq!(
+            shared_fallback("alsa/hw:CARD=NOSUCHCARD,DEV=0", &fixture_sinks()),
+            "auto"
+        );
+        assert_eq!(
+            shared_fallback("alsa/hw:CARD=AUDIO,DEV=0", &[]),
+            "auto",
+            "and a machine with no sound server at all has no sinks to offer"
+        );
+    }
+
+    #[test]
+    fn a_device_the_server_owns_is_its_own_fallback() {
+        // Goal: when the sound server refused to give up a device it holds, the
+        // same device shared is exactly what is wanted - giving the exclusivity
+        // back is the whole of the fallback, and moving the audio elsewhere
+        // would be a surprise nobody asked for.
+        let sinks = fixture_sinks();
+        assert_eq!(
+            shared_fallback("pipewire/alsa_output.usb-x", &sinks),
+            "pipewire/alsa_output.usb-x"
+        );
+        assert_eq!(shared_fallback("auto", &sinks), "auto");
+    }
+
+    #[test]
+    fn a_buffer_can_only_be_replayed_while_it_still_holds_its_own_beginning() {
+        // Goal: reloading a track plays it from the start, and `trim` releases
+        // what the reader has gone past. Serving a stream whose first bytes are
+        // gone would fail the same way the refusal did, with a different cause.
+        let sh = shared(vec![7; 64], false);
+        lock(&sh.inner).read_pos = 40;
+        assert!(rewind(&sh), "nothing has been released yet");
+        assert_eq!(
+            lock(&sh.inner).read_pos,
+            0,
+            "or the first read would trim what it is about to serve"
+        );
+
+        let gone = shared(vec![7; 64], false);
+        lock(&gone.inner).base = 8;
+        assert!(!rewind(&gone), "the beginning is no longer obtainable");
+
+        let dead = shared(vec![7; 64], false);
+        lock(&dead.inner).aborted = true;
+        assert!(!rewind(&dead), "and an abandoned stream serves nothing");
+    }
+
+    #[test]
+    fn a_refused_hardware_device_is_left_behind_and_the_track_is_reloaded() {
+        // Goal: the regression that hardware testing found. Giving the
+        // exclusivity back and reapplying the *same* `hw:` device changes
+        // nothing - an ALSA card device is exclusive by construction, and the
+        // card is still held by whatever refused it - so priel has to move to a
+        // different output altogether. And mpv abandons the file when the
+        // output will not open, so restoring a working device on its own leaves
+        // the interface buffering for a track that is no longer loaded.
+        //
+        // This reads the sound-server graph, which is a read-only subprocess
+        // and opens nothing; the card named here exists nowhere, so nothing is
+        // asserted about what it answers.
+        let mpv = silent_mpv();
+        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let mut output = no_output();
+        let refused = "alsa/hw:CARD=NOSUCHCARD,DEV=0";
+        output.exclusive = true;
+        apply_device(&mpv, refused);
+        output.pending = Some(Switch {
+            previous: refused.into(),
+            previous_exclusive: false,
+            requested: refused.into(),
+            exclusive: true,
+            deadline: Instant::now(),
+        });
+
+        let entries = vec![Entry {
+            id: 7,
+            seq: None,
+            source: "http://127.0.0.1:1/a".into(),
+        }];
+        settle_switch(&mpv, &registry, &entries, &mut output);
+
+        assert_ne!(
+            mpv.get_property::<String>("audio-device")
+                .unwrap_or_default(),
+            refused,
+            "falling back onto the device that just refused is not a fallback"
+        );
+        assert_eq!(
+            mpv.get_property::<i64>("playlist-count").unwrap_or(0),
+            1,
+            "the abandoned track has to be loaded again or nothing ever resumes"
+        );
+    }
+
+    #[test]
+    fn the_first_track_to_play_is_what_puts_a_standing_request_to_the_test() {
+        // Goal: --exclusive is given before there is anything to play, so the
+        // only thing that ever opens the device is a track. Arming it there is
+        // what stops the session going silent when the device is already held -
+        // and arming it only once is what stops a slow-starting later track
+        // condemning an exclusivity that is working.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        output.exclusive = true;
+
+        arm_exclusive_check(&mpv, &mut output);
+        assert!(
+            output.pending.is_some(),
+            "the first load arms the judgement"
+        );
+        assert!(output.judged);
+        let deadline = output.pending.as_ref().map(|s| s.deadline);
+        assert!(
+            deadline.is_some_and(|d| d > Instant::now() + SWITCH_GRACE),
+            "and gives the track longer than a reinit, because nothing is open yet"
+        );
+
+        output.pending = None;
+        arm_exclusive_check(&mpv, &mut output);
+        assert!(
+            output.pending.is_none(),
+            "a later track must not re-arm what has already been tested"
+        );
+
+        let mut shared = no_output();
+        arm_exclusive_check(&mpv, &mut shared);
+        assert!(
+            shared.pending.is_none(),
+            "and nothing is armed when nothing was asked for"
+        );
+    }
+
+    /// A pending exclusive request whose deadline is far enough away that only
+    /// an event can settle it.
+    fn awaiting_a_verdict(device: &str) -> Switch {
+        Switch {
+            previous: device.into(),
+            previous_exclusive: false,
+            requested: device.into(),
+            exclusive: true,
+            deadline: Instant::now() + Duration::from_secs(3600),
+        }
+    }
+
+    /// Drain mpv's events until `done`, or until patience runs out.
+    fn drain_until(
+        mpv: &Mpv,
+        registry: &Registry,
+        entries: &[Entry],
+        output: &mut Output,
+        done: impl Fn(&Output) -> bool,
+    ) {
+        for _ in 0..200 {
+            drain_events(mpv, registry, entries, output);
+            if done(output) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_failed_load_settles_a_refusal_without_waiting_for_the_deadline() {
+        // Goal: the deadline is eight seconds, and hardware testing heard every
+        // one of them as silence with a buffering indicator over it. mpv says
+        // outright that it gave up on the file - that arrives as an error from
+        // `wait_event` and is the only place a failed load is ever visible - so
+        // the recovery starts there and the deadline is only the backstop.
+        let mpv = silent_mpv();
+        let registry = registry();
+        let mut output = no_output();
+        let refused = "alsa/hw:CARD=NOSUCHCARD,DEV=0";
+        output.exclusive = true;
+        apply_device(&mpv, refused);
+        output.pending = Some(awaiting_a_verdict(refused));
+
+        let entries = vec![Entry {
+            id: 7,
+            seq: None,
+            source: "/nonexistent/priel-not-a-file.flac".into(),
+        }];
+        command(&mpv, "loadfile", &[&entries[0].source, "replace"]);
+        drain_until(&mpv, &registry, &entries, &mut output, |o| o.refused);
+
+        assert!(
+            output.refused,
+            "the event has to settle it; the deadline is an hour away"
+        );
+        assert_ne!(
+            mpv.get_property::<String>("audio-device")
+                .unwrap_or_default(),
+            refused,
+            "and the fallback has to have happened, not just been recorded"
+        );
+    }
+
+    #[test]
+    fn a_reload_that_fails_again_never_settles_a_second_time() {
+        // Goal: the reload loads a track that may fail again, which produces
+        // another failure event - and settling on that would reload again,
+        // forever. The guard is that judging a change consumes it: a failure
+        // arriving with nothing pending is a track's own problem and moves no
+        // device. Asserted by counting, because reasoning about it is exactly
+        // what the queue-advance fallback shows to be unreliable.
+        // The card is named uniquely so the count cannot pick up a line another
+        // test wrote: the capture buffer is global, and a test driving a live
+        // mpv logs into whichever capture happens to be open.
+        let refused = "alsa/hw:CARD=PRIELLOOPGUARD,DEV=0";
+        let mut left_pending = None;
+        let lines = captured(|| {
+            let mpv = silent_mpv();
+            let registry = registry();
+            let mut output = no_output();
+            output.exclusive = true;
+            output.pending = Some(awaiting_a_verdict(refused));
+            // A file that cannot load however often it is tried, so every
+            // reload produces another failure event to settle on.
+            let entries = vec![Entry {
+                id: 7,
+                seq: None,
+                source: "/nonexistent/priel-not-a-file.flac".into(),
+            }];
+            command(&mpv, "loadfile", &[&entries[0].source, "replace"]);
+            for _ in 0..100 {
+                drain_events(&mpv, &registry, &entries, &mut output);
+                thread::sleep(Duration::from_millis(5));
+            }
+            left_pending = Some(output.pending.is_some());
+        });
+
+        let settled = lines
+            .iter()
+            .filter(|l| l.contains("PRIELLOOPGUARD"))
+            .count();
+        assert_eq!(settled, 1, "one refusal, however many times it fails");
+        assert_eq!(
+            left_pending,
+            Some(false),
+            "a change left armed is a reload waiting to happen again"
+        );
+    }
+
+    #[test]
+    fn a_track_that_fails_with_the_output_open_leaves_the_device_alone() {
+        // Goal: a failed load is not proof that a device refused. A 404, a
+        // corrupt stream and an aborted buffer all arrive the same way, and
+        // what tells them apart is whether there is an output open - which is
+        // the same question a device change is already judged by. A bad track
+        // must cost nothing but itself.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        output.exclusive = true;
+        apply_device(&mpv, "pipewire/some.dac");
+        output.pending = Some(awaiting_a_verdict("pipewire/some.dac"));
+
+        settle_now(&mpv, &registry(), &[entry(3)], &mut output, true);
+
+        assert!(!output.refused, "the device did what it was asked");
+        assert!(output.exclusive, "so the request stands");
+        assert_eq!(
+            mpv.get_property::<String>("audio-device")
+                .unwrap_or_default(),
+            "pipewire/some.dac",
+            "and nothing moved"
+        );
+        assert!(
+            output.pending.is_none(),
+            "the change is judged and done with either way"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_device_change_that_fails_also_reloads_the_track_it_cost() {
+        // Goal: the same bug on the other branch. mpv abandons the file
+        // whenever an output will not open, and that is not particular to an
+        // exclusive request - so restoring the previous device leaves the
+        // interface waiting for a track that is no longer loaded, exactly as a
+        // refused exclusive open did.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        output.pending = Some(Switch {
+            previous: "auto".into(),
+            previous_exclusive: false,
+            requested: "pipewire/one-that-left".into(),
+            exclusive: false,
+            deadline: Instant::now(),
+        });
+
+        settle_switch(&mpv, &registry(), &[entry(3)], &mut output);
+
+        assert_eq!(
+            mpv.get_property::<String>("audio-device")
+                .unwrap_or_default(),
+            "auto",
+            "the previous device is restored, as it always was"
+        );
+        assert_eq!(
+            mpv.get_property::<i64>("playlist-count").unwrap_or(0),
+            1,
+            "and the track it cost is loaded again, or nothing resumes"
+        );
+    }
+
+    #[test]
+    fn a_plain_device_change_that_fails_leaves_exclusivity_where_it_was() {
+        // Goal: the two are orthogonal. A device that will not open says
+        // nothing about whether exclusivity was available, so restoring the
+        // previous device must not also invent a refusal.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        output.pending = Some(Switch {
+            previous: "auto".into(),
+            previous_exclusive: false,
+            requested: "pipewire/one-that-left".into(),
+            exclusive: false,
+            deadline: Instant::now(),
+        });
+
+        settle_switch(&mpv, &registry(), &[entry(1)], &mut output);
+
+        assert!(
+            !output.refused,
+            "no exclusivity was asked for, so none was refused"
+        );
+        assert_eq!(
+            mpv.get_property::<String>("audio-device")
+                .unwrap_or_default(),
+            "auto",
+            "the previous device is restored, as it always was"
+        );
+    }
+
+    #[test]
     fn a_change_is_judged_only_once_mpv_has_had_time_to_make_it() {
         // Goal: the reinit happens on mpv's own playloop, so judging it the
         // instant the property is set would call every switch a failure.
@@ -2100,10 +3048,12 @@ mod tests {
         let mut output = no_output();
         output.pending = Some(Switch {
             previous: "auto".into(),
+            previous_exclusive: false,
             requested: "pipewire/some.dac".into(),
+            exclusive: false,
             deadline: Instant::now() + Duration::from_secs(30),
         });
-        settle_switch(&mpv, &[], &mut output);
+        settle_switch(&mpv, &registry(), &[], &mut output);
         assert!(
             output.pending.is_some(),
             "it must still be waiting for the deadline"
@@ -2117,7 +3067,7 @@ mod tests {
         // this snapshot, so an idle player must report honestly rather than
         // looking like a loaded track at position zero.
         let mpv = silent_mpv();
-        let st = read_status(&mpv, &[], None, None);
+        let st = read_status(&mpv, &[], None, &no_output());
         assert!(!st.loaded);
         assert!(!st.playing);
         assert_eq!(st.current_id, 0, "no entry means no track id");
@@ -2130,8 +3080,8 @@ mod tests {
         // Goal: current_id drives the gapless hand-off in the app, and has_next
         // tells it whether a preload already exists.
         let mpv = silent_mpv();
-        let entries = vec![Entry { id: 11, seq: None }, Entry { id: 22, seq: None }];
-        let st = read_status(&mpv, &entries, None, None);
+        let entries = vec![entry(11), entry(22)];
+        let st = read_status(&mpv, &entries, None, &no_output());
         assert_eq!(st.current_id, 11);
         assert!(st.has_next);
     }
@@ -2229,7 +3179,7 @@ mod tests {
         // would free the buffer of the track being played.
         let mpv = silent_mpv();
         let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
-        let mut entries = vec![Entry { id: 1, seq: None }];
+        let mut entries = vec![entry(1)];
         cleanup_playlist(&mpv, &reg, &mut entries);
         assert_eq!(entries.len(), 1);
     }
@@ -2494,7 +3444,7 @@ mod tests {
             if mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.5 {
                 break;
             }
-            drain_events(&mpv);
+            drain_events(&mpv, &registry, &[], &mut no_output());
             thread::sleep(Duration::from_millis(10));
         }
         assert!(
@@ -2510,7 +3460,7 @@ mod tests {
                 went_back = true;
                 break;
             }
-            drain_events(&mpv);
+            drain_events(&mpv, &registry, &[], &mut no_output());
             thread::sleep(Duration::from_millis(10));
         }
         command(&mpv, "stop", &[]);

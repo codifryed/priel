@@ -20,6 +20,7 @@
 //! (herdr/ncspot-inspired). Unofficial; not affiliated with or endorsed by TIDAL.
 //!
 //!   --device <mpv-device>   e.g. pipewire/alsa_output.usb-SMSL...pro-output-0
+//!   --exclusive             take that device for priel alone (never automatic)
 //!   --list-devices          print the output devices and exit
 //!   --log-level <level>     diagnostics detail (default: warn; `$PRIEL_LOG` too)
 //!   --log-file <path>       default: `~/.local/state/priel/priel.log`
@@ -149,6 +150,7 @@ fn session(args: cli::Cli, recent: logging::Recent) -> Result<()> {
     let player = priel_player::PlayerConfig {
         mpv_log_level: args.mpv_log_level(),
         audio_device: args.device,
+        exclusive: args.exclusive,
     };
     let res = App::new(player, priel_core::Client::default_token_path(), recent)
         .and_then(|mut app| run(&mut terminal, &mut app, &mut TerminalEvents));
@@ -317,6 +319,29 @@ mod tests {
         // Goal: --device is how a user reaches their DAC.
         let cli = parse(&["--device", "pipewire/dac"]);
         assert_eq!(cli.device.as_deref(), Some("pipewire/dac"));
+    }
+
+    #[test]
+    fn exclusive_access_is_asked_for_separately_from_the_device() {
+        // Goal: the two are deliberately orthogonal - choosing a hardware
+        // device does not imply taking it from everything else on the machine,
+        // and a device can be opened either way. Spelling exclusivity as a
+        // variant of --device would weld them together.
+        assert!(
+            !parse(&[]).exclusive,
+            "priel never takes a device on its own"
+        );
+        assert!(
+            !parse(&["--device", "alsa/hw:CARD=AUDIO,DEV=0"]).exclusive,
+            "a hardware device on its own is still shared"
+        );
+        let cli = parse(&["--device", "alsa/hw:CARD=AUDIO,DEV=0", "--exclusive"]);
+        assert!(cli.exclusive);
+        assert_eq!(cli.device.as_deref(), Some("alsa/hw:CARD=AUDIO,DEV=0"));
+        assert!(
+            parse(&["--exclusive"]).exclusive,
+            "and it is answerable on its own, for whatever device is default"
+        );
     }
 
     #[test]

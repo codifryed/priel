@@ -21,7 +21,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
 
-use priel_player::{Alteration, Fidelity};
+use priel_player::{Alteration, Fidelity, OutputAccess};
 
 use crate::app::{App, GraphRow, GraphRowKind, Hit, Mode, View};
 
@@ -275,6 +275,8 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
         &[
             ("D", "the chain to the device"),
             ("d", "choose the device"),
+            ("x", "exclusive, in the picker"),
+            ("exclusive", "the device is priel's"),
             ("DAC", "live from the device"),
             ("OUT", "what the server took"),
             ("bit-perfect", "nothing altered"),
@@ -533,8 +535,11 @@ fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         .title(" Output device ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    // Rebuilt every frame, exactly as the header's hit boxes are.
+    // Rebuilt every frame, exactly as the header's hit boxes are - and cleared
+    // before the early return below, so a terminal too short to draw the
+    // toggle does not leave the last frame's hit box behind to be clicked.
     app.device_rows.clear();
+    app.device_exclusive_rect = Rect::default();
     if inner.height <= 2 {
         return;
     }
@@ -557,23 +562,58 @@ fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let footer = Style::default().fg(Color::DarkGray);
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                "  this session only — --device makes a choice permanent",
-                footer,
-            )),
-            Line::from(Span::styled(
-                "  j k move · g G ends · Enter choose · click a row · d, Esc or q to close",
-                footer,
-            )),
-        ]),
+    exclusive_toggle(
+        f,
+        app,
         Rect {
             y: inner.y + inner.height.saturating_sub(2),
-            height: 2,
+            height: 1,
             ..inner
         },
     );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  j k move · g G ends · Enter choose · x exclusive · click · d, Esc or q to close",
+            footer,
+        ))),
+        Rect {
+            y: inner.y + inner.height.saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+/// The exclusivity toggle, and what choosing anything here is worth.
+///
+/// Laid out and hit-boxed in the same left-to-right walk the header controls
+/// are, and measured with `Span::width` for the same reason: a hit box that
+/// drifted from what was painted would take the device on a click meant for
+/// something else. Exclusivity is *not* implied by picking a row, so it is its
+/// own control rather than a spelling of one of them.
+fn exclusive_toggle(f: &mut Frame, app: &mut App, row: Rect) {
+    let on = app.exclusive();
+    let mut bar = ControlBar::new(row);
+    bar.label("  ", Style::default());
+    let control = bar.push(Span::styled(
+        if on {
+            " x exclusive: on  ".to_string()
+        } else {
+            " x exclusive: off ".to_string()
+        },
+        toggle_style(on),
+    ));
+    bar.label(
+        "  this session only — --device and --exclusive make a choice permanent",
+        Style::default().fg(Color::DarkGray),
+    );
+    // Do not offer a control the row was too narrow to draw.
+    app.device_exclusive_rect = if control.x < row.x.saturating_add(row.width) {
+        control
+    } else {
+        Rect::default()
+    };
+    f.render_widget(Paragraph::new(Line::from(bar.spans)), row);
 }
 
 /// The device rows themselves, windowed onto the selection.
@@ -979,8 +1019,10 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     // then the keyboard reference. The clickable controls live in the header.
     let (act_text, act_color) = activity(app);
     let (fid_text, fid_color) = fidelity_badge(app);
+    let (access_text, access_color) = access_badge(app.status.access);
     let mut bar = ControlBar::new(l2);
     bar.label(dac_badge(&app.status), Style::default().fg(Color::Green));
+    bar.label(access_text, Style::default().fg(access_color));
     bar.label(
         fid_text,
         Style::default().fg(fid_color).add_modifier(Modifier::BOLD),
@@ -1299,6 +1341,21 @@ fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
     format!(" {label} {fmt} · {rate}")
 }
 
+/// How the output device is being held.
+///
+/// A separate arm per state rather than a condition inside [`dac_badge`],
+/// because the judgement is the player's and this only names it. The ordinary
+/// shared path says nothing at all: it is the default, and a badge that
+/// announced it would be noise on every session that never asked for anything
+/// else. Only what was asked for and not granted has to be spelled out.
+fn access_badge(access: OutputAccess) -> (String, Color) {
+    match access {
+        OutputAccess::Shared => (String::new(), Color::DarkGray),
+        OutputAccess::Exclusive => ("  · exclusive".to_string(), Color::Green),
+        OutputAccess::Refused => ("  ⚠ shared · exclusive refused".to_string(), Color::Yellow),
+    }
+}
+
 fn short_quality(q: &str) -> String {
     let u = q.to_uppercase();
     if u.contains("HI_RES") || u.contains("HIRES") {
@@ -1356,7 +1413,9 @@ mod tests {
     use super::{ControlBar, HINTS, HINTS_ESSENTIAL, button_style, hint_width, push_hints, render};
     use crate::app::{App, Hit, Mode, View};
     use crate::worker::{FromWorker, ToWorker};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use priel_core::{Playlist, Track};
+    use priel_player::OutputAccess;
     use priel_player::graph::{AudioGraph, GraphError, GraphNode, NodeRole};
     use ratatui::layout::Rect;
     use ratatui::style::Style;
@@ -2161,6 +2220,104 @@ mod tests {
         let out = text(&mut sc.app, 140, 12);
         assert!(out.contains("OUT S32"), "{out}");
         assert!(!out.contains("DAC"), "the badge must not overstate: {out}");
+    }
+
+    #[test]
+    fn the_badge_reports_exclusive_output_apart_from_the_ordinary_path() {
+        // Goal: the whole reason for taking a device is that the chain is then
+        // priel's alone, and an indicator that could not say so would leave the
+        // listener no way to tell they got what they asked for.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+
+        let shared = text(&mut sc.app, 140, 12);
+        assert!(
+            !shared.contains("exclusive"),
+            "the ordinary path says nothing: {shared}"
+        );
+
+        sc.app.status.access = OutputAccess::Exclusive;
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("exclusive"), "{out}");
+    }
+
+    #[test]
+    fn a_refused_exclusive_open_is_reported_as_shared_output() {
+        // Goal: the indicator never claims exclusivity it did not get. A player
+        // that fell back to the mixer while the badge still implied a direct
+        // connection would be worse than not offering the path at all.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        sc.app.status.access = OutputAccess::Refused;
+
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("shared"), "it has to say what it got: {out}");
+        assert!(
+            out.contains("refused"),
+            "and that the request was not met: {out}"
+        );
+    }
+
+    #[test]
+    fn the_picker_carries_the_exclusivity_toggle_where_it_can_be_clicked() {
+        // Goal: parity runs both ways - the `x` key and this control run the
+        // same method, and a hit box that drifted from what was painted would
+        // take a device on a click meant for something else.
+        let mut sc = screen();
+        sc.app.set_devices_for_test(devices());
+        sc.app.mode = Mode::Devices;
+
+        let lines = draw(&mut sc.app, 100, 20);
+        let rect = sc.app.device_exclusive_rect;
+        assert!(rect.width > 0, "the control has to be drawn to be clicked");
+        let painted = &lines[rect.y as usize];
+        assert!(
+            painted.contains("exclusive"),
+            "the hit box claims a line that does not show it: {painted}"
+        );
+        assert!(
+            painted.contains("off"),
+            "and it says which way it is set: {painted}"
+        );
+
+        sc.app
+            .on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let after = draw(&mut sc.app, 100, 20);
+        assert!(
+            after[sc.app.device_exclusive_rect.y as usize].contains("on"),
+            "the toggle has to show the new state: {:?}",
+            after[sc.app.device_exclusive_rect.y as usize]
+        );
+    }
+
+    #[test]
+    fn a_picker_too_short_to_draw_the_toggle_offers_nothing_to_click() {
+        // Goal: hit boxes outlive the frame that drew them unless they are
+        // cleared, and a control that was not painted must not still take the
+        // device when something else is clicked where it used to be.
+        let mut sc = screen();
+        sc.app.set_devices_for_test(devices());
+        sc.app.mode = Mode::Devices;
+        draw(&mut sc.app, 100, 20);
+        assert!(sc.app.device_exclusive_rect.width > 0);
+
+        draw(&mut sc.app, 100, 4);
+        assert_eq!(
+            sc.app.device_exclusive_rect,
+            Rect::default(),
+            "nothing was painted, so there is nothing to click"
+        );
+    }
+
+    #[test]
+    fn the_reference_lists_the_key_that_takes_the_device() {
+        // Goal: the bottom row stays short by keeping everything not used
+        // constantly in the `?` overlay, which makes the overlay the only place
+        // this key is discoverable.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 100, 30);
+        assert!(out.contains("exclusive"), "{out}");
     }
 
     #[test]

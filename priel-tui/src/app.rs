@@ -305,6 +305,17 @@ pub struct App {
     /// Clickable device rows and the index each stands for, rebuilt by the
     /// renderer while the picker is up.
     pub device_rows: Vec<(Rect, usize)>,
+    /// Where the picker painted its exclusivity toggle, so a click on it runs
+    /// the same method the `x` key does. Rebuilt by the renderer, like every
+    /// other hit box here.
+    pub device_exclusive_rect: Rect,
+    /// Exclusive use of the output device has been asked for.
+    ///
+    /// What the *listener* wants, which is not the same thing as what the
+    /// player achieved - that is `status.access`, and the badge reports it. Kept
+    /// here because it is the thing the picker toggles and priel itself never
+    /// changes.
+    exclusive: bool,
     /// When the list was last asked for. The picker says it is still looking
     /// until this is old enough to mean nothing is going to answer.
     devices_asked: Option<Instant>,
@@ -360,11 +371,15 @@ impl App {
         token_path: String,
         recent: crate::logging::Recent,
     ) -> anyhow::Result<Self> {
+        // Read before the config is handed over: the picker shows what was
+        // asked for, and `--exclusive` is where a session starts from.
+        let exclusive = player.exclusive;
         let player = Player::with_config(player)?;
         let creds_path = Credentials::default_path();
         let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
         let worker = worker::spawn(token_path.clone(), creds_path.clone());
         let mut app = Self::with(player, worker);
+        app.exclusive = exclusive;
         app.recent = recent;
         let has_session = priel_core::auth::StoredToken::load(&token_path).is_ok();
         app.credentials_path = Some(creds_path.clone());
@@ -439,6 +454,8 @@ impl App {
             device_selected: 0,
             device_offset: 0,
             device_rows: Vec::new(),
+            device_exclusive_rect: Rect::default(),
+            exclusive: false,
             devices_asked: None,
             reported_device_error: None,
             last_sig: RenderSig::default(),
@@ -1550,6 +1567,14 @@ impl App {
         // Cleared rather than kept: the last reading shown as if it were
         // current is exactly the lie this overlay exists to stop.
         self.audio_graph = None;
+        // A direct device puts priel outside the sound server entirely, so
+        // there is no graph to read rather than a graph priel is missing from.
+        // Asking anyway would answer "priel has no stream in the graph", which
+        // reads as "nothing is playing yet" - the opposite of what is true.
+        if self.status.bypasses_sound_server() {
+            self.audio_graph = Some(Err(GraphError::Bypassed));
+            return;
+        }
         let _ = self.worker.tx.send(ToWorker::ReadAudioGraph);
     }
 
@@ -1645,9 +1670,40 @@ impl App {
             KeyCode::Char('g') => self.device_selected = 0,
             KeyCode::Char('G') => self.device_selected = self.devices.len().saturating_sub(1),
             KeyCode::Enter => self.choose_device(self.device_selected),
+            KeyCode::Char('x') => self.toggle_exclusive(),
             _ => {}
         }
         self.dirty = true;
+    }
+
+    /// Ask for the output device exclusively, or give it back.
+    ///
+    /// The one place that changes it: the `x` key and a click on the toggle
+    /// both arrive here, so the two cannot drift apart. Deliberately does not
+    /// close the picker - this is a setting whose effect is worth watching on
+    /// the badge, not a choice to make and walk away from. And deliberately
+    /// separate from choosing a device: taking a device is not implied by
+    /// selecting one.
+    fn toggle_exclusive(&mut self) {
+        self.exclusive = !self.exclusive;
+        self.player.set_exclusive(self.exclusive);
+        self.notice = Some(if self.exclusive {
+            "Asking for the device exclusively — this session only, --exclusive makes it permanent"
+                .to_string()
+        } else {
+            "Sharing the output device again — this session only, --exclusive makes it permanent"
+                .to_string()
+        });
+        self.dirty = true;
+    }
+
+    /// Has exclusive use of the device been asked for?
+    ///
+    /// What was *asked*, not what was got: the player answers the second
+    /// through `status.access`, and only that may reach the badge.
+    #[must_use]
+    pub fn exclusive(&self) -> bool {
+        self.exclusive
     }
 
     /// Move the output to the device on this row, for this session.
@@ -1699,9 +1755,14 @@ impl App {
         self.device_selected = self.device_selected.saturating_sub(by);
     }
 
-    /// A click inside the picker. On a row it takes that row; anywhere else it
-    /// dismisses, as a click on the log overlay does.
+    /// A click inside the picker. On the toggle it flips exclusivity, on a row
+    /// it takes that row, and anywhere else it dismisses, as a click on the log
+    /// overlay does.
     fn click_device(&mut self, col: u16, row: u16) {
+        if hit(self.device_exclusive_rect, col, row) {
+            self.toggle_exclusive();
+            return;
+        }
         match self
             .device_rows
             .iter()
@@ -2922,6 +2983,36 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_output_says_there_is_no_graph_rather_than_no_stream() {
+        // Goal: on the direct path priel is not a client of the sound server at
+        // all, so asking pw-dump gets "priel has no stream in the graph" - which
+        // reads as "nothing is playing yet" and is the opposite of the truth.
+        // The player knows which device it holds, so the overlay is told.
+        let mut r = rig();
+        r.app.status.audio_device = "alsa/hw:CARD=AUDIO,DEV=0".into();
+        r.app.on_key(key('D'));
+
+        let rows = r.app.graph_rows();
+        let text = rows
+            .iter()
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("no graph"),
+            "it has to say what is missing: {text}"
+        );
+        assert!(
+            !text.contains("no stream"),
+            "and not the sentence that means nothing is playing: {text}"
+        );
+        assert!(
+            r.from_app.try_recv().is_err(),
+            "and there is nothing to ask pw-dump, so it is not run"
+        );
+    }
+
+    #[test]
     fn the_chain_the_worker_read_is_what_the_overlay_lists() {
         // Goal: the whole point - every node between priel and the device, in
         // order, with what each one negotiated.
@@ -3126,6 +3217,65 @@ mod tests {
             r.app.notice.is_none(),
             "moving and cancelling chooses nothing: {:?}",
             r.app.notice
+        );
+    }
+
+    #[test]
+    fn the_picker_toggles_exclusive_access_and_leaves_the_device_alone() {
+        // Goal: exclusivity is orthogonal to which device is chosen, so the
+        // toggle must not move the output, and it must not close the picker
+        // either - it is a setting to see the effect of, not a choice to make
+        // and leave on.
+        let mut r = with_picker("pipewire/dac");
+        assert!(!r.app.exclusive(), "priel never asks for this on its own");
+
+        r.app.on_key(key('x'));
+        assert!(r.app.exclusive());
+        assert_eq!(r.app.mode, Mode::Devices, "the picker stays up");
+        assert_eq!(
+            r.app.device_selected(),
+            1,
+            "and the chosen device is untouched"
+        );
+
+        r.app.on_key(key('x'));
+        assert!(!r.app.exclusive(), "and it is a toggle, not a latch");
+    }
+
+    #[test]
+    fn the_exclusive_toggle_answers_to_a_click_and_to_its_key_alike() {
+        // Goal: parity runs both ways here - every action has a key binding and
+        // every action is reachable with the mouse. Both go through the one
+        // method, so the two paths cannot drift apart.
+        let mut r = with_picker("pipewire/dac");
+        let box_ = Rect {
+            x: 4,
+            y: 18,
+            width: 20,
+            height: 1,
+        };
+        r.app.device_exclusive_rect = box_;
+
+        r.app.click_device(box_.x + 1, box_.y);
+        assert!(r.app.exclusive(), "a click on the control asks for it");
+        assert_eq!(r.app.mode, Mode::Devices, "and does not dismiss the picker");
+
+        r.app.click_device(box_.x + 1, box_.y);
+        assert!(!r.app.exclusive(), "clicking again gives it back");
+    }
+
+    #[test]
+    fn asking_for_exclusive_access_says_it_lasts_for_this_session() {
+        // Goal: priel reads no configuration file, so a toggle that said
+        // nothing would look broken on the next start. --exclusive is what
+        // makes it permanent, exactly as --device is for the device.
+        let mut r = with_picker("pipewire/dac");
+        r.app.notice = None;
+        r.app.on_key(key('x'));
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("--exclusive"),
+            "the notice says what makes it permanent: {notice}"
         );
     }
 
