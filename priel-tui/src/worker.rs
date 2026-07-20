@@ -33,17 +33,42 @@ use priel_player::graph::{self, AudioGraph, GraphError};
 /// the first page is on screen quickly.
 pub const FAVORITES_PAGE: u32 = 100;
 
+/// Rows one playlists request asks for. A playlist row is cheap and a user has
+/// far fewer playlists than favorites, so this is usually the whole listing.
+pub const PLAYLISTS_PAGE: u32 = 100;
+
+/// Rows one playlist-tracks request asks for. Larger than the others because a
+/// playlist is normally read from the top and played straight through.
+pub const PLAYLIST_TRACKS_PAGE: u32 = 200;
+
+/// Rows one search request asks for. The smallest of the four: a searcher looks
+/// at the head of the results, and a wrong query should cost the least.
+pub const SEARCH_PAGE: u32 = 50;
+
+/// A request for one page of a listing.
+///
+/// Every one carries an explicit offset and limit, and the reply carries the
+/// same identity back: a page for a listing the view has since thrown away can
+/// then be recognised and dropped instead of appended in the wrong place.
 pub enum ToWorker {
-    /// One page of favorites. The offset comes back on the reply, so a page for
-    /// a listing the view has since thrown away can be recognised and dropped
-    /// instead of appended in the wrong place.
     LoadFavorites {
         offset: u32,
         limit: u32,
     },
-    LoadPlaylists,
-    LoadPlaylistTracks(String), // uuid
-    Search(String),
+    LoadPlaylists {
+        offset: u32,
+        limit: u32,
+    },
+    LoadPlaylistTracks {
+        uuid: String,
+        offset: u32,
+        limit: u32,
+    },
+    Search {
+        query: String,
+        offset: u32,
+        limit: u32,
+    },
     Resolve(u64),
     /// Read the chain to the output device. Runs `pw-dump` and waits for it,
     /// which is why it is here and not on the UI thread.
@@ -57,15 +82,19 @@ pub enum ToWorker {
 /// waiting on a page that died cannot otherwise tell that the death was its
 /// own, so it waits for a reply that is never coming.
 ///
+/// Each identity is everything that makes the request unique, which for a paged
+/// listing is the page *and* the listing: a failure for the playlist the user
+/// has just left would otherwise stall the one they have just opened.
+///
 /// The display name lives here too, so the words on screen and the identity the
 /// interface branches on cannot drift apart.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Task {
     Startup,
     Favorites { offset: u32 },
-    Playlists,
-    PlaylistTracks,
-    Search,
+    Playlists { offset: u32 },
+    PlaylistTracks { uuid: String, offset: u32 },
+    Search { query: String, offset: u32 },
     Resolve,
 }
 
@@ -74,23 +103,34 @@ impl std::fmt::Display for Task {
         f.write_str(match self {
             Self::Startup => "startup",
             Self::Favorites { .. } => "favorites",
-            Self::Playlists => "playlists",
-            Self::PlaylistTracks => "playlist tracks",
-            Self::Search => "search",
+            Self::Playlists { .. } => "playlists",
+            Self::PlaylistTracks { .. } => "playlist tracks",
+            Self::Search { .. } => "search",
             Self::Resolve => "resolve",
         })
     }
 }
 
+/// A page of a listing, named by the request it answers.
 pub enum FromWorker {
-    /// A page of favorites and the offset it answers.
     Favorites {
         offset: u32,
         page: Page<Track>,
     },
-    Playlists(Vec<Playlist>),
-    PlaylistTracks(String, Vec<Track>), // uuid, tracks
-    SearchResults(Vec<Track>),
+    Playlists {
+        offset: u32,
+        page: Page<Playlist>,
+    },
+    PlaylistTracks {
+        uuid: String,
+        offset: u32,
+        page: Page<Track>,
+    },
+    SearchResults {
+        query: String,
+        offset: u32,
+        page: Page<Track>,
+    },
     Resolved(u64, ResolvedStream),
     /// The chain to the output device, or the reason there is none to show.
     ///
@@ -134,10 +174,11 @@ impl Worker {
 /// screen; the full chain goes to the log, which has room for it.
 fn failed(task: Task, e: &anyhow::Error) -> FromWorker {
     log::warn!("{task}: {e:#}");
+    let detail = format!("{task}: {e}");
     FromWorker::Failed {
         task,
         fault: Fault::of(e),
-        detail: format!("{task}: {e}"),
+        detail,
     }
 }
 
@@ -193,17 +234,31 @@ where
                         Err(e) => failed(Task::Favorites { offset }, &e),
                     }
                 }
-                ToWorker::LoadPlaylists => match client.user_playlists(0, 100) {
-                    Ok(p) => FromWorker::Playlists(p.items),
-                    Err(e) => failed(Task::Playlists, &e),
+                ToWorker::LoadPlaylists { offset, limit } => {
+                    match client.user_playlists(offset, limit) {
+                        Ok(page) => FromWorker::Playlists { offset, page },
+                        Err(e) => failed(Task::Playlists { offset }, &e),
+                    }
+                }
+                ToWorker::LoadPlaylistTracks {
+                    uuid,
+                    offset,
+                    limit,
+                } => match client.playlist_tracks(&uuid, offset, limit) {
+                    Ok(page) => FromWorker::PlaylistTracks { uuid, offset, page },
+                    Err(e) => failed(Task::PlaylistTracks { uuid, offset }, &e),
                 },
-                ToWorker::LoadPlaylistTracks(uuid) => match client.playlist_tracks(&uuid, 0, 200) {
-                    Ok(t) => FromWorker::PlaylistTracks(uuid, t.items),
-                    Err(e) => failed(Task::PlaylistTracks, &e),
-                },
-                ToWorker::Search(q) => match client.search_tracks(&q, 0, 50) {
-                    Ok(r) => FromWorker::SearchResults(r.items),
-                    Err(e) => failed(Task::Search, &e),
+                ToWorker::Search {
+                    query,
+                    offset,
+                    limit,
+                } => match client.search_tracks(&query, offset, limit) {
+                    Ok(page) => FromWorker::SearchResults {
+                        query,
+                        offset,
+                        page,
+                    },
+                    Err(e) => failed(Task::Search { query, offset }, &e),
                 },
                 ToWorker::Resolve(id) => match client.resolve_stream(id, Quality::HiRes) {
                     Ok(r) => FromWorker::Resolved(id, r),
@@ -285,7 +340,12 @@ mod tests {
                         r#"{{"manifestMimeType":"application/vnd.tidal.bts","manifest":"{b64}"}}"#
                     )
                 } else if line.contains("/v1/search") {
-                    r#"{"tracks":{"items":[]},"playlists":{"items":[]}}"#.to_string()
+                    // Varied by offset for the same reason the favorites are.
+                    let id = if line.contains("offset=0") { 1 } else { 2 };
+                    format!(r#"{{"tracks":{{"totalNumberOfItems":2,"items":[{{"id":{id}}}]}}}}"#)
+                } else if line.contains("/tracks") || line.contains("/playlists") {
+                    let id = if line.contains("offset=0") { 1 } else { 2 };
+                    format!(r#"{{"totalNumberOfItems":2,"items":[{{"id":{id},"uuid":"p{id}"}}]}}"#)
                 } else {
                     r#"{"items":[]}"#.to_string()
                 };
@@ -384,19 +444,33 @@ mod tests {
         .unwrap();
         assert!(matches!(next(&w), FromWorker::Favorites { .. }));
 
-        w.tx.send(ToWorker::LoadPlaylists).unwrap();
-        assert!(matches!(next(&w), FromWorker::Playlists(_)));
+        w.tx.send(ToWorker::LoadPlaylists {
+            offset: 0,
+            limit: 10,
+        })
+        .unwrap();
+        assert!(matches!(next(&w), FromWorker::Playlists { .. }));
 
-        w.tx.send(ToWorker::LoadPlaylistTracks("u".into())).unwrap();
+        w.tx.send(ToWorker::LoadPlaylistTracks {
+            uuid: "u".into(),
+            offset: 0,
+            limit: 10,
+        })
+        .unwrap();
         match next(&w) {
-            FromWorker::PlaylistTracks(uuid, _) => {
+            FromWorker::PlaylistTracks { uuid, .. } => {
                 assert_eq!(uuid, "u", "the reply must name which playlist it is for");
             }
             other => panic!("wrong reply variant: {}", variant(&other)),
         }
 
-        w.tx.send(ToWorker::Search("q".into())).unwrap();
-        assert!(matches!(next(&w), FromWorker::SearchResults(_)));
+        w.tx.send(ToWorker::Search {
+            query: "q".into(),
+            offset: 0,
+            limit: 10,
+        })
+        .unwrap();
+        assert!(matches!(next(&w), FromWorker::SearchResults { .. }));
 
         w.tx.send(ToWorker::Resolve(7)).unwrap();
         match next(&w) {
@@ -405,12 +479,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_listing_reply_names_the_page_and_the_listing_it_answers() {
+        // Goal: the offset alone is not an identity where more than one listing
+        // can be open. A page of the playlist the user has just left, or of the
+        // query they have just replaced, has to be recognisable as such - and
+        // every listing has to report how long it is, or nothing can page.
+        let w = worker_on(origin());
+
+        w.tx.send(ToWorker::LoadPlaylists {
+            offset: 1,
+            limit: 1,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::Playlists { offset, page } => {
+                assert_eq!(offset, 1, "the reply names the page it answers");
+                assert_eq!(page.items[0].uuid, "p2", "the offset has to reach the URL");
+                assert_eq!(page.total, 2, "and carries the length of the listing");
+            }
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+
+        w.tx.send(ToWorker::LoadPlaylistTracks {
+            uuid: "abc".into(),
+            offset: 1,
+            limit: 1,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::PlaylistTracks { uuid, offset, page } => {
+                assert_eq!((uuid.as_str(), offset), ("abc", 1));
+                assert_eq!(page.items[0].id, 2, "the offset has to reach the URL");
+                assert_eq!(page.total, 2);
+            }
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+
+        w.tx.send(ToWorker::Search {
+            query: "blue".into(),
+            offset: 1,
+            limit: 1,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::SearchResults {
+                query,
+                offset,
+                page,
+            } => {
+                assert_eq!((query.as_str(), offset), ("blue", 1));
+                assert_eq!(page.items[0].id, 2, "the offset has to reach the URL");
+                assert_eq!(page.total, 2);
+            }
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_failed_listing_page_names_the_page_and_the_listing_too() {
+        // Goal: a failure has to carry the same identity a success does, or one
+        // view's dead request latches another view's paging.
+        let base = origin();
+        let w = spawn_with(move || {
+            let mut c = Client::new("tok".into())?.with_base_url(base);
+            c.connect()?;
+            Ok(c.with_base_url("http://127.0.0.1:1"))
+        });
+
+        let expected = [
+            (
+                ToWorker::LoadPlaylists {
+                    offset: 7,
+                    limit: 1,
+                },
+                Task::Playlists { offset: 7 },
+            ),
+            (
+                ToWorker::LoadPlaylistTracks {
+                    uuid: "abc".into(),
+                    offset: 8,
+                    limit: 1,
+                },
+                Task::PlaylistTracks {
+                    uuid: "abc".into(),
+                    offset: 8,
+                },
+            ),
+            (
+                ToWorker::Search {
+                    query: "blue".into(),
+                    offset: 9,
+                    limit: 1,
+                },
+                Task::Search {
+                    query: "blue".into(),
+                    offset: 9,
+                },
+            ),
+        ];
+        for (cmd, want) in expected {
+            w.tx.send(cmd).unwrap();
+            match next(&w) {
+                FromWorker::Failed { task, .. } => assert_eq!(task, want),
+                other => panic!("expected an error, got {}", variant(&other)),
+            }
+        }
+    }
+
     fn variant(m: &FromWorker) -> &'static str {
         match m {
             FromWorker::Favorites { .. } => "Favorites",
-            FromWorker::Playlists(_) => "Playlists",
-            FromWorker::PlaylistTracks(..) => "PlaylistTracks",
-            FromWorker::SearchResults(_) => "SearchResults",
+            FromWorker::Playlists { .. } => "Playlists",
+            FromWorker::PlaylistTracks { .. } => "PlaylistTracks",
+            FromWorker::SearchResults { .. } => "SearchResults",
             FromWorker::Resolved(..) => "Resolved",
             FromWorker::AudioGraph(_) => "AudioGraph",
             FromWorker::Failed { .. } => "Failed",
@@ -485,9 +667,29 @@ mod tests {
         });
 
         for (cmd, expected) in [
-            (ToWorker::LoadPlaylists, "playlists"),
-            (ToWorker::LoadPlaylistTracks("u".into()), "playlist tracks"),
-            (ToWorker::Search("q".into()), "search"),
+            (
+                ToWorker::LoadPlaylists {
+                    offset: 0,
+                    limit: 1,
+                },
+                "playlists",
+            ),
+            (
+                ToWorker::LoadPlaylistTracks {
+                    uuid: "u".into(),
+                    offset: 0,
+                    limit: 1,
+                },
+                "playlist tracks",
+            ),
+            (
+                ToWorker::Search {
+                    query: "q".into(),
+                    offset: 0,
+                    limit: 1,
+                },
+                "search",
+            ),
             (ToWorker::Resolve(1), "resolve"),
         ] {
             w.tx.send(cmd).unwrap();

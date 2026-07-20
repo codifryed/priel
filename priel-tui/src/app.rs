@@ -198,7 +198,12 @@ impl LoginFlow {
 /// other views the same treatment is one field each, not three.
 #[derive(Default)]
 pub struct Paging {
-    /// Rows the service says the whole listing has. Zero until a page lands.
+    /// Rows the listing has, as best as is known. Zero until something says.
+    ///
+    /// Usually the service's own count, arriving with the first page. The
+    /// playlist-tracks view is the exception: a playlist row already carries its
+    /// track count, so that view knows its length before it has asked for a
+    /// single track.
     pub total: u32,
     /// The offset of the request in flight, if any.
     ///
@@ -223,11 +228,50 @@ impl Paging {
     }
 
     /// Start the listing again from the top, waiting on its first page.
-    fn restart(&mut self) {
+    ///
+    /// `known_total` is what the caller can already say the length is - a
+    /// playlist's own track count - or zero when only the service can say.
+    /// Restarting also clears the stall latch, so no failure can leave a view
+    /// permanently unable to load.
+    fn restart(&mut self, known_total: u32) {
         *self = Self {
+            total: known_total,
             wanted: Some(0),
-            ..Self::default()
+            stalled: false,
         };
+    }
+
+    /// Take in a page that answers `offset`, and record how much is left.
+    ///
+    /// The first page replaces and every later one appends. Appending is what
+    /// keeps the user's row under their cursor: selection is an index into the
+    /// filtered rows, and rows that only ever arrive after the ones already
+    /// there cannot shift it.
+    fn absorb<T>(&mut self, rows: &mut Vec<T>, offset: u32, page: priel_core::Page<T>) {
+        debug_assert!(
+            offset == 0 || usize::try_from(offset).is_ok_and(|o| o == rows.len()),
+            "a page either restarts the list or continues where it ended"
+        );
+        self.wanted = None;
+        let ran_out = page.items.is_empty() && offset > 0;
+        if offset == 0 {
+            *rows = page.items;
+        } else {
+            rows.extend(page.items);
+        }
+        let loaded = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        if ran_out {
+            // The service has no more rows to give, whatever it counted. Its
+            // count is sometimes the larger of the two, and believing it over
+            // an empty answer asks for that same empty page on every tick.
+            self.total = loaded;
+            return;
+        }
+        // Never below what is already loaded: an answer carrying no count would
+        // otherwise read as "0 available" beside rows that are plainly on
+        // screen. Never below what was already known either, so a page with no
+        // count of its own cannot unsay a playlist's own track count.
+        self.total = page.total.max(loaded).max(self.total);
     }
 }
 
@@ -251,14 +295,22 @@ pub struct App {
     // View data.
     pub view: View,
     pub favorites: Vec<Track>,
-    /// How much of the favorites listing has been fetched. The other three
-    /// views are still single-page.
-    pub favorites_paging: Paging,
     pub playlists: Vec<Playlist>,
     pub playlist_tracks: Vec<Track>,
     pub open_playlist: Option<(String, String)>, // (uuid, title)
     pub search_tracks: Vec<Track>,
     pub search_query: String,
+    /// The query the loaded results answer, which is not `search_query`: that
+    /// one changes under the user's fingers while the box is open, and a reply
+    /// has to be matched against what was actually asked for.
+    search_asked: String,
+    /// How much of each listing has been fetched. One per view, because the
+    /// stall latch and the page in flight belong to a listing rather than to
+    /// the app.
+    pub favorites_paging: Paging,
+    pub playlists_paging: Paging,
+    pub playlist_tracks_paging: Paging,
+    pub search_paging: Paging,
 
     pub selected: usize,
     pub list_offset: usize,
@@ -415,12 +467,16 @@ impl App {
             worker,
             view: View::Favorites,
             favorites: Vec::new(),
-            favorites_paging: Paging::default(),
             playlists: Vec::new(),
             playlist_tracks: Vec::new(),
             open_playlist: None,
             search_tracks: Vec::new(),
             search_query: String::new(),
+            search_asked: String::new(),
+            favorites_paging: Paging::default(),
+            playlists_paging: Paging::default(),
+            playlist_tracks_paging: Paging::default(),
+            search_paging: Paging::default(),
             selected: 0,
             list_offset: 0,
             now_playing: None,
@@ -798,12 +854,107 @@ impl App {
     /// Also the retry after a page failed: restarting clears the stall latch, so
     /// nothing can leave the view permanently unable to load.
     fn load_favorites_from_the_top(&mut self) {
-        self.favorites_paging.restart();
+        self.favorites_paging.restart(0);
         self.loading = true;
         self.ask(ToWorker::LoadFavorites {
             offset: 0,
             limit: worker::FAVORITES_PAGE,
         });
+    }
+
+    /// Ask for the first page of the user's playlists, discarding any loaded.
+    fn load_playlists_from_the_top(&mut self) {
+        self.playlists_paging.restart(0);
+        self.loading = true;
+        self.ask(ToWorker::LoadPlaylists {
+            offset: 0,
+            limit: worker::PLAYLISTS_PAGE,
+        });
+    }
+
+    /// The paging state of the view on screen.
+    ///
+    /// One listing at a time is on screen, and only that listing's rows can be
+    /// scrolled towards, so the trigger below needs no more than this.
+    fn paging(&self) -> &Paging {
+        match self.view {
+            View::Favorites => &self.favorites_paging,
+            View::Playlists => &self.playlists_paging,
+            View::PlaylistTracks => &self.playlist_tracks_paging,
+            View::Search => &self.search_paging,
+        }
+    }
+
+    fn paging_mut(&mut self) -> &mut Paging {
+        match self.view {
+            View::Favorites => &mut self.favorites_paging,
+            View::Playlists => &mut self.playlists_paging,
+            View::PlaylistTracks => &mut self.playlist_tracks_paging,
+            View::Search => &mut self.search_paging,
+        }
+    }
+
+    /// The listing a failed request belongs to, and the page it was for.
+    ///
+    /// Matched on the task's whole identity rather than on the view on screen:
+    /// a page can fail long after the user has moved on, and clearing another
+    /// listing's slot would let a second copy of its page go out - or latch a
+    /// listing that has nothing wrong with it. `None` when the failure belongs
+    /// to no listing at all, or to one the user has already left.
+    fn paging_for(&mut self, task: &Task) -> Option<(&mut Paging, u32)> {
+        match task {
+            Task::Favorites { offset } => Some((&mut self.favorites_paging, *offset)),
+            Task::Playlists { offset } => Some((&mut self.playlists_paging, *offset)),
+            Task::PlaylistTracks { uuid, offset } => {
+                let open = self.open_playlist.as_ref().is_some_and(|(u, _)| u == uuid);
+                open.then_some((&mut self.playlist_tracks_paging, *offset))
+            }
+            Task::Search { query, offset } => {
+                (*query == self.search_asked).then_some((&mut self.search_paging, *offset))
+            }
+            Task::Startup | Task::Resolve => None,
+        }
+    }
+
+    /// Rows of the current listing that have been fetched.
+    ///
+    /// Not `visible_len`: an offset counts rows the service has handed over, and
+    /// the local filter hides rows without unfetching them. Asking for
+    /// `visible_len` as the next offset would skip everything filtered out.
+    fn loaded_rows(&self) -> usize {
+        match self.view {
+            View::Favorites => self.favorites.len(),
+            View::Playlists => self.playlists.len(),
+            View::PlaylistTracks => self.playlist_tracks.len(),
+            View::Search => self.search_tracks.len(),
+        }
+    }
+
+    /// What would fetch `offset` for the view on screen, if it has anything to
+    /// ask for: a playlist view with no playlist open, and a search with no
+    /// query behind it, have nothing to page.
+    fn page_request(&self, offset: u32) -> Option<ToWorker> {
+        Some(match self.view {
+            View::Favorites => ToWorker::LoadFavorites {
+                offset,
+                limit: worker::FAVORITES_PAGE,
+            },
+            View::Playlists => ToWorker::LoadPlaylists {
+                offset,
+                limit: worker::PLAYLISTS_PAGE,
+            },
+            View::PlaylistTracks => ToWorker::LoadPlaylistTracks {
+                uuid: self.open_playlist.as_ref()?.0.clone(),
+                offset,
+                limit: worker::PLAYLIST_TRACKS_PAGE,
+            },
+            View::Search if !self.search_asked.is_empty() => ToWorker::Search {
+                query: self.search_asked.clone(),
+                offset,
+                limit: worker::SEARCH_PAGE,
+            },
+            View::Search => return None,
+        })
     }
 
     /// Ask for the next page when the selection nears the end of what is loaded.
@@ -813,10 +964,11 @@ impl App {
     /// are what keep that cheap: the ordinary cases - a list fully loaded, a
     /// page already in flight, a view that gave up - all answer before anything
     /// is walked.
-    fn page_in_more_favorites(&mut self) {
-        if self.view != View::Favorites {
-            return;
-        }
+    ///
+    /// One trigger for all four views rather than four of them: everything that
+    /// differs between the listings is in `paging`, `loaded_rows` and
+    /// `page_request`, and the guards are the part that must not drift.
+    fn page_in_more(&mut self) {
         // The renderer is what publishes the list geometry, so before the first
         // frame "near the bottom" is a question with no answer. Acting on a
         // zero-height list would page the whole library in before anything had
@@ -824,7 +976,8 @@ impl App {
         if self.list_inner.height == 0 {
             return;
         }
-        if !self.favorites_paging.wants_more(self.favorites.len()) {
+        let loaded = self.loaded_rows();
+        if !self.paging().wants_more(loaded) {
             return;
         }
         // A screenful of lookahead: the next page has to be there before the
@@ -833,14 +986,14 @@ impl App {
         if self.selected + self.full_page() < self.visible_len() {
             return;
         }
-        let Ok(offset) = u32::try_from(self.favorites.len()) else {
+        let Ok(offset) = u32::try_from(loaded) else {
             return; // more rows than an offset can name; there is nothing to ask
         };
-        self.favorites_paging.wanted = Some(offset);
-        self.ask(ToWorker::LoadFavorites {
-            offset,
-            limit: worker::FAVORITES_PAGE,
-        });
+        let Some(req) = self.page_request(offset) else {
+            return;
+        };
+        self.paging_mut().wanted = Some(offset);
+        self.ask(req);
     }
 
     /// A page of favorites arrived.
@@ -853,44 +1006,98 @@ impl App {
             log::debug!("dropping a favorites page at offset {offset}: nothing is waiting for it");
             return;
         }
-        self.favorites_paging.wanted = None;
-        debug_assert!(
-            offset == 0 || usize::try_from(offset).is_ok_and(|o| o == self.favorites.len()),
-            "a page either restarts the list or continues where it ended"
-        );
-        // The first page replaces and every later one appends. Appending is
-        // what keeps the user's row under their cursor: selection is an index
-        // into the filtered rows, and rows that only ever arrive after the ones
-        // already there cannot shift it.
-        if offset == 0 {
-            self.favorites = page.items;
-        } else {
-            self.favorites.extend(page.items);
-        }
-        let loaded = u32::try_from(self.favorites.len()).unwrap_or(u32::MAX);
-        // An answer carrying no count would otherwise read as "0 available"
-        // beside rows that are plainly on screen.
-        self.favorites_paging.total = page.total.max(loaded);
+        let mut rows = std::mem::take(&mut self.favorites);
+        self.favorites_paging.absorb(&mut rows, offset, page);
+        self.favorites = rows;
         self.loading = false;
-        self.notice = Some(match self.favorites_available() {
+        let loaded = self.favorites.len();
+        self.notice = Some(match rows_missing(loaded, self.favorites_paging.total) {
             Some(total) => format!("{loaded} of {total} favorites"),
             None => format!("{loaded} favorites"),
         });
+        if self.view == View::Favorites {
+            self.clamp_selection();
+        }
+    }
+
+    /// A page of the user's playlists arrived, matched by the offset it answers.
+    fn on_playlists_page(&mut self, offset: u32, page: priel_core::Page<Playlist>) {
+        if self.playlists_paging.wanted != Some(offset) {
+            log::debug!("dropping a playlists page at offset {offset}: nothing is waiting for it");
+            return;
+        }
+        let mut rows = std::mem::take(&mut self.playlists);
+        self.playlists_paging.absorb(&mut rows, offset, page);
+        self.playlists = rows;
+        self.loading = false;
+        if self.view == View::Playlists {
+            self.clamp_selection();
+        }
+    }
+
+    /// A page of one playlist's tracks arrived.
+    ///
+    /// Two things make one of these stale and both have to be checked. A reply
+    /// for a playlist the user has left is the one that was always guarded
+    /// against; a page of the *open* playlist that was superseded before it
+    /// arrived is just as wrong, and paging is what made it possible.
+    fn on_playlist_tracks_page(&mut self, uuid: &str, offset: u32, page: priel_core::Page<Track>) {
+        if self.open_playlist.as_ref().is_none_or(|(u, _)| u != uuid) {
+            log::debug!("dropping tracks for {uuid}: that playlist is not open");
+            return;
+        }
+        if self.playlist_tracks_paging.wanted != Some(offset) {
+            log::debug!("dropping {uuid} tracks at offset {offset}: nothing is waiting for it");
+            return;
+        }
+        let mut rows = std::mem::take(&mut self.playlist_tracks);
+        self.playlist_tracks_paging.absorb(&mut rows, offset, page);
+        self.playlist_tracks = rows;
+        self.loading = false;
         self.clamp_selection();
     }
 
-    /// How many favorites the service says exist, while some are still missing.
+    /// A page of search results arrived.
     ///
-    /// `None` once everything is loaded, so the heading and the notice mention a
-    /// total only while it still tells the user something.
-    #[must_use]
-    pub fn favorites_available(&self) -> Option<u32> {
-        let total = usize::try_from(self.favorites_paging.total).ok()?;
-        if self.favorites.len() < total {
-            Some(self.favorites_paging.total)
-        } else {
-            None
+    /// The query is half the identity: both a new search and a reload ask for
+    /// offset zero, so the offset alone cannot tell a page of the results on
+    /// screen from a page of the query the user has just replaced.
+    fn on_search_page(&mut self, query: &str, offset: u32, page: priel_core::Page<Track>) {
+        if query != self.search_asked {
+            log::debug!("dropping results for {query:?}: the query has moved on");
+            return;
         }
+        if self.search_paging.wanted != Some(offset) {
+            log::debug!("dropping results at offset {offset}: nothing is waiting for them");
+            return;
+        }
+        // A fresh set of results starts at the top; rows added to the end of the
+        // ones being read must leave the cursor exactly where it is. Sending it
+        // to the top on every reply is what this replaces.
+        if offset == 0 {
+            self.selected = 0;
+        }
+        let mut rows = std::mem::take(&mut self.search_tracks);
+        self.search_paging.absorb(&mut rows, offset, page);
+        self.search_tracks = rows;
+        self.loading = false;
+        let loaded = self.search_tracks.len();
+        self.notice = Some(match rows_missing(loaded, self.search_paging.total) {
+            Some(total) => format!("{loaded} of {total} results"),
+            None => format!("{loaded} results"),
+        });
+        if self.view == View::Search {
+            self.clamp_selection();
+        }
+    }
+
+    /// How long the current listing is, while some of it is still missing.
+    ///
+    /// `None` once everything is loaded, so the heading mentions a total only
+    /// while it still tells the user something.
+    #[must_use]
+    pub fn rows_available(&self) -> Option<u32> {
+        rows_missing(self.loaded_rows(), self.paging().total)
     }
 
     /// Track slice backing the current view (empty for the Playlists list).
@@ -944,11 +1151,7 @@ impl App {
     #[must_use]
     pub fn visible_len(&self) -> usize {
         if self.filter.is_empty() {
-            return if self.view == View::Playlists {
-                self.playlists.len()
-            } else {
-                self.current_tracks().len()
-            };
+            return self.loaded_rows();
         }
         let mut count = 0;
         self.each_visible(|_| count += 1);
@@ -1020,16 +1223,16 @@ impl App {
     /// `task` says which one, so the view that was waiting stops waiting. The
     /// rows already loaded are left exactly as they are: a page that did not
     /// arrive is a page missing from the end, not a reason to empty the list.
-    fn on_failed(&mut self, task: Task, fault: Fault, detail: &str) {
+    fn on_failed(&mut self, task: &Task, fault: Fault, detail: &str) {
         self.loading = false;
-        if let Task::Favorites { offset } = task
-            && self.favorites_paging.wanted == Some(offset)
+        if let Some((paging, offset)) = self.paging_for(task)
+            && paging.wanted == Some(offset)
         {
-            self.favorites_paging.wanted = None;
+            paging.wanted = None;
             // Latched rather than retried. The trigger runs on every tick, so a
             // service that is down would otherwise be asked ten times a second
             // until priel was closed.
-            self.favorites_paging.stalled = true;
+            paging.stalled = true;
         }
         // Branching on the classification, never on the words. This was
         // `e.contains("log in again")`, which made the core's wording
@@ -1059,26 +1262,15 @@ impl App {
             self.dirty = true;
             match msg {
                 FromWorker::Favorites { offset, page } => self.on_favorites_page(offset, page),
-                FromWorker::Playlists(p) => {
-                    self.playlists = p;
-                    self.loading = false;
-                    if self.view == View::Playlists {
-                        self.clamp_selection();
-                    }
+                FromWorker::Playlists { offset, page } => self.on_playlists_page(offset, page),
+                FromWorker::PlaylistTracks { uuid, offset, page } => {
+                    self.on_playlist_tracks_page(&uuid, offset, page);
                 }
-                FromWorker::PlaylistTracks(uuid, t) => {
-                    if self.open_playlist.as_ref().is_some_and(|(u, _)| u == &uuid) {
-                        self.playlist_tracks = t;
-                        self.loading = false;
-                        self.clamp_selection();
-                    }
-                }
-                FromWorker::SearchResults(tracks) => {
-                    self.search_tracks = tracks;
-                    self.loading = false;
-                    self.selected = 0;
-                    self.notice = Some(format!("{} results", self.search_tracks.len()));
-                }
+                FromWorker::SearchResults {
+                    query,
+                    offset,
+                    page,
+                } => self.on_search_page(&query, offset, page),
                 FromWorker::Resolved(id, r) => self.on_resolved(id, &r),
                 FromWorker::AudioGraph(read) => {
                     self.audio_graph = Some(read);
@@ -1091,7 +1283,7 @@ impl App {
                     task,
                     fault,
                     detail,
-                } => self.on_failed(task, fault, &detail),
+                } => self.on_failed(&task, fault, &detail),
             }
         }
     }
@@ -1142,7 +1334,7 @@ impl App {
         self.drain_login();
         self.status = self.player.status();
         self.refresh_from_status();
-        self.page_in_more_favorites();
+        self.page_in_more();
         self.refresh_devices();
     }
 
@@ -1260,18 +1452,15 @@ impl App {
         // Leaving a view leaves its input mode with it. Without this, clicking a
         // tab while filtering strands the user in a text mode whose text is gone.
         self.mode = Mode::Normal;
+        // Coming back to a list is the retry. A page that failed left that view
+        // unwilling to ask again; arriving here is the deliberate user action
+        // that clears it, and it is worth at most one more request.
+        self.paging_mut().stalled = false;
         match v {
-            View::Playlists if self.playlists.is_empty() => {
-                self.loading = true;
-                self.ask(ToWorker::LoadPlaylists);
-            }
+            View::Playlists if self.playlists.is_empty() => self.load_playlists_from_the_top(),
             View::Search if self.search_tracks.is_empty() => {
                 self.mode = Mode::Search; // start typing a query
             }
-            // Coming back to the list is the retry. A page that failed left the
-            // view unwilling to ask again; this is the deliberate user action
-            // that clears that, and it is worth at most one more request.
-            View::Favorites => self.favorites_paging.stalled = false,
             _ => {}
         }
     }
@@ -1293,11 +1482,19 @@ impl App {
             self.open_playlist = Some((p.uuid.clone(), p.title.clone()));
             self.view = View::PlaylistTracks;
             self.playlist_tracks.clear();
+            // The playlist row already says how many tracks there are, so this
+            // view knows where its end is before a single track has arrived -
+            // and does not depend on a total the tracks response may not carry.
+            self.playlist_tracks_paging.restart(p.num_tracks);
             self.selected = 0;
             self.list_offset = 0;
             self.filter.clear();
             self.loading = true;
-            self.ask(ToWorker::LoadPlaylistTracks(p.uuid));
+            self.ask(ToWorker::LoadPlaylistTracks {
+                uuid: p.uuid,
+                offset: 0,
+                limit: worker::PLAYLIST_TRACKS_PAGE,
+            });
         }
     }
 
@@ -1872,13 +2069,7 @@ impl App {
             KeyCode::Tab => self.cycle_view(),
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
-                let q = self.search_query.trim().to_string();
-                if !q.is_empty() {
-                    self.loading = true;
-                    self.search_tracks.clear();
-                    self.selected = 0;
-                    self.ask(ToWorker::Search(q));
-                }
+                self.submit_search();
             }
             KeyCode::Backspace => {
                 self.search_query.pop();
@@ -1886,6 +2077,28 @@ impl App {
             KeyCode::Char(c) => self.search_query.push(c),
             _ => {}
         }
+    }
+
+    /// Run the query in the box, from its first page.
+    ///
+    /// The query is remembered as `search_asked` because the box keeps taking
+    /// keys after the request has gone out: a reply matched against
+    /// `search_query` would be dropped the moment the user typed another letter.
+    fn submit_search(&mut self) {
+        let query = self.search_query.trim().to_string();
+        if query.is_empty() {
+            return; // an accidental Enter on an empty box is not a request
+        }
+        self.search_asked.clone_from(&query);
+        self.search_tracks.clear();
+        self.search_paging.restart(0);
+        self.selected = 0;
+        self.loading = true;
+        self.ask(ToWorker::Search {
+            query,
+            offset: 0,
+            limit: worker::SEARCH_PAGE,
+        });
     }
 
     fn on_key_normal(&mut self, key: KeyEvent) {
@@ -2222,6 +2435,15 @@ fn negotiated(node: &GraphNode) -> String {
 /// by the caller, which is what keeps this off the per-row allocation path.
 /// An empty filter matches everything; `secondary` may be empty for item kinds
 /// that only have one searchable field.
+/// The length of a listing, while some of it is still missing.
+///
+/// `None` once `loaded` has caught up, so nothing on screen offers a total that
+/// only repeats the row count beside it.
+fn rows_missing(loaded: usize, total: u32) -> Option<u32> {
+    let known = usize::try_from(total).ok()?;
+    (loaded < known).then_some(total)
+}
+
 fn row_matches(primary: &str, secondary: &str, filter_lower: &str) -> bool {
     filter_lower.is_empty()
         || primary.to_lowercase().contains(filter_lower)
@@ -2348,13 +2570,48 @@ mod tests {
 
     /// A page of favorites as the worker would deliver it: rows `ids`, starting
     /// at `offset`, out of a listing `total` long.
+    fn track_page(ids: std::ops::Range<u64>, total: u32) -> priel_core::Page<Track> {
+        priel_core::Page {
+            items: ids.map(|i| track(i, "T", "A")).collect(),
+            total,
+        }
+    }
+
     fn favorites_page(offset: u32, ids: std::ops::Range<u64>, total: u32) -> FromWorker {
         FromWorker::Favorites {
             offset,
+            page: track_page(ids, total),
+        }
+    }
+
+    fn playlists_page(offset: u32, uuids: &[&str], total: u32) -> FromWorker {
+        FromWorker::Playlists {
+            offset,
             page: priel_core::Page {
-                items: ids.map(|i| track(i, "T", "A")).collect(),
+                items: uuids.iter().map(|u| playlist(u, u)).collect(),
                 total,
             },
+        }
+    }
+
+    fn playlist_tracks_page(
+        uuid: &str,
+        offset: u32,
+        ids: std::ops::Range<u64>,
+        total: u32,
+    ) -> FromWorker {
+        FromWorker::PlaylistTracks {
+            uuid: uuid.into(),
+            offset,
+            page: track_page(ids, total),
+        }
+    }
+
+    fn search_page(query: &str, offset: u32, ids: std::ops::Range<u64>, total: u32) -> FromWorker {
+        FromWorker::SearchResults {
+            query: query.into(),
+            offset,
+            page: track_page(ids, total),
         }
     }
 
@@ -2526,7 +2783,7 @@ mod tests {
         }
         assert!(requests(&r).is_empty(), "everything is already loaded");
         assert_eq!(
-            r.app.favorites_available(),
+            r.app.rows_available(),
             None,
             "and the heading should stop mentioning a total"
         );
@@ -2647,6 +2904,373 @@ mod tests {
             requests(&r).is_empty(),
             "the favorites page is still in flight"
         );
+    }
+
+    // ---- paging: the other three views ----
+
+    /// Put the playlists view on screen with one page of `uuids` loaded and the
+    /// selection on the last of them.
+    fn playlists_loaded(r: &mut Rig, uuids: &[&str], total: u32) {
+        r.app.on_key(key('2'));
+        r.to_app.send(playlists_page(0, uuids, total)).unwrap();
+        r.app.drain_worker();
+        scrolled_to_the_end(&mut r.app);
+        let _ = requests(r);
+    }
+
+    /// Open a playlist of `num_tracks` tracks with one page of them loaded, and
+    /// the selection on the last loaded row.
+    fn playlist_open(r: &mut Rig, uuid: &str, num_tracks: u32, loaded: std::ops::Range<u64>) {
+        r.app.playlists = vec![Playlist {
+            uuid: uuid.into(),
+            title: uuid.into(),
+            num_tracks,
+            duration_secs: 0,
+        }];
+        r.app.view = View::Playlists;
+        r.app.selected = 0;
+        r.app.on_key(code(KeyCode::Enter));
+        let end = u32::try_from(loaded.end).unwrap_or(0);
+        r.to_app
+            .send(playlist_tracks_page(uuid, 0, loaded, end))
+            .unwrap();
+        r.app.drain_worker();
+        scrolled_to_the_end(&mut r.app);
+        let _ = requests(r);
+    }
+
+    /// Run a search and load its first page, with the selection at the end.
+    fn searched(r: &mut Rig, query: &str, ids: std::ops::Range<u64>, total: u32) {
+        r.app.on_key(key('3'));
+        for c in query.chars() {
+            r.app.on_key(key(c));
+        }
+        r.app.on_key(code(KeyCode::Enter));
+        r.to_app.send(search_page(query, 0, ids, total)).unwrap();
+        r.app.drain_worker();
+        scrolled_to_the_end(&mut r.app);
+        let _ = requests(r);
+    }
+
+    fn uuids(lists: &[Playlist]) -> Vec<String> {
+        lists.iter().map(|p| p.uuid.clone()).collect()
+    }
+
+    #[test]
+    fn scrolling_the_playlists_to_the_end_asks_for_the_next_page_and_appends_it() {
+        // Goal: the playlists list stopped at whatever the first request
+        // returned. It has to grow at its end, the only place that leaves the
+        // rows above where the user left them.
+        let mut r = rig();
+        playlists_loaded(&mut r, &["a", "b"], 4);
+
+        r.app.refresh();
+        assert!(
+            matches!(
+                requests(&r)[..],
+                [ToWorker::LoadPlaylists { offset: 2, limit }] if limit > 0
+            ),
+            "the next page starts where the loaded rows end"
+        );
+
+        r.to_app.send(playlists_page(2, &["c", "d"], 4)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(uuids(&r.app.playlists), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn the_playlists_stop_at_the_count_the_service_reports() {
+        // Goal: the end of the listing comes from the service's own count, and
+        // once it is reached nothing more may be asked for on any tick.
+        let mut r = rig();
+        playlists_loaded(&mut r, &["a", "b"], 2);
+        for _ in 0..3 {
+            r.app.refresh();
+        }
+        assert!(requests(&r).is_empty(), "everything is already loaded");
+    }
+
+    #[test]
+    fn a_playlists_page_nobody_is_waiting_for_is_discarded() {
+        // Goal: a page that arrives after the listing moved on belongs to a
+        // listing that no longer exists; appending it would interleave two.
+        let mut r = rig();
+        playlists_loaded(&mut r, &["a", "b"], 9);
+
+        r.to_app.send(playlists_page(5, &["z"], 9)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(uuids(&r.app.playlists), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_playlist_knows_its_length_before_its_first_page_of_tracks_arrives() {
+        // Goal: the playlist listing already says how many tracks a playlist
+        // holds, so this view does not have to wait for - or trust - a total in
+        // the tracks response to know it has more to fetch.
+        let mut r = rig();
+        playlist_open(&mut r, "mix", 5, 0..3);
+        assert_eq!(
+            r.app.rows_available(),
+            Some(5),
+            "the count came from the playlist row, not from the page"
+        );
+
+        r.app.refresh();
+        assert!(
+            matches!(
+                requests(&r)[..],
+                [ToWorker::LoadPlaylistTracks { uuid: ref u, offset: 3, .. }] if u == "mix"
+            ),
+            "the next page starts where the loaded rows end"
+        );
+
+        // The page that answers carries no count of its own, which must not
+        // undo what the playlist row already said.
+        r.to_app
+            .send(playlist_tracks_page("mix", 3, 3..5, 0))
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.playlist_tracks), vec![0, 1, 2, 3, 4]);
+
+        for _ in 0..3 {
+            r.app.refresh();
+        }
+        assert!(requests(&r).is_empty(), "the playlist is complete");
+    }
+
+    #[test]
+    fn a_superseded_playlist_tracks_page_is_dropped_whichever_way_it_is_stale() {
+        // Goal: two things make one of these replies wrong, and both have to be
+        // checked. A page for a playlist the user has left, and a page of the
+        // open playlist that was superseded before it arrived, are equally not
+        // the rows on screen.
+        let mut r = rig();
+        playlist_open(&mut r, "mix", 9, 0..3);
+        r.app.refresh(); // asks "mix" for offset 3
+
+        r.to_app
+            .send(playlist_tracks_page("other", 3, 90..93, 9))
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(
+            ids(&r.app.playlist_tracks),
+            vec![0, 1, 2],
+            "a page for a playlist that is not open must be dropped"
+        );
+
+        r.to_app
+            .send(playlist_tracks_page("mix", 6, 60..63, 9))
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(
+            ids(&r.app.playlist_tracks),
+            vec![0, 1, 2],
+            "and so must a page of the open playlist nobody asked for"
+        );
+    }
+
+    #[test]
+    fn a_search_appends_a_page_but_replaces_a_new_query() {
+        // Goal: the reply used to send the cursor to the top every time, which
+        // is right for a fresh set of results and wrong for rows added to the
+        // end of the ones being read.
+        let mut r = rig();
+        searched(&mut r, "blue", 0..3, 6);
+        let row = r.app.selected;
+        assert!(
+            row > 0,
+            "the test needs a cursor that is not already at the top"
+        );
+
+        r.app.refresh();
+        assert!(
+            matches!(
+                requests(&r)[..],
+                [ToWorker::Search { query: ref q, offset: 3, .. }] if q == "blue"
+            ),
+            "the next page starts where the loaded rows end"
+        );
+
+        r.to_app.send(search_page("blue", 3, 3..6, 6)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.search_tracks), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            r.app.selected, row,
+            "an appended page must not move the cursor"
+        );
+
+        // A fresh query is the other case: it replaces, and starts at the top.
+        r.app.on_key(key('i')); // re-edit, so the box still holds "blue"
+        for c in "s".chars() {
+            r.app.on_key(key(c));
+        }
+        r.app.on_key(code(KeyCode::Enter));
+        r.to_app.send(search_page("blues", 0, 9..12, 3)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.search_tracks), vec![9, 10, 11]);
+        assert_eq!(r.app.selected, 0, "a new set of results starts at the top");
+    }
+
+    #[test]
+    fn a_page_for_a_query_that_has_been_replaced_is_dropped() {
+        // Goal: the offset alone cannot tell these apart - both are page zero -
+        // so the query is part of the reply's identity. Without it the results
+        // for an abandoned query overwrite the ones the user is waiting for.
+        let mut r = rig();
+        searched(&mut r, "blue", 0..3, 6);
+
+        r.app.on_key(key('i'));
+        for c in "s".chars() {
+            r.app.on_key(key(c));
+        }
+        r.app.on_key(code(KeyCode::Enter)); // now waiting on "blues" page zero
+        let _ = requests(&r);
+
+        r.to_app.send(search_page("blue", 0, 70..73, 6)).unwrap();
+        r.app.drain_worker();
+        assert!(
+            r.app.search_tracks.is_empty(),
+            "the abandoned query's page must not land in the new results"
+        );
+
+        r.to_app.send(search_page("blues", 0, 40..42, 2)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.search_tracks), vec![40, 41]);
+    }
+
+    fn unreachable(task: Task) -> FromWorker {
+        FromWorker::Failed {
+            task,
+            fault: Fault::Unreachable,
+            detail: "no route to host".into(),
+        }
+    }
+
+    #[test]
+    fn a_failure_for_a_listing_the_user_has_left_touches_nothing() {
+        // Goal: a failure carries the listing as well as the page precisely so
+        // it cannot be mistaken for another listing's. Taken for the open
+        // playlist's, it would free a slot that is still in flight - and the
+        // page that then arrives would be dropped as unwanted, leaving the view
+        // short of rows with nothing left to ask.
+        let mut r = rig();
+        playlist_open(&mut r, "mix", 9, 0..3);
+        r.app.refresh(); // asks "mix" for offset 3
+        let _ = requests(&r);
+
+        r.to_app
+            .send(unreachable(Task::PlaylistTracks {
+                uuid: "other".into(),
+                offset: 3,
+            }))
+            .unwrap();
+        r.app.drain_worker();
+
+        r.to_app
+            .send(playlist_tracks_page("mix", 3, 3..6, 9))
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(
+            ids(&r.app.playlist_tracks),
+            vec![0, 1, 2, 3, 4, 5],
+            "the page the view was waiting for must still be accepted"
+        );
+    }
+
+    #[test]
+    fn a_failure_for_a_query_that_has_been_replaced_touches_nothing() {
+        // Goal: the same rule on the search view, where the listing is the
+        // query. Both requests are for page zero, so only the query tells them
+        // apart.
+        let mut r = rig();
+        searched(&mut r, "blue", 0..3, 6);
+        r.app.on_key(key('i'));
+        r.app.on_key(key('s'));
+        r.app.on_key(code(KeyCode::Enter)); // now waiting on "blues" page zero
+        let _ = requests(&r);
+
+        r.to_app
+            .send(unreachable(Task::Search {
+                query: "blue".into(),
+                offset: 0,
+            }))
+            .unwrap();
+        r.app.drain_worker();
+
+        r.to_app.send(search_page("blues", 0, 40..42, 2)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.search_tracks), vec![40, 41]);
+    }
+
+    #[test]
+    fn a_failed_page_keeps_the_rows_and_does_not_spin_on_any_view() {
+        // Goal: the anti-spin latch is per listing. A page that never arrived is
+        // a page missing from the end, not a reason to empty the list, and the
+        // trigger runs on every tick - so a dead link must not turn into a
+        // request storm on whichever view the user is looking at.
+        let mut r = rig();
+        playlist_open(&mut r, "mix", 9, 0..3);
+        r.app.refresh(); // asks "mix" for offset 3
+        assert_eq!(requests(&r).len(), 1);
+
+        r.to_app
+            .send(unreachable(Task::PlaylistTracks {
+                uuid: "mix".into(),
+                offset: 3,
+            }))
+            .unwrap();
+        r.app.drain_worker();
+        for _ in 0..5 {
+            r.app.refresh();
+        }
+        assert!(
+            requests(&r).is_empty(),
+            "a failed page must not be retried on a timer"
+        );
+        assert_eq!(
+            ids(&r.app.playlist_tracks),
+            vec![0, 1, 2],
+            "rows stay usable"
+        );
+
+        // And the latch belongs to that listing alone: another view is free.
+        let mut r = rig();
+        playlists_loaded(&mut r, &["a", "b"], 9);
+        r.app.refresh();
+        let _ = requests(&r);
+        r.to_app
+            .send(unreachable(Task::Favorites { offset: 0 }))
+            .unwrap();
+        r.app.drain_worker();
+        r.to_app.send(playlists_page(2, &["c"], 9)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(
+            uuids(&r.app.playlists),
+            vec!["a", "b", "c"],
+            "a favorites failure must not stall the playlists"
+        );
+    }
+
+    #[test]
+    fn a_listing_that_runs_out_early_stops_asking() {
+        // Goal: the count is the service's, and it is sometimes larger than the
+        // rows it will actually hand over. An empty page is the end of the
+        // listing whatever the count says - without that the same empty page is
+        // requested on every tick, forever.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..3, 500)).unwrap();
+        r.app.drain_worker();
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh();
+        let _ = requests(&r);
+
+        r.to_app.send(favorites_page(3, 3..3, 500)).unwrap();
+        r.app.drain_worker();
+        for _ in 0..5 {
+            r.app.refresh();
+        }
+        assert!(requests(&r).is_empty(), "the listing has run out");
     }
 
     #[test]
@@ -3493,10 +4117,7 @@ mod tests {
         let mut r = rig();
         r.app.playlists = vec![playlist("wanted", "W")];
         r.to_app
-            .send(FromWorker::PlaylistTracks(
-                "stale".into(),
-                vec![track(9, "S", "S")],
-            ))
+            .send(playlist_tracks_page("stale", 0, 9..10, 1))
             .unwrap();
         r.app.drain_worker();
         assert!(
@@ -3546,11 +4167,12 @@ mod tests {
         // held; the request is what costs a round trip.
         let mut r = rig();
         r.app.on_key(key('2'));
-        assert!(matches!(requests(&r)[..], [ToWorker::LoadPlaylists]));
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadPlaylists { offset: 0, .. }]
+        ));
 
-        r.to_app
-            .send(FromWorker::Playlists(vec![playlist("u", "P")]))
-            .unwrap();
+        r.to_app.send(playlists_page(0, &["u"], 1)).unwrap();
         r.app.drain_worker();
         r.app.on_key(key('1'));
         r.app.on_key(key('2'));
@@ -3569,14 +4191,11 @@ mod tests {
         assert_eq!(r.app.view, View::PlaylistTracks);
         assert!(matches!(
             requests(&r)[..],
-            [ToWorker::LoadPlaylistTracks(ref u)] if u == "uuid-1"
+            [ToWorker::LoadPlaylistTracks { uuid: ref u, offset: 0, .. }] if u == "uuid-1"
         ));
 
         r.to_app
-            .send(FromWorker::PlaylistTracks(
-                "uuid-1".into(),
-                vec![track(4, "T", "A")],
-            ))
+            .send(playlist_tracks_page("uuid-1", 0, 4..5, 1))
             .unwrap();
         r.app.drain_worker();
         assert_eq!(r.app.playlist_tracks.len(), 1);
@@ -3687,16 +4306,10 @@ mod tests {
         r.app.on_key(code(KeyCode::Enter));
         assert!(matches!(
             requests(&r)[..],
-            [ToWorker::Search(ref q)] if q == "mil"
+            [ToWorker::Search { query: ref q, offset: 0, .. }] if q == "mil"
         ));
 
-        r.to_app
-            .send(FromWorker::SearchResults(vec![track(
-                3,
-                "Milestones",
-                "Miles",
-            )]))
-            .unwrap();
+        r.to_app.send(search_page("mil", 0, 3..4, 1)).unwrap();
         r.app.drain_worker();
         assert_eq!(r.app.search_tracks.len(), 1);
     }
