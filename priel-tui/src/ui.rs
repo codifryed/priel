@@ -284,6 +284,7 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
             ("near", "level changed only"),
             ("resampled", "rate changed"),
             ("truncated", "format too narrow"),
+            ("⚠ in D", "the node that did it"),
             ("0", "restore unity gain"),
         ],
     ),
@@ -410,7 +411,12 @@ fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
 /// The DAC badge on the bottom row says whether the chain is clean, because it
 /// reads the device's own live parameters. It cannot say *what* made it that
 /// way. This is that answer: every node on the path, in order, with the format
-/// each one settled on.
+/// each one settled on, and a `⚠` on the node where the track's rate or width is
+/// first lost.
+///
+/// Which node that is - or that no node explains it - is decided in the player
+/// crate, by `AudioGraph::attribute`. Nothing here judges anything; it colours
+/// what it was handed.
 ///
 /// Modal and scrolled like the log overlay, and for the same reason - a second
 /// idiom for the same gesture is its own bug.
@@ -482,6 +488,13 @@ fn graph_line(row: &GraphRow, width: u16) -> Line<'static> {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
             Style::default().fg(Color::Cyan),
+        ),
+        // Red, and the same red the fidelity badge uses for the same finding:
+        // the badge says the samples were altered and this says which node did
+        // it, and two colours for one answer would read as two opinions.
+        GraphRowKind::Culprit => (
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red),
         ),
         GraphRowKind::Link => (
             Style::default().fg(Color::DarkGray),
@@ -1870,6 +1883,44 @@ mod tests {
         // Unlike the help and log overlays this one is sized to its content, so
         // it is not expected to cover the whole list. Being modal is about the
         // input it swallows, which `app` covers.
+    }
+
+    #[test]
+    fn the_node_that_altered_the_samples_is_marked_on_screen() {
+        // Goal: the accusation is only useful if it survives onto the screen
+        // next to the row it is about. The overlay is sized to its content and
+        // clips whatever overflows, so a sentence added below the chain is
+        // exactly the thing that can be lost without any test noticing.
+        let mut sc = screen();
+        sc.app.status.loaded = true;
+        sc.app.status.playing = true;
+        sc.app.status.volume = 100.0;
+        sc.app.status.in_sample_rate = 44_100;
+        sc.app.status.in_format = "s32".into();
+        sc.app.status.sample_rate = 48_000;
+        sc.app.status.out_format = "s32".into();
+        sc.app.now_meta.bit_depth = 24;
+        with_chain(
+            &mut sc,
+            AudioGraph {
+                path: vec![
+                    node("mpv", NodeRole::Stream, 44_100, "S32LE"),
+                    node("Loopback", NodeRole::Intermediate, 48_000, "F32LE"),
+                    node("Studio DAC", NodeRole::Device, 48_000, "S32LE"),
+                ],
+            },
+        );
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 26);
+        assert!(out.contains("⚠ Loopback"), "the row is marked: {out}");
+        assert!(
+            out.contains("Loopback is resampling."),
+            "and named in words: {out}"
+        );
+        assert!(
+            !out.contains("⚠ Studio DAC"),
+            "the device behind it is at 48 kHz too and is not the cause: {out}"
+        );
     }
 
     #[test]
