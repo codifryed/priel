@@ -111,6 +111,15 @@ pub enum GraphError {
     Unreadable,
     /// The dump parsed, but priel has no stream in the graph.
     NoStream,
+    /// There is no graph to read: priel is playing straight to the hardware.
+    ///
+    /// Distinct from [`Self::NoStream`], which means the graph exists and priel
+    /// is not in it yet - that reads as "nothing is playing", and this is the
+    /// opposite situation. Nothing sits between priel and the DAC at all, which
+    /// is the point of the direct path rather than a failure of it. The player
+    /// knows which device it is using, so this is *told* to the overlay rather
+    /// than inferred from an absence.
+    Bypassed,
 }
 
 impl GraphError {
@@ -128,6 +137,7 @@ impl GraphError {
             Self::TimedOut => Some("The graph was busy. Try again."),
             Self::Unreadable => Some("Worth reporting, with the log from [M]."),
             Self::NoStream => Some("It appears once playback starts."),
+            Self::Bypassed => Some("Nothing sits between priel and the DAC. That is the point."),
         }
     }
 }
@@ -140,6 +150,9 @@ impl fmt::Display for GraphError {
             Self::TimedOut => f.write_str("pw-dump did not answer within two seconds."),
             Self::Unreadable => f.write_str("pw-dump answered with something priel cannot parse."),
             Self::NoStream => f.write_str("priel has no stream in the graph."),
+            Self::Bypassed => {
+                f.write_str("There is no graph: priel holds the output device directly.")
+            }
         }
     }
 }
@@ -632,6 +645,7 @@ mod tests {
             GraphError::TimedOut,
             GraphError::Unreadable,
             GraphError::NoStream,
+            GraphError::Bypassed,
         ];
         for e in all {
             let line = e.to_string();

@@ -230,6 +230,20 @@ impl PlaybackStatus {
         }
     }
 
+    /// Is the output going straight to the hardware, with no sound server in
+    /// the chain at all?
+    ///
+    /// True of a direct ALSA card device, which is what the exclusive path
+    /// uses. The distinction matters to anything that reports on the sound
+    /// server's graph: there is not merely no stream of priel's in it, there is
+    /// no graph between priel and the DAC to have an opinion about - which is
+    /// the bit-perfect ideal rather than a failure, and reads as the opposite
+    /// if the two are confused.
+    #[must_use]
+    pub fn bypasses_sound_server(&self) -> bool {
+        hw::is_direct_card_device(&self.audio_device)
+    }
+
     /// True when the verdict is based on the hardware rather than on what the
     /// audio server claimed.
     #[must_use]
@@ -655,6 +669,30 @@ mod tests {
             OutputAccess::Shared,
             "the default must be the modest answer, not the flattering one"
         );
+    }
+
+    #[test]
+    fn a_direct_device_is_known_to_have_no_sound_server_behind_it() {
+        // Goal: the graph overlay has nothing to show on the direct path, and
+        // the reason is the ideal rather than a failure - priel holds the card
+        // itself, so there is no graph between it and the DAC. The player knows
+        // which it is; the interface must not have to guess.
+        let mut s = PlaybackStatus {
+            audio_device: "alsa/hw:CARD=AUDIO,DEV=0".into(),
+            ..PlaybackStatus::default()
+        };
+        assert!(s.bypasses_sound_server());
+
+        s.audio_device = "pipewire/alsa_output.usb-x".into();
+        assert!(!s.bypasses_sound_server());
+
+        s.audio_device = "alsa/pipewire".into();
+        assert!(
+            !s.bypasses_sound_server(),
+            "the server's own ALSA device is still the server"
+        );
+
+        assert!(!PlaybackStatus::default().bypasses_sound_server());
     }
 
     #[test]

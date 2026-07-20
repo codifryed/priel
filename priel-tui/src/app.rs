@@ -1567,6 +1567,14 @@ impl App {
         // Cleared rather than kept: the last reading shown as if it were
         // current is exactly the lie this overlay exists to stop.
         self.audio_graph = None;
+        // A direct device puts priel outside the sound server entirely, so
+        // there is no graph to read rather than a graph priel is missing from.
+        // Asking anyway would answer "priel has no stream in the graph", which
+        // reads as "nothing is playing yet" - the opposite of what is true.
+        if self.status.bypasses_sound_server() {
+            self.audio_graph = Some(Err(GraphError::Bypassed));
+            return;
+        }
         let _ = self.worker.tx.send(ToWorker::ReadAudioGraph);
     }
 
@@ -2972,6 +2980,36 @@ mod tests {
         r.app.on_mouse(click(2, 2));
         assert_eq!(r.app.mode, Mode::Normal, "a click dismisses it");
         assert_eq!(r.app.selected, 0, "and does not land on a row underneath");
+    }
+
+    #[test]
+    fn a_direct_output_says_there_is_no_graph_rather_than_no_stream() {
+        // Goal: on the direct path priel is not a client of the sound server at
+        // all, so asking pw-dump gets "priel has no stream in the graph" - which
+        // reads as "nothing is playing yet" and is the opposite of the truth.
+        // The player knows which device it holds, so the overlay is told.
+        let mut r = rig();
+        r.app.status.audio_device = "alsa/hw:CARD=AUDIO,DEV=0".into();
+        r.app.on_key(key('D'));
+
+        let rows = r.app.graph_rows();
+        let text = rows
+            .iter()
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("no graph"),
+            "it has to say what is missing: {text}"
+        );
+        assert!(
+            !text.contains("no stream"),
+            "and not the sentence that means nothing is playing: {text}"
+        );
+        assert!(
+            r.from_app.try_recv().is_err(),
+            "and there is nothing to ask pw-dump, so it is not run"
+        );
     }
 
     #[test]
