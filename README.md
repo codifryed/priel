@@ -125,9 +125,10 @@ sudo make install      # binary, man page, completions, licence
 make run ARGS="--device pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0"
 ```
 
-`--device` is optional; the default sink is used when it is omitted.
-`--log-level` and `--log-file` control the diagnostic log. See `man priel` or
-`priel --help`.
+`--device` is optional; the default sink is used when it is omitted. `priel
+--list-devices` prints every device with the identifier `--device` takes, and
+`d` opens the same list inside the player. `--log-level` and `--log-file`
+control the diagnostic log. See `man priel` or `priel --help`.
 
 For UI work or a machine without mpv headers, `make build-nolibmpv` compiles the
 interface with playback stubbed out.
