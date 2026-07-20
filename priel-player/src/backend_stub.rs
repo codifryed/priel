@@ -26,12 +26,18 @@ use std::time::Duration;
 
 use crate::{Cmd, PlaybackStatus, PlayerConfig};
 
+/// Start the (no-op) player thread.
+///
+/// # Errors
+///
+/// If the OS will not give us a thread. Matches the libmpv backend, which names
+/// its thread for the log and so cannot spawn infallibly.
 pub fn spawn(
     _config: PlayerConfig,
     rx: Receiver<Cmd>,
     _status: Arc<Mutex<PlaybackStatus>>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new().name("player".into()).spawn(move || {
         loop {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => break,

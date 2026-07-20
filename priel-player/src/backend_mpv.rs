@@ -191,12 +191,21 @@ fn size(cookie: &mut Cookie) -> i64 {
 
 // ---- player thread ----
 
+/// Start the player thread.
+///
+/// # Errors
+///
+/// If the OS will not give us a thread.
 pub fn spawn(
     config: PlayerConfig,
     rx: Receiver<Cmd>,
     status: Arc<Mutex<PlaybackStatus>>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
+) -> std::io::Result<JoinHandle<()>> {
+    // Named, because the log records which thread wrote each line and "-" says
+    // nothing. This is also why the spawn is fallible now: `thread::spawn`
+    // panics on the same condition, and a panic is not how priel reports that
+    // it could not start.
+    thread::Builder::new().name("player".into()).spawn(move || {
         let mpv = match Mpv::new() {
             Ok(m) => m,
             Err(e) => {
@@ -521,7 +530,7 @@ fn register_source(
                 cv: Condvar::new(),
             });
             lock(registry).insert(s, shared.clone());
-            spawn_downloader(urls, shared);
+            spawn_downloader(urls, &shared);
             (format!("prielseg://{s}"), Some(s))
         }
     }
@@ -595,8 +604,10 @@ enum Stop {
     Failed,
 }
 
-fn spawn_downloader(urls: Vec<String>, shared: Arc<Shared>) {
-    thread::spawn(move || {
+fn spawn_downloader(urls: Vec<String>, shared: &Arc<Shared>) {
+    let owned = shared.clone();
+    let started = thread::Builder::new().name("segments".into()).spawn(move || {
+        let shared = owned;
         let total = urls.len();
         for (done, u) in urls.iter().enumerate() {
             // A non-2xx is an `Err` here (the agent keeps ureq's default
@@ -623,11 +634,26 @@ fn spawn_downloader(urls: Vec<String>, shared: Arc<Shared>) {
                 }
             }
         }
-        let mut g = lock(&shared.inner);
-        g.total = Some(g.data.len() as u64);
-        g.complete = true;
-        shared.cv.notify_all();
+        finish(&shared);
     });
+    if let Err(e) = started {
+        // Nothing will ever fill this buffer, and a reader parked on the
+        // condvar would wait for it forever. Release it here instead.
+        log::error!(target: "priel::download", "no thread for the download: {e}");
+        finish(shared);
+    }
+}
+
+/// Mark a buffer finished and wake whoever is waiting on it.
+///
+/// Every path out of a download ends here, including the one where the download
+/// never started: a reader blocked in the `read` callback is only ever released
+/// by `complete`.
+fn finish(shared: &Arc<Shared>) {
+    let mut g = lock(&shared.inner);
+    g.total = Some(g.data.len() as u64);
+    g.complete = true;
+    shared.cv.notify_all();
 }
 
 /// Feed one segment into the shared buffer *as it arrives*.
@@ -770,7 +796,11 @@ mod tests {
             true
         }
         fn log(&self, record: &log::Record) {
-            lock(&LINES).push(format!("{} {}", record.target(), record.args()));
+            // The thread name is part of what is being asserted: a line is only
+            // placeable if the thread that wrote it has a name.
+            let current = thread::current();
+            let who = current.name().unwrap_or("-").to_string();
+            lock(&LINES).push(format!("{who}|{} {}", record.target(), record.args()));
         }
         fn flush(&self) {}
     }
@@ -991,7 +1021,7 @@ mod tests {
         // tells a waiting reader it has reached the real end of the track.
         let url = one_shot(b"segment-bytes");
         let sh = shared(Vec::new(), false);
-        spawn_downloader(vec![url], sh.clone());
+        spawn_downloader(vec![url], &sh);
         for _ in 0..200 {
             if lock(&sh.inner).complete {
                 break;
@@ -1011,7 +1041,7 @@ mod tests {
         // recoverable without a restart.
         let sh = shared(Vec::new(), false);
         // Port 1 on loopback refuses immediately, so this does not touch DNS.
-        spawn_downloader(vec!["http://127.0.0.1:1/x".into()], sh.clone());
+        spawn_downloader(vec!["http://127.0.0.1:1/x".into()], &sh);
         for _ in 0..200 {
             if lock(&sh.inner).complete {
                 break;
@@ -1173,7 +1203,7 @@ mod tests {
         let sh = shared(Vec::new(), false);
         let dead = "http://127.0.0.1:1/never".to_string();
         let lines = captured(|| {
-            spawn_downloader(vec![dead], sh.clone());
+            spawn_downloader(vec![dead], &sh);
             for _ in 0..200 {
                 if lock(&sh.inner).complete {
                     break;
@@ -1214,6 +1244,50 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("mpv")),
             "the failed load should be recorded: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_downloader_says_which_thread_it_is() {
+        // Goal: the log's thread column is worth its width only if the threads
+        // have names. A stalled download and a player that will not start are
+        // read together, and they come from different threads.
+        let sh = shared(Vec::new(), false);
+        let lines = captured(|| {
+            spawn_downloader(vec!["http://127.0.0.1:1/never".into()], &sh);
+            for _ in 0..200 {
+                if lock(&sh.inner).complete {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        assert!(
+            lines.iter().any(|l| l.starts_with("segments|")),
+            "the downloader should be named: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_player_thread_says_which_thread_it_is() {
+        // Goal: as above, for the thread that owns mpv. Seeking an idle player
+        // is declined by mpv, which is a line the player thread writes itself.
+        let lines = captured(|| {
+            let player = crate::Player::new(Some("null".into())).expect("player");
+            player.seek(10.0);
+            for _ in 0..200 {
+                if lock(&LINES)
+                    .iter()
+                    .any(|l: &String| l.starts_with("player|"))
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        assert!(
+            lines.iter().any(|l| l.starts_with("player|")),
+            "the player thread should be named: {lines:?}"
         );
     }
 
@@ -1399,7 +1473,7 @@ mod tests {
         // is still in flight.
         let url = trickle(b"first-half", b"second-half", Duration::from_millis(400));
         let sh = shared(Vec::new(), false);
-        spawn_downloader(vec![url], sh.clone());
+        spawn_downloader(vec![url], &sh);
 
         // A reader blocked on an empty buffer must be released by the first
         // chunk, well before the response completes.
@@ -1426,7 +1500,7 @@ mod tests {
         // bytes are a FLAC stream and a gap in the middle is a decode failure.
         let url = trickle(b"AAAA", b"BBBB", Duration::from_millis(50));
         let sh = shared(Vec::new(), false);
-        spawn_downloader(vec![url], sh.clone());
+        spawn_downloader(vec![url], &sh);
         for _ in 0..200 {
             if lock(&sh.inner).complete {
                 break;
@@ -1444,7 +1518,7 @@ mod tests {
         // the thread rather than let it keep filling a discarded buffer.
         let url = trickle(b"early", b"late", Duration::from_secs(3));
         let sh = shared(Vec::new(), false);
-        spawn_downloader(vec![url], sh.clone());
+        spawn_downloader(vec![url], &sh);
         for _ in 0..200 {
             if !lock(&sh.inner).data.is_empty() {
                 break;

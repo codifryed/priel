@@ -415,20 +415,27 @@ impl App {
         flow.status = Some("signing in…".into());
         let (tx, rx) = std::sync::mpsc::channel();
         let (pkce, key) = (flow.pkce.clone(), flow.unique_key.clone());
-        std::thread::spawn(move || {
-            let agent = priel_core::new_agent();
-            let outcome = priel_core::auth::exchange_code(
-                &agent,
-                &creds.into_config(),
-                &code,
-                &pkce,
-                &key,
-                priel_core::auth::now_epoch(),
-            )
-            .and_then(|token| token.save(&token_path))
-            .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(outcome);
-        });
+        // Named for the log. A failure to start drops the sending end, and
+        // `drain_login` already reports a sign-in that did not finish.
+        let started = std::thread::Builder::new()
+            .name("login".into())
+            .spawn(move || {
+                let agent = priel_core::new_agent();
+                let outcome = priel_core::auth::exchange_code(
+                    &agent,
+                    &creds.into_config(),
+                    &code,
+                    &pkce,
+                    &key,
+                    priel_core::auth::now_epoch(),
+                )
+                .and_then(|token| token.save(&token_path))
+                .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(outcome);
+            });
+        if let Err(e) = started {
+            log::error!("no thread for the sign-in exchange: {e}");
+        }
         flow.exchanging = Some(rx);
         self.dirty = true;
     }
@@ -564,14 +571,20 @@ impl App {
         }
         self.credential_status = Some("downloading…".into());
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let agent = priel_core::new_agent();
-            let outcome =
-                priel_core::auth::fetch_credentials(&agent, priel_core::auth::UPSTREAM_SOURCES)
-                    .and_then(|creds| creds.save(&path))
-                    .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(outcome);
-        });
+        // As above: `drain_fetch` reports a download that did not finish.
+        let started = std::thread::Builder::new()
+            .name("credentials".into())
+            .spawn(move || {
+                let agent = priel_core::new_agent();
+                let outcome =
+                    priel_core::auth::fetch_credentials(&agent, priel_core::auth::UPSTREAM_SOURCES)
+                        .and_then(|creds| creds.save(&path))
+                        .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(outcome);
+            });
+        if let Err(e) = started {
+            log::error!("no thread for the client-key download: {e}");
+        }
         self.fetching = Some(rx);
     }
 

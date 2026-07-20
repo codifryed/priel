@@ -28,7 +28,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use priel_core::PlayableSource;
 
 use crate::hw::HwParams;
@@ -287,9 +287,8 @@ impl Player {
     /// default sink, or `Some("null")` for a silent test.
     ///
     /// # Errors
-    /// Reserved. Both backends start their thread infallibly and report an mpv
-    /// init failure on that thread, so this does not fail today; the signature
-    /// stays fallible so propagating that failure later is not a breaking change.
+    /// If the player thread cannot be started. An mpv init failure is *not*
+    /// reported here: it happens on that thread and is recorded in the log.
     pub fn new(audio_device: Option<String>) -> Result<Self> {
         Self::with_config(PlayerConfig {
             audio_device,
@@ -300,11 +299,12 @@ impl Player {
     /// Create a player from a full configuration.
     ///
     /// # Errors
-    /// Reserved, exactly as for [`Player::new`].
+    /// If the player thread cannot be started.
     pub fn with_config(config: PlayerConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let status = Arc::new(Mutex::new(PlaybackStatus::default()));
-        let handle = backend::spawn(config, rx, status.clone());
+        let handle =
+            backend::spawn(config, rx, status.clone()).context("starting the player thread")?;
         Ok(Self {
             tx,
             status,

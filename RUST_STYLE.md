@@ -163,6 +163,10 @@ and is lost. Diagnostics go to `$XDG_STATE_HOME/priel/priel.log` through the sin
 - **Nothing may log from mpv's `read`/`seek` callbacks.** Formatting allocates, and those
   callbacks may not. Log at the edges instead - the protocol open, the segment fetched, the
   starved buffer - which is where the useful data is anyway.
+- **Every thread priel starts is named**, via `thread::Builder::new().name(..)`: the log records
+  which thread wrote each line, and `-` places nothing. That makes spawning fallible, and none of
+  those failures is a panic - each site has a caller that already copes with the thread being
+  absent, from `Player::with_config` returning `Err` to the app's own worker-disconnect check.
 - A log line is developer-facing and `App::notice` is user-facing. A failure the user has to
   act on needs both; neither substitutes for the other, and neither substitutes for a typed
   error where the caller has to branch.

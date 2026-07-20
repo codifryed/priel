@@ -145,7 +145,8 @@ pub fn init(level: LevelFilter, path: &str, recent: &Recent) -> Result<()> {
     // sitting in the buffer when the process dies - is bought back by flushing
     // every warning, and by the panic hook flushing before it lets go.
     let out = std::io::BufWriter::new(file);
-    let (logger, _writer) = Logger::with_sink(level, out, MAX_BYTES, recent.clone());
+    let (logger, _writer) = Logger::with_sink(level, out, MAX_BYTES, recent.clone())
+        .context("starting the log writer thread")?;
     // The handle is dropped on purpose: the writer thread lives as long as the
     // process, since the installed logger keeps its end of the queue forever.
     log::set_boxed_logger(Box::new(logger)).context("installing the logger")?;
@@ -179,11 +180,15 @@ impl Logger {
         out: W,
         limit: u64,
         recent: Recent,
-    ) -> (Self, JoinHandle<()>) {
+    ) -> std::io::Result<(Self, JoinHandle<()>)> {
         let (tx, rx) = sync_channel(QUEUE_DEPTH);
         let mut sink = Sink::new(out, limit, recent);
-        let writer = std::thread::spawn(move || sink.run(&rx));
-        (Self::with_channel(level, tx), writer)
+        // Named so its own lines are placeable, like every other thread priel
+        // starts. Fallible for the same reason: `thread::spawn` would panic.
+        let writer = std::thread::Builder::new()
+            .name("log".into())
+            .spawn(move || sink.run(&rx))?;
+        Ok((Self::with_channel(level, tx), writer))
     }
 
     /// A logger posting to an existing channel, so the queue can be inspected
@@ -505,6 +510,22 @@ mod tests {
     }
 
     #[test]
+    fn a_line_says_which_thread_wrote_it() {
+        // Goal: the thread column is what tells a worker failure from a player
+        // one, and it reads whatever name the thread was given at spawn. A
+        // thread with no name is recorded as "-", which places nothing.
+        let (tx, rx) = sync_channel(4);
+        let logger = Logger::with_channel(LevelFilter::Info, tx);
+        std::thread::Builder::new()
+            .name("worker".into())
+            .spawn(move || logger.log(&record(Level::Warn, &format_args!("from over here"))))
+            .expect("a test thread")
+            .join()
+            .expect("the thread should not panic");
+        assert!(drain(&rx).join("").contains("[worker]"));
+    }
+
+    #[test]
     fn the_level_decides_what_is_recorded() {
         // Goal: --log-level is the whole verbosity control, so the filter has to
         // hold for the macros' own check and for ours.
@@ -578,7 +599,8 @@ mod tests {
             shared.clone(),
             MAX_BYTES,
             Recent::default(),
-        );
+        )
+        .expect("a writer thread");
         logger.log(&record(Level::Error, &format_args!("boom")));
         logger.flush();
         assert!(shared.text().contains("boom"), "{}", shared.text());
@@ -610,7 +632,8 @@ mod tests {
         let shared = Shared::default();
         let recent = Recent::default();
         let (logger, _writer) =
-            Logger::with_sink(LevelFilter::Info, shared.clone(), MAX_BYTES, recent.clone());
+            Logger::with_sink(LevelFilter::Info, shared.clone(), MAX_BYTES, recent.clone())
+                .expect("a writer thread");
         logger.log(&record(Level::Error, &format_args!("boom")));
         logger.flush();
         assert!(shared.text().contains("boom"));

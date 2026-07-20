@@ -92,7 +92,10 @@ where
     let (tx, cmd_rx) = mpsc::channel::<ToWorker>();
     let (evt_tx, rx) = mpsc::channel::<FromWorker>();
 
-    thread::spawn(move || {
+    // Named so the log can say which thread a line came from. If the OS will
+    // not give us one, both channel ends drop with the closure and the app's own
+    // disconnect check reports it - which is a better failure than a panic.
+    let started = thread::Builder::new().name("worker".into()).spawn(move || {
         let mut client = match build() {
             Ok(c) => c,
             Err(e) => {
@@ -137,6 +140,9 @@ where
         // worker that stopped for any other reason.
         log::info!("the worker thread is stopping");
     });
+    if let Err(e) = started {
+        log::error!("no thread for the worker: {e}");
+    }
 
     Worker { tx, rx }
 }
