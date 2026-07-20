@@ -1907,6 +1907,7 @@ mod tests {
                     node("Loopback", NodeRole::Intermediate, 48_000, "F32LE"),
                     node("Studio DAC", NodeRole::Device, 48_000, "S32LE"),
                 ],
+                ..AudioGraph::default()
             },
         );
         sc.app.mode = Mode::Graph;
@@ -1945,6 +1946,7 @@ mod tests {
                     node("Loopback", NodeRole::Intermediate, 48_000, "F32LE"),
                     node("Studio DAC", NodeRole::Device, 48_000, "S32LE"),
                 ],
+                ..AudioGraph::default()
             },
         );
         sc.app.mode = Mode::Graph;
@@ -2159,6 +2161,7 @@ mod tests {
                         96_000,
                         "S24_3LE",
                     )],
+                    ..AudioGraph::default()
                 },
             );
             sc.app.mode = Mode::Graph;

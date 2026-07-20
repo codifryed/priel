@@ -3799,6 +3799,7 @@ mod tests {
                     channels: Some(2),
                 },
             ],
+            ..AudioGraph::default()
         }
     }
 

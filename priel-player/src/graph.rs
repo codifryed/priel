@@ -99,6 +99,38 @@ pub struct GraphNode {
 pub struct AudioGraph {
     /// The stream first, the device last. Never empty when this is `Ok`.
     pub path: Vec<GraphNode>,
+    /// What the server is permitted to clock this chain at, read from the same
+    /// dump so the chain and the setting cannot come from two moments.
+    pub clock: ClockRates,
+}
+
+/// The rates the sound server is permitted to clock its graph at.
+///
+/// This is where a resample that no node on the path accounts for usually comes
+/// from. [`AudioGraph::attribute`] compares node against node, and a rate the
+/// server was never allowed to run at is refused *before* any of them sees a
+/// sample - so the chain diverges nowhere and something still moved. That is
+/// [`Attribution::Unexplained`], and this is the other half of the answer.
+///
+/// Every field is `None` for "the dump did not say", which is deliberately not
+/// the same as an empty list: an empty `clock.allowed-rates` is a finding - the
+/// server may not switch rates at all - and no list is the absence of one.
+/// Reporting the second as the first would advise a change from data that was
+/// never read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClockRates {
+    /// The rates the server may switch between, in the order it publishes them.
+    ///
+    /// `Some([])` is an empty published list, which pins the graph to
+    /// [`current_hz`](Self::current_hz); `None` is a dump that named no list at
+    /// all.
+    pub allowed_hz: Option<Vec<u32>>,
+    /// `clock.rate`: the rate the graph runs at when it is not switching.
+    pub current_hz: Option<u32>,
+    /// `clock.force-rate`, when something set it: the graph is pinned here and
+    /// the permitted list is not consulted at all. Zero on the wire means unset
+    /// and arrives here as `None`, because "pinned to 0 Hz" is not a thing.
+    pub forced_hz: Option<u32>,
 }
 
 /// The track as the decoder produced it, which every node is compared against.
@@ -407,6 +439,89 @@ pub fn parse_sinks(dump: &str) -> Vec<ServerSink> {
         .collect()
 }
 
+/// Pull the server's clock settings out of a `pw-dump` object list.
+///
+/// Separate from [`parse`] so the reading is testable against a recorded dump,
+/// and because it does not need priel to have a stream in the graph: the setting
+/// is the server's, not this process's.
+///
+/// Anything unreadable is [`ClockRates::default`], which claims nothing. There
+/// is no error arm because there is nothing a caller could do with one that it
+/// would not also do with "the dump did not say".
+#[must_use]
+pub fn parse_clock(dump: &str) -> ClockRates {
+    let Ok(objects) = serde_json::from_str::<Vec<Value>>(dump) else {
+        return ClockRates::default();
+    };
+    clock_of(&objects)
+}
+
+/// The live settings first, the configured ones second.
+///
+/// The `settings` metadata is what the server is running on *now* and can be
+/// changed while it runs; the core object carries what its configuration asked
+/// for. Preferring the file's answer over the running one would advise a change
+/// that has already been made.
+fn clock_of(objects: &[Value]) -> ClockRates {
+    let live = objects.iter().find(|o| {
+        is_type(o, "PipeWire:Interface:Metadata")
+            && o.pointer("/props/metadata.name").and_then(Value::as_str) == Some("settings")
+    });
+    let core = objects
+        .iter()
+        .find(|o| is_type(o, "PipeWire:Interface:Core"));
+    let configured = |key: &str| core.and_then(|o| o.pointer(&format!("/info/props/{key}")));
+
+    ClockRates {
+        allowed_hz: live
+            .and_then(|o| setting(o, "clock.allowed-rates"))
+            .and_then(rate_list)
+            .or_else(|| configured("default.clock.allowed-rates").and_then(rate_list)),
+        current_hz: live
+            .and_then(|o| setting(o, "clock.rate"))
+            .and_then(as_u32)
+            .or_else(|| configured("default.clock.rate").and_then(as_u32)),
+        // Only the live metadata carries this one: it is set at runtime and has
+        // no spelling in the configuration file.
+        forced_hz: live
+            .and_then(|o| setting(o, "clock.force-rate"))
+            .and_then(as_u32)
+            .filter(|&hz| hz > 0),
+    }
+}
+
+/// One entry out of a metadata object's list.
+fn setting<'a>(metadata: &'a Value, key: &str) -> Option<&'a Value> {
+    metadata
+        .get("metadata")?
+        .as_array()?
+        .iter()
+        .find(|e| e.get("key").and_then(Value::as_str) == Some(key))
+        .and_then(|e| e.get("value"))
+}
+
+/// Every rate in a rate list, however this build chose to spell one.
+///
+/// The same list arrives from the live metadata as `"[ 44100, 48000 ]"` and
+/// from the core object as a multi-line array of *quoted* strings, and a build
+/// that published a real JSON array would be a third spelling. So the runs of
+/// digits are read and the punctuation between them is not: nothing in a rate
+/// list is a rate except a number.
+///
+/// `None` for a value that is neither text nor an array, because an empty list
+/// is a finding and must not be invented out of something unread.
+fn rate_list(v: &Value) -> Option<Vec<u32>> {
+    if let Some(items) = v.as_array() {
+        return Some(items.iter().filter_map(as_u32).collect());
+    }
+    let text = v.as_str()?;
+    Some(
+        text.split(|c: char| !c.is_ascii_digit())
+            .filter_map(|run| run.parse().ok())
+            .collect(),
+    )
+}
+
 /// Pull the path belonging to `pid` out of a `pw-dump` object list.
 ///
 /// Separate from [`probe`] so the parsing is testable against a recorded dump
@@ -447,7 +562,10 @@ pub fn parse(dump: &str, pid: u32) -> Result<AudioGraph, GraphError> {
     if path.is_empty() {
         return Err(GraphError::NoStream);
     }
-    Ok(AudioGraph { path })
+    Ok(AudioGraph {
+        path,
+        clock: clock_of(&objects),
+    })
 }
 
 /// Where a hop sits, from its position rather than from its `media.class`.
@@ -587,13 +705,28 @@ fn as_u32(v: &Value) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Attribution, AudioGraph, GraphError, NodeRole, SourceFormat, parse, parse_sinks};
+    use super::{
+        Attribution, AudioGraph, ClockRates, GraphError, NodeRole, SourceFormat, parse,
+        parse_clock, parse_sinks,
+    };
     use crate::Alteration;
 
     /// A real `pw-dump`, taken while priel was playing a 44.1 kHz track into a
     /// USB DAC. Trimmed to the objects on the path plus one unrelated sink, and
     /// with the host and user names replaced; nothing else was touched.
     const DUMP: &str = include_str!("../tests/fixtures/pw-dump-usb-dac.json");
+
+    /// A real `pw-dump`, trimmed to the two objects that carry the server's
+    /// clock settings: the `settings` metadata it publishes live, and the core
+    /// object carrying what the configuration asked for. Host and user names
+    /// replaced and the unrelated properties dropped; the clock entries are
+    /// verbatim, including the two different ways this build spells a rate
+    /// list.
+    ///
+    /// Separate from [`DUMP`] rather than spliced into it: that capture was
+    /// trimmed to the path before this slice existed, and a dump with no clock
+    /// settings in it is itself a case worth keeping.
+    const CLOCK: &str = include_str!("../tests/fixtures/pw-dump-clock-settings.json");
 
     /// The pid priel was running under when the fixture was captured.
     const PID: u32 = 3_124_085;
@@ -1058,6 +1191,164 @@ mod tests {
             Attribution::NothingToCompare,
             "no node said how wide it was, so nothing was checked"
         );
+    }
+
+    #[test]
+    fn the_rates_the_server_may_clock_at_come_from_the_dump_already_being_read() {
+        // Goal: the permitted list is the other half of the diagnosis, and it
+        // has to come from the dump priel already runs rather than from a
+        // second source of truth on disk. The live `settings` metadata is what
+        // the server is using *now*, which is the question being asked.
+        let clock = parse_clock(CLOCK);
+        assert_eq!(
+            clock.allowed_hz.as_deref(),
+            Some(
+                [
+                    44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600,
+                    768_000
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            clock.current_hz,
+            Some(48_000),
+            "clock.rate, what it sits at"
+        );
+        assert_eq!(
+            clock.forced_hz, None,
+            "a force-rate of zero is not pinned, not pinned to zero"
+        );
+    }
+
+    #[test]
+    fn a_dump_that_says_nothing_about_the_clock_is_unknown_rather_than_empty() {
+        // Goal: the discipline this whole slice turns on. An empty list is a
+        // finding - the server may not switch rates at all - and no list is the
+        // absence of one. Reporting the second as the first would advise a
+        // change from data that was never there.
+        let unknown = ClockRates::default();
+        assert_eq!(parse_clock(DUMP), unknown, "trimmed to the path, no clock");
+        assert_eq!(parse_clock(""), unknown);
+        assert_eq!(parse_clock("not json at all"), unknown);
+        assert_eq!(parse_clock("[]"), unknown);
+        assert_eq!(
+            parse_clock(&CLOCK[..CLOCK.len() / 2]),
+            unknown,
+            "a truncated dump is no better than none"
+        );
+        assert!(unknown.allowed_hz.is_none(), "unknown, not an empty list");
+    }
+
+    #[test]
+    fn a_server_that_may_not_switch_rates_at_all_says_so_rather_than_going_quiet() {
+        // Goal: an empty `clock.allowed-rates` is the default on a great many
+        // machines and is exactly the setup this feature exists to explain. It
+        // must parse as a known, empty list - the one case where every track
+        // off the server's own rate is resampled.
+        let dump = r#"[
+          {"id": 32, "type": "PipeWire:Interface:Metadata",
+           "props": {"metadata.name": "settings"},
+           "metadata": [
+             {"subject": 0, "key": "clock.rate", "type": "", "value": 48000},
+             {"subject": 0, "key": "clock.allowed-rates", "type": "", "value": "[ ]"}
+           ]}
+        ]"#;
+        let clock = parse_clock(dump);
+        assert_eq!(clock.allowed_hz.as_deref(), Some([].as_slice()));
+        assert_eq!(clock.current_hz, Some(48_000));
+    }
+
+    #[test]
+    fn what_the_server_is_running_now_wins_over_what_its_configuration_asked_for() {
+        // Goal: the metadata can be changed at runtime and the core object
+        // still carries what the file said. Reading the file's answer while the
+        // server runs on another would advise a change that is already made.
+        let dump = r#"[
+          {"id": 0, "type": "PipeWire:Interface:Core",
+           "info": {"props": {"default.clock.allowed-rates": "[ \"48000\" ]",
+                              "default.clock.rate": 48000}}},
+          {"id": 32, "type": "PipeWire:Interface:Metadata",
+           "props": {"metadata.name": "settings"},
+           "metadata": [
+             {"subject": 0, "key": "clock.rate", "type": "", "value": 44100},
+             {"subject": 0, "key": "clock.allowed-rates", "type": "",
+              "value": "[ 44100, 48000 ]"}
+           ]}
+        ]"#;
+        let clock = parse_clock(dump);
+        assert_eq!(
+            clock.allowed_hz.as_deref(),
+            Some([44_100, 48_000].as_slice())
+        );
+        assert_eq!(clock.current_hz, Some(44_100));
+    }
+
+    #[test]
+    fn the_configured_list_is_read_when_the_server_publishes_no_live_one() {
+        // Goal: not every build publishes a `settings` metadata, and the core
+        // object carries the configured list in a different spelling again -
+        // quoted strings across several lines. Both are the same list.
+        let dump = r#"[
+          {"id": 0, "type": "PipeWire:Interface:Core",
+           "info": {"props": {
+             "default.clock.allowed-rates": "[\n  \"44100\",\n  \"96000\"\n]",
+             "default.clock.rate": 48000}}}
+        ]"#;
+        let clock = parse_clock(dump);
+        assert_eq!(
+            clock.allowed_hz.as_deref(),
+            Some([44_100, 96_000].as_slice())
+        );
+        assert_eq!(clock.current_hz, Some(48_000));
+    }
+
+    #[test]
+    fn a_server_pinned_to_one_rate_is_reported_as_pinned_and_not_as_a_list() {
+        // Goal: `clock.force-rate` overrides the permitted list outright. A
+        // machine with it set would otherwise be told to add a rate to a list
+        // the server is no longer consulting, which is a change that does
+        // nothing - the exact wrong-explanation failure this slice guards.
+        let dump = r#"[
+          {"id": 32, "type": "PipeWire:Interface:Metadata",
+           "props": {"metadata.name": "settings"},
+           "metadata": [
+             {"subject": 0, "key": "clock.rate", "type": "", "value": 48000},
+             {"subject": 0, "key": "clock.allowed-rates", "type": "",
+              "value": "[ 44100, 48000 ]"},
+             {"subject": 0, "key": "clock.force-rate", "type": "", "value": 48000}
+           ]}
+        ]"#;
+        let clock = parse_clock(dump);
+        assert_eq!(clock.forced_hz, Some(48_000));
+        assert_eq!(
+            clock.allowed_hz.as_deref(),
+            Some([44_100, 48_000].as_slice()),
+            "the list is still reported; it is simply not what decides"
+        );
+    }
+
+    #[test]
+    fn a_metadata_that_is_not_the_settings_one_is_not_read_as_it() {
+        // Goal: a session carries several metadata objects - default sinks,
+        // route settings, a schema - and they share the entry shape. Only the
+        // one named `settings` holds the clock.
+        let dump = r#"[
+          {"id": 30, "type": "PipeWire:Interface:Metadata",
+           "props": {"metadata.name": "default"},
+           "metadata": [
+             {"subject": 0, "key": "clock.allowed-rates", "type": "", "value": "[ 96000 ]"}
+           ]}
+        ]"#;
+        assert_eq!(parse_clock(dump), ClockRates::default());
+    }
+
+    #[test]
+    fn the_graph_carries_the_clock_settings_read_from_the_same_dump() {
+        // Goal: one `pw-dump` answers both questions, so the overlay cannot
+        // show a chain from one moment and a setting from another.
+        let g = path_of(DUMP, PID);
+        assert_eq!(g.clock, ClockRates::default(), "this capture carries none");
     }
 
     #[test]
