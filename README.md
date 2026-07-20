@@ -80,7 +80,7 @@ roadmap below.
 
 ## Install
 
-Needs Rust ≥ 1.85, `libmpv` (`mpv-devel` / `libmpv-dev` to build), a working
+Needs Rust ≥ 1.88, `libmpv` (`mpv-devel` / `libmpv-dev` to build), a working
 PipeWire or ALSA setup, and a subscription.
 
 **Signing in.** On first run priel opens your browser, you sign in, and you land
@@ -228,7 +228,7 @@ rules live in [`RUST_STYLE.md`](RUST_STYLE.md).
   binary parses with** (`make assets`), so they cannot drift from reality.
 - `make dist` produces a source tarball; `make vendor` vendors the crates for an
   offline build. `CARGO_FLAGS` defaults to `--locked`.
-- Minimum supported Rust is 1.85, declared as `rust-version` in the workspace.
+- Minimum supported Rust is 1.88, declared as `rust-version` in the workspace.
 - No trademarked term appears in the package name, binary name, crate names, or
   any identifier — the service is named only in prose describing what the client
   talks to. Do not ship the TIDAL logo, wordmark, or brand typography with the

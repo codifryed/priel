@@ -271,8 +271,13 @@ and is lost. Diagnostics go to `$XDG_STATE_HOME/priel/priel.log` through the sin
 - Prefer fixing over allowing where a real conversion exists: `u32::try_from(..).ok()` for a value
   that could be out of range, `i8::from_ne_bytes([b])` when reinterpreting a byte rather than
   numerically converting it.
-- MSRV is 1.85, the edition-2024 floor, declared as `rust-version` in `[workspace.package]`. Do not
-  raise it for convenience - clippy honours it and will stop suggesting newer APIs. Distro
+- MSRV is 1.88, declared as `rust-version` in `[workspace.package]`. It is **the lowest toolchain
+  that builds, not the newest one installed**: the source uses let chains (stable from 1.88 in
+  edition 2024) and the dependency tree declares 1.88 in seven places. Raise it only when something
+  concrete needs it, and say what in the commit subject - every version above the floor excludes a
+  packager for nothing. Verify a change with `cargo +<msrv> check --workspace --all-targets
+  --locked`; the metadata alone will not tell you, since a language feature can raise the floor
+  without any dependency doing so. Do not raise it for convenience - clippy honours it and will stop suggesting newer APIs. Distro
   packaging is a goal, and distro toolchains lag.
 
 ### Naming and the trademark constraint

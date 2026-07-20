@@ -1085,7 +1085,7 @@ fn fmt_khz(hz: u32) -> String {
     if hz == 0 {
         return "?".to_string();
     }
-    if hz % 1000 == 0 {
+    if hz.is_multiple_of(1000) {
         format!("{} kHz", hz / 1000)
     } else {
         format!("{:.1} kHz", f64::from(hz) / 1000.0)

@@ -15,8 +15,11 @@ members = ["priel-core", "priel-player", "priel-tui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# Edition 2024 requires 1.85; nothing here needs newer.
-rust-version = "1.85"
+# The lowest toolchain that actually builds, which is what this field promises.
+# Two independent things set it: the source uses let chains, stable from 1.88 in
+# edition 2024, and seven crates in the tree declare 1.88 themselves. Nothing
+# wants newer, so nothing here is newer - raising it excludes packagers for free.
+rust-version = "1.88"
 license = "GPL-3.0-or-later"
 repository = ""
 
