@@ -148,6 +148,27 @@ async would buy nothing at the one boundary where it would have to earn its keep
 - Per-tick allocation in the player loop or the render path is a red flag. Allocation in `fn new`
   or a one-shot resolve is fine.
 
+### Diagnostics
+
+priel owns the whole terminal, so anything printed to stderr lands on the alternate screen
+and is lost. Diagnostics go to `$XDG_STATE_HOME/priel/priel.log` through the sink in
+`priel-tui/src/logging.rs`.
+
+- The libraries use the `log` facade and nothing else. They still return errors rather than
+  printing them, and the facade costs a future GUI frontend nothing: it installs its own sink.
+- **Logging never does I/O on the calling thread.** A record is formatted and posted to a
+  bounded queue that one writer thread drains. A full queue drops records and reports how
+  many; it must never block the UI or the player. `Logger::flush` is the single deliberate
+  round-trip, and it exists for the way out.
+- **Nothing may log from mpv's `read`/`seek` callbacks.** Formatting allocates, and those
+  callbacks may not. Log at the edges instead - the protocol open, the segment fetched, the
+  starved buffer - which is where the useful data is anyway.
+- A log line is developer-facing and `App::notice` is user-facing. A failure the user has to
+  act on needs both; neither substitutes for the other, and neither substitutes for a typed
+  error where the caller has to branch.
+- Release builds are `panic = "abort"`, so the panic hook in `main.rs` is the only chance to
+  record a panic on any thread. It writes and flushes before restoring the terminal.
+
 ## Developer Experience
 
 ### Naming

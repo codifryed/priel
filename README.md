@@ -93,7 +93,14 @@ runtime state, closer to a persisted cookie than to a setting, so they live in
 `~/.local/state/priel/`. The only thing in `~/.config/priel/` is a
 `credentials.json` you write yourself, which overrides the obtained one. priel
 never reads or writes another application's files, and it moves its own out of
-the old config location once, so an existing session is not lost.
+the old config location once, so an existing session is not lost. There is no
+flag for the session path: pointing priel at a file another application owns
+would rewrite it on every token refresh.
+
+`~/.local/state/priel/priel.log` is the diagnostic log, started fresh each run
+and holding warnings and errors by default. `--log-level debug` (or
+`PRIEL_LOG=debug`) is what to attach to a bug report; `--log-level off` keeps no
+file at all.
 
 Set `PRIEL_NO_BROWSER=1` to stop priel launching a browser; the sign-in screen
 always shows the URL as well, so a headless or remote session still works.
@@ -127,7 +134,8 @@ make run ARGS="--device pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-outp
 ```
 
 `--device` is optional; the default sink is used when it is omitted.
-`--token-file` overrides the token path. See `man priel` or `priel --help`.
+`--log-level` and `--log-file` control the diagnostic log. See `man priel` or
+`priel --help`.
 
 For UI work or a machine without mpv headers, `make build-nolibmpv` compiles the
 interface with playback stubbed out.

@@ -763,6 +763,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "crossterm",
+ "log",
  "priel-core",
  "priel-player",
  "rand",

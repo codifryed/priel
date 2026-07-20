@@ -20,17 +20,19 @@
 //! (herdr/ncspot-inspired). Unofficial; not affiliated with or endorsed by TIDAL.
 //!
 //!   --device <mpv-device>   e.g. pipewire/alsa_output.usb-SMSL...pro-output-0
-//!   --token-file <path>     saved session (default: `~/.config/priel/token.json`)
+//!   --log-level <level>     diagnostics detail (default: warn; `$PRIEL_LOG` too)
+//!   --log-file <path>       default: `~/.local/state/priel/priel.log`
 
 mod app;
 mod cli;
+mod logging;
 mod ui;
 mod worker;
 
 use std::io::{self, Stdout};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
     event::{
@@ -50,6 +52,43 @@ fn main() -> Result<()> {
     // clap handles --help and --version itself, exiting before we touch the
     // terminal - important, since setup() puts it in raw mode.
     let args = cli::Cli::parse();
+    // Started before the terminal is taken, so a problem opening the log lands
+    // on a stderr the user can still see. It is never fatal: priel plays music
+    // with or without a log.
+    //
+    // Done here rather than in `App::new` for the same reason as the migration
+    // below - it writes to the user's home directory, and tests build an `App`.
+    if let Err(e) = logging::init(args.log_level(), &args.log_path()) {
+        eprintln!("priel: no diagnostic log: {e:#}");
+    }
+    log::info!("priel {} starting", env!("CARGO_PKG_VERSION"));
+    // Installed here, before the terminal exists, so it sits underneath the
+    // restoring hook that `setup` adds and covers the run that never gets that
+    // far. The hook is global, so it also catches the worker, player and
+    // downloader threads, whose panics otherwise leave no trace at all - and
+    // release builds are `panic = "abort"`, so there is no second chance.
+    let orig = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        logging::record_panic(&info.to_string());
+        orig(info);
+    }));
+    let outcome = session(args);
+    match &outcome {
+        Ok(()) => log::info!("priel stopping"),
+        Err(e) => log::error!("exiting: {e:?}"),
+    }
+    // The writer thread is detached and its sink is buffered, so the tail of the
+    // log has to be asked for.
+    log::logger().flush();
+    outcome
+}
+
+/// Everything between the log being up and the log being flushed.
+///
+/// Split out so that no exit path can skip the record of why priel stopped: a
+/// terminal that cannot be prepared used to return straight out of `main`,
+/// leaving the one file that would have explained it empty.
+fn session(args: cli::Cli) -> Result<()> {
     // Both files used to live in the config directory. Move them once rather
     // than silently logging the user out to make a spec point.
     //
@@ -57,12 +96,14 @@ fn main() -> Result<()> {
     // home directory, and `App::new` is constructed by tests.
     priel_core::auth::migrate_from_config("token.json");
     priel_core::auth::migrate_from_config("credentials.json");
-    let token = args.token_path();
-    let mut terminal = setup()?;
-    let res = App::new(args.device, token)
+    let mut terminal = setup().context("preparing the terminal")?;
+    let res = App::new(args.device, priel_core::Client::default_token_path())
         .and_then(|mut app| run(&mut terminal, &mut app, &mut TerminalEvents));
     restore(&mut terminal)?;
+    // Reported rather than returned: the terminal is back, and printing the
+    // error beats anyhow's own rendering of it after an interactive session.
     if let Err(e) = res {
+        log::error!("the session ended in an error: {e:?}");
         eprintln!("priel error: {e:?}");
     }
     Ok(())
@@ -205,23 +246,61 @@ mod tests {
     }
 
     #[test]
-    fn no_arguments_means_default_sink_and_default_token() {
-        // Goal: priel must be runnable with no flags at all.
+    fn no_arguments_means_default_sink_and_a_quiet_log() {
+        // Goal: priel must be runnable with no flags at all, and the log it
+        // keeps by default must be small enough that nobody has to think about
+        // it - warnings and errors only.
         let cli = parse(&[]);
         assert!(
             cli.device.is_none(),
             "no --device means the system default sink"
         );
-        assert!(cli.token_path().ends_with("/priel/token.json"));
+        assert_eq!(cli.log_level(), log::LevelFilter::Warn);
+        assert!(cli.log_path().ends_with("/priel/priel.log"));
     }
 
     #[test]
-    fn the_device_and_token_flags_are_read() {
-        // Goal: --device is how a user reaches their DAC and --token-file is how
-        // they point at a non-standard login.
-        let cli = parse(&["--device", "pipewire/dac", "--token-file", "/t.json"]);
+    fn the_device_flag_is_read() {
+        // Goal: --device is how a user reaches their DAC.
+        let cli = parse(&["--device", "pipewire/dac"]);
         assert_eq!(cli.device.as_deref(), Some("pipewire/dac"));
-        assert_eq!(cli.token_path(), "/t.json");
+    }
+
+    #[test]
+    fn the_log_flags_are_read() {
+        // Goal: raising the level and redirecting the file are the two things
+        // asked of a user who is reporting a bug.
+        let cli = parse(&["--log-level", "debug", "--log-file", "/tmp/p.log"]);
+        assert_eq!(cli.log_level(), log::LevelFilter::Debug);
+        assert_eq!(cli.log_path(), "/tmp/p.log");
+    }
+
+    #[test]
+    fn the_environment_sets_the_level_only_when_the_flag_does_not() {
+        // Goal: $PRIEL_LOG is how a user raises the level when priel is started
+        // from a launcher rather than a shell. A typo there falls back to the
+        // default instead of refusing to start: it gets set once and forgotten,
+        // and it must not be able to cost someone their music player.
+        use crate::cli::LogLevel;
+        use log::LevelFilter;
+        assert_eq!(Cli::resolve_level(None, Some("debug")), LevelFilter::Debug);
+        assert_eq!(Cli::resolve_level(None, Some("DEBUG")), LevelFilter::Debug);
+        assert_eq!(
+            Cli::resolve_level(Some(LogLevel::Error), Some("trace")),
+            LevelFilter::Error,
+            "the flag wins"
+        );
+        assert_eq!(Cli::resolve_level(None, Some("verbose")), LevelFilter::Warn);
+        assert_eq!(Cli::resolve_level(None, None), LevelFilter::Warn);
+    }
+
+    #[test]
+    fn the_token_file_flag_is_gone() {
+        // Goal: the session lives at one XDG path and nowhere else. Pointing
+        // priel at another application's file would rewrite it on every token
+        // refresh, so there is deliberately no way to ask for that.
+        let err = Cli::try_parse_from(["priel", "--token-file", "/t.json"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -270,7 +349,7 @@ mod tests {
         let help = Cli::command().render_help().to_string();
         assert!(help.contains("not affiliated"), "{help}");
         assert!(help.contains("--device"), "{help}");
-        assert!(help.contains("--token-file"), "{help}");
+        assert!(help.contains("--log-level"), "{help}");
         assert!(DISCLAIMER.contains("not affiliated"));
     }
 

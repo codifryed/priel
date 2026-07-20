@@ -30,6 +30,7 @@ anyhow.workspace = true
 priel-core.workspace = true
 priel-player = { workspace = true }
 clap.workspace = true
+log.workspace = true
 clap_complete = { workspace = true, optional = true }
 clap_mangen = { workspace = true, optional = true }
 ratatui = "0.29"

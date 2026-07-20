@@ -31,6 +31,10 @@ ring = "0.17"
 getrandom = "0.2"
 percent-encoding = "2.3"
 regex = "1"
+# The logging facade only: no sink, no dependencies of its own, and no work at
+# all when the level is off. The sink is written in-house in priel-tui, so a
+# future GUI frontend installs its own and the libraries stay UI-free.
+log = { version = "0.4", features = ["std"] }
 # ureq: blocking, rustls, no async runtime. No tokio/hyper anywhere in the tree.
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 clap = { version = "4", features = ["derive"] }
