@@ -615,9 +615,18 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn list_title(app: &App, count: usize) -> String {
     match app.view {
-        View::Favorites => format!(
-            "Favorites — {count} tracks   (Tab views · j/k move · Enter play · / filter · s shuffle)"
-        ),
+        View::Favorites => {
+            // Rows loaded against rows there are, while those differ. Without
+            // it a list that has only paged in its first hundred reads as the
+            // whole library, and the user has no reason to keep scrolling.
+            let of_total = app
+                .favorites_available()
+                .map_or(String::new(), |total| format!(" of {total}"));
+            format!(
+                "Favorites — {count}{of_total} tracks   \
+                 (Tab views · j/k move · Enter play · / filter · s shuffle)"
+            )
+        }
         View::Playlists => format!("Playlists — {count}   (Enter to open · j/k move)"),
         View::PlaylistTracks => {
             let name = app.open_playlist.as_ref().map_or("", |(_, t)| t.as_str());
@@ -1312,6 +1321,23 @@ mod tests {
         assert!(out.contains("Evening"), "{out}");
         assert!(out.contains("12"), "{out}");
         assert!(out.contains("1:02:05"), "hours format: {out}");
+    }
+
+    #[test]
+    fn the_favorites_heading_separates_rows_loaded_from_rows_there_are() {
+        // Goal: a list that has paged in its first hundred must not read as the
+        // whole library, or the user has no reason to keep scrolling. Once
+        // everything is loaded the second number says nothing, so it goes.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "One"), track(2, "Two")];
+        sc.app.favorites_paging.total = 417;
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains("2 of 417 tracks"), "{out}");
+
+        sc.app.favorites_paging.total = 2;
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains("2 tracks"), "{out}");
+        assert!(!out.contains(" of "), "nothing left to page in: {out}");
     }
 
     #[test]
