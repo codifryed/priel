@@ -230,11 +230,11 @@ const CREDENTIALS_PROMPT: &[&str] = &[
     "how every native player on Linux works.",
     "",
     "If you continue, priel downloads it once and saves it to",
-    "~/.config/priel/credentials.json. Nothing of yours is sent anywhere,",
-    "and you will not be asked again.",
+    "~/.local/state/priel/. Nothing of yours is sent anywhere, and you",
+    "will not be asked again.",
     "",
-    "Prefer to do it yourself? Put a client_id and client_secret in that",
-    "file and restart priel.",
+    "Prefer to do it yourself? Put a client_id and client_secret in",
+    "~/.config/priel/credentials.json and restart priel.",
 ];
 
 /// The complete reference, in two columns. The bottom row carries only what is

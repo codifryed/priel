@@ -88,9 +88,12 @@ on a page that looks like an error — that is expected. Copy its address, paste
 back into priel, and you are in. The session is renewed automatically from then
 on; if it ever lapses, `A` signs in again.
 
-Everything priel keeps lives under `~/.config/priel/`: `token.json` for the
-session and `credentials.json` for the client key. It never reads or writes
-another application's configuration.
+priel follows the XDG layout. Your session and the client key it obtained are
+runtime state, closer to a persisted cookie than to a setting, so they live in
+`~/.local/state/priel/`. The only thing in `~/.config/priel/` is a
+`credentials.json` you write yourself, which overrides the obtained one. priel
+never reads or writes another application's files, and it moves its own out of
+the old config location once, so an existing session is not lost.
 
 Set `PRIEL_NO_BROWSER=1` to stop priel launching a browser; the sign-in screen
 always shows the URL as well, so a headless or remote session still works.

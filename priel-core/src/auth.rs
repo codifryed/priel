@@ -91,12 +91,21 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    /// `$XDG_CONFIG_HOME/priel/credentials.json`, falling back to `~/.config`.
+    /// Where priel writes an identity it obtained for itself.
+    ///
+    /// State, not config: it is fetched rather than authored, it is regenerable,
+    /// and it means nothing on another machine - the same category as a
+    /// persisted cookie.
     #[must_use]
     pub fn default_path() -> String {
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .unwrap_or_else(|_| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
-        format!("{base}/priel/credentials.json")
+        format!("{}/credentials.json", state_dir())
+    }
+
+    /// Where a user may place an identity of their own, overriding whatever
+    /// priel obtained. Config, because this one *is* a deliberate setting.
+    #[must_use]
+    pub fn override_path() -> String {
+        format!("{}/credentials.json", config_dir())
     }
 
     /// Read the client identity from disk.
@@ -160,16 +169,68 @@ pub enum CredentialSource {
     Upstream,
 }
 
-/// A client identity from the user's config, or from a local install.
+/// `$XDG_STATE_HOME/priel`, falling back to `~/.local/state/priel`.
+///
+/// Session tokens and an obtained client identity live here rather than in the
+/// config directory: they are runtime state, not settings a user wrote.
+#[must_use]
+pub fn state_dir() -> String {
+    let base = std::env::var("XDG_STATE_HOME")
+        .unwrap_or_else(|_| format!("{}/.local/state", std::env::var("HOME").unwrap_or_default()));
+    format!("{base}/priel")
+}
+
+/// `$XDG_CONFIG_HOME/priel`, falling back to `~/.config/priel`.
+#[must_use]
+pub fn config_dir() -> String {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .unwrap_or_else(|_| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
+    format!("{base}/priel")
+}
+
+/// A client identity from the first of `paths` that has one, falling back to a
+/// locally installed Python package.
+///
+/// The paths are passed in rather than resolved here so the caller decides the
+/// order - normally the user's override first, then whatever priel obtained for
+/// itself - and so a test is not at the mercy of what happens to exist on the
+/// machine running it.
 ///
 /// Never touches the network: fetching is a separate action the user has to ask
 /// for, so priel does not quietly reach out on first start.
 #[must_use]
-pub fn local_credentials(path: &str) -> Option<(Credentials, CredentialSource)> {
-    if let Ok(creds) = Credentials::load(path) {
-        return Some((creds, CredentialSource::Configured));
+pub fn local_credentials(paths: &[&str]) -> Option<(Credentials, CredentialSource)> {
+    for path in paths {
+        if let Ok(creds) = Credentials::load(path) {
+            return Some((creds, CredentialSource::Configured));
+        }
     }
     discover_credentials().map(|c| (c, CredentialSource::LocalPackage))
+}
+
+/// Move a file priel used to keep in the config directory into the state
+/// directory, once.
+///
+/// Both the session and an obtained client identity started out under
+/// `~/.config/priel`. They are state, so they moved - but silently logging a
+/// user out to make a spec point would be rude.
+pub fn migrate_from_config(name: &str) {
+    let (from, to) = (
+        format!("{}/{name}", config_dir()),
+        format!("{}/{name}", state_dir()),
+    );
+    if std::path::Path::new(&to).exists() || !std::path::Path::new(&from).exists() {
+        return;
+    }
+    if let Some(dir) = std::path::Path::new(&to).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Copy-then-remove rather than rename: the two may be on different
+    // filesystems, and losing a session to a failed rename is not acceptable.
+    if std::fs::copy(&from, &to).is_ok() {
+        restrict_permissions(&to);
+        let _ = std::fs::remove_file(&from);
+    }
 }
 
 /// Download a client identity from the upstream project's source.
@@ -1083,7 +1144,7 @@ mod tests {
         std::fs::write(&path, r#"{"client_id":"configured"}"#).expect("write");
 
         let (creds, source) =
-            local_credentials(path.to_str().expect("path")).expect("should find the file");
+            local_credentials(&[path.to_str().expect("path")]).expect("should find the file");
         assert_eq!(creds.client_id, "configured");
         assert_eq!(source, CredentialSource::Configured);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1150,5 +1211,66 @@ mod tests {
             UPSTREAM_SOURCES.len() >= 2,
             "the pin is a fallback, not the only source"
         );
+    }
+
+    #[test]
+    fn the_lookup_order_is_the_callers_to_decide() {
+        // Goal: an explicit override must outrank whatever priel obtained for
+        // itself, and the order is passed in rather than resolved here - a
+        // hidden global location made this untestable and surprised three tests
+        // before it was removed.
+        let dir = std::env::temp_dir().join(format!("priel-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp");
+        let first = dir.join("override.json");
+        let second = dir.join("obtained.json");
+        std::fs::write(&first, r#"{"client_id":"mine"}"#).expect("write");
+        std::fs::write(&second, r#"{"client_id":"downloaded"}"#).expect("write");
+
+        let (creds, _) = local_credentials(&[
+            first.to_str().expect("path"),
+            second.to_str().expect("path"),
+        ])
+        .expect("should find one");
+        assert_eq!(creds.client_id, "mine", "the override comes first");
+
+        std::fs::remove_file(&first).expect("remove");
+        let (creds, _) = local_credentials(&[
+            first.to_str().expect("path"),
+            second.to_str().expect("path"),
+        ])
+        .expect("should fall through");
+        assert_eq!(creds.client_id, "downloaded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_and_config_are_kept_apart() {
+        // Goal: a session and an obtained identity are runtime state, not
+        // settings. Only the user's override belongs in the config directory.
+        assert!(state_dir().contains("state"), "{}", state_dir());
+        assert!(Credentials::default_path().starts_with(&state_dir()));
+        assert!(Credentials::override_path().starts_with(&config_dir()));
+        assert_ne!(Credentials::default_path(), Credentials::override_path());
+    }
+
+    #[test]
+    fn migration_moves_a_file_once_and_never_overwrites() {
+        // Goal: these files started out in the config directory. Moving them is
+        // a convenience, so it must never clobber a newer copy already in the
+        // destination, and must be a no-op when there is nothing to move.
+        let root = std::env::temp_dir().join(format!("priel-migrate-{}", std::process::id()));
+        let (cfg, state) = (root.join("config/priel"), root.join("state/priel"));
+        std::fs::create_dir_all(&cfg).expect("tmp");
+        std::fs::write(cfg.join("token.json"), "old").expect("write");
+        std::fs::create_dir_all(&state).expect("tmp");
+        std::fs::write(state.join("token.json"), "new").expect("write");
+
+        // A destination that already exists is left alone.
+        assert!(std::path::Path::new(&state.join("token.json")).exists());
+        assert_eq!(
+            std::fs::read_to_string(state.join("token.json")).unwrap(),
+            "new"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

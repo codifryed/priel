@@ -166,6 +166,9 @@ pub struct App {
     /// Where the credentials file should live, and the state of any attempt to
     /// populate it. `None` once there is nothing left to ask about.
     credentials_path: Option<String>,
+    /// Where to look for a client identity, in order: the user's override
+    /// first, then whatever priel obtained for itself.
+    credentials_lookup: Vec<String>,
     /// Kept so the worker can be rebuilt once credentials arrive, rather than
     /// asking the user to restart.
     token_path: Option<String>,
@@ -197,12 +200,20 @@ struct RenderSig {
 impl App {
     pub fn new(device: Option<String>, token_path: String) -> anyhow::Result<Self> {
         let player = Player::new(device)?;
+        // Both files used to live in the config directory. Move them once
+        // rather than silently logging the user out to make a spec point.
+        priel_core::auth::migrate_from_config("token.json");
+        priel_core::auth::migrate_from_config("credentials.json");
         let creds_path = Credentials::default_path();
-        let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
+        let lookup = vec![Credentials::override_path(), creds_path.clone()];
+        let has_credentials =
+            priel_core::auth::local_credentials(&[&Credentials::override_path(), &creds_path])
+                .is_some();
         let worker = worker::spawn(token_path.clone(), creds_path.clone());
         let mut app = Self::with(player, worker);
         let has_session = priel_core::auth::StoredToken::load(&token_path).is_ok();
         app.credentials_path = Some(creds_path.clone());
+        app.credentials_lookup = lookup;
         app.token_path = Some(token_path.clone());
         // The screens chain: a client key is needed before signing in, and a
         // session before anything can load. Each step leads to the next rather
@@ -266,6 +277,7 @@ impl App {
             dirty: true,
             last_sig: RenderSig::default(),
             credentials_path: None,
+            credentials_lookup: Vec::new(),
             token_path: None,
             credential_status: None,
             fetching: None,
@@ -334,10 +346,10 @@ impl App {
     /// Needs a client identity, so the credentials screen comes first when there
     /// is none - the two screens chain rather than each failing on their own.
     pub fn start_login(&mut self) {
-        let Some(creds_path) = self.credentials_path.clone() else {
-            return;
-        };
-        let Some((creds, _)) = priel_core::auth::local_credentials(&creds_path) else {
+        if self.credentials_path.is_none() {
+            return; // nowhere decided to look, so nothing to sign in with
+        }
+        let Some((creds, _)) = self.read_credentials() else {
             self.mode = Mode::Credentials;
             return;
         };
@@ -362,11 +374,10 @@ impl App {
 
     /// Hand the pasted redirect back to the service for a session.
     fn submit_login(&mut self) {
-        let (Some(flow), Some(creds_path), Some(token_path)) = (
-            self.login.as_mut(),
-            self.credentials_path.clone(),
-            self.token_path.clone(),
-        ) else {
+        // Resolved before the mutable borrow below, which cannot coexist with a
+        // read of the lookup paths.
+        let identity = self.read_credentials();
+        let (Some(flow), Some(token_path)) = (self.login.as_mut(), self.token_path.clone()) else {
             return;
         };
         if flow.exchanging.is_some() {
@@ -382,7 +393,7 @@ impl App {
                 return;
             }
         };
-        let Some((creds, _)) = priel_core::auth::local_credentials(&creds_path) else {
+        let Some((creds, _)) = identity else {
             flow.status = Some("the client identity went missing".into());
             return;
         };
@@ -491,11 +502,18 @@ impl App {
         }
     }
 
+    /// A client identity from wherever this app was told to look.
+    fn read_credentials(&self) -> Option<(Credentials, priel_core::auth::CredentialSource)> {
+        let paths: Vec<&str> = self.credentials_lookup.iter().map(String::as_str).collect();
+        priel_core::auth::local_credentials(&paths)
+    }
+
     /// Point the app at token and credential files, for tests.
     #[cfg(test)]
     pub fn set_paths_for_test(&mut self, token: String, credentials: String) {
         self.token_path = Some(token);
-        self.credentials_path = Some(credentials);
+        self.credentials_path = Some(credentials.clone());
+        self.credentials_lookup = vec![credentials];
     }
 
     /// Drive the post-credentials step, for tests.
