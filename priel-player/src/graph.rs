@@ -30,12 +30,19 @@
 //! day libmpv renames it. The client object carries
 //! `application.process.id`, so the answer is exact.
 //!
-//! **This slice only reports.** The parsed path is deliberately shaped to be
-//! built on: [`GraphNode::id`] is kept so a later pass can go back to the dump
-//! for a node's other properties, and [`NodeRole`] separates the hops that sit
-//! between the stream and the device - which is where a resampler would be
-//! named, where `allowed-rates` would be explained, and where a second
-//! application holding the device would show up.
+//! The path is also *judged*, by [`AudioGraph::attribute`]: every node is
+//! compared against the track and the first one that diverges is named. That is
+//! a pure function over a parsed path, so the whole of it is a table of tests
+//! over recorded dumps rather than something only a live session can show, and
+//! its most important answer is the one that names nobody - a chain that is
+//! readable and accounts for nothing gets an admitted gap, never the nearest
+//! candidate.
+//!
+//! What is here is still deliberately shaped to be built on: [`GraphNode::id`]
+//! is kept so a later pass can go back to the dump for a node's other
+//! properties, and [`NodeRole`] separates the hops that sit between the stream
+//! and the device - which is where `allowed-rates` would be explained, and where
+//! a second application holding the device would show up.
 //!
 //! Linux-only by nature, like the rest of the audio plumbing. Everywhere else
 //! `pw-dump` is simply not installed, which is one of the answers.
