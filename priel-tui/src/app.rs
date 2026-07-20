@@ -83,6 +83,54 @@ pub enum Mode {
     Login,       // signing in: browser is open, waiting for the redirected URL
 }
 
+/// What a status tick reads. See [`App::tick`].
+#[derive(Clone, Copy, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "a flat snapshot of the inputs the decision reads; grouping them would hide it"
+)]
+struct Tick {
+    playing: bool,
+    ended: bool,
+    paused: bool,
+    /// mpv already has the next entry in its playlist.
+    has_next: bool,
+    /// The track mpv says it is on, or 0 for none.
+    current_id: u64,
+    /// The track we believe mpv is on.
+    expected_id: u64,
+    /// A resolve for the track we want to play now is still in flight.
+    resolving_current: bool,
+    /// A resolve for the *next* track has been asked for.
+    preload_queued: bool,
+    /// We advanced recently and have not yet settled. The guard that stops the
+    /// end-of-track fallback re-firing every tick.
+    advanced: bool,
+    /// Something is loaded; an idle player at startup has nothing.
+    have_track: bool,
+}
+
+/// What a status tick asks the queue to do. See [`App::decide`].
+///
+/// Three independent answers rather than one, because that is what the code
+/// this replaced actually did: three `if` blocks in a row, more than one of
+/// which can be true in the same tick. Collapsing them into a priority chain
+/// reads better and is wrong - it stops the end-of-track fallback firing on the
+/// tick that also schedules a preload, so a track whose preload failed stalls
+/// until the tick after. There is a test for each.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Plan {
+    /// mpv moved to this track on its own - a gapless transition we did not
+    /// load. Exclusive: taking it up schedules the next preload itself and sets
+    /// the guard that keeps the fallback out of this tick.
+    adopt: Option<u64>,
+    /// The current track is settled with nothing behind it; resolve the next so
+    /// mpv can transition into it gaplessly.
+    preload: bool,
+    /// Playback stopped with nothing preloaded. Load the next from scratch.
+    advance_fresh: bool,
+}
+
 /// State of a sign-in in progress.
 ///
 /// The verifier has to survive from building the authorize URL until the code
@@ -835,6 +883,73 @@ impl App {
         self.refresh_from_status();
     }
 
+    /// The state a status tick is allowed to look at.
+    ///
+    /// Spelled out as a snapshot so the decision below can be a pure function.
+    /// Every field here is one the advance logic reads; nothing else may be
+    /// consulted, which is what keeps the guards testable.
+    fn tick(&self) -> Tick {
+        Tick {
+            playing: self.status.playing,
+            ended: self.status.ended,
+            paused: self.status.paused,
+            has_next: self.status.has_next,
+            current_id: self.status.current_id,
+            expected_id: self.expected_id,
+            resolving_current: self.current_target.is_some(),
+            preload_queued: self.next_intended.is_some(),
+            advanced: self.advanced,
+            have_track: self.now_playing.is_some(),
+        }
+    }
+
+    /// What this tick asks the queue to do.
+    ///
+    /// Pure, so the guards below can be a table of tests rather than comments
+    /// pleading with the reader. See [`Plan`] for why an adoption is exclusive
+    /// and the other two are not.
+    fn decide(t: &Tick) -> Plan {
+        // mpv moved to a track we never loaded: a gapless transition.
+        if t.current_id != 0 && t.current_id != t.expected_id {
+            return Plan {
+                adopt: Some(t.current_id),
+                ..Plan::default()
+            };
+        }
+        Plan {
+            adopt: None,
+            // The current track is settled and nothing is queued behind it.
+            preload: t.have_track && !t.resolving_current && !t.has_next && !t.preload_queued,
+            // Playback genuinely stopped with nothing preloaded - the end of the
+            // queue, or a preload that never arrived. `!playing` is what keeps
+            // this out of a gapless change, where mpv reports the outgoing track
+            // as ended while audio is still flowing; `!advanced` stops it firing
+            // again on every tick after it has.
+            advance_fresh: t.ended
+                && !t.has_next
+                && !t.advanced
+                && t.have_track
+                && !t.playing
+                && !t.paused
+                && !t.resolving_current,
+        }
+    }
+
+    /// Take up a track mpv moved to on its own.
+    fn adopt(&mut self, id: u64) {
+        self.expected_id = id;
+        // We just advanced, so the end-of-track fallback must not also fire.
+        self.advanced = true;
+        if let Some(p) = self.queue.iter().position(|t| t.id == id) {
+            self.queue_pos = p;
+            self.now_playing = Some(self.queue[p].clone());
+        }
+        self.now_meta = self.metas.get(&id).cloned().unwrap_or_default();
+        self.next_intended = None;
+        self.dirty = true;
+        self.schedule_next();
+    }
+
     fn refresh_from_status(&mut self) {
         self.frame = self.frame.wrapping_add(1);
 
@@ -851,41 +966,14 @@ impl App {
             self.advanced = false;
         }
 
-        let cur = self.status.current_id;
-        if cur != 0 && cur != self.expected_id {
-            // mpv advanced to a track we didn't explicitly load (gapless).
-            self.expected_id = cur;
-            self.advanced = true; // we just advanced — suppress the end-fallback
-            if let Some(p) = self.queue.iter().position(|t| t.id == cur) {
-                self.queue_pos = p;
-                self.now_playing = Some(self.queue[p].clone());
-            }
-            self.now_meta = self.metas.get(&cur).cloned().unwrap_or_default();
-            self.next_intended = None;
-            self.dirty = true;
+        let plan = Self::decide(&self.tick());
+        if let Some(id) = plan.adopt {
+            self.adopt(id);
+        }
+        if plan.preload {
             self.schedule_next();
         }
-
-        // Keep the next preloaded once the current has loaded.
-        if self.now_playing.is_some()
-            && self.current_target.is_none()
-            && !self.status.has_next
-            && self.next_intended.is_none()
-        {
-            self.schedule_next();
-        }
-
-        // Fallback: playback genuinely stopped (idle) with no preloaded next —
-        // end of queue, or a failed preload. Guarded with `!playing` so it never
-        // fires during a healthy gapless transition (where audio IS playing).
-        if self.status.ended
-            && !self.status.has_next
-            && !self.advanced
-            && self.now_playing.is_some()
-            && !self.status.playing
-            && !self.status.paused
-            && self.current_target.is_none()
-        {
+        if plan.advance_fresh {
             self.advanced = true;
             self.advance_fresh();
         }
@@ -1613,6 +1701,182 @@ mod tests {
         assert_eq!(r.app.favorites.len(), 1);
         assert!(!r.app.loading);
         assert!(r.app.notice.as_deref().unwrap().contains('1'));
+    }
+
+    /// A tick where nothing is happening: no track, no audio, nothing queued.
+    fn quiet() -> Tick {
+        Tick {
+            playing: false,
+            ended: false,
+            paused: false,
+            has_next: false,
+            current_id: 0,
+            expected_id: 0,
+            resolving_current: false,
+            preload_queued: false,
+            advanced: false,
+            have_track: false,
+        }
+    }
+
+    /// A tick where a track is loaded and audio is flowing.
+    fn settled() -> Tick {
+        Tick {
+            playing: true,
+            current_id: 7,
+            expected_id: 7,
+            have_track: true,
+            ..quiet()
+        }
+    }
+
+    /// A track that ran out with nothing queued behind it.
+    fn ran_out() -> Tick {
+        Tick {
+            ended: true,
+            have_track: true,
+            current_id: 7,
+            expected_id: 7,
+            ..quiet()
+        }
+    }
+
+    #[test]
+    fn a_track_that_ran_out_both_advances_and_looks_ahead() {
+        // Goal: the regression this refactor nearly introduced. These are three
+        // independent answers, not a priority list: a track whose preload never
+        // arrived needs the fallback *and* the next preload on the same tick.
+        // Ordering them so the first match wins stalls playback for a tick, and
+        // with shuffle on it never advances at all.
+        let plan = App::decide(&ran_out());
+        assert!(plan.advance_fresh, "it has to move on");
+        assert!(plan.preload, "and look ahead while it does");
+    }
+
+    #[test]
+    fn a_quiet_tick_asks_for_nothing() {
+        // Goal: the common case by far. A tick that decides to do something
+        // when nothing has happened is how the queue runs away.
+        assert_eq!(App::decide(&quiet()), Plan::default());
+    }
+
+    #[test]
+    fn a_track_mpv_moved_to_on_its_own_is_adopted() {
+        // Goal: a gapless transition is mpv changing tracks without being told
+        // to. The app finds out by the id changing under it, and everything
+        // else - queue position, metadata, the next preload - follows from
+        // noticing.
+        let t = Tick {
+            current_id: 9,
+            expected_id: 7,
+            ..settled()
+        };
+        assert_eq!(App::decide(&t).adopt, Some(9));
+    }
+
+    #[test]
+    fn an_empty_current_id_is_not_a_transition() {
+        // Goal: mpv reports 0 when it has nothing loaded, and treating that as
+        // a track would adopt a track that does not exist.
+        let t = Tick {
+            current_id: 0,
+            expected_id: 7,
+            ..settled()
+        };
+        assert_eq!(App::decide(&t).adopt, None);
+    }
+
+    #[test]
+    fn a_settled_track_with_nothing_behind_it_asks_for_a_preload() {
+        // Goal: gapless depends on the next entry already being in mpv's
+        // playlist. This is the tick that puts it there.
+        assert!(App::decide(&settled()).preload);
+    }
+
+    #[test]
+    fn a_preload_already_asked_for_is_not_asked_for_twice() {
+        // Goal: one resolve per track. Repeating it every tick would flood the
+        // worker for as long as the track plays.
+        let queued = Tick {
+            preload_queued: true,
+            ..settled()
+        };
+        assert!(!App::decide(&queued).preload);
+        let in_mpv = Tick {
+            has_next: true,
+            ..settled()
+        };
+        assert!(!App::decide(&in_mpv).preload);
+    }
+
+    #[test]
+    fn a_track_that_ran_out_advances_from_scratch() {
+        // Goal: end of queue, or a preload that never arrived. Nothing is
+        // queued in mpv, so the next track has to be loaded outright.
+        assert!(App::decide(&ran_out()).advance_fresh);
+    }
+
+    #[test]
+    fn the_end_of_track_fallback_stays_out_of_a_healthy_transition() {
+        // Goal: this is the bug the guards exist for. During a gapless change
+        // mpv reports `ended` for the outgoing track while audio is still
+        // flowing; advancing here skips a track, and doing it every tick runs
+        // away through the whole queue.
+        let still_playing = Tick {
+            playing: true,
+            ..ran_out()
+        };
+        assert!(
+            !App::decide(&still_playing).advance_fresh,
+            "audio is flowing"
+        );
+
+        let just_advanced = Tick {
+            advanced: true,
+            ..ran_out()
+        };
+        assert!(
+            !App::decide(&just_advanced).advance_fresh,
+            "already advanced"
+        );
+
+        let queued = Tick {
+            has_next: true,
+            ..ran_out()
+        };
+        assert!(!App::decide(&queued).advance_fresh, "mpv has one ready");
+    }
+
+    #[test]
+    fn a_paused_track_at_its_end_waits_for_the_listener() {
+        // Goal: pausing on the last second of a track must not skip it. The
+        // listener stopped on purpose.
+        let t = Tick {
+            paused: true,
+            ..ran_out()
+        };
+        assert!(!App::decide(&t).advance_fresh);
+    }
+
+    #[test]
+    fn a_track_still_being_resolved_is_not_overtaken() {
+        // Goal: a resolve in flight is a track about to start. Advancing past
+        // it would skip whatever the user just asked for.
+        let t = Tick {
+            resolving_current: true,
+            ..ran_out()
+        };
+        assert!(!App::decide(&t).advance_fresh);
+    }
+
+    #[test]
+    fn nothing_advances_when_nothing_was_playing() {
+        // Goal: an idle player at startup reports `ended` from no track at all.
+        let t = Tick {
+            have_track: false,
+            ..ran_out()
+        };
+        assert!(!App::decide(&t).advance_fresh);
     }
 
     #[test]

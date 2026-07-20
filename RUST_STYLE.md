@@ -39,12 +39,13 @@ rather than reinvent:
 - **`TestBackend`** renders real frames; `ui` tests assert on the resulting text and on the hit
   boxes the renderer publishes.
 
-Where a seam does not exist yet, adding one is the preferred fix. Still outstanding:
+- **`App::decide`** takes a `Tick` snapshot and returns a `Plan`, so the queue-advance guards are a
+  table of tests rather than comments pleading with the reader. Note what that extraction found:
+  the three decisions are *independent*, not a priority chain, and collapsing them into one - which
+  reads better - stalls a track whose preload failed and, with shuffle on, stops advancing
+  altogether.
 
-- **`App::refresh` should not need an `App`.** The advance logic reads `status`, `queue_pos`,
-  `expected_id`, `current_target`, `next_intended` and `advanced`, and decides "preload", "advance
-  fresh" or "do nothing". Extracting that into a function returning an intent enum would turn the
-  guards into table-driven tests instead of comments pleading with the reader.
+Where a seam does not exist yet, adding one is the preferred fix.
 
 ### Running tests
 
