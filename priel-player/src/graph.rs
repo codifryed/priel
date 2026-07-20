@@ -38,11 +38,22 @@
 //! readable and accounts for nothing gets an admitted gap, never the nearest
 //! candidate.
 //!
+//! The same dump also carries the server's own clock settings, which is the
+//! other half of that diagnosis. A rate the server is not permitted to use is
+//! resampled *before* any node on the path sees a sample, so the chain diverges
+//! nowhere and something still moved - the exact shape of
+//! [`Attribution::Unexplained`]. [`ClockRates`] reads what the server published
+//! and [`ClockRates::advise`] turns it into the one-line change that would fix
+//! it, both pure and both table-tested. Reading the setting out of the dump is
+//! deliberate: priel reads no configuration of its own and has no business
+//! opening another application's, and the server publishes what it is actually
+//! running on rather than what a file asked for.
+//!
 //! What is here is still deliberately shaped to be built on: [`GraphNode::id`]
 //! is kept so a later pass can go back to the dump for a node's other
 //! properties, and [`NodeRole`] separates the hops that sit between the stream
-//! and the device - which is where `allowed-rates` would be explained, and where
-//! a second application holding the device would show up.
+//! and the device - which is where a second application holding the device would
+//! show up.
 //!
 //! Linux-only by nature, like the rest of the audio plumbing. Everywhere else
 //! `pw-dump` is simply not installed, which is one of the answers.
@@ -131,6 +142,157 @@ pub struct ClockRates {
     /// the permitted list is not consulted at all. Zero on the wire means unset
     /// and arrives here as `None`, because "pinned to 0 Hz" is not a thing.
     pub forced_hz: Option<u32>,
+}
+
+impl ClockRates {
+    /// What the server may actually clock at right now, or `None` when the dump
+    /// did not say enough to know.
+    ///
+    /// Not simply [`allowed_hz`](Self::allowed_hz): a pin overrides the list
+    /// outright, and an empty list is not "no rates" but "no switching", which
+    /// leaves exactly the one rate the graph is already clocked at. The readout
+    /// and [`advise`](Self::advise) both read this, so the overlay cannot list
+    /// rates the advice has already ruled out.
+    #[must_use]
+    pub fn permitted_hz(&self) -> Option<Vec<u32>> {
+        if let Some(forced_hz) = self.forced_hz {
+            return Some(vec![forced_hz]);
+        }
+        match self.allowed_hz.as_deref() {
+            Some([]) => self.current_hz.map(|hz| vec![hz]),
+            Some(rates_hz) => Some(rates_hz.to_vec()),
+            None => None,
+        }
+    }
+
+    /// Whether this track may be played at its own rate, and what to change.
+    ///
+    /// Pure over the published setting and one rate, so the whole of the advice
+    /// is a table of tests rather than something only a live sound server can
+    /// show. A `track_rate_hz` of zero means there is no rate to check - nothing
+    /// playing, or a source whose rate is not known - and is never treated as a
+    /// rate the server refused.
+    #[must_use]
+    pub fn advise(&self, track_rate_hz: u32) -> RateAdvice {
+        if track_rate_hz == 0 {
+            return RateAdvice::NoTrack;
+        }
+        // Checked before the list, because a pin applies whether or not the
+        // dump published a list at all.
+        if let Some(at_hz) = self.forced_hz {
+            return if at_hz == track_rate_hz {
+                RateAdvice::Permitted
+            } else {
+                RateAdvice::Pinned { at_hz }
+            };
+        }
+        let Some(mut proposed_hz) = self.permitted_hz() else {
+            return RateAdvice::Unknown;
+        };
+        if proposed_hz.contains(&track_rate_hz) {
+            return RateAdvice::Permitted;
+        }
+        // The proposal *adds* to what is already permitted and never replaces
+        // it. A list that dropped a rate would fix this track by taking one
+        // away from whatever else on the machine is using it.
+        proposed_hz.push(track_rate_hz);
+        proposed_hz.sort_unstable();
+        proposed_hz.dedup();
+        RateAdvice::Missing { proposed_hz }
+    }
+}
+
+/// Whether the track's rate is one the server may use, and what to do if not.
+///
+/// Three of the five arms are silence. Advice printed over a working setup
+/// teaches the reader to ignore it, and advice invented from a setting that was
+/// never read is the failure this whole module is written against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RateAdvice {
+    /// There is no rate to check: nothing is playing, or the source's rate is
+    /// not known yet.
+    NoTrack,
+    /// The dump published no permitted rates. Nothing is claimed either way -
+    /// distinct from [`Permitted`](Self::Permitted), which is a finding.
+    Unknown,
+    /// The track's rate is one the server may clock at. Nothing to change.
+    Permitted,
+    /// The rate is not among the permitted ones, and
+    /// [`proposed_hz`](Self::Missing::proposed_hz) is the list that would
+    /// include it: everything already permitted, plus this rate, ascending.
+    Missing { proposed_hz: Vec<u32> },
+    /// `clock.force-rate` pins the graph to `at_hz` and the permitted list is
+    /// not consulted at all, so extending it would change nothing.
+    Pinned { at_hz: u32 },
+}
+
+/// The longest line the audio-graph overlay can draw without losing its tail.
+///
+/// The box is 76 columns at most, two of which are the border and two the
+/// indent the overlay adds to prose.
+const ADVICE_WIDTH: usize = 70;
+
+/// How many rates go on one line once the list stops fitting on one.
+const RATES_PER_LINE: usize = 6;
+
+impl RateAdvice {
+    /// What to tell the reader, one line per row of the overlay.
+    ///
+    /// Empty where there is nothing to advise. Lines rather than a paragraph
+    /// because the overlay draws one row per line and cannot rewrap without its
+    /// scroll bounds and its output disagreeing about how many rows there are -
+    /// the same reason [`GraphError::hint`] is separate from its `Display`.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        match self {
+            Self::NoTrack | Self::Unknown | Self::Permitted => Vec::new(),
+            Self::Missing { proposed_hz } => {
+                let mut out = vec![
+                    "This rate is not one the server is permitted to use.".to_string(),
+                    "Put this in ~/.config/pipewire/pipewire.conf.d/10-rates.conf:".to_string(),
+                    "  context.properties = {".to_string(),
+                ];
+                out.extend(allowed_rates_lines(proposed_hz));
+                out.push("  }".to_string());
+                out.push("Restart the sound server for it to take effect.".to_string());
+                out
+            }
+            Self::Pinned { at_hz } => vec![
+                format!("The server is pinned to {at_hz} Hz, whatever the list allows."),
+                "Clear the pin with:".to_string(),
+                "  pw-metadata -n settings 0 clock.force-rate 0".to_string(),
+            ],
+        }
+    }
+}
+
+/// The setting itself, in lines that fit the box it is drawn in.
+///
+/// A ten-rate list runs well past the overlay, and the renderer clips rather
+/// than wrapping - which would leave a configuration line that still looks
+/// copyable and is not. The server's own core object publishes the list across
+/// several lines, so the spread-out spelling is one it writes itself.
+fn allowed_rates_lines(rates_hz: &[u32]) -> Vec<String> {
+    let one = format!("    default.clock.allowed-rates = [ {} ]", spaced(rates_hz));
+    if one.chars().count() <= ADVICE_WIDTH {
+        return vec![one];
+    }
+    let mut out = vec!["    default.clock.allowed-rates = [".to_string()];
+    out.extend(
+        rates_hz
+            .chunks(RATES_PER_LINE)
+            .map(|chunk| format!("      {}", spaced(chunk))),
+    );
+    out.push("    ]".to_string());
+    out
+}
+
+fn spaced(rates_hz: &[u32]) -> String {
+    rates_hz
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The track as the decoder produced it, which every node is compared against.
@@ -706,7 +868,7 @@ fn as_u32(v: &Value) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attribution, AudioGraph, ClockRates, GraphError, NodeRole, SourceFormat, parse,
+        Attribution, AudioGraph, ClockRates, GraphError, NodeRole, RateAdvice, SourceFormat, parse,
         parse_clock, parse_sinks,
     };
     use crate::Alteration;
@@ -1349,6 +1511,222 @@ mod tests {
         // show a chain from one moment and a setting from another.
         let g = path_of(DUMP, PID);
         assert_eq!(g.clock, ClockRates::default(), "this capture carries none");
+    }
+
+    fn clock(allowed_hz: Option<&[u32]>, current_hz: Option<u32>) -> ClockRates {
+        ClockRates {
+            allowed_hz: allowed_hz.map(<[u32]>::to_vec),
+            current_hz,
+            forced_hz: None,
+        }
+    }
+
+    fn pinned_at(at_hz: u32, allowed_hz: Option<&[u32]>) -> ClockRates {
+        ClockRates {
+            forced_hz: Some(at_hz),
+            ..clock(allowed_hz, Some(48_000))
+        }
+    }
+
+    #[test]
+    fn whether_the_track_may_have_its_own_rate_is_decided_by_a_table() {
+        // Goal: the whole of the advice in one place. A rate the server is not
+        // permitted to use is resampled before any node on the path sees a
+        // sample, which is why the chain can diverge nowhere and something
+        // still moved. Each row is (what the server published, the track's
+        // rate, what to say about it).
+        let missing = |proposed: &[u32]| RateAdvice::Missing {
+            proposed_hz: proposed.to_vec(),
+        };
+        let cases: [(ClockRates, u32, RateAdvice); 12] = [
+            // The rate is on the list. Nothing to change, so nothing is said.
+            (
+                clock(Some(&[44_100, 48_000]), Some(48_000)),
+                44_100,
+                RateAdvice::Permitted,
+            ),
+            // It is not, and the list that would include it keeps every rate
+            // that was already there - a proposal that dropped one would take
+            // away a rate something else on the machine is using.
+            (
+                clock(Some(&[44_100, 48_000]), Some(48_000)),
+                96_000,
+                missing(&[44_100, 48_000, 96_000]),
+            ),
+            // Ascending however the server published it, and never twice.
+            (
+                clock(Some(&[48_000, 44_100]), Some(48_000)),
+                88_200,
+                missing(&[44_100, 48_000, 88_200]),
+            ),
+            // An empty list means the server does not switch at all: it stays
+            // on the one rate it is clocked at, which is a permitted rate.
+            (
+                clock(Some(&[]), Some(44_100)),
+                44_100,
+                RateAdvice::Permitted,
+            ),
+            // The same setup with a track it cannot follow. The rate it sits on
+            // has to survive the proposal, or the change fixes this track by
+            // breaking everything else.
+            (
+                clock(Some(&[]), Some(48_000)),
+                44_100,
+                missing(&[44_100, 48_000]),
+            ),
+            // An empty list and no rate published either. Nothing is known, so
+            // nothing is claimed.
+            (clock(Some(&[]), None), 44_100, RateAdvice::Unknown),
+            // No list at all. Distinct from an empty one, and the answer is the
+            // admitted gap rather than the flattering guess.
+            (clock(None, Some(48_000)), 44_100, RateAdvice::Unknown),
+            (ClockRates::default(), 44_100, RateAdvice::Unknown),
+            // Nothing playing, or a track whose rate is not known yet. There is
+            // no question to answer, whatever the server says.
+            (clock(Some(&[48_000]), Some(48_000)), 0, RateAdvice::NoTrack),
+            (ClockRates::default(), 0, RateAdvice::NoTrack),
+            // A pin overrides the list outright, so the advice must be to clear
+            // the pin. Telling the reader to extend a list the server has
+            // stopped consulting is a change that does nothing.
+            (
+                pinned_at(48_000, Some(&[44_100, 48_000])),
+                44_100,
+                RateAdvice::Pinned { at_hz: 48_000 },
+            ),
+            // Pinned to the rate the track wants, which is the one setup where
+            // a pin is doing no harm.
+            (
+                pinned_at(44_100, Some(&[48_000])),
+                44_100,
+                RateAdvice::Permitted,
+            ),
+        ];
+
+        for (clock, track_rate_hz, expected) in cases {
+            assert_eq!(
+                clock.advise(track_rate_hz),
+                expected,
+                "{clock:?} against {track_rate_hz} Hz"
+            );
+        }
+    }
+
+    #[test]
+    fn what_the_server_may_clock_at_reads_the_pin_and_the_empty_list_the_same_way_the_advice_does()
+    {
+        // Goal: the readout and the advice must not disagree about one server.
+        // Listing every allowed rate while the advice says the graph is pinned
+        // to one of them would read as two opinions.
+        assert_eq!(
+            pinned_at(48_000, Some(&[44_100, 48_000])).permitted_hz(),
+            Some(vec![48_000]),
+            "a pin is the whole of what it may use"
+        );
+        assert_eq!(
+            clock(Some(&[]), Some(44_100)).permitted_hz(),
+            Some(vec![44_100]),
+            "an empty list is the one rate it is clocked at"
+        );
+        assert_eq!(clock(Some(&[]), None).permitted_hz(), None);
+        assert_eq!(clock(None, Some(48_000)).permitted_hz(), None);
+        assert_eq!(
+            clock(Some(&[44_100, 48_000]), Some(48_000)).permitted_hz(),
+            Some(vec![44_100, 48_000])
+        );
+    }
+
+    #[test]
+    fn a_permitted_rate_is_told_to_change_nothing() {
+        // Goal: advice on a working setup teaches the reader to ignore it. The
+        // three answers that are not a finding all say nothing at all.
+        for advice in [
+            RateAdvice::Permitted,
+            RateAdvice::Unknown,
+            RateAdvice::NoTrack,
+        ] {
+            assert!(
+                advice.lines().is_empty(),
+                "{advice:?} has nothing to advise"
+            );
+        }
+    }
+
+    #[test]
+    fn the_change_is_quoted_whole_with_where_it_goes_and_that_it_needs_a_restart() {
+        // Goal: the three things that make the advice actionable rather than
+        // merely correct - the exact text, the file it belongs in, and the fact
+        // that the server has to be restarted before any of it applies.
+        let advice = ClockRates {
+            allowed_hz: Some(vec![48_000]),
+            current_hz: Some(48_000),
+            forced_hz: None,
+        }
+        .advise(44_100);
+        let lines = advice.lines();
+        let text = lines.join("\n");
+        assert!(
+            text.contains("default.clock.allowed-rates = [ 44100 48000 ]"),
+            "the whole setting, copyable: {text}"
+        );
+        assert!(
+            text.contains("context.properties = {"),
+            "and the section it has to sit in, or pasting it does nothing: {text}"
+        );
+        assert!(
+            text.contains("~/.config/pipewire/pipewire.conf.d/"),
+            "which file it goes in: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("restart"),
+            "and that it takes a restart: {text}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_server_is_told_to_clear_the_pin_rather_than_to_extend_the_list() {
+        // Goal: the wrong-explanation case. `clock.force-rate` is set at
+        // runtime and has no spelling in the configuration file, so advising a
+        // file edit here would be a change that cannot work.
+        let lines = pinned_at(48_000, Some(&[44_100, 48_000]))
+            .advise(44_100)
+            .lines();
+        let text = lines.join("\n");
+        assert!(text.contains("clock.force-rate"), "names the pin: {text}");
+        assert!(
+            !text.contains("allowed-rates"),
+            "and does not send the reader to the list: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("restart"),
+            "clearing it applies at once: {text}"
+        );
+    }
+
+    #[test]
+    fn every_line_of_advice_fits_the_box_it_is_drawn_in() {
+        // Goal: the overlay draws one row per line and does not rewrap, so a
+        // line longer than the box loses its tail - and a configuration line
+        // with its tail clipped is worse than no advice at all, because it
+        // still looks like something that can be copied.
+        let long = [
+            44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600,
+        ];
+        let advice = clock(Some(&long), Some(48_000)).advise(768_000);
+        let lines = advice.lines();
+        for line in &lines {
+            assert!(line.chars().count() <= 70, "too long to draw: {line}");
+        }
+        let text = lines.join("\n");
+        for rate in long.iter().chain(std::iter::once(&768_000)) {
+            assert!(
+                text.contains(&rate.to_string()),
+                "{rate} was dropped from the wrapped list: {text}"
+            );
+        }
+        assert!(
+            text.contains("default.clock.allowed-rates = ["),
+            "still the same setting, just spread over lines: {text}"
+        );
     }
 
     #[test]
