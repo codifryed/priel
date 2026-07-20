@@ -33,9 +33,9 @@ use priel_core::auth::{Credentials, Pkce};
 use priel_core::{Playlist, Track};
 use priel_player::{PlaybackStatus, Player};
 
-use std::sync::mpsc::Receiver;
 #[cfg(test)]
 use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use crate::worker::{self, FromWorker, ToWorker, Worker};
 
@@ -153,6 +153,9 @@ pub struct App {
 
     pub notice: Option<String>,
     pub loading: bool,
+    /// The worker thread has gone, and has been reported. Latched so the
+    /// report happens once rather than on every pass of the event loop.
+    worker_lost: bool,
     pub frame: usize,
     pub should_quit: bool,
 
@@ -271,6 +274,7 @@ impl App {
             hits: Vec::new(),
             last_click: None,
             dirty: true,
+            worker_lost: false,
             last_sig: RenderSig::default(),
             credentials_path: None,
             credentials_lookup: Vec::new(),
@@ -327,8 +331,9 @@ impl App {
             return;
         };
         self.worker = worker::spawn(token, creds);
+        self.worker_lost = false;
         self.loading = true;
-        let _ = self.worker.tx.send(ToWorker::LoadFavorites);
+        self.ask(ToWorker::LoadFavorites);
     }
 
     /// The sign-in in progress, if any.
@@ -592,8 +597,8 @@ impl App {
         }
     }
 
-    pub fn start(&self) {
-        let _ = self.worker.tx.send(ToWorker::LoadFavorites);
+    pub fn start(&mut self) {
+        self.ask(ToWorker::LoadFavorites);
     }
 
     /// Track slice backing the current view (empty for the Playlists list).
@@ -635,8 +640,47 @@ impl App {
         self.selected = if n == 0 { 0 } else { self.selected.min(n - 1) };
     }
 
+    /// Post a request to the worker.
+    ///
+    /// The send fails only when the worker thread is gone, and from then on
+    /// every request fails too - the interface stops answering keys. Discarding
+    /// this Result is what made that look like a freeze, with nothing on screen
+    /// and nothing anywhere else either.
+    fn ask(&mut self, req: ToWorker) {
+        if self.worker.tx.send(req).is_err() {
+            self.report_worker_lost();
+        }
+    }
+
+    /// Report a worker thread that is no longer there, once.
+    ///
+    /// Once, because `drain_worker` runs on every pass of the event loop:
+    /// repeating it would wipe out whatever else the user was being told and
+    /// leave the screen permanently dirty, which is what the redraw check exists
+    /// to prevent.
+    fn report_worker_lost(&mut self) {
+        if self.worker_lost {
+            return;
+        }
+        self.worker_lost = true;
+        self.loading = false;
+        self.dirty = true;
+        log::error!("the worker thread is gone; nothing more can be loaded");
+        self.notice = Some("\u{26a0} the worker stopped; restart priel".into());
+    }
+
     pub fn drain_worker(&mut self) {
-        while let Ok(msg) = self.worker.rx.try_recv() {
+        loop {
+            let msg = match self.worker.rx.try_recv() {
+                Ok(msg) => msg,
+                Err(TryRecvError::Empty) => return,
+                // Disconnected was indistinguishable from Empty here, so a dead
+                // worker read as an idle one for as long as priel stayed open.
+                Err(TryRecvError::Disconnected) => {
+                    self.report_worker_lost();
+                    return;
+                }
+            };
             self.dirty = true;
             match msg {
                 FromWorker::Favorites(t) => {
@@ -822,7 +866,7 @@ impl App {
         match v {
             View::Playlists if self.playlists.is_empty() => {
                 self.loading = true;
-                let _ = self.worker.tx.send(ToWorker::LoadPlaylists);
+                self.ask(ToWorker::LoadPlaylists);
             }
             View::Search if self.search_tracks.is_empty() => {
                 self.mode = Mode::Search; // start typing a query
@@ -852,7 +896,7 @@ impl App {
             self.list_offset = 0;
             self.filter.clear();
             self.loading = true;
-            let _ = self.worker.tx.send(ToWorker::LoadPlaylistTracks(p.uuid));
+            self.ask(ToWorker::LoadPlaylistTracks(p.uuid));
         }
     }
 
@@ -911,7 +955,7 @@ impl App {
         self.expected_id = t.id;
         self.now_playing = Some(t.clone());
         self.now_meta = StreamMeta::default();
-        let _ = self.worker.tx.send(ToWorker::Resolve(t.id));
+        self.ask(ToWorker::Resolve(t.id));
     }
 
     fn schedule_next(&mut self) {
@@ -930,7 +974,7 @@ impl App {
             Some(p) => {
                 let id = self.queue[p].id;
                 self.next_intended = Some(id);
-                let _ = self.worker.tx.send(ToWorker::Resolve(id));
+                self.ask(ToWorker::Resolve(id));
             }
             None => self.next_intended = None,
         }
@@ -1105,7 +1149,7 @@ impl App {
                     self.loading = true;
                     self.search_tracks.clear();
                     self.selected = 0;
-                    let _ = self.worker.tx.send(ToWorker::Search(q));
+                    self.ask(ToWorker::Search(q));
                 }
             }
             KeyCode::Backspace => {
@@ -1449,7 +1493,7 @@ mod tests {
     #[test]
     fn startup_asks_for_favorites_and_says_it_is_loading() {
         // Goal: the first frame must not look like an empty library.
-        let r = rig();
+        let mut r = rig();
         r.app.start();
         assert!(matches!(requests(&r)[..], [ToWorker::LoadFavorites]));
         assert!(r.app.loading);
@@ -1480,6 +1524,49 @@ mod tests {
         r.app.drain_worker();
         assert!(r.app.notice.as_deref().unwrap().contains("expired"));
         assert!(!r.app.loading);
+    }
+
+    #[test]
+    fn a_worker_that_has_died_is_reported_instead_of_looking_like_a_hang() {
+        // Goal: `try_recv` returns Disconnected for a dead worker and Empty for
+        // an idle one, and this treated them identically - so a worker thread
+        // that ended left the app loading forever with nothing on screen to say
+        // why. The spinner has to stop too.
+        let mut r = rig();
+        r.app.loading = true;
+        drop(r.to_app);
+        r.app.drain_worker();
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("worker"), "{notice}");
+        assert!(!r.app.loading, "a worker that is gone is not still loading");
+    }
+
+    #[test]
+    fn a_dead_worker_is_reported_once_rather_than_every_tick() {
+        // Goal: drain_worker runs on every pass of the event loop. Re-reporting
+        // would wipe out whatever else the user was being told, and mark the
+        // screen dirty forever - which is exactly what the redraw check exists
+        // to avoid.
+        let mut r = rig();
+        drop(r.to_app);
+        r.app.drain_worker();
+        r.app.take_dirty();
+        r.app.notice = Some("something else".into());
+        r.app.drain_worker();
+        assert_eq!(r.app.notice.as_deref(), Some("something else"));
+        assert!(!r.app.take_dirty(), "nothing changed on the second pass");
+    }
+
+    #[test]
+    fn a_request_that_cannot_be_sent_is_reported() {
+        // Goal: every request to the worker was a discarded Result, so once its
+        // thread was gone the interface simply stopped responding to keys with
+        // no explanation anywhere.
+        let mut r = rig();
+        drop(r.from_app);
+        r.app.start();
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("worker"), "{notice}");
     }
 
     #[test]

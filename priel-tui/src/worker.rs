@@ -96,6 +96,7 @@ where
         let mut client = match build() {
             Ok(c) => c,
             Err(e) => {
+                log::error!("the worker could not start: {e}");
                 let _ = evt_tx.send(FromWorker::Error(e));
                 return;
             }
@@ -124,8 +125,17 @@ where
                     Err(e) => FromWorker::Error(format!("resolve: {e}")),
                 },
             };
+            // Recorded here rather than at each call site: one place covers
+            // every request kind, and the app only ever sees the flattened
+            // string.
+            if let FromWorker::Error(e) = &msg {
+                log::warn!("{e}");
+            }
             let _ = evt_tx.send(msg);
         }
+        // The app dropped its end. Normal on quit, and the only trace of a
+        // worker that stopped for any other reason.
+        log::info!("the worker thread is stopping");
     });
 
     Worker { tx, rx }
