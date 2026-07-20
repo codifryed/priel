@@ -62,6 +62,10 @@ nothing on its own - without the reload the interface waits forever for a track
 that is no longer loaded. The position is lost and that is accepted; the bytes
 are still buffered, so this costs no refetch, only the seconds already heard.
 
+None of this is particular to exclusivity. An ordinary device change that fails
+abandons the track in exactly the same way, and reloads it in exactly the same
+way; only the choice of where to fall back to differs.
+
 ## Consequences
 
 Requesting exclusivity and holding it are two different facts, and only the
@@ -72,10 +76,27 @@ separately, in the picker, as the thing they can still toggle.
 
 A refusal is judged by the same symptom a bad device change already is - a file
 loaded with no output open - so it reuses the existing switch-and-settle
-machinery rather than growing a second, competing one. Only the arming differs:
-a change made while something is playing is judged on the short reinit grace,
-while a request made before anything has loaded stays unjudged until a track
-exercises the output.
+machinery rather than growing a second, competing one.
+
+**The verdict is reached when the player says it gave up on the file, not when a
+timer expires.** That was not the first shape: a fixed grace period decided it,
+and hardware testing heard the whole of it - eight seconds of silence with a
+buffering indicator over it, the indicator itself lying, because nothing was
+buffering and the load had already failed. Giving up on a file is deterministic
+and is the only place a failed load is visible at all, so it drives the
+recovery, and the timer stays only as a backstop for a failure that produces no
+event.
+
+Two things follow, and both are load-bearing. **A failed load is not proof of a
+refusal** - a missing file, a corrupt stream and an aborted buffer all arrive
+identically - so what decides is still whether an output is open, the same
+question a device change was always judged by. And **judging a change consumes
+it**, which is what makes a reload loop impossible: the reload may fail in turn
+and produce another event, and that one arrives with nothing pending, moves no
+device and reloads nothing.
+
+A request made before anything has loaded stays unjudged until a track exercises
+the output, since an idle player and a refused device look identical.
 
 The direct path also puts priel **outside the sound server**, so there is no
 graph between it and the DAC to report on. That is a distinct answer from "priel
