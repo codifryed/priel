@@ -1,14 +1,13 @@
 # Releasing priel
 
-A release is a **signed tag plus a source tarball**. Nothing is published to
-crates.io: the two libraries exist so a GUI frontend can share them, not for
-outside consumers, and the binary reaches people through distro packages built
-from the tarball.
+A release is a **signed tag plus a source tarball**, and - once the crates are
+ready for it - three crates.io publishes on top.
 
-That shapes everything below. The audience for a release is a *packager*, and
-what they need is a tarball that builds offline from a committed lockfile with no
-patches. `make dist`, `make vendor` and the GNU install conventions in the
-`Makefile` are the contract; this file is the order to exercise them in.
+The audience is a *packager*, and what they need is a tarball that builds offline
+from a committed lockfile with no patches. `make dist`, `make vendor` and the GNU
+install conventions in the `Makefile` are the contract; steps 1 to 7 are the
+order to exercise them in. Step 8 covers crates.io, which is a different promise
+with different rules: a version published there is permanent.
 
 ## 1. Decide the version
 
@@ -60,7 +59,7 @@ make build-nolibmpv
 Then the things `make check` does not cover:
 
 ```bash
-cargo +<msrv> check --workspace --locked      # the declared rust-version
+cargo +1.88 check --workspace --all-targets --locked   # the declared MSRV
 make assets && man -l target/assets/priel.1   # read it, do not skim it
 ```
 
@@ -68,7 +67,8 @@ make assets && man -l target/assets/priel.1   # read it, do not skim it
   the easiest thing in this repo to get quietly wrong. `rust-version` in the
   root `Cargo.toml` must actually build - and note that it fails for two
   independent reasons: a dependency raising *its* MSRV, and the source using a
-  language feature newer than the claim. Check it, do not assume it.
+  language feature newer than the claim. Only compiling catches the second, so
+  check it rather than reading `cargo metadata` and assuming.
 - **The man page and completions are generated from the clap derive** in
   `priel-tui/src/cli.rs` and are never committed, so `make install` regenerates
   them. Reading the page is still worth a minute: a stale doc comment on a flag
@@ -140,7 +140,49 @@ git push origin main
 git push origin v0.2.0
 ```
 
-## 8. Afterwards
+## 8. Publish to crates.io
+
+Only when the preconditions below are met. Unlike a tag, **a published version
+can never be replaced** - `cargo yank` hides it from new resolutions but the
+files stay up forever - so this step is worth being slower about than the rest.
+
+Publish in dependency order, waiting for the index between each:
+
+```bash
+cargo publish -p priel-core
+cargo publish -p priel-player
+cargo publish -p priel-tui
+```
+
+Dry-run each one first (`--dry-run`), which packages and verifies without
+uploading. What it catches:
+
+- **Path dependencies need a version.** `priel-core = { path = "priel-core" }`
+  publishes nothing, because crates.io has no path to follow:
+
+  ```
+  all dependencies must have a version requirement specified when publishing.
+  dependency `priel-core` does not specify a version
+  ```
+
+  The fix is `{ path = "priel-core", version = "0.2.0" }` in the workspace
+  dependency table - both, not either. Cargo uses the path locally and strips it
+  on publish, so the two must be bumped together at step 2 from then on.
+- **`repository` is read by more than people.** cargo warns without it; scanners
+  and packagers rely on it.
+
+Two things that only bite once:
+
+- **The names must be free.** `priel`, `priel-core` and `priel-player` are
+  claimed by whoever publishes first, and the binary crate is `priel-tui` while
+  the binary itself is `priel` - decide which name goes on crates.io before
+  claiming either.
+- **The MSRV becomes someone else's problem.** Once a crate is published, its
+  `rust-version` is a promise to downstream builds, and raising it in a patch
+  release is the kind of thing that breaks other people's CI. Bump it in a minor
+  release, and say so in the notes.
+
+## 9. Afterwards
 
 - `make clean` removes the build output and the tarball.
 - Check the runtime files a fresh user ends up with, by running the new binary
@@ -150,13 +192,11 @@ git push origin v0.2.0
 
 ## Preconditions this repo has not met yet
 
-Both are one-line fixes, and both would be embarrassing to discover during a
-release rather than before one:
+Neither blocks a tag; both block step 8, and both would be embarrassing to
+discover during a release rather than before one:
 
 - **`repository` in the root `Cargo.toml` is empty.** It is what a packager, a
-  security scanner and `cargo metadata` all read to find the source.
-- **`rust-version = "1.85"` does not build.** `ratatui 0.29` pulls in
-  `instability`, which requires 1.88, and the source itself uses let chains,
-  which are stable only from 1.88 in edition 2024. The claim needs to move to
-  1.88 or the tree needs to stop needing it; leaving it wrong tells packagers
-  something untrue about the toolchain they need.
+  security scanner and `cargo metadata` all read to find the source, and
+  `cargo publish` warns about its absence.
+- **The workspace path dependencies carry no version**, so `cargo publish` on
+  anything but `priel-core` fails outright. See step 8.
