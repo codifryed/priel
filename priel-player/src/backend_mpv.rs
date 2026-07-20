@@ -39,7 +39,7 @@ use priel_core::PlayableSource;
 use ureq::{Agent, Body, http::Response};
 
 use crate::hw::{self, HwParams};
-use crate::{Cmd, PlaybackStatus, PlayerConfig};
+use crate::{AudioDevice, Cmd, PlaybackStatus, PlayerConfig, Published};
 
 /// Lock a mutex, tolerating poisoning.
 ///
@@ -109,6 +109,58 @@ type Registry = Arc<Mutex<HashMap<u64, Arc<Shared>>>>;
 struct Entry {
     id: u64,          // TIDAL track id
     seq: Option<u64>, // registry key (None for Direct/http sources)
+}
+
+/// The output-device state the player thread carries between ticks.
+struct Output {
+    /// What mpv last reported, shared with the `Player` that owns this thread.
+    devices: Arc<Mutex<Vec<AudioDevice>>>,
+}
+
+/// How many devices are taken off mpv's list.
+///
+/// Bounded like everything else fed from outside. A machine with an audio
+/// interface per channel still lands far inside this.
+const DEVICE_LIST_MAX: i64 = 512;
+
+/// Ask mpv which audio devices exist.
+///
+/// mpv publishes this as a node array, which libmpv2 has no type for - but the
+/// same property answers to an indexed path (`audio-device-list/3/name`), so the
+/// safe wrapper is enough and nothing here has to reach past it.
+///
+/// Reading it makes mpv ask each audio driver what it can see. That advertises
+/// devices; it opens none.
+fn read_devices(mpv: &Mpv) -> Vec<AudioDevice> {
+    let count = mpv
+        .get_property::<i64>("audio-device-list/count")
+        .unwrap_or(0)
+        .clamp(0, DEVICE_LIST_MAX);
+    let mut devices = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+    for i in 0..count {
+        // A name is what makes an entry selectable, so an entry without one is
+        // skipped rather than shown as a row that cannot be chosen.
+        let Ok(name) = mpv.get_property::<String>(&format!("audio-device-list/{i}/name")) else {
+            continue;
+        };
+        let description = mpv
+            .get_property::<String>(&format!("audio-device-list/{i}/description"))
+            .unwrap_or_default();
+        devices.push(AudioDevice { name, description });
+    }
+    devices
+}
+
+/// The devices mpv can see, without a player thread. See
+/// [`crate::audio_devices`].
+pub fn audio_devices() -> Vec<AudioDevice> {
+    match Mpv::new() {
+        Ok(mpv) => read_devices(&mpv),
+        Err(e) => {
+            log::error!("mpv would not initialise, so its devices cannot be listed: {e}");
+            Vec::new()
+        }
+    }
 }
 
 struct Cookie {
@@ -199,8 +251,9 @@ fn size(cookie: &mut Cookie) -> i64 {
 pub fn spawn(
     config: PlayerConfig,
     rx: Receiver<Cmd>,
-    status: Arc<Mutex<PlaybackStatus>>,
+    published: Published,
 ) -> std::io::Result<JoinHandle<()>> {
+    let Published { status, devices } = published;
     // Named, because the log records which thread wrote each line and "-" says
     // nothing. This is also why the spawn is fallible now: `thread::spawn`
     // panics on the same condition, and a panic is not how priel reports that
@@ -253,6 +306,10 @@ pub fn spawn(
 
         let mut entries: Vec<Entry> = Vec::new();
         let mut seq: u64 = 0;
+        // Devices are enumerated only when asked for: it questions every audio
+        // driver on the machine, which is work no session that never opens the
+        // picker should pay for.
+        let mut output = Output { devices };
         // The ALSA readout costs a handful of /proc reads, so it is refreshed on
         // its own slower cadence rather than on every status tick.
         let mut hw: Option<HwParams> = None;
@@ -260,7 +317,7 @@ pub fn spawn(
         let mut hw_checked: Option<Instant> = None;
 
         loop {
-            if drain_commands(&mpv, &registry, &mut entries, &mut seq, &rx) {
+            if drain_commands(&mpv, &registry, &mut entries, &mut seq, &mut output, &rx) {
                 break;
             }
             drain_events(&mpv);
@@ -274,7 +331,7 @@ pub fn spawn(
             *lock(&status) = st;
             match rx.recv_timeout(idle_backoff) {
                 Ok(cmd) => {
-                    if handle_cmd(&mpv, &registry, &mut entries, &mut seq, cmd) {
+                    if handle_cmd(&mpv, &registry, &mut entries, &mut seq, &mut output, cmd) {
                         break;
                     }
                 }
@@ -495,12 +552,13 @@ fn drain_commands(
     registry: &Registry,
     entries: &mut Vec<Entry>,
     seq: &mut u64,
+    output: &mut Output,
     rx: &Receiver<Cmd>,
 ) -> bool {
     loop {
         match rx.try_recv() {
             Ok(cmd) => {
-                if handle_cmd(mpv, registry, entries, seq, cmd) {
+                if handle_cmd(mpv, registry, entries, seq, output, cmd) {
                     return true;
                 }
             }
@@ -530,6 +588,7 @@ fn handle_cmd(
     registry: &Registry,
     entries: &mut Vec<Entry>,
     seq: &mut u64,
+    output: &mut Output,
     cmd: Cmd,
 ) -> bool {
     match cmd {
@@ -565,6 +624,9 @@ fn handle_cmd(
         Cmd::Stop => {
             command(mpv, "stop", &[]);
             clear_all(registry, entries);
+        }
+        Cmd::RefreshDevices => {
+            *lock(&output.devices) = read_devices(mpv);
         }
     }
     false
@@ -879,6 +941,13 @@ mod tests {
         lock(&LINES).clear();
         f();
         lock(&LINES).clone()
+    }
+
+    /// Device state nobody is watching, for the command tests.
+    fn no_output() -> Output {
+        Output {
+            devices: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     fn cookie(sh: &Arc<Shared>) -> Cookie {
@@ -1445,6 +1514,32 @@ mod tests {
     }
 
     #[test]
+    fn the_devices_mpv_knows_carry_a_name_and_a_description() {
+        // Goal: both the picker and --list-devices need an identifier to hand
+        // back to mpv and something a person can recognise it by. Enumeration
+        // reads a property and opens no output, so it is safe headlessly.
+        let mpv = silent_mpv();
+        let devices = read_devices(&mpv);
+        assert!(!devices.is_empty(), "mpv reports at least its own default");
+        assert!(
+            devices.iter().any(|d| d.name == "auto"),
+            "the automatic choice is always offered: {devices:?}"
+        );
+        assert!(
+            devices.iter().all(|d| !d.name.is_empty()),
+            "a nameless device could never be selected: {devices:?}"
+        );
+    }
+
+    #[test]
+    fn enumerating_devices_needs_no_player() {
+        // Goal: --list-devices runs before anything else exists, so the list has
+        // to be reachable without starting a player thread.
+        let devices = crate::audio_devices();
+        assert!(devices.iter().any(|d| d.name == "auto"), "{devices:?}");
+    }
+
+    #[test]
     fn status_reflects_an_idle_player() {
         // Goal: the UI derives "buffering" and the end-of-track fallback from
         // this snapshot, so an idle player must report honestly rather than
@@ -1478,11 +1573,13 @@ mod tests {
         let mut entries = Vec::new();
         let mut seq = 0;
 
+        let mut output = no_output();
         assert!(!handle_cmd(
             &mpv,
             &reg,
             &mut entries,
             &mut seq,
+            &mut output,
             Cmd::SetVolume(42.0)
         ));
         assert!((mpv.get_property::<f64>("volume").unwrap() - 42.0).abs() < f64::EPSILON);
@@ -1494,11 +1591,18 @@ mod tests {
             Cmd::Next,
             Cmd::Stop,
         ] {
-            assert!(!handle_cmd(&mpv, &reg, &mut entries, &mut seq, cmd));
+            assert!(!handle_cmd(
+                &mpv,
+                &reg,
+                &mut entries,
+                &mut seq,
+                &mut output,
+                cmd
+            ));
         }
 
         assert!(
-            handle_cmd(&mpv, &reg, &mut entries, &mut seq, Cmd::Quit),
+            handle_cmd(&mpv, &reg, &mut entries, &mut seq, &mut output, Cmd::Quit),
             "only Quit ends the loop"
         );
     }
@@ -1512,15 +1616,37 @@ mod tests {
         let mut entries = Vec::new();
         let mut seq = 0;
         let src = || PlayableSource::Segments(vec!["http://127.0.0.1:1/x".into()]);
+        let mut output = no_output();
 
-        handle_cmd(&mpv, &reg, &mut entries, &mut seq, Cmd::Load(1, src()));
+        handle_cmd(
+            &mpv,
+            &reg,
+            &mut entries,
+            &mut seq,
+            &mut output,
+            Cmd::Load(1, src()),
+        );
         assert_eq!(entries.len(), 1);
-        handle_cmd(&mpv, &reg, &mut entries, &mut seq, Cmd::Append(2, src()));
+        handle_cmd(
+            &mpv,
+            &reg,
+            &mut entries,
+            &mut seq,
+            &mut output,
+            Cmd::Append(2, src()),
+        );
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, 1);
         assert_eq!(entries[1].id, 2);
 
-        handle_cmd(&mpv, &reg, &mut entries, &mut seq, Cmd::Load(3, src()));
+        handle_cmd(
+            &mpv,
+            &reg,
+            &mut entries,
+            &mut seq,
+            &mut output,
+            Cmd::Load(3, src()),
+        );
         assert_eq!(entries.len(), 1, "Load replaces rather than appends");
         assert_eq!(entries[0].id, 3);
     }
