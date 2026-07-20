@@ -90,18 +90,62 @@ pub fn parse_hw_params(body: &str) -> Option<HwParams> {
 ///   whole reason for going direct.
 #[must_use]
 pub fn card_matches(hint: &str, card_id: &str, card_index: u32) -> bool {
-    if let Some(named) = hint.split("CARD=").nth(1) {
-        let named = named
-            .split([',', ':'])
-            .next()
-            .unwrap_or(named)
-            .trim_end_matches('\'');
+    if let Some(named) = named_card(hint) {
         return named == card_id;
     }
     if let Some(index) = hw_card_index(hint) {
         return index == card_index;
     }
     hint.contains(card_id)
+}
+
+/// Does this device identifier refer *directly* to this card?
+///
+/// The same question as [`card_matches`] asked the other way round, and
+/// deliberately stricter: this is used to map a refused hardware device onto
+/// the sound server's own entry for the same card, where a loose substring
+/// match would silently pair a device with the wrong card and move the audio
+/// somewhere nobody asked for. Only the two explicit spellings count.
+///
+/// Either half of the card's identity may be missing from what the server
+/// published, so both are optional and an absent one simply cannot match.
+#[must_use]
+pub fn refers_to_card(device: &str, card_id: Option<&str>, card_index: Option<u32>) -> bool {
+    if let Some(named) = named_card(device) {
+        return card_id == Some(named);
+    }
+    if let Some(index) = hw_card_index(device) {
+        return card_index == Some(index);
+    }
+    false
+}
+
+/// Does this identifier reach an ALSA card directly, with nothing in between?
+///
+/// True for `alsa/hw:CARD=AUDIO,DEV=0` and its plugin spellings, which are the
+/// card itself; false for `alsa/pipewire` and `alsa/default`, which are routed
+/// back into the sound server, and for every other driver, which *is* a sound
+/// server. Two things turn on this: such a device is exclusive by construction
+/// and has no shared spelling to fall back to, and priel is not a client of the
+/// sound server while it is using one, so there is no graph to show.
+#[must_use]
+pub fn is_direct_card_device(device: &str) -> bool {
+    let Some(("alsa", name)) = device.split_once('/') else {
+        return false;
+    };
+    named_card(name).is_some() || hw_card_index(name).is_some()
+}
+
+/// The card id an `...:CARD=<id>...` device name spells out.
+fn named_card(device: &str) -> Option<&str> {
+    let named = device.split("CARD=").nth(1)?;
+    Some(
+        named
+            .split([',', ':'])
+            .next()
+            .unwrap_or(named)
+            .trim_end_matches('\''),
+    )
 }
 
 /// The card index in an `hw:2,0` style device name, if that is what it is.
@@ -213,7 +257,7 @@ fn substreams(card: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{card_matches, parse_hw_params, probe};
+    use super::{card_matches, is_direct_card_device, parse_hw_params, probe, refers_to_card};
 
     const OPEN: &str = "access: MMAP_INTERLEAVED
 format: S32_LE
@@ -322,6 +366,61 @@ buffer_size: 32768";
         // there is nothing to prefer and the first open substream is used.
         assert!(!card_matches("auto", "AUDIO", 2));
         assert!(!card_matches("pipewire", "AUDIO", 2));
+    }
+
+    #[test]
+    fn a_hardware_device_is_told_from_one_routed_through_the_sound_server() {
+        // Goal: two things turn on this. A card device is exclusive by
+        // construction and so has no shared spelling to fall back to when it
+        // refuses, and priel is not a client of the sound server while it is
+        // using one - so there is no graph to show either.
+        assert!(is_direct_card_device("alsa/hw:CARD=AUDIO,DEV=0"));
+        assert!(is_direct_card_device("alsa/hw:2,0"));
+        assert!(is_direct_card_device("alsa/plughw:2"));
+        assert!(is_direct_card_device("alsa/front:CARD=AUDIO,DEV=0"));
+        assert!(
+            !is_direct_card_device("alsa/pipewire"),
+            "the server's own ALSA device is the server, not the card"
+        );
+        assert!(!is_direct_card_device("alsa/default"));
+        assert!(!is_direct_card_device("alsa"));
+        assert!(!is_direct_card_device("pipewire/alsa_output.usb-x"));
+        assert!(!is_direct_card_device("auto"));
+    }
+
+    #[test]
+    fn mapping_a_device_onto_a_card_refuses_to_guess() {
+        // Goal: this is what pairs a refused `hw:` device with the sound
+        // server's entry for the same card, and a loose match would move the
+        // audio to a device nobody asked for. Only the explicit spellings count,
+        // and half an identity is not a match.
+        assert!(refers_to_card(
+            "alsa/hw:CARD=AUDIO,DEV=0",
+            Some("AUDIO"),
+            Some(2)
+        ));
+        assert!(refers_to_card("alsa/hw:2,0", Some("AUDIO"), Some(2)));
+        assert!(
+            refers_to_card("alsa/hw:2,0", None, Some(2)),
+            "an index is enough on its own"
+        );
+        assert!(
+            !refers_to_card("alsa/hw:2,0", Some("AUDIO"), None),
+            "and so is its absence"
+        );
+        assert!(!refers_to_card(
+            "alsa/hw:CARD=AUDIO,DEV=0",
+            Some("Audio"),
+            Some(3)
+        ));
+        assert!(
+            !refers_to_card(
+                "pipewire/alsa_output.usb-x-AUDIO-00",
+                Some("AUDIO"),
+                Some(2)
+            ),
+            "carrying the name inside a longer string is not a direct reference"
+        );
     }
 
     #[test]

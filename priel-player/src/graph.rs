@@ -182,6 +182,73 @@ pub fn probe() -> Result<AudioGraph, GraphError> {
     parse(&text, std::process::id())
 }
 
+/// A sound-server sink that fronts an ALSA card.
+///
+/// This is the join between the two ways of naming one DAC. A hardware device
+/// is `alsa/hw:CARD=AUDIO,DEV=0` and the server's entry for the same card is
+/// `pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0`: the two
+/// strings share no substring at all, so nothing textual can pair them. The
+/// server publishes the card on its own node, and that is the only reliable
+/// link there is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerSink {
+    /// `node.name`, which the player's device identifier is built from by
+    /// putting the driver in front of it.
+    pub node_name: String,
+    /// `alsa.card` - the card index, numbered as `/proc/asound/cardN` is.
+    pub card_index: Option<u32>,
+    /// `alsa.id` - the card id, spelled as `hw:CARD=<id>` spells it.
+    pub card_id: Option<String>,
+}
+
+/// The sound server's sinks, or nothing at all.
+///
+/// **Runs a subprocess and waits for it**, so this belongs on a thread that can
+/// afford to wait. It is called once, on a refused exclusive open, to find
+/// somewhere to keep playing.
+///
+/// Every failure is an empty list rather than an error: a machine with no sound
+/// server has no sinks, which is a perfectly good answer to "what else could
+/// play this", and the caller's next step is the same either way.
+#[must_use]
+pub fn sinks() -> Vec<ServerSink> {
+    let Ok(out) = run::capture("pw-dump", &[], DUMP_TIMEOUT) else {
+        return Vec::new();
+    };
+    let Ok(text) = String::from_utf8(out) else {
+        return Vec::new();
+    };
+    parse_sinks(&text)
+}
+
+/// Pull the ALSA-backed sinks out of a `pw-dump` object list.
+///
+/// Separate from [`sinks`] so the mapping is testable against a recorded dump
+/// with no sound server anywhere near the machine running the tests. Anything
+/// unparseable is an empty list, for the same reason as above.
+#[must_use]
+pub fn parse_sinks(dump: &str) -> Vec<ServerSink> {
+    let Ok(objects) = serde_json::from_str::<Vec<Value>>(dump) else {
+        return Vec::new();
+    };
+    objects
+        .iter()
+        .filter(|o| is_type(o, "PipeWire:Interface:Node"))
+        .filter(|o| prop_str(o, "media.class") == Some("Audio/Sink"))
+        .filter_map(|o| {
+            let node_name = prop_str(o, "node.name")?;
+            let sink = ServerSink {
+                node_name: node_name.to_string(),
+                card_index: prop_u32(o, "alsa.card"),
+                card_id: prop_str(o, "alsa.id").map(ToString::to_string),
+            };
+            // A sink with no card behind it is a virtual one, and there is no
+            // hardware device it could ever be the shared spelling of.
+            (sink.card_index.is_some() || sink.card_id.is_some()).then_some(sink)
+        })
+        .collect()
+}
+
 /// Pull the path belonging to `pid` out of a `pw-dump` object list.
 ///
 /// Separate from [`probe`] so the parsing is testable against a recorded dump
@@ -362,7 +429,7 @@ fn as_u32(v: &Value) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioGraph, GraphError, NodeRole, parse};
+    use super::{AudioGraph, GraphError, NodeRole, parse, parse_sinks};
 
     /// A real `pw-dump`, taken while priel was playing a 44.1 kHz track into a
     /// USB DAC. Trimmed to the objects on the path plus one unrelated sink, and
@@ -403,6 +470,44 @@ mod tests {
         assert_eq!(device.rate_hz, Some(44_100), "the device follows the rate");
         assert_eq!(device.format.as_deref(), Some("S32LE"));
         assert_eq!(device.media_class, "Audio/Sink");
+    }
+
+    #[test]
+    fn a_server_sink_carries_the_card_that_ties_it_to_a_hardware_device() {
+        // Goal: this is the join that lets a refused `hw:` device fall back to
+        // the same physical DAC through the sound server. The two identifiers
+        // share no substring - `alsa/hw:CARD=AUDIO,DEV=0` against
+        // `alsa_output.usb-SMSL_...`, so any textual heuristic would silently
+        // do nothing - and the card the server publishes is the only link.
+        let sinks = parse_sinks(DUMP);
+        let dac = sinks
+            .iter()
+            .find(|s| s.card_id.as_deref() == Some("AUDIO"))
+            .expect("the fixture's USB DAC should be listed");
+        assert_eq!(
+            dac.node_name,
+            "alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0"
+        );
+        assert_eq!(dac.card_index, Some(2), "the index, for an `hw:2,0` device");
+        assert!(
+            sinks.iter().any(|s| s.card_id.as_deref() == Some("Audio")),
+            "the second card is listed too, and differs only in case: {sinks:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_reported_when_there_is_no_dump_to_read() {
+        // Goal: a machine with no sound server has no sinks, which is an
+        // answer rather than a failure - the caller falls through to the
+        // default sink either way. Refusing to parse must not become an error
+        // path with nothing to do about it.
+        assert!(parse_sinks("").is_empty());
+        assert!(parse_sinks("not json at all").is_empty());
+        assert!(parse_sinks("[]").is_empty());
+        assert!(
+            parse_sinks(&DUMP[..DUMP.len() / 2]).is_empty(),
+            "a truncated dump is no better than none"
+        );
     }
 
     #[test]
