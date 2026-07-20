@@ -32,7 +32,7 @@ use ratatui::layout::Rect;
 use priel_core::auth::{Credentials, Pkce};
 use priel_core::{Fault, Playlist, Track};
 use priel_player::graph::{AudioGraph, GraphError, GraphNode, NodeRole};
-use priel_player::{PlaybackStatus, Player, PlayerConfig};
+use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig};
 
 #[cfg(test)]
 use std::sync::mpsc::Sender;
@@ -82,6 +82,7 @@ pub enum Mode {
     Help,        // the shortcut reference is up; it swallows input until dismissed
     Log,         // the recent diagnostics are up; modal in the same way
     Graph,       // the chain to the output device is up; modal in the same way
+    Devices,     // the output picker is up; modal in the same way
     Credentials, // first run with no client identity; asking before fetching one
     Login,       // signing in: browser is open, waiting for the redirected URL
 }
@@ -158,6 +159,13 @@ struct Plan {
     /// Playback stopped with nothing preloaded. Load the next from scratch.
     advance_fresh: bool,
 }
+
+/// How long the picker says it is still looking before it says there is
+/// nothing to look at.
+///
+/// The list is asked for as the overlay opens and answered a tick later, so
+/// without this the first frame of every open would claim there are no devices.
+const DEVICE_WAIT: Duration = Duration::from_secs(2);
 
 /// State of a sign-in in progress.
 ///
@@ -287,6 +295,22 @@ pub struct App {
     audio_graph: Option<Result<AudioGraph, GraphError>>,
     /// How far down the audio-graph overlay is scrolled, from the top.
     graph_scroll: usize,
+    /// The output devices the player last published. Kept only while the picker
+    /// is up; nothing else on screen shows them.
+    devices: Vec<AudioDevice>,
+    device_selected: usize,
+    /// The first device row on screen, maintained by the renderer exactly as
+    /// `list_offset` is.
+    pub device_offset: usize,
+    /// Clickable device rows and the index each stands for, rebuilt by the
+    /// renderer while the picker is up.
+    pub device_rows: Vec<(Rect, usize)>,
+    /// When the list was last asked for. The picker says it is still looking
+    /// until this is old enough to mean nothing is going to answer.
+    devices_asked: Option<Instant>,
+    /// The device failure already shown. Latched so it is reported once rather
+    /// than on every tick for as long as the player carries it.
+    reported_device_error: Option<String>,
     pub frame: usize,
     pub should_quit: bool,
 
@@ -411,6 +435,12 @@ impl App {
             log_scroll: 0,
             audio_graph: None,
             graph_scroll: 0,
+            devices: Vec::new(),
+            device_selected: 0,
+            device_offset: 0,
+            device_rows: Vec::new(),
+            devices_asked: None,
+            reported_device_error: None,
             last_sig: RenderSig::default(),
             credentials_path: None,
             token_path: None,
@@ -1096,6 +1126,7 @@ impl App {
         self.status = self.player.status();
         self.refresh_from_status();
         self.page_in_more_favorites();
+        self.refresh_devices();
     }
 
     /// The half of `refresh` that reacts to `self.status`, split out so tests can
@@ -1174,6 +1205,7 @@ impl App {
 
     fn refresh_from_status(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+        self.report_device_error();
 
         let sig = self.render_sig();
         if sig != self.last_sig {
@@ -1460,6 +1492,7 @@ impl App {
             Mode::Help => self.on_key_help(key),
             Mode::Log => self.on_key_log(key),
             Mode::Graph => self.on_key_graph(key),
+            Mode::Devices => self.on_key_devices(key),
             Mode::Credentials => self.on_key_credentials(key),
             Mode::Login => self.on_key_login(key),
             Mode::Normal => self.on_key_normal(key),
@@ -1575,6 +1608,180 @@ impl App {
         self.log_scroll
     }
 
+    // ---- the output device picker ----
+
+    /// Open the output picker, asking for a fresh list as it opens.
+    ///
+    /// The one way in: the key and the hint click both come through here, so the
+    /// two cannot drift apart.
+    fn open_devices(&mut self) {
+        self.mode = Mode::Devices;
+        self.device_offset = 0;
+        self.devices_asked = Some(Instant::now());
+        // Devices come and go while priel runs. What is on screen should be
+        // what is true now, not what was true at startup.
+        self.player.refresh_devices();
+        self.select_current_device();
+    }
+
+    /// Start the picker on the device already in use, the way a list opens on
+    /// the row that was last touched.
+    fn select_current_device(&mut self) {
+        self.device_selected = self
+            .devices
+            .iter()
+            .position(|d| d.name == self.status.audio_device)
+            .unwrap_or(0);
+    }
+
+    /// The picker: modal like the log overlay, and scrolled with the same keys.
+    fn on_key_devices(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('d' | 'q') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => self.device_down(1),
+            KeyCode::Char('k') | KeyCode::Up => self.device_up(1),
+            KeyCode::Char('J') => self.device_down(self.full_page()),
+            KeyCode::Char('K') => self.device_up(self.full_page()),
+            KeyCode::Char('g') => self.device_selected = 0,
+            KeyCode::Char('G') => self.device_selected = self.devices.len().saturating_sub(1),
+            KeyCode::Enter => self.choose_device(self.device_selected),
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Move the output to the device on this row, for this session.
+    ///
+    /// The one place that changes the output: the Enter key and a click on a
+    /// row both arrive here, so the two cannot drift apart. Nothing is written
+    /// anywhere - priel reads no configuration file, and `--device` is what
+    /// makes a choice outlive the session, which is what the overlay says.
+    fn choose_device(&mut self, index: usize) {
+        let Some(device) = self.devices.get(index) else {
+            return;
+        };
+        let name = device.name.clone();
+        let label = if device.description.is_empty() {
+            name.clone()
+        } else {
+            device.description.clone()
+        };
+        self.player.set_device(&name);
+        self.notice = Some(format!("Output: {label} — this session only"));
+        self.mode = Mode::Normal;
+        self.dirty = true;
+    }
+
+    /// Report a device change that did not take, once.
+    ///
+    /// The player carries the reason in its status until the next change is
+    /// accepted, so without the latch this would replace every other notice on
+    /// screen ten times a second.
+    fn report_device_error(&mut self) {
+        if self.status.device_error == self.reported_device_error {
+            return;
+        }
+        self.reported_device_error = self.status.device_error.clone();
+        if let Some(detail) = self.reported_device_error.clone() {
+            self.notice = Some(detail);
+            self.dirty = true;
+        }
+    }
+
+    fn device_down(&mut self, by: usize) {
+        let n = self.devices.len();
+        if n > 0 {
+            self.device_selected = (self.device_selected + by).min(n - 1);
+        }
+    }
+
+    fn device_up(&mut self, by: usize) {
+        self.device_selected = self.device_selected.saturating_sub(by);
+    }
+
+    /// A click inside the picker. On a row it takes that row; anywhere else it
+    /// dismisses, as a click on the log overlay does.
+    fn click_device(&mut self, col: u16, row: u16) {
+        match self
+            .device_rows
+            .iter()
+            .find(|(r, _)| hit(*r, col, row))
+            .map(|(_, i)| *i)
+        {
+            Some(i) => {
+                self.device_selected = i;
+                self.choose_device(i);
+            }
+            None => self.mode = Mode::Normal,
+        }
+    }
+
+    /// Take up a device list the player has published.
+    ///
+    /// Only while the picker is up: the list is a handful of allocations and
+    /// nothing else on screen shows it, so polling it the rest of the time
+    /// would be work done for nobody.
+    fn refresh_devices(&mut self) {
+        if self.mode != Mode::Devices {
+            return;
+        }
+        let devices = self.player.devices();
+        if devices == self.devices {
+            return;
+        }
+        let was_empty = self.devices.is_empty();
+        self.devices = devices;
+        if was_empty {
+            // The first list to arrive decides where the picker opens.
+            self.select_current_device();
+        }
+        self.device_selected = self
+            .device_selected
+            .min(self.devices.len().saturating_sub(1));
+        self.dirty = true;
+    }
+
+    /// The devices the picker is showing.
+    #[must_use]
+    pub fn devices(&self) -> &[AudioDevice] {
+        &self.devices
+    }
+
+    /// Hand the picker a list without an audio system to ask.
+    #[cfg(test)]
+    pub fn set_devices_for_test(&mut self, devices: Vec<AudioDevice>) {
+        self.devices = devices;
+    }
+
+    /// Which row the picker is on.
+    #[must_use]
+    pub fn device_selected(&self) -> usize {
+        self.device_selected
+    }
+
+    /// What the picker shows instead of a list, when there is no list.
+    #[must_use]
+    pub fn device_notice(&self) -> Option<&'static str> {
+        Self::devices_message(
+            self.devices.is_empty(),
+            self.devices_asked.map(|t| t.elapsed()),
+        )
+    }
+
+    /// Pure, so the two empty cases can be told apart in a test without waiting
+    /// for a clock: the answer is still on its way, or nothing is going to
+    /// answer. The second is what a build without libmpv looks like, and saying
+    /// so beats an empty box that reads as a bug.
+    fn devices_message(empty: bool, since_asked: Option<Duration>) -> Option<&'static str> {
+        if !empty {
+            return None;
+        }
+        match since_asked {
+            Some(waited) if waited < DEVICE_WAIT => Some("Looking for output devices…"),
+            _ => Some("No output devices were reported."),
+        }
+    }
+
     fn on_key_filter(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -1657,6 +1864,7 @@ impl App {
                 self.log_scroll = 0;
             }
             KeyCode::Char('D') => self.open_graph(),
+            KeyCode::Char('d') => self.open_devices(),
             KeyCode::Char('A') => self.start_login(),
             KeyCode::Enter => self.on_enter(),
             KeyCode::Char(' ') => self.player.toggle_pause(),
@@ -1711,6 +1919,16 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+        if self.mode == Mode::Devices {
+            match m.kind {
+                MouseEventKind::ScrollDown => self.device_down(1),
+                MouseEventKind::ScrollUp => self.device_up(1),
+                MouseEventKind::Down(MouseButton::Left) => self.click_device(m.column, m.row),
+                _ => return,
+            }
+            self.dirty = true;
             return;
         }
         if self.mode == Mode::Help {
@@ -2858,6 +3076,223 @@ mod tests {
         assert_eq!(r.app.log_scroll, 0, "G returns to the newest");
     }
 
+    /// Three devices with the middle one in use, so a test can tell the
+    /// selected row from the marked one.
+    fn devices() -> Vec<AudioDevice> {
+        ["auto", "pipewire/dac", "alsa/hdmi"]
+            .iter()
+            .map(|n| AudioDevice {
+                name: (*n).to_string(),
+                description: format!("{n} description"),
+            })
+            .collect()
+    }
+
+    /// A rigged app with the picker open on a known list.
+    fn with_picker(in_use: &str) -> Rig {
+        let mut r = rig();
+        r.app.status.audio_device = in_use.to_string();
+        r.app.set_devices_for_test(devices());
+        r.app.on_key(key('d'));
+        r
+    }
+
+    #[test]
+    fn the_device_picker_opens_on_its_key_and_closes_again() {
+        // Goal: the whole point of the issue is not having to leave the player
+        // to find out what a device is called. The key that opens it closes it,
+        // as every other overlay here does.
+        let mut r = with_picker("auto");
+        assert_eq!(r.app.mode, Mode::Devices);
+        r.app.on_key(key('d'));
+        assert_eq!(r.app.mode, Mode::Normal);
+        r.app.on_key(key('d'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal, "Esc closes it too");
+    }
+
+    #[test]
+    fn escape_leaves_the_picker_without_touching_the_output() {
+        // Goal: a picker that changed the output as the selection moved would
+        // be unusable. Only choosing changes anything, and Esc chooses nothing.
+        let mut r = with_picker("pipewire/dac");
+        r.app.notice = None;
+        r.app.on_key(key('j'));
+        r.app.on_key(key('k'));
+        r.app.on_key(key('G'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(
+            r.app.notice.is_none(),
+            "moving and cancelling chooses nothing: {:?}",
+            r.app.notice
+        );
+    }
+
+    #[test]
+    fn the_device_picker_swallows_the_keys_behind_it() {
+        // Goal: modal like the other overlays. Changing view underneath one is
+        // how a user ends up somewhere they did not ask to be.
+        let mut r = with_picker("auto");
+        r.app.on_key(key('2'));
+        assert_eq!(r.app.view, View::Favorites, "the view must not change");
+        assert_eq!(r.app.mode, Mode::Devices, "and it is still open");
+    }
+
+    #[test]
+    fn the_device_picker_scrolls_with_the_same_keys_as_a_list() {
+        // Goal: j/k and g/G mean here what they mean everywhere else in priel.
+        // A second scrolling idiom would be its own bug.
+        let mut r = with_picker("auto");
+        assert_eq!(r.app.device_selected(), 0);
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.device_selected(), 1);
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.device_selected(), 0);
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.device_selected(), 0, "and stops at the first");
+        r.app.on_key(key('G'));
+        assert_eq!(r.app.device_selected(), 2, "G reaches the last");
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.device_selected(), 2, "and stops there");
+        r.app.on_key(key('g'));
+        assert_eq!(r.app.device_selected(), 0);
+    }
+
+    #[test]
+    fn the_picker_opens_on_the_device_already_in_use() {
+        // Goal: the list is long - forty-odd entries on a normal desktop - so
+        // opening at the top would leave the user hunting for where they are.
+        let r = with_picker("alsa/hdmi");
+        assert_eq!(r.app.device_selected(), 2);
+    }
+
+    #[test]
+    fn a_device_that_is_gone_leaves_the_picker_at_the_top() {
+        // Goal: the device priel was started with can be unplugged. That must
+        // open the list, not index past the end of it.
+        let r = with_picker("pipewire/one-that-left");
+        assert_eq!(r.app.device_selected(), 0);
+    }
+
+    #[test]
+    fn choosing_a_device_closes_the_picker_and_says_it_is_for_this_session() {
+        // Goal: the choice is not written anywhere - priel reads no
+        // configuration file - so the one moment it can be said is now.
+        let mut r = with_picker("auto");
+        r.app.on_key(key('j'));
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.mode, Mode::Normal, "choosing closes the picker");
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("pipewire/dac description"),
+            "the chosen device is named: {notice}"
+        );
+        assert!(
+            notice.contains("this session"),
+            "and the choice is temporary: {notice}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_device_row_does_what_the_enter_key_does() {
+        // Goal: the mouse is a first-class addition, never a second
+        // implementation. Both paths run `choose_device` and nothing else.
+        let mut r = with_picker("auto");
+        let row = Rect {
+            x: 2,
+            y: 5,
+            width: 60,
+            height: 1,
+        };
+        r.app.device_rows = vec![(row, 2)];
+        r.app.on_mouse(click(4, 5));
+        assert_eq!(r.app.device_selected(), 2, "the clicked row is taken");
+        assert_eq!(r.app.mode, Mode::Normal, "and choosing closes the picker");
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("alsa/hdmi description"), "{notice}");
+    }
+
+    #[test]
+    fn a_click_outside_the_rows_dismisses_the_picker_without_choosing() {
+        // Goal: the log overlay behaves this way and a second idiom would be
+        // its own bug. Missing a row must not move the output.
+        let mut r = with_picker("auto");
+        r.app.notice = None;
+        r.app.device_rows = vec![(
+            Rect {
+                x: 2,
+                y: 5,
+                width: 60,
+                height: 1,
+            },
+            1,
+        )];
+        r.app.on_mouse(click(4, 9));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(r.app.notice.is_none(), "nothing was chosen");
+    }
+
+    #[test]
+    fn a_device_that_will_not_open_is_reported_once_rather_than_every_tick() {
+        // Goal: the player carries the reason until the next change is
+        // accepted, so without the latch this would replace every other notice
+        // on screen ten times a second - and a failure the user has to act on
+        // has to survive long enough to be read.
+        let mut r = rig();
+        r.app.status.device_error = Some("alsa/hdmi would not open".into());
+        r.app.refresh_for_test();
+        assert_eq!(
+            r.app.notice.as_deref(),
+            Some("alsa/hdmi would not open"),
+            "the failure reaches the user"
+        );
+
+        r.app.notice = Some("something else".into());
+        r.app.refresh_for_test();
+        assert_eq!(
+            r.app.notice.as_deref(),
+            Some("something else"),
+            "and is not repeated over whatever came after it"
+        );
+
+        r.app.status.device_error = None;
+        r.app.refresh_for_test();
+        r.app.status.device_error = Some("alsa/hdmi would not open".into());
+        r.app.refresh_for_test();
+        assert_eq!(
+            r.app.notice.as_deref(),
+            Some("alsa/hdmi would not open"),
+            "a second failure is a new report"
+        );
+    }
+
+    #[test]
+    fn an_empty_picker_says_which_kind_of_empty_it_is() {
+        // Goal: the list is asked for as the overlay opens and answered a tick
+        // later, so the first frame is always empty - and a build without
+        // libmpv never answers at all. Showing an empty box for either reads as
+        // a bug; the two have to be told apart.
+        assert_eq!(
+            App::devices_message(false, None),
+            None,
+            "a list needs no note"
+        );
+        assert_eq!(
+            App::devices_message(true, Some(Duration::from_millis(50))),
+            Some("Looking for output devices…")
+        );
+        assert_eq!(
+            App::devices_message(true, Some(Duration::from_secs(30))),
+            Some("No output devices were reported."),
+            "nothing answered, and saying so beats an empty box"
+        );
+        assert_eq!(
+            App::devices_message(true, None),
+            Some("No output devices were reported.")
+        );
+    }
+
     #[test]
     fn a_worker_that_has_died_is_reported_instead_of_looking_like_a_hang() {
         // Goal: `try_recv` returns Disconnected for a dead worker and Empty for
@@ -3718,6 +4153,9 @@ mod tests {
 
         r.app.on_key(key('?'));
         assert_eq!(r.app.mode, Mode::Help);
+        r.app.on_key(code(KeyCode::Esc));
+        r.app.on_key(key('d'));
+        assert_eq!(r.app.mode, Mode::Devices);
         r.app.on_key(code(KeyCode::Esc));
         r.app.on_key(key('/'));
         assert_eq!(r.app.mode, Mode::Filter);

@@ -39,7 +39,7 @@ use priel_core::PlayableSource;
 use ureq::{Agent, Body, http::Response};
 
 use crate::hw::{self, HwParams};
-use crate::{Cmd, PlaybackStatus, PlayerConfig};
+use crate::{AudioDevice, Cmd, PlaybackStatus, PlayerConfig, Published};
 
 /// Lock a mutex, tolerating poisoning.
 ///
@@ -143,6 +143,141 @@ type Registry = Arc<Mutex<HashMap<u64, Arc<Shared>>>>;
 struct Entry {
     id: u64,          // TIDAL track id
     seq: Option<u64>, // registry key (None for Direct/http sources)
+}
+
+/// The output-device state the player thread carries between ticks.
+struct Output {
+    /// What mpv last reported, shared with the `Player` that owns this thread.
+    devices: Arc<Mutex<Vec<AudioDevice>>>,
+    /// A change made and not yet judged. See [`settle_switch`].
+    pending: Option<Switch>,
+    /// Why the last change did not take. Published in the status; display only.
+    error: Option<String>,
+}
+
+/// A device change waiting to be judged.
+struct Switch {
+    /// What to go back to if the new device will not open.
+    previous: String,
+    requested: String,
+    /// When mpv has had long enough to have reopened the output.
+    deadline: Instant,
+}
+
+/// How long mpv is given to reopen the output before the change is judged.
+///
+/// The reinit happens on mpv's own playloop, so the answer is not there the
+/// instant the property is set. Short, because until this passes the app can
+/// still advance the queue onto a device that is not working.
+const SWITCH_GRACE: Duration = Duration::from_millis(400);
+
+/// How many devices are taken off mpv's list.
+///
+/// Bounded like everything else fed from outside. A machine with an audio
+/// interface per channel still lands far inside this.
+const DEVICE_LIST_MAX: i64 = 512;
+
+/// Ask mpv which audio devices exist.
+///
+/// mpv publishes this as a node array, which libmpv2 has no type for - but the
+/// same property answers to an indexed path (`audio-device-list/3/name`), so the
+/// safe wrapper is enough and nothing here has to reach past it.
+///
+/// Reading it makes mpv ask each audio driver what it can see. That advertises
+/// devices; it opens none.
+fn read_devices(mpv: &Mpv) -> Vec<AudioDevice> {
+    let count = mpv
+        .get_property::<i64>("audio-device-list/count")
+        .unwrap_or(0)
+        .clamp(0, DEVICE_LIST_MAX);
+    let mut devices = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+    for i in 0..count {
+        // A name is what makes an entry selectable, so an entry without one is
+        // skipped rather than shown as a row that cannot be chosen.
+        let Ok(name) = mpv.get_property::<String>(&format!("audio-device-list/{i}/name")) else {
+            continue;
+        };
+        let description = mpv
+            .get_property::<String>(&format!("audio-device-list/{i}/description"))
+            .unwrap_or_default();
+        devices.push(AudioDevice { name, description });
+    }
+    devices
+}
+
+/// The mpv audio driver a device identifier names.
+///
+/// Every identifier mpv lists carries its driver before the slash, and `--ao`
+/// pins the driver: setting `audio-device` alone is silently ignored when it
+/// names a different one, which is exactly what the picker offers. So a switch
+/// sets both. `auto` is mpv's "no preference", which the driver list spells as
+/// empty rather than as the word.
+fn device_driver(device: &str) -> &str {
+    match device.split_once('/') {
+        Some((driver, _)) => driver,
+        None if device == "auto" => "",
+        None => device,
+    }
+}
+
+/// Point mpv at a device, driver and all. See [`device_driver`].
+fn apply_device(mpv: &Mpv, device: &str) {
+    set_prop(mpv, "ao", device_driver(device));
+    set_prop(mpv, "audio-device", device);
+}
+
+/// Did a device change leave the player with no output at all?
+///
+/// mpv does not fall back when the device it was given will not open: it
+/// abandons the file and says so in its log, leaving a player that is loaded
+/// but idle with no output open. That pair is the only symptom there is, and
+/// it is what the previous device gets restored on.
+fn switch_failed(has_entries: bool, output_open: bool) -> bool {
+    has_entries && !output_open
+}
+
+/// Judge a device change once mpv has had time to act on it.
+///
+/// Restoring the previous device is what keeps audio working: the track that
+/// was playing is already gone, but the queue plays on rather than the session
+/// being silent until priel is restarted.
+fn settle_switch(mpv: &Mpv, entries: &[Entry], output: &mut Output) {
+    if output
+        .pending
+        .as_ref()
+        .is_none_or(|s| Instant::now() < s.deadline)
+    {
+        return;
+    }
+    let Some(switch) = output.pending.take() else {
+        return;
+    };
+    // `current-ao` is unavailable rather than empty when no output is open.
+    let output_open = mpv.get_property::<String>("current-ao").is_ok();
+    if switch_failed(!entries.is_empty(), output_open) {
+        log::error!(
+            "the output {} would not open; going back to {}",
+            switch.requested,
+            switch.previous
+        );
+        output.error = Some(format!(
+            "{} would not open, so the previous output was restored",
+            switch.requested
+        ));
+        apply_device(mpv, &switch.previous);
+    }
+}
+
+/// The devices mpv can see, without a player thread. See
+/// [`crate::audio_devices`].
+pub fn audio_devices() -> Vec<AudioDevice> {
+    match Mpv::new() {
+        Ok(mpv) => read_devices(&mpv),
+        Err(e) => {
+            log::error!("mpv would not initialise, so its devices cannot be listed: {e}");
+            Vec::new()
+        }
+    }
 }
 
 struct Cookie {
@@ -262,8 +397,9 @@ fn size(cookie: &mut Cookie) -> i64 {
 pub fn spawn(
     config: PlayerConfig,
     rx: Receiver<Cmd>,
-    status: Arc<Mutex<PlaybackStatus>>,
+    published: Published,
 ) -> std::io::Result<JoinHandle<()>> {
+    let Published { status, devices } = published;
     // Named, because the log records which thread wrote each line and "-" says
     // nothing. This is also why the spawn is fallible now: `thread::spawn`
     // panics on the same condition, and a panic is not how priel reports that
@@ -324,6 +460,14 @@ pub fn spawn(
 
         let mut entries: Vec<Entry> = Vec::new();
         let mut seq: u64 = 0;
+        // Devices are enumerated only when asked for: it questions every audio
+        // driver on the machine, which is work no session that never opens the
+        // picker should pay for.
+        let mut output = Output {
+            devices,
+            pending: None,
+            error: None,
+        };
         // The ALSA readout costs a handful of /proc reads, so it is refreshed on
         // its own slower cadence rather than on every status tick.
         let mut hw: Option<HwParams> = None;
@@ -331,7 +475,7 @@ pub fn spawn(
         let mut hw_checked: Option<Instant> = None;
 
         loop {
-            if drain_commands(&mpv, &registry, &mut entries, &mut seq, &rx) {
+            if drain_commands(&mpv, &registry, &mut entries, &mut seq, &mut output, &rx) {
                 break;
             }
             drain_events(&mpv);
@@ -340,12 +484,13 @@ pub fn spawn(
                 hw = hw::probe(config.audio_device.as_deref());
                 hw_checked = Some(Instant::now());
             }
-            let st = read_status(&mpv, &entries, hw.clone());
+            settle_switch(&mpv, &entries, &mut output);
+            let st = read_status(&mpv, &entries, hw.clone(), output.error.clone());
             let idle_backoff = poll_interval(st.playing);
             *lock(&status) = st;
             match rx.recv_timeout(idle_backoff) {
                 Ok(cmd) => {
-                    if handle_cmd(&mpv, &registry, &mut entries, &mut seq, cmd) {
+                    if handle_cmd(&mpv, &registry, &mut entries, &mut seq, &mut output, cmd) {
                         break;
                     }
                 }
@@ -566,12 +711,13 @@ fn drain_commands(
     registry: &Registry,
     entries: &mut Vec<Entry>,
     seq: &mut u64,
+    output: &mut Output,
     rx: &Receiver<Cmd>,
 ) -> bool {
     loop {
         match rx.try_recv() {
             Ok(cmd) => {
-                if handle_cmd(mpv, registry, entries, seq, cmd) {
+                if handle_cmd(mpv, registry, entries, seq, output, cmd) {
                     return true;
                 }
             }
@@ -601,6 +747,7 @@ fn handle_cmd(
     registry: &Registry,
     entries: &mut Vec<Entry>,
     seq: &mut u64,
+    output: &mut Output,
     cmd: Cmd,
 ) -> bool {
     match cmd {
@@ -637,8 +784,44 @@ fn handle_cmd(
             command(mpv, "stop", &[]);
             clear_all(registry, entries);
         }
+        Cmd::RefreshDevices => {
+            *lock(&output.devices) = read_devices(mpv);
+        }
+        Cmd::SetDevice(device) => set_device(mpv, output, device),
     }
     false
+}
+
+/// Move the output, refusing a device that is no longer there.
+///
+/// Checking the list first is what covers the device that was unplugged between
+/// the picker opening and a row being chosen: mpv accepts any string for
+/// `audio-device` and only fails later, by which time the track has stopped.
+/// Refusing here costs nothing and leaves the output exactly as it was.
+fn set_device(mpv: &Mpv, output: &mut Output, device: String) {
+    let known = lock(&output.devices);
+    // An empty list means nothing has been enumerated yet, not that no device
+    // exists, so there is nothing to check the name against.
+    if !known.is_empty() && !known.iter().any(|d| d.name == device) {
+        drop(known);
+        log::error!("no output device is called {device}, so the output was left alone");
+        output.error = Some(format!(
+            "{device} is not available; the output was left alone"
+        ));
+        return;
+    }
+    drop(known);
+    let previous = mpv
+        .get_property::<String>("audio-device")
+        .unwrap_or_else(|_| "auto".to_string());
+    log::info!("moving the output from {previous} to {device}");
+    output.error = None;
+    apply_device(mpv, &device);
+    output.pending = Some(Switch {
+        previous,
+        requested: device,
+        deadline: Instant::now() + SWITCH_GRACE,
+    });
 }
 
 /// Register a source and return (loadfile arg, registry seq if buffered).
@@ -843,7 +1026,12 @@ fn stream_body(resp: &mut Response<Body>, shared: &Arc<Shared>) -> Result<(), St
     clippy::cast_possible_truncation,
     reason = "bitrate is a display value; fractional bits/s are meaningless"
 )]
-fn read_status(mpv: &Mpv, entries: &[Entry], hw: Option<HwParams>) -> PlaybackStatus {
+fn read_status(
+    mpv: &Mpv,
+    entries: &[Entry],
+    hw: Option<HwParams>,
+    device_error: Option<String>,
+) -> PlaybackStatus {
     let position = mpv.get_property::<f64>("time-pos").unwrap_or(0.0);
     let duration = mpv.get_property::<f64>("duration").unwrap_or(0.0);
     let paused = mpv.get_property::<bool>("pause").unwrap_or(false);
@@ -878,6 +1066,12 @@ fn read_status(mpv: &Mpv, entries: &[Entry], hw: Option<HwParams>) -> PlaybackSt
     let cache_secs = mpv
         .get_property::<f64>("demuxer-cache-duration")
         .unwrap_or(0.0);
+    // What the picker marks as in use. mpv's own default for this is the word
+    // `auto`, which is also the identifier of the entry it lists for it, so the
+    // two compare directly.
+    let audio_device = mpv
+        .get_property::<String>("audio-device")
+        .unwrap_or_else(|_| "auto".to_string());
     PlaybackStatus {
         loaded: duration > 0.0,
         playing: !idle && !paused,
@@ -896,6 +1090,8 @@ fn read_status(mpv: &Mpv, entries: &[Entry], hw: Option<HwParams>) -> PlaybackSt
         has_next: entries.len() > 1,
         cache_secs,
         ao_volume,
+        audio_device,
+        device_error,
         hw,
     }
 }
@@ -958,6 +1154,15 @@ mod tests {
         lock(&LINES).clear();
         f();
         lock(&LINES).clone()
+    }
+
+    /// Device state nobody is watching, for the command tests.
+    fn no_output() -> Output {
+        Output {
+            devices: Arc::new(Mutex::new(Vec::new())),
+            pending: None,
+            error: None,
+        }
     }
 
     fn cookie(sh: &Arc<Shared>) -> Cookie {
@@ -1768,12 +1973,151 @@ mod tests {
     }
 
     #[test]
+    fn the_devices_mpv_knows_carry_a_name_and_a_description() {
+        // Goal: both the picker and --list-devices need an identifier to hand
+        // back to mpv and something a person can recognise it by. Enumeration
+        // reads a property and opens no output, so it is safe headlessly.
+        let mpv = silent_mpv();
+        let devices = read_devices(&mpv);
+        assert!(!devices.is_empty(), "mpv reports at least its own default");
+        assert!(
+            devices.iter().any(|d| d.name == "auto"),
+            "the automatic choice is always offered: {devices:?}"
+        );
+        assert!(
+            devices.iter().all(|d| !d.name.is_empty()),
+            "a nameless device could never be selected: {devices:?}"
+        );
+    }
+
+    #[test]
+    fn enumerating_devices_needs_no_player() {
+        // Goal: --list-devices runs before anything else exists, so the list has
+        // to be reachable without starting a player thread.
+        let devices = crate::audio_devices();
+        assert!(devices.iter().any(|d| d.name == "auto"), "{devices:?}");
+    }
+
+    #[test]
+    fn a_device_identifier_names_the_driver_that_has_to_be_used_with_it() {
+        // Goal: --ao pins the driver, and priel pins it to pipewire when no
+        // device was given. Setting audio-device alone is then silently ignored
+        // for every alsa and pulse device the picker offers - measured: the
+        // property took the new value and current-ao never changed.
+        assert_eq!(device_driver("alsa/pipewire"), "alsa");
+        assert_eq!(device_driver("pipewire/some.dac"), "pipewire");
+        assert_eq!(device_driver("pipewire"), "pipewire");
+        assert_eq!(
+            device_driver("auto"),
+            "",
+            "mpv's driver list spells no preference as empty, not as the word"
+        );
+        assert_eq!(
+            device_driver("alsa/hw:CARD=X,DEV=0"),
+            "alsa",
+            "only the first slash separates the driver"
+        );
+    }
+
+    #[test]
+    fn both_halves_of_a_switch_are_accepted_by_mpv() {
+        // Goal: a property mpv rejects is silently ignored, so a misspelling
+        // here would make every choice in the picker a no-op with no symptom
+        // but silence. Nothing is loaded, so no output is opened by this.
+        let mpv = Mpv::new().expect("mpv should initialise headlessly");
+        let lines = captured(|| {
+            apply_device(&mpv, "auto");
+            apply_device(&mpv, "pipewire/some.dac");
+        });
+        assert!(
+            !lines.iter().any(|l| l.contains("rejected the property")),
+            "mpv rejected something: {lines:?}"
+        );
+        assert_eq!(
+            mpv.get_property::<String>("audio-device")
+                .unwrap_or_default(),
+            "pipewire/some.dac"
+        );
+    }
+
+    #[test]
+    fn a_device_that_is_not_there_is_refused_before_it_can_silence_anything() {
+        // Goal: a device can be unplugged between the picker opening and a row
+        // being chosen. mpv accepts any string for audio-device and only fails
+        // later, by which time the track has stopped - so the name is checked
+        // against the list first and the output is left exactly as it was.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        *lock(&output.devices) = vec![AudioDevice {
+            name: "auto".into(),
+            description: "Autoselect device".into(),
+        }];
+
+        let lines = captured(|| {
+            set_device(&mpv, &mut output, "pipewire/one-that-left".into());
+        });
+
+        assert_eq!(
+            mpv.get_property::<String>("audio-device")
+                .unwrap_or_default(),
+            "auto",
+            "the output must not have moved"
+        );
+        assert!(output.pending.is_none(), "there is nothing to judge later");
+        let reported = output.error.clone().unwrap_or_default();
+        assert!(
+            reported.contains("pipewire/one-that-left"),
+            "the user is told which device: {reported}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("one-that-left")),
+            "and it is in the log too: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_device_that_will_not_open_is_told_apart_from_an_idle_player() {
+        // Goal: mpv does not fall back when the device it was given refuses to
+        // open - it abandons the file and leaves no output open. A player with
+        // nothing loaded also has no output open, and that is not a failure.
+        assert!(
+            switch_failed(true, false),
+            "loaded with no output open is the failure"
+        );
+        assert!(
+            !switch_failed(false, false),
+            "an idle player has no output open and nothing is wrong"
+        );
+        assert!(!switch_failed(true, true), "playing on the new device");
+        assert!(!switch_failed(false, true));
+    }
+
+    #[test]
+    fn a_change_is_judged_only_once_mpv_has_had_time_to_make_it() {
+        // Goal: the reinit happens on mpv's own playloop, so judging it the
+        // instant the property is set would call every switch a failure.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        output.pending = Some(Switch {
+            previous: "auto".into(),
+            requested: "pipewire/some.dac".into(),
+            deadline: Instant::now() + Duration::from_secs(30),
+        });
+        settle_switch(&mpv, &[], &mut output);
+        assert!(
+            output.pending.is_some(),
+            "it must still be waiting for the deadline"
+        );
+        assert!(output.error.is_none());
+    }
+
+    #[test]
     fn status_reflects_an_idle_player() {
         // Goal: the UI derives "buffering" and the end-of-track fallback from
         // this snapshot, so an idle player must report honestly rather than
         // looking like a loaded track at position zero.
         let mpv = silent_mpv();
-        let st = read_status(&mpv, &[], None);
+        let st = read_status(&mpv, &[], None, None);
         assert!(!st.loaded);
         assert!(!st.playing);
         assert_eq!(st.current_id, 0, "no entry means no track id");
@@ -1787,7 +2131,7 @@ mod tests {
         // tells it whether a preload already exists.
         let mpv = silent_mpv();
         let entries = vec![Entry { id: 11, seq: None }, Entry { id: 22, seq: None }];
-        let st = read_status(&mpv, &entries, None);
+        let st = read_status(&mpv, &entries, None, None);
         assert_eq!(st.current_id, 11);
         assert!(st.has_next);
     }
@@ -1801,11 +2145,13 @@ mod tests {
         let mut entries = Vec::new();
         let mut seq = 0;
 
+        let mut output = no_output();
         assert!(!handle_cmd(
             &mpv,
             &reg,
             &mut entries,
             &mut seq,
+            &mut output,
             Cmd::SetVolume(42.0)
         ));
         assert!((mpv.get_property::<f64>("volume").unwrap() - 42.0).abs() < f64::EPSILON);
@@ -1817,11 +2163,18 @@ mod tests {
             Cmd::Next,
             Cmd::Stop,
         ] {
-            assert!(!handle_cmd(&mpv, &reg, &mut entries, &mut seq, cmd));
+            assert!(!handle_cmd(
+                &mpv,
+                &reg,
+                &mut entries,
+                &mut seq,
+                &mut output,
+                cmd
+            ));
         }
 
         assert!(
-            handle_cmd(&mpv, &reg, &mut entries, &mut seq, Cmd::Quit),
+            handle_cmd(&mpv, &reg, &mut entries, &mut seq, &mut output, Cmd::Quit),
             "only Quit ends the loop"
         );
     }
@@ -1835,15 +2188,37 @@ mod tests {
         let mut entries = Vec::new();
         let mut seq = 0;
         let src = || PlayableSource::Segments(vec!["http://127.0.0.1:1/x".into()]);
+        let mut output = no_output();
 
-        handle_cmd(&mpv, &reg, &mut entries, &mut seq, Cmd::Load(1, src()));
+        handle_cmd(
+            &mpv,
+            &reg,
+            &mut entries,
+            &mut seq,
+            &mut output,
+            Cmd::Load(1, src()),
+        );
         assert_eq!(entries.len(), 1);
-        handle_cmd(&mpv, &reg, &mut entries, &mut seq, Cmd::Append(2, src()));
+        handle_cmd(
+            &mpv,
+            &reg,
+            &mut entries,
+            &mut seq,
+            &mut output,
+            Cmd::Append(2, src()),
+        );
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, 1);
         assert_eq!(entries[1].id, 2);
 
-        handle_cmd(&mpv, &reg, &mut entries, &mut seq, Cmd::Load(3, src()));
+        handle_cmd(
+            &mpv,
+            &reg,
+            &mut entries,
+            &mut seq,
+            &mut output,
+            Cmd::Load(3, src()),
+        );
         assert_eq!(entries.len(), 1, "Load replaces rather than appends");
         assert_eq!(entries[0].id, 3);
     }
