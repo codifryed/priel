@@ -242,6 +242,14 @@ pub fn spawn(
                 // connection. Without it, audio starts on the first fragment.
                 // In-track seeking still works through mpv's demuxer cache,
                 // which it enables precisely because the stream is not seekable.
+                //
+                // This is also what makes bytes below the reader unreachable,
+                // which is what lets `trim` release them. Measured rather than
+                // assumed, by `mpv_never_reads_a_byte_it_has_already_gone_past`:
+                // across a whole playback plus a backward seek, mpv opened the
+                // stream once, never restarted a read behind what it had already
+                // taken, and asked to seek exactly once - to offset 0, before it
+                // had read anything, which is refused here and always has been.
                 None,
                 Some(size),
             )
@@ -1647,6 +1655,215 @@ mod tests {
             next_chunk(usize::MAX),
             SEGMENT_CHUNK_MAX,
             "the doubling must not overflow"
+        );
+    }
+
+    // ---- what mpv asks of a stream it cannot seek ----
+    //
+    // Whether bytes below the reader are reachable at all decides whether they
+    // can be released while a track plays. These four statics are what the
+    // instrumented callbacks below record; only `probe_backward_seek` uses them,
+    // and it takes `PROBING` so its two scenarios cannot interleave.
+
+    static PROBING: Mutex<()> = Mutex::new(());
+    static OPENS: Mutex<usize> = Mutex::new(0);
+    /// Each seek mpv asked for, with how far the reader had got at the time.
+    static SEEKS: Mutex<Vec<(i64, u64)>> = Mutex::new(Vec::new());
+    static HIGH_WATER: Mutex<u64> = Mutex::new(0);
+    static BACKWARD_READS: Mutex<usize> = Mutex::new(0);
+
+    /// `open`, counting how many times mpv opens the stream.
+    ///
+    /// A reopen would start a fresh cookie at offset zero, which is the one way
+    /// mpv could still want a byte the reader has passed.
+    fn watching_open(reg: &mut Registry, uri: &str) -> Cookie {
+        *lock(&OPENS) += 1;
+        open(reg, uri)
+    }
+
+    /// `read`, recording every offset a read starts at.
+    fn watching_read(cookie: &mut Cookie, buf: &mut [i8]) -> i64 {
+        {
+            let mut high = lock(&HIGH_WATER);
+            if cookie.pos < *high {
+                *lock(&BACKWARD_READS) += 1;
+            }
+            *high = (*high).max(cookie.pos);
+        }
+        read(cookie, buf)
+    }
+
+    /// A seek callback that records what was asked and then declines it.
+    ///
+    /// It returns the *same* error libmpv2's wrapper returns when no seek
+    /// callback is registered at all, so mpv sees exactly the production stream
+    /// while the test learns which offsets it would have wanted. Registering a
+    /// working one is what indexes the whole file before playing a note; see
+    /// `spawn`.
+    fn recording_seek(_cookie: &mut Cookie, offset: i64) -> i64 {
+        let reached = *lock(&HIGH_WATER);
+        lock(&SEEKS).push((offset, reached));
+        i64::from(libmpv2::mpv_error::Unsupported)
+    }
+
+    /// What mpv asked of the stream during one probe.
+    struct Asked {
+        opens: usize,
+        seeks: Vec<(i64, u64)>,
+        backward_reads: usize,
+        went_back: bool,
+    }
+
+    /// Did mpv ever ask the stream for an offset the reader had already passed?
+    fn asked_to_go_back(a: &Asked) -> bool {
+        a.seeks
+            .iter()
+            .any(|(offset, reached)| u64::try_from(*offset).is_ok_and(|o| o < *reached))
+    }
+
+    /// A minimal 16-bit 44.1 kHz mono WAV, so the probe needs no media file.
+    ///
+    /// WAV because it demuxes from a stream that cannot seek and its size is
+    /// exactly predictable: 88200 bytes is one second, which is what makes the
+    /// cache sizes below mean something.
+    fn wav_bytes(seconds: u32) -> Vec<u8> {
+        const RATE: u32 = 44_100;
+        let frames = RATE * seconds;
+        let data_len = frames * 2;
+        let mut w = Vec::with_capacity(data_len as usize + 44);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data_len).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&1u16.to_le_bytes()); // mono
+        w.extend_from_slice(&RATE.to_le_bytes());
+        w.extend_from_slice(&(RATE * 2).to_le_bytes()); // bytes per second
+        w.extend_from_slice(&2u16.to_le_bytes()); // block align
+        w.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&data_len.to_le_bytes());
+        for i in 0..frames {
+            // Not silence: a decoder is free to shortcut a stream of zeroes.
+            let s = i16::try_from(i % 2000).unwrap_or(0) * 8;
+            w.extend_from_slice(&s.to_le_bytes());
+        }
+        w
+    }
+
+    /// Play a stream that cannot seek, seek backwards in it, and report
+    /// everything mpv asked of the stream while doing so.
+    ///
+    /// The cache sizes are parameters because the answer depends on them: with a
+    /// cache big enough, mpv serves a backward seek from its own copy and never
+    /// looks at the stream, which proves nothing about a cache that has run out.
+    fn probe_backward_seek(cache_bytes: i64, back_bytes: i64) -> Asked {
+        let _turn = lock(&PROBING);
+        let mpv = Mpv::new().expect("mpv should initialise headlessly");
+        init_mpv(&mpv, &silent_config());
+        set_prop(&mpv, "demuxer-max-bytes", cache_bytes);
+        set_prop(&mpv, "demuxer-max-back-bytes", back_bytes);
+
+        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        // Deliberately not complete: `size` then reports -1, which is what mpv
+        // sees for a real track, because the stream is opened while the download
+        // is still running.
+        let sh = shared(wav_bytes(30), false);
+        lock(&registry).insert(1, sh.clone());
+
+        *lock(&OPENS) = 0;
+        lock(&SEEKS).clear();
+        *lock(&HIGH_WATER) = 0;
+        *lock(&BACKWARD_READS) = 0;
+
+        // SAFETY: same contract as the player thread; see `spawn`.
+        let protocol = unsafe {
+            Protocol::new(
+                &mpv,
+                "prielseg".into(),
+                registry.clone(),
+                watching_open,
+                close,
+                watching_read,
+                Some(recording_seek),
+                Some(size),
+            )
+        };
+        protocol.register().expect("the protocol should register");
+
+        command(&mpv, "loadfile", &["prielseg://1", "replace"]);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.5 {
+                break;
+            }
+            drain_events(&mpv);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.5,
+            "the probe never started playing"
+        );
+
+        command(&mpv, "seek", &["0.05", "absolute"]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut went_back = false;
+        while Instant::now() < deadline {
+            if mpv.get_property::<f64>("time-pos").unwrap_or(1.0) < 0.4 {
+                went_back = true;
+                break;
+            }
+            drain_events(&mpv);
+            thread::sleep(Duration::from_millis(10));
+        }
+        command(&mpv, "stop", &[]);
+        abort(&sh);
+
+        Asked {
+            opens: *lock(&OPENS),
+            seeks: lock(&SEEKS).clone(),
+            backward_reads: *lock(&BACKWARD_READS),
+            went_back,
+        }
+    }
+
+    #[test]
+    fn mpv_never_reads_a_byte_it_has_already_gone_past() {
+        // Goal: settle whether bytes below the reader are reachable, because
+        // releasing them while a track plays depends entirely on that answer.
+        // Two ways mpv could reach back: seeking the stream, which it cannot do
+        // (no seek callback is registered, so the offsets recorded here are only
+        // ever refused), or reopening it, which would restart at offset zero.
+        //
+        // The second scenario is the adversarial one: a demuxer cache of 1 MiB
+        // with no back buffer at all cannot serve the seek from its own copy, so
+        // if mpv had any way to go back to the stream for those bytes, this is
+        // where it would take it.
+        let generous = probe_backward_seek(64 * 1024 * 1024, 50 * 1024 * 1024);
+        assert_eq!(generous.opens, 1, "the stream was reopened");
+        assert_eq!(
+            generous.backward_reads, 0,
+            "a read started behind the furthest byte already served"
+        );
+        assert!(!asked_to_go_back(&generous), "{:?}", generous.seeks);
+        assert!(
+            generous.went_back,
+            "seeking backwards must keep working: mpv serves it from its own cache"
+        );
+
+        let starved = probe_backward_seek(1024 * 1024, 0);
+        assert_eq!(
+            starved.opens, 1,
+            "the stream was reopened to seek backwards"
+        );
+        assert_eq!(
+            starved.backward_reads, 0,
+            "a read started behind the furthest byte already served"
+        );
+        assert!(!asked_to_go_back(&starved), "{:?}", starved.seeks);
+        println!(
+            "PROBE generous: seeks={:?} went_back={}\nPROBE starved:  seeks={:?} went_back={}",
+            generous.seeks, generous.went_back, starved.seeks, starved.went_back
         );
     }
 
