@@ -97,7 +97,11 @@ fn session(args: cli::Cli) -> Result<()> {
     priel_core::auth::migrate_from_config("token.json");
     priel_core::auth::migrate_from_config("credentials.json");
     let mut terminal = setup().context("preparing the terminal")?;
-    let res = App::new(args.device, priel_core::Client::default_token_path())
+    let player = priel_player::PlayerConfig {
+        mpv_log_file: args.mpv_log_file(),
+        audio_device: args.device,
+    };
+    let res = App::new(player, priel_core::Client::default_token_path())
         .and_then(|mut app| run(&mut terminal, &mut app, &mut TerminalEvents));
     restore(&mut terminal)?;
     // Reported rather than returned: the terminal is back, and printing the
@@ -292,6 +296,17 @@ mod tests {
         );
         assert_eq!(Cli::resolve_level(None, Some("verbose")), LevelFilter::Warn);
         assert_eq!(Cli::resolve_level(None, None), LevelFilter::Warn);
+    }
+
+    #[test]
+    fn mpv_keeps_its_own_log_only_when_someone_is_looking() {
+        // Goal: mpv's log is verbose and answers a different question from
+        // priel's, so it is tied to --log-level debug rather than kept always.
+        // It sits beside priel's own log so a bug report picks up both.
+        assert!(parse(&[]).mpv_log_file().is_none(), "not by default");
+        assert!(parse(&["--log-level", "info"]).mpv_log_file().is_none());
+        let cli = parse(&["--log-level", "debug", "--log-file", "/tmp/x/p.log"]);
+        assert_eq!(cli.mpv_log_file().as_deref(), Some("/tmp/x/priel-mpv.log"));
     }
 
     #[test]

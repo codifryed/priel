@@ -258,6 +258,23 @@ pub(crate) enum Cmd {
     Quit,
 }
 
+/// How to start the player.
+///
+/// A struct rather than a growing argument list: everything here is optional and
+/// independent, and a frontend that wants none of it can use [`Player::new`].
+#[derive(Clone, Debug, Default)]
+pub struct PlayerConfig {
+    /// An mpv device string (e.g. `pipewire/alsa_output.usb-SMSL...pro-output-0`),
+    /// `None` for the default sink, or `Some("null")` for a silent test.
+    pub audio_device: Option<String>,
+    /// Where mpv should write its own log, if anywhere.
+    ///
+    /// Separate from the caller's own log because mpv writes this one itself, in
+    /// its own format, and two writers cannot share a file. It is verbose: set
+    /// it only when someone is looking.
+    pub mpv_log_file: Option<String>,
+}
+
 pub struct Player {
     tx: Sender<Cmd>,
     status: Arc<Mutex<PlaybackStatus>>,
@@ -274,9 +291,20 @@ impl Player {
     /// init failure on that thread, so this does not fail today; the signature
     /// stays fallible so propagating that failure later is not a breaking change.
     pub fn new(audio_device: Option<String>) -> Result<Self> {
+        Self::with_config(PlayerConfig {
+            audio_device,
+            ..PlayerConfig::default()
+        })
+    }
+
+    /// Create a player from a full configuration.
+    ///
+    /// # Errors
+    /// Reserved, exactly as for [`Player::new`].
+    pub fn with_config(config: PlayerConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let status = Arc::new(Mutex::new(PlaybackStatus::default()));
-        let handle = backend::spawn(audio_device, rx, status.clone());
+        let handle = backend::spawn(config, rx, status.clone());
         Ok(Self {
             tx,
             status,

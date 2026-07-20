@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::{Cmd, PlaybackStatus};
+use crate::{Cmd, PlaybackStatus, PlayerConfig};
 
 pub fn spawn(
-    _audio_device: Option<String>,
+    _config: PlayerConfig,
     rx: Receiver<Cmd>,
     _status: Arc<Mutex<PlaybackStatus>>,
 ) -> JoinHandle<()> {

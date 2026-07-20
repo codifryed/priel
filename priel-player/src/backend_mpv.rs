@@ -34,12 +34,12 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use libmpv2::{Mpv, SetData, protocol::Protocol};
+use libmpv2::{Mpv, SetData, events::Event, protocol::Protocol};
 use priel_core::PlayableSource;
 use ureq::{Agent, Body, http::Response};
 
 use crate::hw::{self, HwParams};
-use crate::{Cmd, PlaybackStatus};
+use crate::{Cmd, PlaybackStatus, PlayerConfig};
 
 /// Lock a mutex, tolerating poisoning.
 ///
@@ -192,7 +192,7 @@ fn size(cookie: &mut Cookie) -> i64 {
 // ---- player thread ----
 
 pub fn spawn(
-    audio_device: Option<String>,
+    config: PlayerConfig,
     rx: Receiver<Cmd>,
     status: Arc<Mutex<PlaybackStatus>>,
 ) -> JoinHandle<()> {
@@ -204,7 +204,7 @@ pub fn spawn(
                 return;
             }
         };
-        init_mpv(&mpv, audio_device.as_deref());
+        init_mpv(&mpv, &config);
 
         let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
         // SAFETY: `Protocol::new` is unsafe because libmpv stores these callbacks
@@ -270,9 +270,10 @@ pub fn spawn(
             if quit {
                 break;
             }
+            drain_events(&mpv);
             cleanup_playlist(&mpv, &registry, &mut entries);
             if hw_checked.is_none_or(|t| t.elapsed() >= HW_PROBE_INTERVAL) {
-                hw = hw::probe(audio_device.as_deref());
+                hw = hw::probe(config.audio_device.as_deref());
                 hw_checked = Some(Instant::now());
             }
             let st = read_status(&mpv, &entries, hw.clone());
@@ -324,6 +325,64 @@ fn command(mpv: &Mpv, name: &str, args: &[&str]) {
     }
 }
 
+/// How many mpv events one tick will take off the queue.
+///
+/// Bounded like everything else fed from outside: mpv fills this queue on its
+/// own schedule, and the player loop has a status tick to get back to.
+const EVENT_DRAIN_MAX: usize = 64;
+
+/// Take what mpv has to say off its event queue and record it.
+///
+/// Nothing read this queue at all until now, which had two costs. mpv's queue
+/// filled up and it dropped events; and, worse, **a failed load was
+/// indistinguishable from an idle player** - playback state is inferred by
+/// polling properties, and "not playing" looks the same whether the file ended,
+/// never loaded, or was never asked for. The end-of-file reason is the only
+/// place that difference exists.
+///
+/// libmpv2 turns an end-of-file *carrying an error* into `Err` rather than an
+/// `EndFile` event, so that arm is the one that matters here.
+fn drain_events(mpv: &Mpv) {
+    for _ in 0..EVENT_DRAIN_MAX {
+        // Zero timeout: this runs on the player tick and must not block it.
+        match mpv.wait_event(0.0) {
+            None => return,
+            Some(Err(e)) => log::warn!("mpv reported a failure: {e}"),
+            Some(Ok(event)) => match event {
+                Event::EndFile(reason) => {
+                    log::debug!("mpv ended a file: {}", end_file_reason(reason));
+                }
+                Event::FileLoaded => log::debug!("mpv loaded a file"),
+                // The audio output being rebuilt is the audible cost of a
+                // sample-rate change, so it is worth being able to see one.
+                Event::AudioReconfig => log::debug!("mpv reconfigured the audio output"),
+                Event::QueueOverflow => log::warn!("mpv dropped events: its queue overflowed"),
+                Event::Shutdown => log::warn!("mpv is shutting down"),
+                other => log::trace!("mpv event: {other:?}"),
+            },
+        }
+    }
+    log::debug!(
+        "mpv had more than {EVENT_DRAIN_MAX} events waiting; the rest keep until next tick"
+    );
+}
+
+/// Name an end-of-file reason.
+///
+/// The values are `mpv_end_file_reason` from mpv's `client.h`, which libmpv2
+/// re-exports as a bare integer type without the constants. They are part of
+/// mpv's public ABI and so cannot change; an unknown one still prints.
+fn end_file_reason(reason: libmpv2::EndFileReason) -> String {
+    match reason {
+        0 => "reached the end".to_string(),
+        2 => "stopped".to_string(),
+        3 => "mpv quit".to_string(),
+        4 => "an error".to_string(),
+        5 => "redirected".to_string(),
+        other => format!("reason {other}"),
+    }
+}
+
 /// Run an mpv command whose rejection is routine rather than a fault.
 ///
 /// mpv rejects a seek when nothing is loaded, and the seek keys work at any
@@ -336,7 +395,13 @@ fn command_optional(mpv: &Mpv, name: &str, args: &[&str]) {
 }
 
 /// Apply the fixed player settings and select the output device.
-fn init_mpv(mpv: &Mpv, audio_device: Option<&str>) {
+fn init_mpv(mpv: &Mpv, config: &PlayerConfig) {
+    // Nothing read mpv's event queue until `drain_events` existed, and mpv still
+    // queues the events it has deprecated. Turning them off keeps the drain to
+    // things that mean something.
+    if let Err(e) = mpv.disable_deprecated_events() {
+        log::warn!("mpv would not disable its deprecated events: {e}");
+    }
     set_prop(mpv, "vid", "no");
     set_prop(mpv, "volume", 100i64);
     // "weak" = gapless only when the format matches; a sample-rate change
@@ -375,10 +440,16 @@ fn init_mpv(mpv: &Mpv, audio_device: Option<&str>) {
     // Only consulted on the non-network path, where cache-secs does not apply.
     set_prop(mpv, "demuxer-readahead-secs", 30.0);
 
-    match audio_device {
+    match config.audio_device.as_deref() {
         Some("null") => set_prop(mpv, "ao", "null"),
         Some(dev) => set_prop(mpv, "audio-device", dev),
         None => set_prop(mpv, "ao", "pipewire"),
+    }
+
+    // mpv's own log, when the caller asked for one. It writes this itself and
+    // truncates on open, which is why it cannot share priel's file.
+    if let Some(path) = config.mpv_log_file.as_deref() {
+        set_prop(mpv, "log-file", path);
     }
 }
 
@@ -1007,9 +1078,17 @@ mod tests {
 
     // ---- against a real mpv handle ----
 
+    /// The null output, nothing else configured.
+    fn silent_config() -> PlayerConfig {
+        PlayerConfig {
+            audio_device: Some("null".into()),
+            ..PlayerConfig::default()
+        }
+    }
+
     fn silent_mpv() -> Mpv {
         let mpv = Mpv::new().expect("mpv should initialise headlessly");
-        init_mpv(&mpv, Some("null"));
+        init_mpv(&mpv, &silent_config());
         mpv
     }
 
@@ -1055,7 +1134,7 @@ mod tests {
         // where the debug assertion this replaced did nothing.
         let lines = captured(|| {
             let mpv = Mpv::new().expect("mpv should initialise headlessly");
-            init_mpv(&mpv, Some("null"));
+            init_mpv(&mpv, &silent_config());
         });
         assert!(
             !lines.iter().any(|l| l.contains("rejected the property")),
@@ -1107,9 +1186,77 @@ mod tests {
             "the buffer must still be released"
         );
         assert!(
-            lines.iter().any(|l| l.contains("segment")),
-            "the failure should name what it was fetching: {lines:?}"
+            lines.iter().any(|l| l.contains("will end short")),
+            "the failure should say the track was cut off: {lines:?}"
         );
+    }
+
+    #[test]
+    fn a_file_mpv_cannot_load_is_reported_rather_than_looking_idle() {
+        // Goal: nothing here ever read mpv's event queue, so a failed load was
+        // indistinguishable from a player with nothing to do - the UI showed a
+        // track that simply never started and no explanation existed anywhere.
+        let lines = captured(|| {
+            let mpv = silent_mpv();
+            command(
+                &mpv,
+                "loadfile",
+                &["/nonexistent/priel-not-a-file.flac", "replace"],
+            );
+            for _ in 0..200 {
+                drain_events(&mpv);
+                if lock(&LINES).iter().any(|l: &String| l.contains("mpv")) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        assert!(
+            lines.iter().any(|l| l.contains("mpv")),
+            "the failed load should be recorded: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn draining_an_idle_queue_costs_nothing_and_says_nothing() {
+        // Goal: this runs on every tick of the player loop, so the common case
+        // must be a cheap no-op that does not fill the log with noise.
+        let lines = captured(|| {
+            let mpv = silent_mpv();
+            drain_events(&mpv);
+            drain_events(&mpv);
+        });
+        // Named exactly: the buffer is shared with whatever else is running,
+        // and "mpv event" is the catch-all arm that the deprecated events used
+        // to trip. Nothing else in the tree emits it.
+        assert!(
+            !lines.iter().any(|l| l.contains("mpv event")),
+            "an idle queue should be silent: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn mpvs_own_log_is_a_setting_mpv_accepts() {
+        // Goal: the one property priel does not always apply, so it is the one
+        // that could sit misspelled and unnoticed. mpv opens the file itself.
+        let path = std::env::temp_dir().join(format!("priel-mpvlog-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let lines = captured(|| {
+            let mpv = Mpv::new().expect("mpv should initialise headlessly");
+            init_mpv(
+                &mpv,
+                &PlayerConfig {
+                    audio_device: Some("null".into()),
+                    mpv_log_file: Some(path.to_string_lossy().into_owned()),
+                },
+            );
+        });
+        assert!(
+            !lines.iter().any(|l| l.contains("rejected the property")),
+            "{lines:?}"
+        );
+        assert!(path.exists(), "mpv should have opened its own log");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1117,7 +1264,13 @@ mod tests {
         // Goal: `--device` is how a user reaches their DAC; it must become
         // audio-device rather than being swallowed.
         let mpv = Mpv::new().expect("mpv");
-        init_mpv(&mpv, Some("pipewire/some.dac"));
+        init_mpv(
+            &mpv,
+            &PlayerConfig {
+                audio_device: Some("pipewire/some.dac".into()),
+                ..PlayerConfig::default()
+            },
+        );
         assert_eq!(
             mpv.get_property::<String>("audio-device").unwrap(),
             "pipewire/some.dac"
@@ -1374,7 +1527,7 @@ mod tests {
         let total = media.len();
 
         let mpv = Mpv::new().ok()?;
-        init_mpv(&mpv, Some("null"));
+        init_mpv(&mpv, &silent_config());
         let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
         let sh = shared(Vec::new(), false);
         lock(&registry).insert(1, sh.clone());

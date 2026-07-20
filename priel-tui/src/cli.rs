@@ -112,6 +112,24 @@ impl Cli {
             .into()
     }
 
+    /// Where mpv should write its own log, if anywhere.
+    ///
+    /// mpv's log answers a different question from priel's - what the decoder
+    /// and the audio output made of a track - and it is verbose enough that it
+    /// is only kept when someone is deliberately looking, so it follows
+    /// `--log-level debug`. It is a separate file because mpv writes it itself,
+    /// in its own format; two writers cannot share one file. It sits beside
+    /// priel's own log so that attaching one to a bug report picks up both.
+    #[must_use]
+    pub fn mpv_log_file(&self) -> Option<String> {
+        if self.log_level() < LevelFilter::Debug {
+            return None;
+        }
+        let own = self.log_path();
+        let beside = std::path::Path::new(&own).with_file_name("priel-mpv.log");
+        Some(beside.to_string_lossy().into_owned())
+    }
+
     /// The log path to use, resolving the default only when none was given.
     ///
     /// Deliberately *not* a clap `default_value_t`: that is evaluated when the

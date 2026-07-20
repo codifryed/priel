@@ -31,7 +31,7 @@ use ratatui::layout::Rect;
 
 use priel_core::auth::{Credentials, Pkce};
 use priel_core::{Playlist, Track};
-use priel_player::{PlaybackStatus, Player};
+use priel_player::{PlaybackStatus, Player, PlayerConfig};
 
 #[cfg(test)]
 use std::sync::mpsc::Sender;
@@ -201,8 +201,8 @@ struct RenderSig {
 }
 
 impl App {
-    pub fn new(device: Option<String>, token_path: String) -> anyhow::Result<Self> {
-        let player = Player::new(device)?;
+    pub fn new(player: PlayerConfig, token_path: String) -> anyhow::Result<Self> {
+        let player = Player::with_config(player)?;
         let creds_path = Credentials::default_path();
         let lookup = vec![Credentials::override_path(), creds_path.clone()];
         let has_credentials =
@@ -2414,8 +2414,14 @@ mod tests {
     fn the_real_constructor_wires_a_player_and_a_worker() {
         // Goal: `new` is what main calls. A bad token path must still produce a
         // usable app - the failure arrives later as a notice.
-        let app = App::new(Some("null".into()), "/nonexistent/priel.json".into())
-            .expect("an app should be constructible without a valid token");
+        let app = App::new(
+            PlayerConfig {
+                audio_device: Some("null".into()),
+                ..PlayerConfig::default()
+            },
+            "/nonexistent/priel.json".into(),
+        )
+        .expect("an app should be constructible without a valid token");
         assert_eq!(app.view, View::Favorites);
         assert!(app.loading, "it starts out loading");
     }
