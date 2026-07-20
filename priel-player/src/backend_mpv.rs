@@ -260,23 +260,7 @@ pub fn spawn(
         let mut hw_checked: Option<Instant> = None;
 
         loop {
-            let mut quit = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(cmd) => {
-                        if handle_cmd(&mpv, &registry, &mut entries, &mut seq, cmd) {
-                            quit = true;
-                            break;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        quit = true;
-                        break;
-                    }
-                }
-            }
-            if quit {
+            if drain_commands(&mpv, &registry, &mut entries, &mut seq, &rx) {
                 break;
             }
             drain_events(&mpv);
@@ -286,15 +270,7 @@ pub fn spawn(
                 hw_checked = Some(Instant::now());
             }
             let st = read_status(&mpv, &entries, hw.clone());
-            // Poll fast enough for a smooth progress bar while audio is moving,
-            // and back off when it is not. `recv_timeout` rather than `sleep` so
-            // a command still wakes the thread immediately either way - the
-            // backoff must not cost keypress latency.
-            let idle_backoff = if st.playing {
-                Duration::from_millis(100)
-            } else {
-                Duration::from_millis(500)
-            };
+            let idle_backoff = poll_interval(st.playing);
             *lock(&status) = st;
             match rx.recv_timeout(idle_backoff) {
                 Ok(cmd) => {
@@ -506,6 +482,45 @@ fn request_log_messages(mpv: &Mpv, level: &str) {
     let rc = unsafe { libmpv2_sys::mpv_request_log_messages(mpv.ctx.as_ptr(), level.as_ptr()) };
     if rc < 0 {
         log::warn!("mpv would not give up its log: error {rc}");
+    }
+}
+
+/// Take every command that is already waiting, without blocking.
+///
+/// Separate from the tick below because they answer different questions: this
+/// one is "has anything been asked of us", the tick is "what should we report".
+/// Returns true if the thread should quit.
+fn drain_commands(
+    mpv: &Mpv,
+    registry: &Registry,
+    entries: &mut Vec<Entry>,
+    seq: &mut u64,
+    rx: &Receiver<Cmd>,
+) -> bool {
+    loop {
+        match rx.try_recv() {
+            Ok(cmd) => {
+                if handle_cmd(mpv, registry, entries, seq, cmd) {
+                    return true;
+                }
+            }
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => return true,
+        }
+    }
+}
+
+/// How long to wait before the next status tick.
+///
+/// Fast enough for a smooth progress bar while audio is moving, and backed off
+/// when it is not. The caller waits with `recv_timeout` rather than sleeping, so
+/// a command still wakes the thread immediately either way - the backoff must
+/// not cost keypress latency.
+fn poll_interval(playing: bool) -> Duration {
+    if playing {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_millis(500)
     }
 }
 

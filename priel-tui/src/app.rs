@@ -695,6 +695,32 @@ impl App {
         self.notice = Some("\u{26a0} the worker stopped; restart priel".into());
     }
 
+    /// A stream came back resolved.
+    ///
+    /// Which of the two things to do with it is decided by *which* track was
+    /// asked for, never by arrival order: replies are correlated by id, and a
+    /// slow resolve for a track the user has already left must not start
+    /// playing.
+    fn on_resolved(&mut self, id: u64, r: &priel_core::ResolvedStream) {
+        let meta = StreamMeta {
+            bit_depth: r.bit_depth,
+            sample_rate: r.sample_rate,
+            codec: r.codec.clone(),
+            quality: r.quality.clone(),
+        };
+        self.metas.insert(id, meta);
+        if self.current_target == Some(id) {
+            self.player.play_now(id, r.source.clone());
+            self.current_target = None;
+            self.expected_id = id;
+            self.advanced = false;
+            self.now_meta = self.metas.get(&id).cloned().unwrap_or_default();
+            self.schedule_next();
+        } else if self.next_intended == Some(id) {
+            self.player.append_next(id, r.source.clone());
+        }
+    }
+
     pub fn drain_worker(&mut self) {
         loop {
             let msg = match self.worker.rx.try_recv() {
@@ -735,25 +761,7 @@ impl App {
                     self.selected = 0;
                     self.notice = Some(format!("{} results", self.search_tracks.len()));
                 }
-                FromWorker::Resolved(id, r) => {
-                    let meta = StreamMeta {
-                        bit_depth: r.bit_depth,
-                        sample_rate: r.sample_rate,
-                        codec: r.codec.clone(),
-                        quality: r.quality.clone(),
-                    };
-                    self.metas.insert(id, meta);
-                    if self.current_target == Some(id) {
-                        self.player.play_now(id, r.source.clone());
-                        self.current_target = None;
-                        self.expected_id = id;
-                        self.advanced = false;
-                        self.now_meta = self.metas.get(&id).cloned().unwrap_or_default();
-                        self.schedule_next();
-                    } else if self.next_intended == Some(id) {
-                        self.player.append_next(id, r.source.clone());
-                    }
-                }
+                FromWorker::Resolved(id, r) => self.on_resolved(id, &r),
                 FromWorker::Failed { fault, detail } => {
                     self.loading = false;
                     // Branching on the classification, never on the words. This

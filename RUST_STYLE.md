@@ -209,8 +209,12 @@ and is lost. Diagnostics go to `$XDG_STATE_HOME/priel/priel.log` through the sin
 ### Function length and ordering
 
 - **Soft limit of 70 lines per function.** Push `if`/`match` up into the parent, push loops and
-  iterator chains down into helpers. `backend_mpv::spawn` is the current outlier at ~75 lines and
-  should shed its setup block into an `init_mpv` helper when next touched.
+  iterator chains down into helpers. `backend_mpv::spawn` is the standing outlier at ~90 lines, and
+  the reason is worth knowing before trying again: `Protocol<'parent>` borrows the `Mpv`, so the two
+  cannot be built in a helper and returned together, and their drop order is what unregisters the
+  protocol while the handle is still alive. About a third of what is left is the `// SAFETY:` block
+  explaining that. Getting under the limit needs the thread's mutable state moved into a struct so
+  the loop can take `&mut self`, not another extraction.
 - `pub fn new` leads the `impl` block, then core logic and per-tick paths, then rare helpers.
 - Keep leaf functions pure where you can; let the parent own the state. This is also what makes
   them testable, so it pays twice.
