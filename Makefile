@@ -66,6 +66,7 @@ test: ## Run the test suite
 
 test-all: test ## Test both feature configurations
 	$(CARGO) test $(CARGO_FLAGS) -p priel-tui --no-default-features
+	$(CARGO) test $(CARGO_FLAGS) -p priel-player --no-default-features
 
 lint: ## Clippy (pedantic) over both feature configurations
 	$(CARGO) clippy $(CARGO_FLAGS) --workspace --all-targets -- -D warnings
