@@ -1954,6 +1954,34 @@ mod tests {
     }
 
     #[test]
+    fn the_startup_flag_reaches_mpv_and_is_off_without_it() {
+        // Goal: --exclusive is the half of this that has no interactive
+        // feedback until a track plays, so a request that never reached mpv
+        // would look identical to one that was refused. And the default has to
+        // be off: priel never takes a device on its own.
+        let mpv = Mpv::new().expect("mpv should initialise headlessly");
+        init_mpv(&mpv, &silent_config());
+        assert!(
+            !mpv.get_property::<bool>("audio-exclusive").unwrap_or(true),
+            "no flag, no exclusivity"
+        );
+
+        let mpv = Mpv::new().expect("mpv should initialise headlessly");
+        init_mpv(
+            &mpv,
+            &PlayerConfig {
+                audio_device: Some("null".into()),
+                exclusive: true,
+                ..PlayerConfig::default()
+            },
+        );
+        assert!(
+            mpv.get_property::<bool>("audio-exclusive").unwrap_or(false),
+            "the flag has to reach mpv, not just priel's own state"
+        );
+    }
+
+    #[test]
     fn a_property_mpv_rejects_is_recorded_by_name() {
         // Goal: the failure has no other symptom - the setting simply does not
         // apply - so the log line is the only way anyone finds out.
