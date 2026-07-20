@@ -257,6 +257,7 @@ const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
             ("1 2 3", "jump to a view"),
             ("Enter", "open playlist"),
             ("Esc", "back to playlists"),
+            ("r", "reload this list"),
             ("M", "recent log messages"),
         ],
     ),
@@ -807,7 +808,12 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
         bar.button(format!(" {label} "), Hit::View(view), tab_style(active));
     }
 
-    bar.label("   ", Style::default());
+    bar.label(" ", Style::default());
+    // Next to the tabs because it acts on the list, not on the playback: it
+    // fetches whichever list is on screen again, from its first page.
+    bar.button(" ↻ ", Hit::Reload, button_style());
+
+    bar.label("  ", Style::default());
     bar.button(" |◁ ", Hit::Prev, button_style());
     // A control shows the action it performs, not the state it is in.
     bar.button(
@@ -898,23 +904,23 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn list_title(app: &App, count: usize) -> String {
+    // Rows loaded against rows there are, while those differ. Without it a list
+    // that has only paged in its first hundred reads as the whole thing, and
+    // the user has no reason to keep scrolling.
+    let of_total = app
+        .rows_available()
+        .map_or(String::new(), |total| format!(" of {total}"));
     match app.view {
-        View::Favorites => {
-            // Rows loaded against rows there are, while those differ. Without
-            // it a list that has only paged in its first hundred reads as the
-            // whole library, and the user has no reason to keep scrolling.
-            let of_total = app
-                .favorites_available()
-                .map_or(String::new(), |total| format!(" of {total}"));
-            format!(
-                "Favorites — {count}{of_total} tracks   \
-                 (Tab views · j/k move · Enter play · / filter · s shuffle)"
-            )
+        View::Favorites => format!(
+            "Favorites — {count}{of_total} tracks   \
+             (Tab views · j/k move · Enter play · / filter · s shuffle)"
+        ),
+        View::Playlists => {
+            format!("Playlists — {count}{of_total}   (Enter to open · j/k move)")
         }
-        View::Playlists => format!("Playlists — {count}   (Enter to open · j/k move)"),
         View::PlaylistTracks => {
             let name = app.open_playlist.as_ref().map_or("", |(_, t)| t.as_str());
-            format!("▸ {name} — {count} tracks   (Esc back · Enter play)")
+            format!("▸ {name} — {count}{of_total} tracks   (Esc back · Enter play)")
         }
         View::Search => {
             if app.mode == Mode::Search {
@@ -926,7 +932,7 @@ fn list_title(app: &App, count: usize) -> String {
                 "Search   (i or type to search TIDAL)".to_string()
             } else {
                 format!(
-                    "Search: {} — {count} results   (i to edit)",
+                    "Search: {} — {count}{of_total} results   (i to edit)",
                     app.search_query
                 )
             }
@@ -1670,6 +1676,37 @@ mod tests {
     }
 
     #[test]
+    fn every_heading_separates_rows_loaded_from_rows_there_are() {
+        // Goal: the same reason as above, on the three views that used to stop
+        // at their first page. A heading that hides the difference is a list
+        // the user has no reason to keep scrolling.
+        let mut sc = screen();
+        sc.app.view = View::Playlists;
+        sc.app.playlists = vec![Playlist {
+            uuid: "u".into(),
+            title: "Mix".into(),
+            num_tracks: 3,
+            duration_secs: 60,
+        }];
+        sc.app.playlists_paging.total = 40;
+        assert!(text(&mut sc.app, 120, 12).contains("1 of 40"));
+
+        let mut sc = screen();
+        sc.app.view = View::PlaylistTracks;
+        sc.app.open_playlist = Some(("u".into(), "Late Night".into()));
+        sc.app.playlist_tracks = vec![track(2, "Track")];
+        sc.app.playlist_tracks_paging.total = 312;
+        assert!(text(&mut sc.app, 120, 12).contains("1 of 312 tracks"));
+
+        let mut sc = screen();
+        sc.app.view = View::Search;
+        sc.app.search_query = "blue".into();
+        sc.app.search_tracks = vec![track(3, "Kind of Blue")];
+        sc.app.search_paging.total = 900;
+        assert!(text(&mut sc.app, 120, 12).contains("1 of 900 results"));
+    }
+
+    #[test]
     fn an_open_playlist_is_titled_by_its_name() {
         // Goal: the drill-down has to say which playlist you are inside.
         let mut sc = screen();
@@ -2152,6 +2189,23 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert_eq!(sc.app.view, View::Search);
+    }
+
+    #[test]
+    fn the_reload_control_is_painted_where_a_click_on_it_lands() {
+        // Goal: every action has to be reachable with the mouse as well as from
+        // the keyboard, and a control whose hit box has drifted from what was
+        // drawn is reachable from neither.
+        let mut sc = screen();
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains('↻'), "the control has to be visible: {out}");
+        let (rect, _) = *sc
+            .app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == Hit::Reload)
+            .expect("reload should be clickable");
+        assert!(rect.width > 0, "and have somewhere to click");
     }
 
     #[test]

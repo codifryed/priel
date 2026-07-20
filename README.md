@@ -188,6 +188,7 @@ row of the interface is also clickable.
 | Seek ±5s | `h`/`l`, `←`/`→` | click or drag the progress bar |
 | Previous / next track | `H`/`L`, or `p`/`n` | click `|◁` / `▷|` |
 | Filter the current list | `/`, type, `Enter`/`Esc` | click `[/]` |
+| Reload the current list | `r` | click `↻` |
 | Search the catalogue | `3`, type, `Enter`; `i` to re-edit | — |
 | Shuffle the current view | `s` | click `⇄` |
 | Volume | `+` / `-` | click `-` / `+` |
@@ -199,8 +200,10 @@ playlist. It never quits.
 
 ## Status
 
-Working: favorites, playlists and catalogue search; local filtering; hi-res
-resolution and playback (24/192 via progressive segment streaming); a gapless
+Working: favorites, playlists and catalogue search, each paged in as the
+selection nears the end of the loaded rows and reloadable with `r`; local
+filtering; hi-res resolution and playback (24/192 via progressive segment
+streaming); a gapless
 play queue with a preloaded next track; shuffle with auto-advance; play, pause,
 seek, skip and volume; a now-playing bar with a scrubbable progress bar, a live
 DAC badge and a bit-perfect indicator; the `?` reference overlay; a diagnostic
@@ -231,7 +234,6 @@ Roadmap, roughly in order:
   cannot listen on, so the flow ends with a paste. A client registered with a
   loopback redirect would remove that step; the developer terms do not currently
   permit a native player, so it stands.
-- **Incremental paging** — listings currently fetch a first page only.
 - MPRIS, cover art (kitty/sixel).
 - **Spectrum visualiser**, if it can coexist with bit-perfect output.
 

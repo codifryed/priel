@@ -108,13 +108,6 @@ pub struct Page<T> {
     pub total: u32,
 }
 
-/// Multi-type search results.
-#[derive(Clone, Debug, Default)]
-pub struct SearchResults {
-    pub tracks: Vec<Track>,
-    pub playlists: Vec<Playlist>,
-}
-
 /// What the player needs to actually play a resolved track.
 #[derive(Clone, Debug)]
 pub enum PlayableSource {
@@ -579,16 +572,22 @@ impl Client {
         })
     }
 
-    /// The user's own playlists.
+    /// A page of the user's own playlists.
+    ///
+    /// Carries the length of the whole listing, as [`Self::favorite_tracks`]
+    /// does, so a caller paging through it stops on the service's count rather
+    /// than on a short page.
     ///
     /// # Errors
     /// If [`Self::connect`] has not run, on a transport failure, or on a
     /// non-success status.
-    pub fn user_playlists(&mut self, offset: u32, limit: u32) -> Result<Vec<Playlist>> {
+    pub fn user_playlists(&mut self, offset: u32, limit: u32) -> Result<Page<Playlist>> {
         #[derive(Deserialize)]
         struct R {
             #[serde(default)]
             items: Vec<PlaylistBrief>,
+            #[serde(rename = "totalNumberOfItems", default)]
+            total_number_of_items: u32,
         }
 
         let sess = self.session()?.clone();
@@ -606,22 +605,31 @@ impl Client {
             bail!("playlists -> HTTP {}", resp.status());
         }
         let r: R = resp.body_mut().read_json()?;
-        Ok(r.items
-            .into_iter()
-            .map(PlaylistBrief::into_playlist)
-            .collect())
+        Ok(Page {
+            items: r
+                .items
+                .into_iter()
+                .map(PlaylistBrief::into_playlist)
+                .collect(),
+            total: r.total_number_of_items,
+        })
     }
 
-    /// Tracks in a playlist.
+    /// A page of the tracks in a playlist.
+    ///
+    /// The total is reported here too, but a caller need not wait for it: the
+    /// playlist listing already says how many tracks a playlist holds.
     ///
     /// # Errors
     /// If [`Self::connect`] has not run, on a transport failure, or on a
     /// non-success status (an unknown or private `uuid` yields 404).
-    pub fn playlist_tracks(&mut self, uuid: &str, offset: u32, limit: u32) -> Result<Vec<Track>> {
+    pub fn playlist_tracks(&mut self, uuid: &str, offset: u32, limit: u32) -> Result<Page<Track>> {
         #[derive(Deserialize)]
         struct R {
             #[serde(default)]
             items: Vec<TrackBrief>,
+            #[serde(rename = "totalNumberOfItems", default)]
+            total_number_of_items: u32,
         }
 
         let sess = self.session()?.clone();
@@ -639,61 +647,68 @@ impl Client {
             bail!("playlist tracks -> HTTP {}", resp.status());
         }
         let r: R = resp.body_mut().read_json()?;
-        Ok(r.items.into_iter().map(TrackBrief::into_track).collect())
+        Ok(Page {
+            items: r.items.into_iter().map(TrackBrief::into_track).collect(),
+            total: r.total_number_of_items,
+        })
     }
 
-    /// Multi-type search (tracks + playlists).
+    /// A page of tracks matching a search.
+    ///
+    /// **Tracks only, deliberately.** The endpoint will also return playlists,
+    /// albums and artists, and this used to ask for playlists as well and hand
+    /// them back for every caller to discard. Paging is why that is no longer
+    /// harmless: one `offset` applies to the whole request, so advancing
+    /// through the tracks would advance through the other kinds in step with
+    /// them, and a caller reading one kind would silently skip most of the
+    /// other. Searching a second kind means a second call with an offset of its
+    /// own, which is what a frontend that wants playlist hits should add.
     ///
     /// # Errors
     /// If [`Self::connect`] has not run, on a transport failure, or on a
     /// non-success status. An empty result set is `Ok`, not an error.
-    pub fn search(&mut self, query: &str, limit: u32) -> Result<SearchResults> {
-        #[derive(Deserialize)]
-        struct Wrap<T> {
-            items: Vec<T>,
-        }
-        impl<T> Default for Wrap<T> {
-            fn default() -> Self {
-                Self { items: Vec::new() }
-            }
+    pub fn search_tracks(&mut self, query: &str, offset: u32, limit: u32) -> Result<Page<Track>> {
+        // Defaulted throughout: an answer with no `tracks` object at all - which
+        // is what a query with no hits can look like - is an empty page, not a
+        // parse failure.
+        #[derive(Deserialize, Default)]
+        struct Wrap {
+            #[serde(default)]
+            items: Vec<TrackBrief>,
+            #[serde(rename = "totalNumberOfItems", default)]
+            total_number_of_items: u32,
         }
         #[derive(Deserialize)]
         struct R {
             #[serde(default)]
-            tracks: Wrap<TrackBrief>,
-            #[serde(default)]
-            playlists: Wrap<PlaylistBrief>,
+            tracks: Wrap,
         }
 
         let sess = self.session()?.clone();
         let url = self.url("/v1/search");
-        let lim = limit.to_string();
+        let (off, lim) = (offset.to_string(), limit.to_string());
         let mut resp = self.get_authed(
             &url,
             &[
                 ("query", query),
                 ("countryCode", sess.country_code.as_str()),
                 ("limit", lim.as_str()),
-                ("types", "TRACKS,PLAYLISTS"),
+                ("offset", off.as_str()),
+                ("types", "TRACKS"),
             ],
         )?;
         if !resp.status().is_success() {
             bail!("search -> HTTP {}", resp.status());
         }
         let r: R = resp.body_mut().read_json()?;
-        Ok(SearchResults {
-            tracks: r
+        Ok(Page {
+            items: r
                 .tracks
                 .items
                 .into_iter()
                 .map(TrackBrief::into_track)
                 .collect(),
-            playlists: r
-                .playlists
-                .items
-                .into_iter()
-                .map(PlaylistBrief::into_playlist)
-                .collect(),
+            total: r.tracks.total_number_of_items,
         })
     }
 
@@ -982,11 +997,11 @@ mod tests {
         let mut c = connected(&s);
 
         let lists = c.user_playlists(0, 10).unwrap();
-        assert_eq!(lists[0].uuid, "abc");
-        assert_eq!(lists[0].num_tracks, 3);
+        assert_eq!(lists.items[0].uuid, "abc");
+        assert_eq!(lists.items[0].num_tracks, 3);
 
         let tracks = c.playlist_tracks("abc", 0, 10).unwrap();
-        assert_eq!(tracks[0].id, 5);
+        assert_eq!(tracks.items[0].id, 5);
 
         let _ = s.seen.recv().unwrap();
         let _ = s.seen.recv().unwrap();
@@ -994,23 +1009,76 @@ mod tests {
     }
 
     #[test]
-    fn search_returns_both_kinds_and_an_empty_result_is_not_an_error() {
-        // Goal: a query with no hits is a normal answer. Treating it as an error
-        // would put a scary notice on screen for an ordinary typo.
+    fn every_listing_reports_the_length_of_the_whole_listing() {
+        // Goal: favorites already page off the service's own count, and the
+        // other three listings send the same field. A caller that had to guess
+        // the end from a short page would stop early on any listing the service
+        // caps below the limit it was asked for.
         let s = stub(vec![
             ok(SESSION),
-            ok(r#"{"tracks":{"items":[{"id":2,"title":"S"}]},
-                  "playlists":{"items":[{"uuid":"u","title":"P"}]}}"#),
-            ok("{}"),
+            ok(r#"{"totalNumberOfItems":40,"items":[{"uuid":"abc"}]}"#),
+            ok(r#"{"totalNumberOfItems":312,"items":[{"id":5}]}"#),
+            ok(r#"{"tracks":{"totalNumberOfItems":900,"items":[{"id":2}]}}"#),
         ]);
         let mut c = connected(&s);
 
-        let hits = c.search("blue", 50).unwrap();
-        assert_eq!(hits.tracks.len(), 1);
-        assert_eq!(hits.playlists.len(), 1);
+        assert_eq!(c.user_playlists(0, 10).unwrap().total, 40);
+        assert_eq!(c.playlist_tracks("abc", 0, 10).unwrap().total, 312);
+        assert_eq!(c.search_tracks("blue", 0, 10).unwrap().total, 900);
+    }
 
-        let empty = c.search("zzz", 50).unwrap();
-        assert!(empty.tracks.is_empty() && empty.playlists.is_empty());
+    #[test]
+    fn a_listing_with_no_count_of_its_own_reports_zero() {
+        // Goal: the field is absent from some answers, on every listing. Zero
+        // says "unknown" and lets the caller fall back on something it knows;
+        // a guessed total would page past the end.
+        let s = stub(vec![
+            ok(SESSION),
+            ok(r#"{"items":[{"uuid":"abc"}]}"#),
+            ok(r#"{"items":[{"id":5}]}"#),
+            ok(r#"{"tracks":{"items":[{"id":2}]}}"#),
+        ]);
+        let mut c = connected(&s);
+
+        assert_eq!(c.user_playlists(0, 10).unwrap().total, 0);
+        assert_eq!(c.playlist_tracks("abc", 0, 10).unwrap().total, 0);
+        assert_eq!(c.search_tracks("blue", 0, 10).unwrap().total, 0);
+    }
+
+    #[test]
+    fn a_search_page_asks_for_tracks_at_the_offset_it_was_given() {
+        // Goal: search took a limit and no offset at all, so every page was the
+        // first one. The offset has to reach the query string, and the request
+        // has to name the one result kind the page type can carry.
+        let s = stub(vec![
+            ok(SESSION),
+            ok(r#"{"tracks":{"items":[{"id":2,"title":"S"}]}}"#),
+        ]);
+        let page = connected(&s).search_tracks("blue", 60, 30).unwrap();
+        assert_eq!(page.items[0].id, 2);
+
+        let _ = s.seen.recv().unwrap();
+        let req = s.seen.recv().unwrap();
+        assert!(req.contains("offset=60"), "{req}");
+        assert!(req.contains("limit=30"), "{req}");
+        assert!(
+            req.contains("types=TRACKS") && !req.contains("PLAYLISTS"),
+            "one offset cannot page two result kinds: {req}"
+        );
+    }
+
+    #[test]
+    fn a_search_with_no_hits_is_not_an_error() {
+        // Goal: a query with no hits is a normal answer. Treating it as an error
+        // would put a scary notice on screen for an ordinary typo.
+        let s = stub(vec![ok(SESSION), ok("{}")]);
+        assert!(
+            connected(&s)
+                .search_tracks("zzz", 0, 50)
+                .unwrap()
+                .items
+                .is_empty()
+        );
     }
 
     #[test]
