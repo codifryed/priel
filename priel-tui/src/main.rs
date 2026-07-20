@@ -50,6 +50,13 @@ fn main() -> Result<()> {
     // clap handles --help and --version itself, exiting before we touch the
     // terminal - important, since setup() puts it in raw mode.
     let args = cli::Cli::parse();
+    // Both files used to live in the config directory. Move them once rather
+    // than silently logging the user out to make a spec point.
+    //
+    // Done here rather than in `App::new` on purpose: this writes to the user's
+    // home directory, and `App::new` is constructed by tests.
+    priel_core::auth::migrate_from_config("token.json");
+    priel_core::auth::migrate_from_config("credentials.json");
     let token = args.token_path();
     let mut terminal = setup()?;
     let res = App::new(args.device, token)

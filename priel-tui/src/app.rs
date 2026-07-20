@@ -200,10 +200,6 @@ struct RenderSig {
 impl App {
     pub fn new(device: Option<String>, token_path: String) -> anyhow::Result<Self> {
         let player = Player::new(device)?;
-        // Both files used to live in the config directory. Move them once
-        // rather than silently logging the user out to make a spec point.
-        priel_core::auth::migrate_from_config("token.json");
-        priel_core::auth::migrate_from_config("credentials.json");
         let creds_path = Credentials::default_path();
         let lookup = vec![Credentials::override_path(), creds_path.clone()];
         let has_credentials =
