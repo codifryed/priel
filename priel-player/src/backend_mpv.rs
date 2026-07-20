@@ -216,7 +216,7 @@ const EXCLUSIVE_OPEN_GRACE: Duration = Duration::from_secs(8);
 /// interface per channel still lands far inside this.
 const DEVICE_LIST_MAX: i64 = 512;
 
-/// Ask mpv which audio devices exist.
+/// Ask mpv which audio devices exist, and add the ones it cannot see.
 ///
 /// mpv publishes this as a node array, which libmpv2 has no type for - but the
 /// same property answers to an indexed path (`audio-device-list/3/name`), so the
@@ -224,6 +224,13 @@ const DEVICE_LIST_MAX: i64 = 512;
 ///
 /// Reading it makes mpv ask each audio driver what it can see. That advertises
 /// devices; it opens none.
+///
+/// What it advertises is not everything that exists. ALSA's discovery interface
+/// reports the plugin spellings of a card and never the raw `hw:` PCM
+/// underneath - so the devices where exclusivity means anything were exactly
+/// the ones the picker could not offer. [`hw::with_card_devices`] constructs
+/// those from the kernel's own listing. This is the single place the published
+/// list is built, so the picker and `--list-devices` cannot disagree.
 fn read_devices(mpv: &Mpv) -> Vec<AudioDevice> {
     let count = mpv
         .get_property::<i64>("audio-device-list/count")
@@ -241,7 +248,7 @@ fn read_devices(mpv: &Mpv) -> Vec<AudioDevice> {
             .unwrap_or_default();
         devices.push(AudioDevice { name, description });
     }
-    devices
+    hw::with_card_devices(devices)
 }
 
 /// The mpv audio driver a device identifier names.
@@ -2400,6 +2407,31 @@ mod tests {
             devices.iter().all(|d| !d.name.is_empty()),
             "a nameless device could never be selected: {devices:?}"
         );
+    }
+
+    #[test]
+    fn the_published_list_carries_the_hardware_devices_the_kernel_names() {
+        // Goal: this is the one place the published list is built, so it is the
+        // one place the constructed entries have to arrive - miss it and the
+        // picker is back to offering everything except the direct path.
+        //
+        // Both sides of the check depend on the host, and deliberately so: a
+        // machine with no /proc/asound names no cards and nothing extra is the
+        // right answer, and a player with no ALSA output would reject the
+        // identifiers, so they are withheld there too. On a Linux machine with
+        // a sound card this asserts the whole wiring.
+        let mpv = silent_mpv();
+        let devices = read_devices(&mpv);
+        if !devices.iter().any(|d| d.name.starts_with("alsa/")) {
+            return;
+        }
+        for card in crate::hw::card_devices() {
+            assert!(
+                devices.iter().any(|d| d.name == card.name),
+                "{} should be offered: {devices:?}",
+                card.name
+            );
+        }
     }
 
     #[test]

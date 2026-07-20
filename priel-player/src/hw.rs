@@ -230,6 +230,42 @@ pub fn card_devices() -> Vec<AudioDevice> {
     card_devices_in(Path::new(ASOUND))
 }
 
+/// Add the direct hardware devices to a list the player enumerated.
+///
+/// Called wherever that list is published, so the picker and `--list-devices`
+/// cannot disagree about what exists.
+#[must_use]
+pub fn with_card_devices(listed: Vec<AudioDevice>) -> Vec<AudioDevice> {
+    merge(listed, card_devices())
+}
+
+/// The merge itself, pure so both guards are a table of tests.
+///
+/// Two things it must not do. It must not offer an identifier the player would
+/// reject: `alsa/hw:...` is only accepted by a build with the ALSA output in
+/// it, and one that reports no ALSA device at all does not have it. And it must
+/// not list a card twice under one name - nothing advertises a raw `hw:` PCM
+/// today, but an `asoundrc` could, and the enumerated entry is the one to keep
+/// because its description came from the driver that will open the device.
+///
+/// The constructed entries go last rather than beside the card they belong to.
+/// The order the player reported is the order it prefers, the sound server's
+/// entry is still the right default, and a stable tail is easier to find twice
+/// than a position that moves with the card list.
+fn merge(listed: Vec<AudioDevice>, direct: Vec<AudioDevice>) -> Vec<AudioDevice> {
+    if !listed.iter().any(|d| d.name.starts_with("alsa/")) {
+        return listed;
+    }
+    let mut out = listed;
+    for device in direct {
+        if out.iter().any(|d| d.name == device.name) {
+            continue;
+        }
+        out.push(device);
+    }
+    out
+}
+
 /// [`card_devices`], against any directory, so it is testable against a fixture
 /// on a machine with no sound card at all.
 fn card_devices_in(root: &Path) -> Vec<AudioDevice> {
@@ -524,6 +560,74 @@ mod tests {
             ],
             "by card index, then by device number"
         );
+    }
+
+    fn listed(names: &[&str]) -> Vec<crate::AudioDevice> {
+        names
+            .iter()
+            .map(|n| crate::AudioDevice {
+                name: (*n).to_string(),
+                description: format!("as the player described {n}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_hardware_devices_are_added_to_what_the_player_enumerated() {
+        // Goal: the constructed entries are an addition, not a replacement.
+        // Everything the player reported keeps its place and its order, because
+        // the sound server's entry for a card is still the right default.
+        let merged = super::merge(
+            listed(&[
+                "auto",
+                "alsa/sysdefault:CARD=AUDIO",
+                "pipewire/alsa_output.x",
+            ]),
+            listed(&["alsa/hw:CARD=AUDIO,DEV=0"]),
+        );
+        let names: Vec<&str> = merged.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "auto",
+                "alsa/sysdefault:CARD=AUDIO",
+                "pipewire/alsa_output.x",
+                "alsa/hw:CARD=AUDIO,DEV=0",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_device_the_player_already_reported_is_not_offered_twice() {
+        // Goal: nothing advertises a raw `hw:` PCM today, but an asoundrc or a
+        // later ALSA could. One card must not appear twice under one name, and
+        // the player's own description is the one to keep - it came from the
+        // driver that will open the device.
+        let merged = super::merge(
+            listed(&["auto", "alsa/hw:CARD=AUDIO,DEV=0"]),
+            vec![crate::AudioDevice {
+                name: "alsa/hw:CARD=AUDIO,DEV=0".to_string(),
+                description: "constructed".to_string(),
+            }],
+        );
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(
+            merged[1].description.contains("as the player described"),
+            "the enumerated entry stands: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_added_when_the_player_has_no_alsa_output_to_offer_them_to() {
+        // Goal: every identifier in this list is one `--device` accepts, and
+        // `alsa/hw:...` is only accepted by a player built with ALSA. A player
+        // that reports no ALSA device at all has none, so these would be rows
+        // that resolve to nothing.
+        let merged = super::merge(
+            listed(&["auto", "pipewire/alsa_output.x"]),
+            listed(&["alsa/hw:CARD=AUDIO,DEV=0"]),
+        );
+        assert_eq!(merged.len(), 2, "{merged:?}");
     }
 
     #[test]
