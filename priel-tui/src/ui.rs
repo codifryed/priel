@@ -535,8 +535,11 @@ fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         .title(" Output device ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    // Rebuilt every frame, exactly as the header's hit boxes are.
+    // Rebuilt every frame, exactly as the header's hit boxes are - and cleared
+    // before the early return below, so a terminal too short to draw the
+    // toggle does not leave the last frame's hit box behind to be clicked.
     app.device_rows.clear();
+    app.device_exclusive_rect = Rect::default();
     if inner.height <= 2 {
         return;
     }
@@ -2284,6 +2287,25 @@ mod tests {
             after[sc.app.device_exclusive_rect.y as usize].contains("on"),
             "the toggle has to show the new state: {:?}",
             after[sc.app.device_exclusive_rect.y as usize]
+        );
+    }
+
+    #[test]
+    fn a_picker_too_short_to_draw_the_toggle_offers_nothing_to_click() {
+        // Goal: hit boxes outlive the frame that drew them unless they are
+        // cleared, and a control that was not painted must not still take the
+        // device when something else is clicked where it used to be.
+        let mut sc = screen();
+        sc.app.set_devices_for_test(devices());
+        sc.app.mode = Mode::Devices;
+        draw(&mut sc.app, 100, 20);
+        assert!(sc.app.device_exclusive_rect.width > 0);
+
+        draw(&mut sc.app, 100, 4);
+        assert_eq!(
+            sc.app.device_exclusive_rect,
+            Rect::default(),
+            "nothing was painted, so there is nothing to click"
         );
     }
 
