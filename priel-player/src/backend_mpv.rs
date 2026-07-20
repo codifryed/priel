@@ -200,7 +200,7 @@ pub fn spawn(
         let mpv = match Mpv::new() {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("priel-player: Mpv::new failed: {e:?}");
+                log::error!("mpv would not initialise, so there is no playback: {e}");
                 return;
             }
         };
@@ -238,7 +238,7 @@ pub fn spawn(
             )
         };
         if let Err(e) = protocol.register() {
-            eprintln!("priel-player: protocol register failed: {e:?}");
+            log::error!("the prielseg protocol would not register, so there is no playback: {e}");
             return;
         }
 
@@ -297,19 +297,42 @@ pub fn spawn(
             }
         }
 
-        let _ = mpv.command("stop", &[]);
+        command(&mpv, "stop", &[]);
         clear_all(&registry, &mut entries);
     })
 }
 
-/// Set an mpv property, asserting in debug builds that mpv accepted it.
+/// Set an mpv property, recording a rejection rather than discarding it.
 ///
-/// There is no channel to report a rejected property on, so a wrong name or type
-/// would silently do nothing. That is not hypothetical: `demuxer-readahead-secs`
-/// was set here for a while and had no effect, and nothing said so.
+/// A wrong name or type silently does nothing: libmpv returns an error and the
+/// setting simply never applies. That is not hypothetical -
+/// `demuxer-readahead-secs` was set here for a while and had no effect, and
+/// nothing said so. The log line is the only symptom there will ever be.
 fn set_prop<V: SetData>(mpv: &Mpv, name: &str, value: V) {
-    let accepted = mpv.set_property(name, value).is_ok();
-    debug_assert!(accepted, "mpv rejected property {name}");
+    if let Err(e) = mpv.set_property(name, value) {
+        log::warn!("mpv rejected the property {name}: {e}");
+    }
+}
+
+/// Run an mpv command, recording a rejection rather than discarding it.
+///
+/// Commands here are fire-and-forget by design - the UI must never wait on the
+/// player - so a rejected one otherwise leaves the player quietly doing nothing.
+fn command(mpv: &Mpv, name: &str, args: &[&str]) {
+    if let Err(e) = mpv.command(name, args) {
+        log::warn!("mpv rejected the command {name} {args:?}: {e}");
+    }
+}
+
+/// Run an mpv command whose rejection is routine rather than a fault.
+///
+/// mpv rejects a seek when nothing is loaded, and the seek keys work at any
+/// time, so this would otherwise warn about the user pressing a key on an idle
+/// player.
+fn command_optional(mpv: &Mpv, name: &str, args: &[&str]) {
+    if let Err(e) = mpv.command(name, args) {
+        log::debug!("mpv declined the command {name} {args:?}: {e}");
+    }
 }
 
 /// Apply the fixed player settings and select the output device.
@@ -372,33 +395,33 @@ fn handle_cmd(
         Cmd::Load(id, src) => {
             clear_all(registry, entries);
             let (arg, s) = register_source(registry, seq, src);
-            let _ = mpv.command("loadfile", &[&arg, "replace"]);
+            command(mpv, "loadfile", &[&arg, "replace"]);
             entries.push(Entry { id, seq: s });
         }
         Cmd::Append(id, src) => {
             let (arg, s) = register_source(registry, seq, src);
-            let _ = mpv.command("loadfile", &[&arg, "append"]);
+            command(mpv, "loadfile", &[&arg, "append"]);
             entries.push(Entry { id, seq: s });
         }
         Cmd::Next => {
-            let _ = mpv.command("playlist-next", &["force"]);
+            command(mpv, "playlist-next", &["force"]);
         }
         Cmd::TogglePause => {
-            let _ = mpv.command("cycle", &["pause"]);
+            command(mpv, "cycle", &["pause"]);
         }
         Cmd::Seek(t) => {
             let v = format!("{t}");
-            let _ = mpv.command("seek", &[&v, "absolute"]);
+            command_optional(mpv, "seek", &[&v, "absolute"]);
         }
         Cmd::SeekRelative(t) => {
             let v = format!("{t}");
-            let _ = mpv.command("seek", &[&v, "relative"]);
+            command_optional(mpv, "seek", &[&v, "relative"]);
         }
         Cmd::SetVolume(v) => {
-            let _ = mpv.set_property("volume", v);
+            set_prop(mpv, "volume", v);
         }
         Cmd::Stop => {
-            let _ = mpv.command("stop", &[]);
+            command(mpv, "stop", &[]);
             clear_all(registry, entries);
         }
     }
@@ -440,7 +463,7 @@ fn cleanup_playlist(mpv: &Mpv, registry: &Registry, entries: &mut Vec<Entry>) {
         if pos <= 0 {
             break;
         }
-        let _ = mpv.command("playlist-remove", &["0"]);
+        command(mpv, "playlist-remove", &["0"]);
         if !entries.is_empty() {
             let e = entries.remove(0);
             if let Some(s) = e.seq
@@ -503,17 +526,30 @@ enum Stop {
 
 fn spawn_downloader(urls: Vec<String>, shared: Arc<Shared>) {
     thread::spawn(move || {
-        for u in &urls {
+        let total = urls.len();
+        for (done, u) in urls.iter().enumerate() {
             // A non-2xx is an `Err` here (the agent keeps ureq's default
             // `http_status_as_error`), matching the old `error_for_status`.
             let outcome = match HTTP.get(u).call() {
                 Ok(mut resp) => stream_body(&mut resp, &shared),
-                Err(_) => Err(Stop::Failed),
+                Err(e) => {
+                    log::warn!(target: "priel::download", "segment {} of {total} could not be fetched: {e}", done + 1);
+                    Err(Stop::Failed)
+                }
             };
             match outcome {
                 Ok(()) => {}
                 Err(Stop::Aborted) => return,
-                Err(Stop::Failed) => break,
+                Err(Stop::Failed) => {
+                    // The buffer is still completed below, so a waiting reader
+                    // is released - but the track stops here, and this line is
+                    // the only thing that will ever say why.
+                    log::error!(
+                        target: "priel::download",
+                        "the track will end short: {done} of {total} segments fetched"
+                    );
+                    break;
+                }
             }
         }
         let mut g = lock(&shared.inner);
@@ -561,7 +597,10 @@ fn stream_body(resp: &mut Response<Body>, shared: &Arc<Shared>) -> Result<(), St
                 }
                 want = next_chunk(want);
             }
-            Err(_) => return Err(Stop::Failed),
+            Err(e) => {
+                log::warn!(target: "priel::download", "a segment stopped mid-stream: {e}");
+                return Err(Stop::Failed);
+            }
         }
     }
 }
@@ -644,6 +683,39 @@ mod tests {
             }),
             cv: Condvar::new(),
         })
+    }
+
+    /// A logger the tests read back, so "this was recorded" is asserted rather
+    /// than assumed. A rejected property or command does nothing observable
+    /// otherwise, which is the whole reason it is logged.
+    struct Capture;
+
+    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    /// The buffer is global, so the tests that read it take turns.
+    static READING: Mutex<()> = Mutex::new(());
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            lock(&LINES).push(format!("{} {}", record.target(), record.args()));
+        }
+        fn flush(&self) {}
+    }
+
+    /// Run `f` and hand back everything it logged.
+    fn captured<F: FnOnce()>(f: F) -> Vec<String> {
+        static CAPTURE: Capture = Capture;
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        let _turn = lock(&READING);
+        INSTALLED.call_once(|| {
+            let _ = log::set_logger(&CAPTURE);
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+        lock(&LINES).clear();
+        f();
+        lock(&LINES).clone()
     }
 
     fn cookie(sh: &Arc<Shared>) -> Cookie {
@@ -972,6 +1044,71 @@ mod tests {
                 != "no",
             "the stream is served without a seek callback, so in-track seeking \
              depends entirely on mpv's cache"
+        );
+    }
+
+    #[test]
+    fn every_property_the_player_sets_is_accepted_by_mpv() {
+        // Goal: a misspelled property or a wrong type is silently ignored by
+        // libmpv, which is exactly how demuxer-readahead-secs sat here dead for
+        // a while. This catches the whole set at once, in release builds too,
+        // where the debug assertion this replaced did nothing.
+        let lines = captured(|| {
+            let mpv = Mpv::new().expect("mpv should initialise headlessly");
+            init_mpv(&mpv, Some("null"));
+        });
+        assert!(
+            !lines.iter().any(|l| l.contains("rejected the property")),
+            "mpv rejected something: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_property_mpv_rejects_is_recorded_by_name() {
+        // Goal: the failure has no other symptom - the setting simply does not
+        // apply - so the log line is the only way anyone finds out.
+        let mpv = silent_mpv();
+        let lines = captured(|| set_prop(&mpv, "not-a-real-property", "x"));
+        assert!(
+            lines.iter().any(|l| l.contains("not-a-real-property")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_mpv_rejects_is_recorded_by_name() {
+        // Goal: every command here is fire-and-forget, so a rejected one leaves
+        // the player quietly doing nothing at all.
+        let mpv = silent_mpv();
+        let lines = captured(|| command(&mpv, "not-a-real-command", &[]));
+        assert!(
+            lines.iter().any(|l| l.contains("not-a-real-command")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_segment_that_cannot_be_fetched_says_which_track_ends_short() {
+        // Goal: a failed fetch ends the track early with no other symptom. The
+        // user hears a song stop; without this nothing anywhere says why.
+        let sh = shared(Vec::new(), false);
+        let dead = "http://127.0.0.1:1/never".to_string();
+        let lines = captured(|| {
+            spawn_downloader(vec![dead], sh.clone());
+            for _ in 0..200 {
+                if lock(&sh.inner).complete {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        assert!(
+            lock(&sh.inner).complete,
+            "the buffer must still be released"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("segment")),
+            "the failure should name what it was fetching: {lines:?}"
         );
     }
 

@@ -286,30 +286,42 @@ impl Player {
 
     /// Start playing a track now (replaces the playlist).
     pub fn play_now(&self, id: u64, source: PlayableSource) {
-        let _ = self.tx.send(Cmd::Load(id, source));
+        self.send(Cmd::Load(id, source));
     }
     /// Preload the next track (appended, for gapless transition).
     pub fn append_next(&self, id: u64, source: PlayableSource) {
-        let _ = self.tx.send(Cmd::Append(id, source));
+        self.send(Cmd::Append(id, source));
     }
     /// Skip to the preloaded next entry.
     pub fn skip_next(&self) {
-        let _ = self.tx.send(Cmd::Next);
+        self.send(Cmd::Next);
     }
     pub fn toggle_pause(&self) {
-        let _ = self.tx.send(Cmd::TogglePause);
+        self.send(Cmd::TogglePause);
     }
     pub fn seek(&self, seconds: f64) {
-        let _ = self.tx.send(Cmd::Seek(seconds));
+        self.send(Cmd::Seek(seconds));
     }
     pub fn seek_relative(&self, delta: f64) {
-        let _ = self.tx.send(Cmd::SeekRelative(delta));
+        self.send(Cmd::SeekRelative(delta));
     }
     pub fn set_volume(&self, vol: f64) {
-        let _ = self.tx.send(Cmd::SetVolume(vol.clamp(0.0, 130.0)));
+        self.send(Cmd::SetVolume(vol.clamp(0.0, 130.0)));
     }
     pub fn stop(&self) {
-        let _ = self.tx.send(Cmd::Stop);
+        self.send(Cmd::Stop);
+    }
+
+    /// Post a command to the player thread.
+    ///
+    /// Fire-and-forget by design - the UI must never wait on the player - so the
+    /// only failure is a thread that is no longer there, in which case every
+    /// command from here on is a no-op and the interface looks frozen. Say so
+    /// once per command rather than letting it happen in silence.
+    fn send(&self, cmd: Cmd) {
+        if self.tx.send(cmd).is_err() {
+            log::error!("the player thread is gone; this command was dropped");
+        }
     }
 
     pub fn status(&self) -> PlaybackStatus {
@@ -323,11 +335,30 @@ impl Player {
     }
 }
 
+/// The message inside a joined thread's panic payload.
+///
+/// `join` hands back a `Box<dyn Any>`, which holds a `&'static str` for a plain
+/// `panic!("...")` and a `String` for a formatted one. Anything else carries no
+/// readable message.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
 impl Drop for Player {
     fn drop(&mut self) {
         let _ = self.tx.send(Cmd::Quit);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        // The join result carries the panic payload, and dropping it is how a
+        // dead player thread stayed invisible. Release builds abort on panic, so
+        // this only ever reports in a development build - which is exactly where
+        // it is read.
+        if let Some(h) = self.handle.take()
+            && let Err(payload) = h.join()
+        {
+            log::error!("the player thread panicked: {}", panic_text(&*payload));
         }
     }
 }
@@ -342,6 +373,20 @@ mod tests {
     /// device, so it behaves identically on a headless machine.
     fn silent() -> Player {
         Player::new(Some("null".into())).expect("player")
+    }
+
+    #[test]
+    fn a_panic_payload_is_read_back_whatever_shape_it_was_thrown_in() {
+        // Goal: a player thread that panicked is reported by what it said, and
+        // `join` hands the message back in one of two shapes depending on
+        // whether the panic was formatted. Reading only one of them would report
+        // half the panics as blank.
+        assert_eq!(panic_text(&"a literal"), "a literal");
+        assert_eq!(
+            panic_text(&String::from("a formatted one")),
+            "a formatted one"
+        );
+        assert_eq!(panic_text(&7u8), "no message", "an odd payload still reads");
     }
 
     fn wait_for(p: &Player, cond: impl Fn(&PlaybackStatus) -> bool) -> bool {

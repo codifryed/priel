@@ -193,9 +193,10 @@ and is lost. Diagnostics go to `$XDG_STATE_HOME/priel/priel.log` through the sin
   Do not widen it to `pub` for convenience.
 - Every `pub` item in `priel-core` and `priel-player` carries a doc comment. `priel-tui` internals
   need doc comments only where the reason is non-obvious.
-- The libraries contain **no UI code and no printing**. Errors are returned, never printed. The one
-  exception is the player thread's `eprintln!` on a failed mpv init, which has no channel to report
-  through; do not add more.
+- The libraries contain **no UI code and no printing**. Errors are returned to the caller, or - on
+  the player thread and the downloaders, which have no caller to return to - recorded with `log`.
+  Nothing in `priel-core` or `priel-player` writes to stdout or stderr: the terminal belongs to the
+  TUI, and an `eprintln!` there lands on the alternate screen and is lost.
 
 ### Function length and ordering
 

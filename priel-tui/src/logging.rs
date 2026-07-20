@@ -117,7 +117,8 @@ pub fn init(level: LevelFilter, path: &str) -> Result<()> {
 /// Release builds are `panic = "abort"`, so this is the only trace a panic on
 /// the worker, player or downloader threads will ever leave.
 pub fn record_panic(info: &str) {
-    log::error!(target: "panic", "{}", panic_report(info));
+    // A `priel::` target so the ceiling in `Logger::ceiling` treats it as ours.
+    log::error!(target: "priel::panic", "{}", panic_report(info));
     // The process is about to die, so wait for the line to reach the file.
     log::logger().flush();
 }
@@ -157,11 +158,26 @@ impl Logger {
     fn send(&self, text: String, urgent: bool) -> bool {
         self.tx.try_send(Msg::Line { text, urgent }).is_ok()
     }
+
+    /// The most detail a target is allowed.
+    ///
+    /// Other crates log through this same facade, and `ureq` and `rustls` are
+    /// chatty: at `debug` their DNS and TLS internals bury priel's own lines,
+    /// which is what a bug report is actually for. They are held to warnings -
+    /// which still surface a refused connection - until the level is `trace`,
+    /// the setting that deliberately holds nothing back.
+    fn ceiling(&self, target: &str) -> LevelFilter {
+        if self.level == LevelFilter::Trace || target.starts_with("priel") {
+            self.level
+        } else {
+            self.level.min(LevelFilter::Warn)
+        }
+    }
 }
 
 impl log::Log for Logger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
+        metadata.level() <= self.ceiling(metadata.target())
     }
 
     fn log(&self, record: &Record) {
@@ -345,11 +361,71 @@ mod tests {
     }
 
     fn record<'a>(level: Level, args: &'a std::fmt::Arguments<'a>) -> Record<'a> {
+        at_target(level, "priel_tui::test", args)
+    }
+
+    fn at_target<'a>(
+        level: Level,
+        target: &'a str,
+        args: &'a std::fmt::Arguments<'a>,
+    ) -> Record<'a> {
         Record::builder()
             .level(level)
-            .target("priel_tui::test")
+            .target(target)
             .args(*args)
             .build()
+    }
+
+    /// Everything a logger queued, in order.
+    fn drain(rx: &std::sync::mpsc::Receiver<Msg>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(Msg::Line { text, .. }) = rx.try_recv() {
+            out.push(text);
+        }
+        out
+    }
+
+    #[test]
+    fn other_crates_are_held_to_warnings_until_the_level_is_trace() {
+        // Goal: ureq and rustls log through this same facade, and at debug they
+        // bury priel's own lines under DNS and TLS chatter. A bug report wants
+        // priel's detail; a third-party warning still matters, and its detail
+        // only when someone deliberately asks for everything.
+        let (tx, rx) = sync_channel(8);
+        let logger = Logger::with_channel(LevelFilter::Debug, tx);
+        logger.log(&at_target(
+            Level::Debug,
+            "ureq::run",
+            &format_args!("noise"),
+        ));
+        logger.log(&at_target(
+            Level::Warn,
+            "ureq::run",
+            &format_args!("refused"),
+        ));
+        logger.log(&at_target(
+            Level::Debug,
+            "priel_core::mpd",
+            &format_args!("ours"),
+        ));
+        let lines = drain(&rx).join("");
+        assert!(!lines.contains("noise"), "{lines}");
+        assert!(lines.contains("refused"), "{lines}");
+        assert!(lines.contains("ours"), "{lines}");
+    }
+
+    #[test]
+    fn trace_is_the_setting_that_holds_nothing_back() {
+        // Goal: when priel's own log is not enough, the next step has to be a
+        // level that shows the HTTP layer too, rather than a rebuild.
+        let (tx, rx) = sync_channel(8);
+        let logger = Logger::with_channel(LevelFilter::Trace, tx);
+        logger.log(&at_target(
+            Level::Trace,
+            "ureq::run",
+            &format_args!("noise"),
+        ));
+        assert!(drain(&rx).join("").contains("noise"));
     }
 
     #[test]

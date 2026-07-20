@@ -17,6 +17,7 @@ anyhow.workspace = true
 ureq.workspace = true
 priel-core.workspace = true
 libmpv2 = { version = "6", optional = true }
+log.workspace = true
 
 [lints]
 workspace = true
