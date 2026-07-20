@@ -30,7 +30,7 @@ use rand::Rng;
 use ratatui::layout::Rect;
 
 use priel_core::auth::{Credentials, Pkce};
-use priel_core::{Playlist, Track};
+use priel_core::{Fault, Playlist, Track};
 use priel_player::{PlaybackStatus, Player, PlayerConfig};
 
 #[cfg(test)]
@@ -754,14 +754,18 @@ impl App {
                         self.player.append_next(id, r.source.clone());
                     }
                 }
-                FromWorker::Error(e) => {
+                FromWorker::Failed { fault, detail } => {
                     self.loading = false;
-                    // "log in again" is the phrase the core uses when a refresh
-                    // was refused, which is the one error a user can act on.
-                    if e.contains("log in again") || e.starts_with("token:") {
-                        self.offer_relogin(&e);
-                    } else {
-                        self.notice = Some(format!("⚠ {e}"));
+                    // Branching on the classification, never on the words. This
+                    // was `e.contains("log in again")`, which made the core's
+                    // wording load-bearing: rewording that sentence would have
+                    // quietly stopped the login screen from being offered.
+                    match fault {
+                        Fault::SignedOut => self.offer_relogin(&detail),
+                        Fault::Unreachable => {
+                            self.notice = Some(format!("⚠ could not reach the service: {detail}"));
+                        }
+                        Fault::Refused => self.notice = Some(format!("⚠ {detail}")),
                     }
                 }
             }
@@ -1604,13 +1608,55 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_session_offers_the_login_screen_whatever_it_says() {
+        // Goal: this used to be `e.contains("log in again")` - the interface
+        // recognised the one failure a user can fix by reading the sentence
+        // that described it. Rewording the message in the core would have
+        // silently stopped the login screen from appearing.
+        let mut r = rig();
+        r.app
+            .set_paths_for_test("/nonexistent/token.json".into(), credentials_fixture());
+        r.to_app
+            .send(FromWorker::Failed {
+                fault: Fault::SignedOut,
+                detail: "something nobody thought to grep for".into(),
+            })
+            .expect("send");
+        r.app.drain_worker();
+        assert_eq!(r.app.mode, Mode::Login, "the fix is offered, not described");
+    }
+
+    #[test]
+    fn a_connection_that_dropped_is_not_treated_as_a_sign_out() {
+        // Goal: the opposite mistake. Being thrown at the login screen because
+        // the wifi went is worse than useless - the session is fine, and the
+        // notice should say what actually happened.
+        let mut r = rig();
+        r.app.loading = true;
+        r.to_app
+            .send(FromWorker::Failed {
+                fault: Fault::Unreachable,
+                detail: "favorites".into(),
+            })
+            .expect("send");
+        r.app.drain_worker();
+        assert_ne!(r.app.mode, Mode::Login);
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("reach"), "{notice}");
+        assert!(!r.app.loading);
+    }
+
+    #[test]
     fn a_worker_error_becomes_a_visible_notice() {
         // Goal: errors are the user's only feedback that something broke, and
         // they must not leave the spinner running forever.
         let mut r = rig();
         r.app.loading = true;
         r.to_app
-            .send(FromWorker::Error("token: expired".into()))
+            .send(FromWorker::Failed {
+                fault: Fault::Refused,
+                detail: "token: expired".into(),
+            })
             .unwrap();
         r.app.drain_worker();
         assert!(r.app.notice.as_deref().unwrap().contains("expired"));
@@ -2835,7 +2881,10 @@ mod tests {
         r.app
             .set_paths_for_test("/nonexistent/token.json".into(), credentials_fixture());
         r.to_app
-            .send(FromWorker::Error("resolve: log in again".into()))
+            .send(FromWorker::Failed {
+                fault: Fault::SignedOut,
+                detail: "resolve: refused".into(),
+            })
             .unwrap();
         r.app.drain_worker();
         assert_eq!(r.app.mode, Mode::Login, "it should offer the way back in");

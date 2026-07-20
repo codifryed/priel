@@ -221,9 +221,11 @@ and is lost. Diagnostics go to `$XDG_STATE_HOME/priel/priel.log` through the sin
   and, where useful, what the user can do: the existing "not signed in?" and "session expired? log
   in again" are the model.
 - **Do not stringify errors to pass them between layers** where the receiver needs to branch.
-  `FromWorker::Error(String)` currently flattens everything into a notice line, so the UI cannot
-  distinguish an expired token from a dropped network. When auth work lands, that becomes a typed
-  variant so the UI can prompt a re-login. New worker messages should not add to the string pile.
+  `FromWorker::Failed { fault, detail }` is the pattern: `priel_core::Fault` says what kind of
+  failure it was and the string is only ever displayed. The classification belongs in the layer
+  that *knows* - only the core can tell a refused session from a dropped connection - and nothing
+  above it may match on `detail`. This replaced `e.contains("log in again")`, which made a sentence
+  in the core load-bearing: rewording it would have silently stopped the login screen appearing.
 - Simplify return types. `()` beats `bool` beats `Option<T>` beats `Result<Option<T>, E>`. Every
   extra dimension multiplies the branches at the call site.
 

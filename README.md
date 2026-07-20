@@ -198,8 +198,6 @@ Roadmap, roughly in order:
 - **Per-track memory ceiling.** Buffers are bounded and downloads apply
   backpressure, but a fully played track is still retained; trimming it needs a
   segment offset index so a backward seek can refetch.
-- **Typed errors across the worker boundary**, so the interface can tell an
-  expired token from a dropped network and prompt accordingly.
 - **Incremental paging** — listings currently fetch a first page only.
 - MPRIS, a configuration file for keybindings, cover art (kitty/sixel).
 - **Spectrum visualiser**, if it can coexist with bit-perfect output.

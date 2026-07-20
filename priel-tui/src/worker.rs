@@ -23,7 +23,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use priel_core::auth::Credentials;
-use priel_core::{Client, Playlist, Quality, ResolvedStream, SearchResults, Track};
+use priel_core::{Client, Fault, Playlist, Quality, ResolvedStream, SearchResults, Track};
 
 pub enum ToWorker {
     LoadFavorites,
@@ -39,7 +39,13 @@ pub enum FromWorker {
     PlaylistTracks(String, Vec<Track>), // uuid, tracks
     SearchResults(SearchResults),
     Resolved(u64, ResolvedStream),
-    Error(String),
+    /// A request failed. `fault` is what the interface branches on; `detail` is
+    /// the sentence it shows. Nothing may match on `detail` - that is the whole
+    /// point of `fault` existing.
+    Failed {
+        fault: Fault,
+        detail: String,
+    },
 }
 
 pub struct Worker {
@@ -60,6 +66,19 @@ impl Worker {
     }
 }
 
+/// Turn a failed request into the reply the app branches on.
+///
+/// The classification comes from the core, the only layer that can tell a
+/// refused session from a dropped connection. `detail` is one line for the
+/// screen; the full chain goes to the log, which has room for it.
+fn failed(task: &str, e: &anyhow::Error) -> FromWorker {
+    log::warn!("{task}: {e:#}");
+    FromWorker::Failed {
+        fault: Fault::of(e),
+        detail: format!("{task}: {e}"),
+    }
+}
+
 /// Start a worker.
 ///
 /// Both paths are passed in rather than resolved here so the caller decides,
@@ -71,11 +90,10 @@ pub fn spawn(token_path: String, credentials_path: String) -> Worker {
         // is what stops the access token expiring mid-listen. Without them it
         // still works from the stored token, until that token runs out.
         let mut client = match Credentials::load(&credentials_path) {
-            Ok(creds) => Client::with_auth(&token_path, creds.into_config())
-                .map_err(|e| format!("token: {e}"))?,
-            Err(_) => Client::from_token_file(&token_path).map_err(|e| format!("token: {e}"))?,
+            Ok(creds) => Client::with_auth(&token_path, creds.into_config())?,
+            Err(_) => Client::from_token_file(&token_path)?,
         };
-        client.connect().map_err(|e| format!("connect: {e}"))?;
+        client.connect()?;
         Ok(client)
     })
 }
@@ -87,7 +105,7 @@ pub fn spawn(token_path: String, credentials_path: String) -> Worker {
 /// Tests use this to point the worker at a stub origin with no token file.
 pub fn spawn_with<F>(build: F) -> Worker
 where
-    F: FnOnce() -> Result<Client, String> + Send + 'static,
+    F: FnOnce() -> anyhow::Result<Client> + Send + 'static,
 {
     let (tx, cmd_rx) = mpsc::channel::<ToWorker>();
     let (evt_tx, rx) = mpsc::channel::<FromWorker>();
@@ -99,8 +117,8 @@ where
         let mut client = match build() {
             Ok(c) => c,
             Err(e) => {
-                log::error!("the worker could not start: {e}");
-                let _ = evt_tx.send(FromWorker::Error(e));
+                log::error!("the worker could not start: {e:#}");
+                let _ = evt_tx.send(failed("startup", &e));
                 return;
             }
         };
@@ -109,30 +127,30 @@ where
             let msg = match cmd {
                 ToWorker::LoadFavorites => match client.favorite_tracks(0, 100) {
                     Ok(t) => FromWorker::Favorites(t),
-                    Err(e) => FromWorker::Error(format!("favorites: {e}")),
+                    Err(e) => failed("favorites", &e),
                 },
                 ToWorker::LoadPlaylists => match client.user_playlists(0, 100) {
                     Ok(p) => FromWorker::Playlists(p),
-                    Err(e) => FromWorker::Error(format!("playlists: {e}")),
+                    Err(e) => failed("playlists", &e),
                 },
                 ToWorker::LoadPlaylistTracks(uuid) => match client.playlist_tracks(&uuid, 0, 200) {
                     Ok(t) => FromWorker::PlaylistTracks(uuid, t),
-                    Err(e) => FromWorker::Error(format!("playlist tracks: {e}")),
+                    Err(e) => failed("playlist tracks", &e),
                 },
                 ToWorker::Search(q) => match client.search(&q, 50) {
                     Ok(r) => FromWorker::SearchResults(r),
-                    Err(e) => FromWorker::Error(format!("search: {e}")),
+                    Err(e) => failed("search", &e),
                 },
                 ToWorker::Resolve(id) => match client.resolve_stream(id, Quality::HiRes) {
                     Ok(r) => FromWorker::Resolved(id, r),
-                    Err(e) => FromWorker::Error(format!("resolve: {e}")),
+                    Err(e) => failed("resolve", &e),
                 },
             };
             // Recorded here rather than at each call site: one place covers
             // every request kind, and the app only ever sees the flattened
             // string.
-            if let FromWorker::Error(e) = &msg {
-                log::warn!("{e}");
+            if let FromWorker::Failed { detail, .. } = &msg {
+                log::warn!("{detail}");
             }
             let _ = evt_tx.send(msg);
         }
@@ -149,7 +167,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{FromWorker, ToWorker, Worker, spawn_with};
+    use super::{Fault, FromWorker, ToWorker, Worker, spawn_with};
     use priel_core::Client;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -203,10 +221,8 @@ mod tests {
 
     fn worker_on(base: String) -> Worker {
         spawn_with(move || {
-            let mut c = Client::new("tok".into())
-                .map_err(|e| e.to_string())?
-                .with_base_url(base);
-            c.connect().map_err(|e| format!("connect: {e}"))?;
+            let mut c = Client::new("tok".into())?.with_base_url(base);
+            c.connect()?;
             Ok(c)
         })
     }
@@ -254,7 +270,7 @@ mod tests {
             FromWorker::PlaylistTracks(..) => "PlaylistTracks",
             FromWorker::SearchResults(_) => "SearchResults",
             FromWorker::Resolved(..) => "Resolved",
-            FromWorker::Error(_) => "Error",
+            FromWorker::Failed { .. } => "Failed",
         }
     }
 
@@ -266,7 +282,7 @@ mod tests {
         // Port 1 on loopback refuses at once, so this never touches the network.
         let w = worker_on("http://127.0.0.1:1".into());
         match next(&w) {
-            FromWorker::Error(e) => assert!(e.contains("connect"), "{e}"),
+            FromWorker::Failed { detail, .. } => assert!(detail.contains("startup"), "{detail}"),
             other => panic!("expected an error, got {}", variant(&other)),
         }
     }
@@ -277,17 +293,15 @@ mod tests {
         // failed call by itself.
         let base = origin();
         let w = spawn_with(move || {
-            let mut c = Client::new("tok".into())
-                .map_err(|e| e.to_string())?
-                .with_base_url(base);
-            c.connect().map_err(|e| format!("connect: {e}"))?;
+            let mut c = Client::new("tok".into())?.with_base_url(base);
+            c.connect()?;
             // Repoint at a dead port so the handshake succeeds and the request
             // that follows does not.
             Ok(c.with_base_url("http://127.0.0.1:1"))
         });
         w.tx.send(ToWorker::LoadFavorites).unwrap();
         match next(&w) {
-            FromWorker::Error(e) => assert!(e.contains("favorites"), "{e}"),
+            FromWorker::Failed { detail, .. } => assert!(detail.contains("favorites"), "{detail}"),
             other => panic!("expected an error, got {}", variant(&other)),
         }
     }
@@ -318,10 +332,8 @@ mod tests {
         // name would send the user looking in the wrong place.
         let base = origin();
         let w = spawn_with(move || {
-            let mut c = Client::new("tok".into())
-                .map_err(|e| e.to_string())?
-                .with_base_url(base);
-            c.connect().map_err(|e| format!("connect: {e}"))?;
+            let mut c = Client::new("tok".into())?.with_base_url(base);
+            c.connect()?;
             Ok(c.with_base_url("http://127.0.0.1:1"))
         });
 
@@ -333,8 +345,11 @@ mod tests {
         ] {
             w.tx.send(cmd).unwrap();
             match next(&w) {
-                FromWorker::Error(e) => {
-                    assert!(e.contains(expected), "expected {expected:?} in {e:?}");
+                FromWorker::Failed { detail, .. } => {
+                    assert!(
+                        detail.contains(expected),
+                        "expected {expected:?} in {detail:?}"
+                    );
                 }
                 other => panic!("expected an error, got {}", variant(&other)),
             }
@@ -351,9 +366,13 @@ mod tests {
             "/nonexistent/priel/credentials.json".into(),
         );
         match next(&w) {
-            FromWorker::Error(e) => {
-                assert!(e.starts_with("token:"), "should name the stage: {e}");
-                assert!(e.contains("not signed in"), "should say how to fix it: {e}");
+            FromWorker::Failed { fault, detail } => {
+                assert_eq!(
+                    fault,
+                    Fault::SignedOut,
+                    "a first run and an expired session lead to the same screen"
+                );
+                assert!(detail.contains("not signed in"), "and say so: {detail}");
             }
             other => panic!("expected an error, got {}", variant(&other)),
         }

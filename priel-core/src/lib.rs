@@ -264,6 +264,63 @@ struct BtsManifest {
 /// Exposed so callers that need a one-off request - fetching a client identity
 /// before any `Client` exists, say - do not have to reinvent the settings.
 #[must_use]
+/// Why a request failed, for a caller that has to *act* rather than display.
+///
+/// The message still says what happened, in prose, for the log and for the
+/// screen. This says what kind of thing it was, so the interface can branch
+/// without matching on text - a reworded sentence must not be able to stop the
+/// sign-in screen from being offered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fault {
+    /// The session is gone and cannot be renewed. Signing in again is the fix,
+    /// and it is one keystroke.
+    SignedOut,
+    /// Nothing reached the service, or nothing came back. Worth retrying;
+    /// there is nothing for the user to correct.
+    Unreachable,
+    /// The service answered, and the answer was no. Retrying will not help.
+    Refused,
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SignedOut => "the session is no longer valid",
+            Self::Unreachable => "the service could not be reached",
+            Self::Refused => "the request was refused",
+        })
+    }
+}
+
+impl Fault {
+    /// Classify an error.
+    ///
+    /// An explicit marker wins, because only the code that made the request
+    /// knows a refusal was final. Failing that the transport decides: a request
+    /// that never arrived is a different thing from an answer we did not like,
+    /// and only ureq can tell them apart.
+    pub fn of(err: &anyhow::Error) -> Self {
+        // `downcast_ref` on an anyhow error searches the whole chain, including
+        // values attached with `.context()`, which is how the marker is carried.
+        if let Some(fault) = err.downcast_ref::<Self>() {
+            return *fault;
+        }
+        match err.downcast_ref::<ureq::Error>() {
+            Some(
+                ureq::Error::Io(_)
+                | ureq::Error::Timeout(_)
+                | ureq::Error::HostNotFound
+                | ureq::Error::ConnectionFailed
+                | ureq::Error::RedirectFailed,
+            ) => Self::Unreachable,
+            _ => Self::Refused,
+        }
+    }
+}
+
+impl std::error::Error for Fault {}
+
+#[must_use]
 pub fn new_agent() -> Agent {
     Agent::new_with_config(
         Agent::config_builder()
@@ -304,6 +361,7 @@ impl Client {
     /// If the file is unreadable (not logged in) or is not the expected JSON.
     pub fn from_token_file(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::Error::new(e).context(Fault::SignedOut))
             .with_context(|| format!("reading token file {path} (not signed in?)"))?;
         let tf: TokenFile =
             serde_json::from_str(&raw).with_context(|| format!("parsing token file {path}"))?;
@@ -407,6 +465,7 @@ impl Client {
         }
         drop(resp);
         self.refresh_session()
+            .map_err(|e| e.context(Fault::SignedOut))
             .context("the session was rejected and could not be renewed; log in again")?;
         self.get(url, query)
     }
@@ -437,10 +496,16 @@ impl Client {
         let url = self.url("/v1/sessions");
         let mut resp = self.get_authed(&url, &[])?;
         if !resp.status().is_success() {
-            bail!(
-                "GET /v1/sessions -> HTTP {} (session expired? log in again)",
-                resp.status()
-            );
+            // Only 401 means the session itself was refused. Any other status is
+            // the service saying no for its own reasons, and telling the user to
+            // sign in again would send them round a loop that cannot help.
+            let status = resp.status();
+            if status == 401 {
+                return Err(anyhow!(Fault::SignedOut).context(format!(
+                    "GET /v1/sessions -> HTTP {status} (session expired? log in again)"
+                )));
+            }
+            bail!("GET /v1/sessions -> HTTP {status}");
         }
         let s: SessionResp = resp.body_mut().read_json()?;
         let sess = Session {
@@ -760,6 +825,48 @@ mod tests {
             err.contains("log in again"),
             "and what to do about it: {err}"
         );
+    }
+
+    #[test]
+    fn a_refused_session_is_a_fault_the_interface_can_act_on() {
+        // Goal: "sign in again" is the one failure a user can fix from the
+        // keyboard, and the interface has to recognise it without reading the
+        // message. Matching on text is how a reworded sentence silently stops
+        // offering the login screen.
+        let s = stub(vec![(401, "no".into())]);
+        let err = client(&s).connect().unwrap_err();
+        assert_eq!(Fault::of(&err), Fault::SignedOut);
+    }
+
+    #[test]
+    fn a_service_that_cannot_be_reached_is_not_a_refusal() {
+        // Goal: a dropped network and a rejected request need different words -
+        // one is worth retrying and the other is not - and only the transport
+        // knows which happened.
+        let mut c = Client::new(String::new())
+            .expect("client")
+            .with_base_url("http://127.0.0.1:1");
+        let err = c.connect().unwrap_err();
+        assert_eq!(Fault::of(&err), Fault::Unreachable);
+    }
+
+    #[test]
+    fn an_answer_we_did_not_like_is_a_refusal() {
+        // Goal: the service answered, so the connection is fine and the session
+        // is fine. Neither retrying nor signing in again would help.
+        let s = stub(vec![(500, "boom".into())]);
+        let err = client(&s).connect().unwrap_err();
+        assert_eq!(Fault::of(&err), Fault::Refused);
+    }
+
+    #[test]
+    fn a_session_that_was_never_saved_is_a_signed_out_fault() {
+        // Goal: a first run and an expired session lead to the same screen, so
+        // they should classify the same way.
+        let Err(err) = Client::from_token_file("/nonexistent/priel-token.json") else {
+            panic!("a path that does not exist should not load")
+        };
+        assert_eq!(Fault::of(&err), Fault::SignedOut);
     }
 
     #[test]
