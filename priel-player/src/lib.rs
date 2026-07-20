@@ -470,9 +470,11 @@ impl Player {
     /// Move the output to `device`, named as [`AudioDevice::name`] spells it.
     ///
     /// The output is reopened, which costs the same short gap a sample-rate
-    /// change already does; nothing else about the queue or the position
-    /// changes. A device that is gone or will not open leaves the previous one
-    /// in use and reports itself through [`PlaybackStatus::device_error`].
+    /// change already does; nothing else about the queue changes. A device that
+    /// is gone or will not open leaves the previous one in use and reports
+    /// itself through [`PlaybackStatus::device_error`] - and the track it cost
+    /// is loaded again, from the start, because the player abandons a file
+    /// whose output fails to open.
     ///
     /// The choice lasts for this session. priel reads no configuration file, so
     /// `--device` is what makes one permanent.

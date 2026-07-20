@@ -439,9 +439,10 @@ fn settle_switch(mpv: &Mpv, registry: &Registry, entries: &[Entry], output: &mut
 
 /// Judge the pending change, and act on it.
 ///
-/// Restoring the previous device is what keeps audio working: the track that
-/// was playing is already gone, but the queue plays on rather than the session
-/// being silent until priel is restarted. An exclusive request is judged the
+/// Restoring a working device is what keeps audio going, and reloading is what
+/// makes that mean anything: mpv abandons the file when an output will not
+/// open, so the device alone recovers nothing and the interface waits forever
+/// for a track that is no longer loaded. An exclusive request is judged the
 /// same way and by the same symptom, because a device already held by
 /// something else fails in exactly that manner.
 ///
@@ -490,6 +491,9 @@ fn settle_now(
     output.exclusive = switch.previous_exclusive;
     set_prop(mpv, "audio-exclusive", switch.previous_exclusive);
     apply_device(mpv, &switch.previous);
+    // The track mpv abandoned when the output failed. Without this the device
+    // is working again and nothing is playing through it.
+    reload_entries(mpv, registry, entries);
 }
 
 /// Give the device back, move somewhere it can still be heard, and resume.
@@ -2972,6 +2976,38 @@ mod tests {
         assert!(
             output.pending.is_none(),
             "the change is judged and done with either way"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_device_change_that_fails_also_reloads_the_track_it_cost() {
+        // Goal: the same bug on the other branch. mpv abandons the file
+        // whenever an output will not open, and that is not particular to an
+        // exclusive request - so restoring the previous device leaves the
+        // interface waiting for a track that is no longer loaded, exactly as a
+        // refused exclusive open did.
+        let mpv = silent_mpv();
+        let mut output = no_output();
+        output.pending = Some(Switch {
+            previous: "auto".into(),
+            previous_exclusive: false,
+            requested: "pipewire/one-that-left".into(),
+            exclusive: false,
+            deadline: Instant::now(),
+        });
+
+        settle_switch(&mpv, &registry(), &[entry(3)], &mut output);
+
+        assert_eq!(
+            mpv.get_property::<String>("audio-device")
+                .unwrap_or_default(),
+            "auto",
+            "the previous device is restored, as it always was"
+        );
+        assert_eq!(
+            mpv.get_property::<i64>("playlist-count").unwrap_or(0),
+            1,
+            "and the track it cost is loaded again, or nothing resumes"
         );
     }
 
