@@ -1020,7 +1020,7 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     // then the keyboard reference. The clickable controls live in the header.
     let (act_text, act_color) = activity(app);
     let (fid_text, fid_color) = fidelity_badge(app);
-    let (access_text, access_color) = access_badge(app.status.access);
+    let (access_text, access_color) = access_badge(&app.status);
     let mut bar = ControlBar::new(l2);
     bar.label(dac_badge(&app.status), Style::default().fg(Color::Green));
     bar.label(access_text, Style::default().fg(access_color));
@@ -1317,11 +1317,20 @@ fn fidelity_badge(app: &App) -> (String, Color) {
 /// not the rate the hardware is clocked at. `PipeWire` can accept 44.1 kHz and
 /// resample it into a 48 kHz graph without mpv ever seeing it. Showing the real
 /// device rate means reading the graph, which is a separate piece of work.
-fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
+/// Is any output actually open?
+///
+/// Asked by both the device badge and the access badge, so the row cannot say
+/// `OUT —` and name an access mode in the same breath.
+fn has_output(s: &priel_player::PlaybackStatus) -> bool {
     let (rate_hz, format) = s.effective_output();
-    if rate_hz == 0 && format.is_empty() {
+    rate_hz > 0 || !format.is_empty()
+}
+
+fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
+    if !has_output(s) {
         return " OUT —".into();
     }
+    let (rate_hz, format) = s.effective_output();
     // `DAC` only when the numbers came from the ALSA device itself. Otherwise
     // this is what the audio server accepted from us, which it may yet resample.
     let label = if s.verdict_is_from_hardware() {
@@ -1352,8 +1361,14 @@ fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
 /// listener who saw no word for it could not tell a shared device from a
 /// version that did not report access at all. The shared arm is drawn dim
 /// rather than green, so the row still reads at a glance as the plain case.
-fn access_badge(access: OutputAccess) -> (String, Color) {
-    match access {
+fn access_badge(s: &priel_player::PlaybackStatus) -> (String, Color) {
+    // `OUT —` already says there is no output; naming an access mode beside it
+    // would claim priel holds a device it does not hold. Both badges ask
+    // `has_output`, so they cannot contradict each other.
+    if !has_output(s) {
+        return (String::new(), Color::DarkGray);
+    }
+    match s.access {
         OutputAccess::Shared => ("  · shared".to_string(), Color::DarkGray),
         OutputAccess::Exclusive => ("  · exclusive".to_string(), Color::Green),
         OutputAccess::Refused => ("  ⚠ shared · exclusive refused".to_string(), Color::Yellow),
@@ -2250,6 +2265,21 @@ mod tests {
         sc.app.status.access = OutputAccess::Exclusive;
         let out = text(&mut sc.app, 140, 12);
         assert!(out.contains("exclusive"), "{out}");
+    }
+
+    #[test]
+    fn nothing_playing_names_no_access_at_all() {
+        // Goal: `OUT —` already says there is no output open. Naming an access
+        // mode beside it would claim priel is holding a device shared when it
+        // is holding none, which is the same overstatement the `DAC`/`OUT`
+        // distinction exists to avoid.
+        let mut sc = screen();
+
+        let out = text(&mut sc.app, 140, 12);
+        assert!(
+            !out.contains("shared"),
+            "an idle player holds nothing, so it names no access: {out}"
+        );
     }
 
     #[test]
