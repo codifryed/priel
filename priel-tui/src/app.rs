@@ -31,6 +31,7 @@ use ratatui::layout::Rect;
 
 use priel_core::auth::{Credentials, Pkce};
 use priel_core::{Fault, Playlist, Track};
+use priel_player::graph::{AudioGraph, GraphError, GraphNode, NodeRole};
 use priel_player::{PlaybackStatus, Player, PlayerConfig};
 
 #[cfg(test)]
@@ -69,6 +70,7 @@ pub enum Hit {
     Filter,
     CycleView,
     Help,
+    Graph,
     Quit,
 }
 
@@ -79,8 +81,34 @@ pub enum Mode {
     Search,      // editing the global TIDAL search query
     Help,        // the shortcut reference is up; it swallows input until dismissed
     Log,         // the recent diagnostics are up; modal in the same way
+    Graph,       // the chain to the output device is up; modal in the same way
     Credentials, // first run with no client identity; asking before fetching one
     Login,       // signing in: browser is open, waiting for the redirected URL
+}
+
+/// What one line of the audio-graph overlay says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GraphRowKind {
+    /// A node on the path from priel to the device.
+    Node,
+    /// The connector drawn between two nodes.
+    Link,
+    /// Prose: what is being waited for, or why there is nothing to show.
+    Note,
+}
+
+/// One line of the audio-graph overlay, ready to draw.
+///
+/// Built in `App` rather than in the renderer so the overlay's scroll bounds and
+/// what it paints count the same lines. A renderer that laid the rows out itself
+/// would be the only thing that knew how many there were, and the scroll would
+/// drift the moment either changed.
+pub struct GraphRow {
+    /// The left column: a node, or a whole sentence.
+    pub label: String,
+    /// The right column: what that node negotiated. Empty for prose.
+    pub detail: String,
+    pub kind: GraphRowKind,
 }
 
 /// What a status tick reads. See [`App::tick`].
@@ -210,6 +238,11 @@ pub struct App {
     /// How many lines back from the newest the log overlay is scrolled. Counted
     /// from the end because that is where the interesting line always is.
     log_scroll: usize,
+    /// The last chain the worker read, or the reason it could not. `None` while
+    /// a read is in flight, which is what the overlay says it is doing.
+    audio_graph: Option<Result<AudioGraph, GraphError>>,
+    /// How far down the audio-graph overlay is scrolled, from the top.
+    graph_scroll: usize,
     pub frame: usize,
     pub should_quit: bool,
 
@@ -331,6 +364,8 @@ impl App {
             worker_lost: false,
             recent: crate::logging::Recent::default(),
             log_scroll: 0,
+            audio_graph: None,
+            graph_scroll: 0,
             last_sig: RenderSig::default(),
             credentials_path: None,
             token_path: None,
@@ -802,6 +837,13 @@ impl App {
                     self.notice = Some(format!("{} results", self.search_tracks.len()));
                 }
                 FromWorker::Resolved(id, r) => self.on_resolved(id, &r),
+                FromWorker::AudioGraph(read) => {
+                    self.audio_graph = Some(read);
+                    // The reply can be longer than the request that opened the
+                    // overlay left room for, so the scroll starts again rather
+                    // than pointing past the end of the new reading.
+                    self.graph_scroll = 0;
+                }
                 FromWorker::Failed { fault, detail } => {
                     self.loading = false;
                     // Branching on the classification, never on the words. This
@@ -1217,6 +1259,7 @@ impl App {
             Mode::Search => self.on_key_search(key),
             Mode::Help => self.on_key_help(key),
             Mode::Log => self.on_key_log(key),
+            Mode::Graph => self.on_key_graph(key),
             Mode::Credentials => self.on_key_credentials(key),
             Mode::Login => self.on_key_login(key),
             Mode::Normal => self.on_key_normal(key),
@@ -1260,6 +1303,64 @@ impl App {
     /// How far back the overlay may be scrolled.
     fn log_scroll_max(&self) -> usize {
         self.recent.lines().len().saturating_sub(1)
+    }
+
+    /// Open the audio-graph overlay and ask the worker to read the chain.
+    ///
+    /// Shared by the key press and the click so the two paths cannot drift.
+    /// Reading it means running `pw-dump` and waiting for it, so the request
+    /// goes to the worker and the overlay opens straight away with nothing in
+    /// it - the render loop waits for nothing.
+    fn open_graph(&mut self) {
+        self.mode = Mode::Graph;
+        self.graph_scroll = 0;
+        // Cleared rather than kept: the last reading shown as if it were
+        // current is exactly the lie this overlay exists to stop.
+        self.audio_graph = None;
+        let _ = self.worker.tx.send(ToWorker::ReadAudioGraph);
+    }
+
+    /// The audio-graph overlay: modal like the log one, scrolled like every list.
+    fn on_key_graph(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('D' | 'q' | ' ') => {
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.graph_scroll = (self.graph_scroll + 1).min(self.graph_scroll_max());
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.graph_scroll = self.graph_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('g') => self.graph_scroll = 0,
+            KeyCode::Char('G') => self.graph_scroll = self.graph_scroll_max(),
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    fn graph_scroll_max(&self) -> usize {
+        self.graph_rows().len().saturating_sub(1)
+    }
+
+    /// How far down the audio-graph overlay is scrolled.
+    #[must_use]
+    pub fn graph_offset(&self) -> usize {
+        self.graph_scroll
+    }
+
+    /// The lines of the audio-graph overlay, top to bottom.
+    #[must_use]
+    pub fn graph_rows(&self) -> Vec<GraphRow> {
+        match &self.audio_graph {
+            None => vec![note("Reading the graph…")],
+            Some(Err(e)) => {
+                let mut rows = vec![note(&e.to_string())];
+                rows.extend(e.hint().map(note));
+                rows
+            }
+            Some(Ok(g)) => path_rows(g),
+        }
     }
 
     /// The diagnostics to show, oldest first.
@@ -1355,6 +1456,7 @@ impl App {
                 // almost always something that just happened.
                 self.log_scroll = 0;
             }
+            KeyCode::Char('D') => self.open_graph(),
             KeyCode::Char('A') => self.start_login(),
             KeyCode::Enter => self.on_enter(),
             KeyCode::Char(' ') => self.player.toggle_pause(),
@@ -1383,6 +1485,24 @@ impl App {
                 }
                 MouseEventKind::ScrollDown => {
                     self.log_scroll = self.log_scroll.saturating_sub(1);
+                    self.dirty = true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.mode = Mode::Normal;
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.mode == Mode::Graph {
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    self.graph_scroll = (self.graph_scroll + 1).min(self.graph_scroll_max());
+                    self.dirty = true;
+                }
+                MouseEventKind::ScrollUp => {
+                    self.graph_scroll = self.graph_scroll.saturating_sub(1);
                     self.dirty = true;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -1435,6 +1555,7 @@ impl App {
             Hit::Filter => self.start_filter(),
             Hit::CycleView => self.cycle_view(),
             Hit::Help => self.mode = Mode::Help,
+            Hit::Graph => self.open_graph(),
             Hit::Quit => self.should_quit = true,
         }
     }
@@ -1545,6 +1666,77 @@ fn open_in_browser(url: &str) {
 
 fn hit(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+}
+
+/// A line of prose in the audio-graph overlay.
+fn note(text: &str) -> GraphRow {
+    GraphRow {
+        label: text.to_string(),
+        detail: String::new(),
+        kind: GraphRowKind::Note,
+    }
+}
+
+/// The chain, one row per node with a connector between them.
+///
+/// Pure so the overlay's content is a table of tests rather than something only
+/// a rendered frame can show.
+fn path_rows(g: &AudioGraph) -> Vec<GraphRow> {
+    let mut rows = Vec::with_capacity(g.path.len() * 2);
+    for (hop, node) in g.path.iter().enumerate() {
+        if hop > 0 {
+            rows.push(GraphRow {
+                label: "  │".into(),
+                detail: String::new(),
+                kind: GraphRowKind::Link,
+            });
+        }
+        rows.push(GraphRow {
+            label: node_label(node),
+            detail: negotiated(node),
+            kind: GraphRowKind::Node,
+        });
+    }
+    rows
+}
+
+/// How a node introduces itself.
+///
+/// The stream is libmpv's and `PipeWire` calls it `mpv`, which is a puzzle on
+/// screen until it is labelled - so it is labelled.
+fn node_label(node: &GraphNode) -> String {
+    let name = if node.description.is_empty() {
+        &node.name
+    } else {
+        &node.description
+    };
+    match node.role {
+        NodeRole::Stream => format!("  {name}  (priel)"),
+        NodeRole::Intermediate => format!("  {name}"),
+        NodeRole::Device => format!("  {name}  (device)"),
+    }
+}
+
+/// What a node settled on, or a plain statement that it has not settled yet.
+///
+/// Rates are written the way the badge writes them - `crate::ui::fmt_khz` is
+/// shared rather than reimplemented, so 44.1 kHz cannot appear as "44 kHz" in
+/// one place and "44.1 kHz" in the other.
+fn negotiated(node: &GraphNode) -> String {
+    let Some(rate) = node.rate_hz else {
+        return "no format yet".into();
+    };
+    let mut out = crate::ui::fmt_khz(rate);
+    if let Some(format) = &node.format {
+        out.push_str("  ");
+        out.push_str(format);
+    }
+    if let Some(channels) = node.channels {
+        out.push_str("  ");
+        out.push_str(&channels.to_string());
+        out.push_str(" ch");
+    }
+    out
 }
 
 /// Does a row match the local filter? `filter_lower` must already be lowercased
@@ -1925,6 +2117,192 @@ mod tests {
         r.app.drain_worker();
         assert!(r.app.notice.as_deref().unwrap().contains("expired"));
         assert!(!r.app.loading);
+    }
+
+    /// A two-node chain: priel's stream straight into a DAC, no resample.
+    fn chain() -> AudioGraph {
+        AudioGraph {
+            path: vec![
+                GraphNode {
+                    id: 58,
+                    name: "mpv".into(),
+                    description: "mpv".into(),
+                    media_class: "Stream/Output/Audio".into(),
+                    role: NodeRole::Stream,
+                    rate_hz: Some(44_100),
+                    format: Some("S16LE".into()),
+                    channels: Some(2),
+                },
+                GraphNode {
+                    id: 48,
+                    name: "alsa_output.usb-DAC".into(),
+                    description: "Studio DAC".into(),
+                    media_class: "Audio/Sink".into(),
+                    role: NodeRole::Device,
+                    rate_hz: Some(44_100),
+                    format: Some("S32LE".into()),
+                    channels: Some(2),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn the_graph_key_opens_the_overlay_and_asks_the_worker_to_read_it() {
+        // Goal: reading the graph runs a subprocess, so the request must leave
+        // the UI thread. The overlay opens on the key press and says it is
+        // reading, rather than the key press waiting for pw-dump.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        assert_eq!(r.app.mode, Mode::Graph);
+        assert!(
+            matches!(r.from_app.try_recv(), Ok(ToWorker::ReadAudioGraph)),
+            "the read has to go to the worker"
+        );
+        let rows = r.app.graph_rows();
+        assert_eq!(rows.len(), 1, "nothing to show until the reply arrives");
+        assert_eq!(rows[0].kind, GraphRowKind::Note);
+    }
+
+    #[test]
+    fn the_graph_overlay_opens_on_its_key_and_closes_again() {
+        // Goal: dismissed the way the help and log overlays are, so there is
+        // one way out of an overlay rather than three.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.app.on_key(key('D'));
+        assert_eq!(r.app.mode, Mode::Normal);
+        r.app.on_key(key('D'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal, "Esc closes it too");
+        r.app.on_key(key('D'));
+        r.app.on_key(key('q'));
+        assert_eq!(r.app.mode, Mode::Normal, "q closes it rather than quitting");
+        assert!(!r.app.should_quit);
+    }
+
+    #[test]
+    fn the_graph_overlay_swallows_the_keys_and_clicks_behind_it() {
+        // Goal: modal like the other overlays. A view change or a track
+        // starting underneath one is how a user ends up somewhere they did not
+        // ask to be.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.on_key(key('D'));
+        r.app.on_key(key('2'));
+        assert_eq!(r.app.view, View::Favorites, "the view must not change");
+        assert_eq!(r.app.mode, Mode::Graph, "and it is still open");
+        r.app.on_mouse(click(2, 2));
+        assert_eq!(r.app.mode, Mode::Normal, "a click dismisses it");
+        assert_eq!(r.app.selected, 0, "and does not land on a row underneath");
+    }
+
+    #[test]
+    fn the_chain_the_worker_read_is_what_the_overlay_lists() {
+        // Goal: the whole point - every node between priel and the device, in
+        // order, with what each one negotiated.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Ok(chain())))
+            .expect("send");
+        r.app.drain_worker();
+        let rows = r.app.graph_rows();
+        let nodes: Vec<&GraphRow> = rows
+            .iter()
+            .filter(|r| r.kind == GraphRowKind::Node)
+            .collect();
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes[0].label.contains("priel"), "{}", nodes[0].label);
+        assert_eq!(nodes[0].detail, "44.1 kHz  S16LE  2 ch");
+        assert!(nodes[1].label.contains("Studio DAC"), "{}", nodes[1].label);
+        assert_eq!(nodes[1].detail, "44.1 kHz  S32LE  2 ch");
+        assert!(
+            rows.iter().any(|r| r.kind == GraphRowKind::Link),
+            "the two nodes are drawn as a chain, not a list"
+        );
+    }
+
+    #[test]
+    fn a_graph_that_could_not_be_read_explains_itself_rather_than_showing_a_box() {
+        // Goal: the machine with no PipeWire tools is the common case, and an
+        // empty overlay there reads as a bug in priel.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Err(GraphError::NotInstalled)))
+            .expect("send");
+        r.app.drain_worker();
+        let rows = r.app.graph_rows();
+        assert!(rows.iter().all(|r| r.kind == GraphRowKind::Note));
+        assert!(rows[0].label.contains("pw-dump"), "{}", rows[0].label);
+        assert_eq!(rows.len(), 2, "the sentence and what to do about it");
+    }
+
+    #[test]
+    fn a_node_with_no_negotiated_format_says_so_rather_than_showing_nothing() {
+        // Goal: a suspended device has no format yet. A blank right-hand column
+        // reads as "bit-perfect" to the eye scanning it.
+        let mut r = rig();
+        let mut g = chain();
+        g.path[1].rate_hz = None;
+        g.path[1].format = None;
+        r.app.on_key(key('D'));
+        r.to_app.send(FromWorker::AudioGraph(Ok(g))).expect("send");
+        r.app.drain_worker();
+        let rows = r.app.graph_rows();
+        let last = rows.last().expect("a row");
+        assert_eq!(last.detail, "no format yet");
+    }
+
+    #[test]
+    fn the_graph_overlay_scrolls_with_the_same_keys_as_a_list() {
+        // Goal: every other list in priel moves on j/k and g/G, so this one
+        // must too - a second scrolling idiom would be its own bug.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Ok(chain())))
+            .expect("send");
+        r.app.drain_worker();
+        assert_eq!(r.app.graph_offset(), 0, "it opens at the top");
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.graph_offset(), 1, "j goes down");
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.graph_offset(), 0);
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.graph_offset(), 0, "and stops at the top");
+        r.app.on_key(key('G'));
+        assert_eq!(r.app.graph_offset(), 2, "G reaches the last line");
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.graph_offset(), 2, "and stops there");
+        r.app.on_key(key('g'));
+        assert_eq!(r.app.graph_offset(), 0, "g returns to the top");
+    }
+
+    #[test]
+    fn reopening_the_overlay_reads_the_graph_again_rather_than_reusing_it() {
+        // Goal: the chain changes when the device or the track rate does, and a
+        // stale reading presented as current is the one thing this overlay must
+        // never do.
+        let mut r = rig();
+        r.app.on_key(key('D'));
+        r.to_app
+            .send(FromWorker::AudioGraph(Ok(chain())))
+            .expect("send");
+        r.app.drain_worker();
+        while r.from_app.try_recv().is_ok() {}
+        r.app.on_key(key('D'));
+        r.app.on_key(key('D'));
+        assert!(
+            matches!(r.from_app.try_recv(), Ok(ToWorker::ReadAudioGraph)),
+            "opening it again asks again"
+        );
+        assert_eq!(
+            r.app.graph_rows().len(),
+            1,
+            "and shows nothing until the new answer lands"
+        );
     }
 
     #[test]

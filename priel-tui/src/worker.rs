@@ -24,6 +24,7 @@ use std::thread;
 
 use priel_core::auth::Credentials;
 use priel_core::{Client, Fault, Playlist, Quality, ResolvedStream, SearchResults, Track};
+use priel_player::graph::{self, AudioGraph, GraphError};
 
 pub enum ToWorker {
     LoadFavorites,
@@ -31,6 +32,9 @@ pub enum ToWorker {
     LoadPlaylistTracks(String), // uuid
     Search(String),
     Resolve(u64),
+    /// Read the chain to the output device. Runs `pw-dump` and waits for it,
+    /// which is why it is here and not on the UI thread.
+    ReadAudioGraph,
 }
 
 pub enum FromWorker {
@@ -39,6 +43,12 @@ pub enum FromWorker {
     PlaylistTracks(String, Vec<Track>), // uuid, tracks
     SearchResults(SearchResults),
     Resolved(u64, ResolvedStream),
+    /// The chain to the output device, or the reason there is none to show.
+    ///
+    /// The failure travels as `GraphError` rather than `Failed`: nothing about
+    /// it is a request that went wrong, and the overlay has its own sentence
+    /// for each case.
+    AudioGraph(Result<AudioGraph, GraphError>),
     /// A request failed. `fault` is what the interface branches on; `detail` is
     /// the sentence it shows. Nothing may match on `detail` - that is the whole
     /// point of `fault` existing.
@@ -145,6 +155,16 @@ where
                     Ok(r) => FromWorker::Resolved(id, r),
                     Err(e) => failed("resolve", &e),
                 },
+                // The only request here that touches no network. It is still on
+                // this thread because it waits on a subprocess, and the render
+                // loop may not wait on anything.
+                ToWorker::ReadAudioGraph => {
+                    let read = graph::probe();
+                    if let Err(e) = &read {
+                        log::info!("audio graph: {e}");
+                    }
+                    FromWorker::AudioGraph(read)
+                }
             };
             // Recorded here rather than at each call site: one place covers
             // every request kind, and the app only ever sees the flattened
@@ -270,6 +290,7 @@ mod tests {
             FromWorker::PlaylistTracks(..) => "PlaylistTracks",
             FromWorker::SearchResults(_) => "SearchResults",
             FromWorker::Resolved(..) => "Resolved",
+            FromWorker::AudioGraph(_) => "AudioGraph",
             FromWorker::Failed { .. } => "Failed",
         }
     }
