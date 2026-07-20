@@ -1,7 +1,7 @@
 # priel — hi-res terminal client for TIDAL
 
-A VIM-first, mouse-first terminal client with bit-perfect, rate-following
-playback. Blocking HTTP (ureq, no async runtime) + libmpv over a custom
+A mouse-first terminal client with a complete VIM keyboard, and bit-perfect,
+rate-following playback. Blocking HTTP (ureq, no async runtime) + libmpv over a custom
 `stream_cb` segment protocol → PipeWire node-targeted output.
 
 > **Unofficial software.** priel is not affiliated with, endorsed by, or
@@ -39,14 +39,15 @@ water in and out of the flats twice a day, on the pull of the moon.*
   otherwise, `0` restores it, and both stages are watched — priel's own volume
   and the audio server's volume for our stream. Enthusiasts: leave both at unity
   and set level on the DAC.
-- **VIM keys first, with alternatives for everyone else.** `j`/`k` and the arrow
-  keys, `g`/`G`, `J`/`K` and `Ctrl-D`/`Ctrl-U`, `/` to filter. Every action has a
-  key binding, and `?` opens the full reference rather than making you read this
-  file.
-- **First-class mouse, not an afterthought.** Clickable view tabs and transport
-  controls, a scrubbable progress bar, wheel scrolling, double-click to play —
-  and every key shown in the bottom hint row is itself a button. There is no
-  control that only the mouse can reach, and none that only the keyboard can.
+- **Mouse-first, and it shows.** Clickable view tabs and transport controls, a
+  scrubbable progress bar, wheel scrolling, double-click to play — and every key
+  shown in the bottom hint row is itself a button. If an action cannot be done by
+  pointing at it, that is a bug rather than a design choice.
+- **A complete VIM keyboard, not the leftovers.** `j`/`k` and the arrow keys,
+  `g`/`G`, `J`/`K` and `Ctrl-D`/`Ctrl-U`, `/` to filter. `?` opens the full
+  reference rather than making you read this file. Parity runs both ways: there
+  is no control that only the mouse can reach, and none that only the keyboard
+  can.
 - **A dependency list you can actually audit.** No async runtime anywhere in the
   tree — no tokio, no hyper. No OpenSSL: TLS is rustls. Under 40 crates for the
   API library and around 100 for the whole binary. **libmpv is the only non-Rust
