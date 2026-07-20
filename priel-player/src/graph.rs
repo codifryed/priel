@@ -1400,6 +1400,18 @@ mod tests {
             "a truncated dump is no better than none"
         );
         assert!(unknown.allowed_hz.is_none(), "unknown, not an empty list");
+
+        // A value that is neither text nor an array is something priel does not
+        // understand, and reading it as an empty list would turn a spelling it
+        // has never seen into the finding that the server may not switch rates.
+        let odd = r#"[
+          {"id": 32, "type": "PipeWire:Interface:Metadata",
+           "props": {"metadata.name": "settings"},
+           "metadata": [
+             {"subject": 0, "key": "clock.allowed-rates", "type": "", "value": true}
+           ]}
+        ]"#;
+        assert!(parse_clock(odd).allowed_hz.is_none(), "unread, not empty");
     }
 
     #[test]
@@ -1538,7 +1550,7 @@ mod tests {
         let missing = |proposed: &[u32]| RateAdvice::Missing {
             proposed_hz: proposed.to_vec(),
         };
-        let cases: [(ClockRates, u32, RateAdvice); 12] = [
+        let cases: [(ClockRates, u32, RateAdvice); 13] = [
             // The rate is on the list. Nothing to change, so nothing is said.
             (
                 clock(Some(&[44_100, 48_000]), Some(48_000)),
@@ -1558,6 +1570,13 @@ mod tests {
                 clock(Some(&[48_000, 44_100]), Some(48_000)),
                 88_200,
                 missing(&[44_100, 48_000, 88_200]),
+            ),
+            // A hand-edited list can name the same rate twice, and a proposal
+            // that repeated it back would look like priel made the mess.
+            (
+                clock(Some(&[48_000, 48_000]), Some(48_000)),
+                44_100,
+                missing(&[44_100, 48_000]),
             ),
             // An empty list means the server does not switch at all: it stays
             // on the one rate it is clocked at, which is a permitted rate.

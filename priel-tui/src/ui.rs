@@ -1941,6 +1941,10 @@ mod tests {
         let out = text(&mut sc.app, 100, 40);
         assert!(out.contains("Server clock"), "{out}");
         assert!(out.contains("352.8 kHz  not permitted"), "{out}");
+        assert!(
+            out.contains("768 kHz"),
+            "the readout carries onto a second row rather than losing its tail: {out}"
+        );
         assert!(out.contains("default.clock.allowed-rates = ["), "{out}");
         assert!(out.contains("352800"), "the rate being added: {out}");
         assert!(out.contains("768000"), "and the tail of the list: {out}");
@@ -2585,6 +2589,22 @@ mod tests {
         assert_eq!(super::fmt_khz(48_000), "48 kHz", "whole rates stay whole");
         assert_eq!(super::fmt_khz(192_000), "192 kHz");
         assert_eq!(super::fmt_khz(0), "?");
+    }
+
+    #[test]
+    fn a_list_of_rates_says_the_unit_once_and_keeps_every_decimal() {
+        // Goal: a permitted-rate list runs to ten entries, and a " kHz" after
+        // each of them pushes the row past the box for no information at all -
+        // but the decimal is the whole distinction and stays on every one.
+        assert_eq!(
+            super::fmt_khz_list(&[44_100, 48_000, 705_600]),
+            "44.1 / 48 / 705.6 kHz"
+        );
+        assert_eq!(super::fmt_khz_list(&[48_000]), "48 kHz");
+        assert!(
+            super::fmt_khz_list(&[]).is_empty(),
+            "no rates is no reading, not a bare unit"
+        );
     }
 
     #[test]

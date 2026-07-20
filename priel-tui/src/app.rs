@@ -4216,6 +4216,11 @@ mod tests {
             .expect("and the rate the track wants");
         assert!(track.detail.starts_with("44.1 kHz"), "{}", track.detail);
         assert!(track.detail.contains("not permitted"), "{}", track.detail);
+        assert_eq!(
+            track.kind,
+            GraphRowKind::Culprit,
+            "drawn the colour the badge uses for the same finding: {text}"
+        );
         assert!(
             text.contains("default.clock.allowed-rates = [ 44100 48000 ]"),
             "the whole setting, copyable: {text}"
