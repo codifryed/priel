@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::Alteration;
 use crate::run::{self, RunError};
 
 /// Where a node sits on the path from priel to the device.
@@ -91,6 +92,143 @@ pub struct GraphNode {
 pub struct AudioGraph {
     /// The stream first, the device last. Never empty when this is `Ok`.
     pub path: Vec<GraphNode>,
+}
+
+/// The track as the decoder produced it, which every node is compared against.
+///
+/// Both fields are zero when the answer is not known - between tracks, or for a
+/// source whose depth the service did not declare and whose container width says
+/// nothing useful. Zero means "do not compare", never "zero of them".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceFormat {
+    /// The decoded sample rate in Hz.
+    pub rate_hz: u32,
+    /// The source's true bit depth, *not* the width of the container it arrives
+    /// in: 24-bit content decodes into a 32-bit word, and comparing containers
+    /// would call a lossless `S32LE -> S24LE` hop a truncation.
+    pub bits: u32,
+}
+
+/// What the graph has to say about the samples being altered.
+///
+/// The badge already reports *that* they were altered, from the device's own
+/// parameters. This is the other half of the question - which node did it - and
+/// its most important arm is [`Unexplained`](Self::Unexplained): the chain is
+/// readable, it accounts for nothing, and the nearest candidate is a guess. A
+/// wrong name sends the reader to reconfigure something that was working, which
+/// is worse than admitting the gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attribution {
+    /// Every node carries the track's own rate and enough width for it. There
+    /// is no accusation to make.
+    Clean,
+    /// `path[index]` is the first node whose rate or width differs from the
+    /// track's. Everything downstream of it is already altered, so it is the
+    /// only one worth naming.
+    Node {
+        index: usize,
+        alteration: Alteration,
+    },
+    /// The samples are being altered and no node on the path accounts for it.
+    ///
+    /// The normal cause is a resample the sound server performs inside a node
+    /// rather than between two of them, which the published formats do not show.
+    Unexplained(Alteration),
+    /// There was nothing to compare: the track's own format is not known yet, or
+    /// no node on the path has published one.
+    ///
+    /// Distinct from [`Clean`](Self::Clean), which is a finding. This one is the
+    /// absence of a finding, and reporting it as the former would turn silence
+    /// into a green light.
+    NothingToCompare,
+}
+
+impl AudioGraph {
+    /// Name the node that is altering the samples, if the chain names one.
+    ///
+    /// Pure, so the whole of it is a table of tests against recorded dumps
+    /// rather than something only a live sound server can show. `observed` is
+    /// the alteration the player already graded from the device's parameters,
+    /// or `None` when it graded none; it is what makes the difference between
+    /// "the chain is clean" and "the chain is clean and something still moved".
+    #[must_use]
+    pub fn attribute(&self, source: SourceFormat, observed: Option<Alteration>) -> Attribution {
+        if let Some(named) = self.first_divergence(source) {
+            return named;
+        }
+        // A graph publishes rates and widths and nothing else, so a volume
+        // control is neither something it can name nor something it can fail to
+        // explain - it is judged against whatever there was to compare at all.
+        let compared = match observed {
+            Some(Alteration::Resampled) => self.compared_rates(source),
+            Some(Alteration::Truncated) => self.compared_widths(source),
+            Some(Alteration::VolumeScaled | Alteration::ServerVolumeScaled) | None => {
+                self.compared_rates(source) || self.compared_widths(source)
+            }
+        };
+        if !compared {
+            return Attribution::NothingToCompare;
+        }
+        match observed {
+            Some(a @ (Alteration::Resampled | Alteration::Truncated)) => {
+                Attribution::Unexplained(a)
+            }
+            _ => Attribution::Clean,
+        }
+    }
+
+    /// The first hop that is off the track's rate or below its width.
+    ///
+    /// The two are searched independently and the earlier one wins, because
+    /// everything downstream of a divergence is working on samples that have
+    /// already been rebuilt. Where both land on the same hop the rate is
+    /// reported: it replaces every sample, where a narrowing keeps them and
+    /// drops the low bits.
+    fn first_divergence(&self, source: SourceFormat) -> Option<Attribution> {
+        let resampler = self.first(|n| {
+            source.rate_hz > 0 && n.rate_hz.is_some_and(|rate_hz| rate_hz != source.rate_hz)
+        });
+        let narrower =
+            self.first(|n| source.bits > 0 && node_bits(n).is_some_and(|bits| bits < source.bits));
+        match (resampler, narrower) {
+            (Some(rate_hop), Some(width_hop)) if width_hop < rate_hop => Some(Attribution::Node {
+                index: width_hop,
+                alteration: Alteration::Truncated,
+            }),
+            (Some(index), _) => Some(Attribution::Node {
+                index,
+                alteration: Alteration::Resampled,
+            }),
+            (None, Some(index)) => Some(Attribution::Node {
+                index,
+                alteration: Alteration::Truncated,
+            }),
+            (None, None) => None,
+        }
+    }
+
+    fn first(&self, matches: impl Fn(&GraphNode) -> bool) -> Option<usize> {
+        self.path.iter().position(matches)
+    }
+
+    /// Was there a rate on both sides to compare at all?
+    fn compared_rates(&self, source: SourceFormat) -> bool {
+        source.rate_hz > 0 && self.path.iter().any(|n| n.rate_hz.is_some())
+    }
+
+    /// Was there a width on both sides to compare at all?
+    fn compared_widths(&self, source: SourceFormat) -> bool {
+        source.bits > 0 && self.path.iter().any(|n| node_bits(n).is_some())
+    }
+}
+
+/// How many bits of resolution a node's negotiated format carries.
+///
+/// `None` covers both "it has not negotiated one" and "it named a format priel
+/// does not know the width of", which come to the same thing here: nothing to
+/// compare.
+fn node_bits(node: &GraphNode) -> Option<u32> {
+    node.format.as_deref().and_then(crate::format_bits)
 }
 
 /// Why the graph could not be read.
@@ -442,7 +580,8 @@ fn as_u32(v: &Value) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioGraph, GraphError, NodeRole, parse, parse_sinks};
+    use super::{Attribution, AudioGraph, GraphError, NodeRole, SourceFormat, parse, parse_sinks};
+    use crate::Alteration;
 
     /// A real `pw-dump`, taken while priel was playing a 44.1 kHz track into a
     /// USB DAC. Trimmed to the objects on the path plus one unrelated sink, and
@@ -451,6 +590,24 @@ mod tests {
 
     /// The pid priel was running under when the fixture was captured.
     const PID: u32 = 3_124_085;
+
+    /// **Synthetic**, not captured: a chain shaped like the real one with a
+    /// loopback wedged into it, running at 48 kHz and narrowing to `S16LE` at
+    /// the device. The captured dump has a clean chain, so there was nothing in
+    /// it to attribute; this is what a machine with a virtual sink in the way
+    /// looks like.
+    const RESAMPLING: &str = include_str!("../tests/fixtures/pw-dump-resampling-loopback.json");
+
+    /// **Synthetic**, not captured: the same shape with no loopback and the rate
+    /// intact, so the only thing wrong is the width the sink settled on.
+    const TRUNCATING: &str = include_str!("../tests/fixtures/pw-dump-truncating-sink.json");
+
+    /// The pid the two hand-authored dumps are written for.
+    const SYNTHETIC_PID: u32 = 4242;
+
+    fn track(rate_hz: u32, bits: u32) -> SourceFormat {
+        SourceFormat { rate_hz, bits }
+    }
 
     fn path_of(dump: &str, pid: u32) -> AudioGraph {
         match parse(dump, pid) {
@@ -654,6 +811,246 @@ mod tests {
                 assert!(hint.chars().count() <= 60, "too long to draw: {hint}");
             }
         }
+    }
+
+    #[test]
+    fn who_alters_the_samples_is_decided_by_a_table_over_the_recorded_chains() {
+        // Goal: the whole feature in one place. The badge says *that* the
+        // samples were altered; this says *which node did it*, and - the case
+        // that matters as much - refuses to name one when the chain does not
+        // account for what was measured. Each row is (dump, pid, the track, what
+        // the player graded, what the graph may say about it).
+        let cases: [(&str, u32, SourceFormat, Option<Alteration>, Attribution); 12] = [
+            // The captured chain carries the track's own rate end to end, and
+            // widens 16 bits into a 32-bit word, which alters nothing.
+            (DUMP, PID, track(44_100, 16), None, Attribution::Clean),
+            // The same chain with a resample measured at the hardware. Nothing
+            // on the path did it, and saying so is the point: the nearest
+            // candidate is the DAC, and blaming it would be a guess.
+            (
+                DUMP,
+                PID,
+                track(44_100, 16),
+                Some(Alteration::Resampled),
+                Attribution::Unexplained(Alteration::Resampled),
+            ),
+            (
+                DUMP,
+                PID,
+                track(44_100, 16),
+                Some(Alteration::Truncated),
+                Attribution::Unexplained(Alteration::Truncated),
+            ),
+            // A volume control is not a thing the graph publishes, so there is
+            // nothing here to admit a gap about either.
+            (
+                DUMP,
+                PID,
+                track(44_100, 16),
+                Some(Alteration::VolumeScaled),
+                Attribution::Clean,
+            ),
+            (
+                DUMP,
+                PID,
+                track(44_100, 16),
+                Some(Alteration::ServerVolumeScaled),
+                Attribution::Clean,
+            ),
+            // The loopback is the first node off the track's rate. The device
+            // behind it is at 48 kHz too, and naming that one would send the
+            // reader to reconfigure the wrong thing.
+            (
+                RESAMPLING,
+                SYNTHETIC_PID,
+                track(44_100, 24),
+                None,
+                Attribution::Node {
+                    index: 1,
+                    alteration: Alteration::Resampled,
+                },
+            ),
+            (
+                RESAMPLING,
+                SYNTHETIC_PID,
+                track(44_100, 24),
+                Some(Alteration::Resampled),
+                Attribution::Node {
+                    index: 1,
+                    alteration: Alteration::Resampled,
+                },
+            ),
+            // That chain also narrows, at the device two hops down. The rate
+            // goes first because it is the earlier divergence: everything after
+            // it is already rebuilt.
+            (
+                RESAMPLING,
+                SYNTHETIC_PID,
+                track(44_100, 24),
+                Some(Alteration::Truncated),
+                Attribution::Node {
+                    index: 1,
+                    alteration: Alteration::Resampled,
+                },
+            ),
+            // The rate holds all the way down, so only the width is left.
+            (
+                TRUNCATING,
+                SYNTHETIC_PID,
+                track(44_100, 24),
+                None,
+                Attribution::Node {
+                    index: 1,
+                    alteration: Alteration::Truncated,
+                },
+            ),
+            // The same chain with a 16-bit track: `S16LE` carries it exactly,
+            // and a chain that alters nothing accuses nobody.
+            (
+                TRUNCATING,
+                SYNTHETIC_PID,
+                track(44_100, 16),
+                None,
+                Attribution::Clean,
+            ),
+            // Nothing known about the track. "Clean" would be a claim made from
+            // no data, which is the flattering answer rather than the true one.
+            (DUMP, PID, track(0, 0), None, Attribution::NothingToCompare),
+            (
+                DUMP,
+                PID,
+                track(0, 0),
+                Some(Alteration::Resampled),
+                Attribution::NothingToCompare,
+            ),
+        ];
+
+        for (dump, pid, source, observed, expected) in cases {
+            let g = path_of(dump, pid);
+            assert_eq!(
+                g.attribute(source, observed),
+                expected,
+                "track {source:?} observed {observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_named_node_is_the_one_the_reader_has_to_go_and_fix() {
+        // Goal: an index is only useful if it points at the node a person
+        // recognises. The loopback and the device are both at 48 kHz, so an
+        // off-by-one here would send them to the DAC's settings for a problem
+        // a virtual sink is causing.
+        let g = path_of(RESAMPLING, SYNTHETIC_PID);
+        let Attribution::Node { index, .. } = g.attribute(track(44_100, 24), None) else {
+            panic!("the loopback should have been named");
+        };
+        assert_eq!(g.path[index].description, "Studio loopback");
+        assert_eq!(g.path[index].role, NodeRole::Intermediate);
+    }
+
+    #[test]
+    fn a_node_that_resamples_and_narrows_at_once_is_named_for_the_worse_of_the_two() {
+        // Goal: both divergences land on the same hop, and the two answers are
+        // not equal - a rate change rebuilds every sample, where a narrowing
+        // keeps them and drops the low bits. Reporting the milder one would
+        // understate what happened.
+        let dump = r#"[
+          {"id": 1, "type": "PipeWire:Interface:Client",
+           "info": {"props": {"application.process.id": 42}}},
+          {"id": 2, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"client.id": 1, "media.class": "Stream/Output/Audio",
+                              "node.name": "mpv"},
+                    "params": {"Format": [{"format": "S32LE", "rate": 44100, "channels": 2}]}}},
+          {"id": 3, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"media.class": "Audio/Sink", "node.name": "dac"},
+                    "params": {"Format": [{"format": "S16LE", "rate": 48000, "channels": 2}]}}},
+          {"id": 4, "type": "PipeWire:Interface:Link",
+           "info": {"output-node-id": 2, "input-node-id": 3}}
+        ]"#;
+        let g = path_of(dump, 42);
+        assert_eq!(
+            g.attribute(track(44_100, 24), None),
+            Attribution::Node {
+                index: 1,
+                alteration: Alteration::Resampled,
+            }
+        );
+    }
+
+    #[test]
+    fn priels_own_stream_is_named_when_it_is_the_one_that_moved() {
+        // Goal: the node at the top of the chain is libmpv's, and it is not
+        // above suspicion - a player told to output at a fixed rate resamples
+        // before the graph ever sees the samples. Skipping the first hop would
+        // report "nothing here explains it" for a cause priel owns.
+        let dump = r#"[
+          {"id": 1, "type": "PipeWire:Interface:Client",
+           "info": {"props": {"application.process.id": 42}}},
+          {"id": 2, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"client.id": 1, "media.class": "Stream/Output/Audio",
+                              "node.name": "mpv"},
+                    "params": {"Format": [{"format": "S32LE", "rate": 48000, "channels": 2}]}}}
+        ]"#;
+        let g = path_of(dump, 42);
+        assert_eq!(
+            g.attribute(track(44_100, 24), None),
+            Attribution::Node {
+                index: 0,
+                alteration: Alteration::Resampled,
+            }
+        );
+    }
+
+    #[test]
+    fn a_chain_that_has_negotiated_nothing_admits_it_rather_than_reporting_a_clean_bill() {
+        // Goal: a suspended node publishes no Format at all. There is a
+        // difference between "compared and found nothing wrong" and "had
+        // nothing to compare", and collapsing them turns silence into a green
+        // light.
+        let dump = r#"[
+          {"id": 1, "type": "PipeWire:Interface:Client",
+           "info": {"props": {"application.process.id": 42}}},
+          {"id": 2, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"client.id": 1, "media.class": "Stream/Output/Audio",
+                              "node.name": "mpv"}}}
+        ]"#;
+        let g = path_of(dump, 42);
+        assert_eq!(
+            g.attribute(track(44_100, 24), None),
+            Attribution::NothingToCompare
+        );
+        assert_eq!(
+            g.attribute(track(44_100, 24), Some(Alteration::Resampled)),
+            Attribution::NothingToCompare
+        );
+    }
+
+    #[test]
+    fn a_gap_is_admitted_per_measurement_rather_than_for_the_chain_as_a_whole() {
+        // Goal: a node can publish a rate and no width, which leaves the rate
+        // answerable and the width not. Treating "some of it is comparable" as
+        // "all of it is" would let a truncation be reported as unexplained when
+        // it was never looked at.
+        let dump = r#"[
+          {"id": 1, "type": "PipeWire:Interface:Client",
+           "info": {"props": {"application.process.id": 42}}},
+          {"id": 2, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"client.id": 1, "media.class": "Stream/Output/Audio",
+                              "node.name": "mpv"},
+                    "params": {"Format": [{"rate": 44100, "channels": 2}]}}}
+        ]"#;
+        let g = path_of(dump, 42);
+        assert_eq!(
+            g.attribute(track(44_100, 24), Some(Alteration::Resampled)),
+            Attribution::Unexplained(Alteration::Resampled),
+            "the rates were all there and all agreed"
+        );
+        assert_eq!(
+            g.attribute(track(44_100, 24), Some(Alteration::Truncated)),
+            Attribution::NothingToCompare,
+            "no node said how wide it was, so nothing was checked"
+        );
     }
 
     #[test]

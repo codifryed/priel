@@ -1,0 +1,85 @@
+[
+  {
+    "id": 200,
+    "type": "PipeWire:Interface:Client",
+    "version": 3,
+    "info": {
+      "props": {
+        "application.name": "mpv",
+        "application.process.id": 4242
+      }
+    }
+  },
+  {
+    "id": 201,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "info": {
+      "state": "running",
+      "props": {
+        "application.name": "mpv",
+        "client.id": 200,
+        "media.class": "Stream/Output/Audio",
+        "media.name": "5 - mpv",
+        "node.description": "mpv",
+        "node.name": "mpv",
+        "node.rate": "1/44100"
+      },
+      "params": {
+        "Format": [
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "raw",
+            "format": "S32LE",
+            "rate": 44100,
+            "channels": 2,
+            "position": ["FL", "FR"]
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 202,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "info": {
+      "state": "running",
+      "props": {
+        "alsa.card": 3,
+        "alsa.card_name": "Example DAC",
+        "alsa.id": "DAC",
+        "api.alsa.path": "hw:3,0",
+        "audio.format": "S16LE",
+        "device.api": "alsa",
+        "media.class": "Audio/Sink",
+        "node.description": "Example DAC Analog Stereo",
+        "node.name": "alsa_output.usb-Example_DAC-00.analog-stereo"
+      },
+      "params": {
+        "Format": [
+          {
+            "mediaType": "audio",
+            "mediaSubtype": "raw",
+            "format": "S16LE",
+            "rate": 44100,
+            "channels": 2,
+            "position": ["FL", "FR"]
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 203,
+    "type": "PipeWire:Interface:Link",
+    "version": 3,
+    "info": {
+      "output-node-id": 201,
+      "output-port-id": 1,
+      "input-node-id": 202,
+      "input-port-id": 2,
+      "state": "active"
+    }
+  }
+]

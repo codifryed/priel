@@ -31,6 +31,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use priel_core::PlayableSource;
 
+use crate::graph::SourceFormat;
 use crate::hw::HwParams;
 
 pub mod graph;
@@ -159,6 +160,23 @@ pub enum Fidelity {
     Altered(Alteration),
 }
 
+impl Fidelity {
+    /// The rebuilt sample stream the graph could be asked to account for, if
+    /// there is one.
+    ///
+    /// Only [`Altered`](Self::Altered) qualifies, and only ever with a cause the
+    /// graph publishes: a volume control is not a node on the path, so handing
+    /// one to [`AudioGraph::attribute`](graph::AudioGraph::attribute) would ask
+    /// the chain to explain something it never shows.
+    #[must_use]
+    pub fn alteration(self) -> Option<Alteration> {
+        match self {
+            Self::Altered(a @ (Alteration::Resampled | Alteration::Truncated)) => Some(a),
+            _ => None,
+        }
+    }
+}
+
 /// Why playback is not bit-perfect, most damaging first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Alteration {
@@ -264,6 +282,26 @@ impl PlaybackStatus {
         self.hw.is_some()
     }
 
+    /// The track as the decoder produced it, for comparing a graph's nodes
+    /// against.
+    ///
+    /// Shares the source rule with [`fidelity`](Self::fidelity) rather than
+    /// restating it: a declared depth wins, and only where the service declared
+    /// none does the container width stand in as an upper bound. Two readings
+    /// of the same track that disagreed about how wide it was would put the
+    /// badge and the graph overlay at odds.
+    #[must_use]
+    pub fn decoded_format(&self, source_bits: u32) -> SourceFormat {
+        SourceFormat {
+            rate_hz: self.in_sample_rate,
+            bits: if source_bits > 0 {
+                source_bits
+            } else {
+                format_bits(&self.in_format).unwrap_or(0)
+            },
+        }
+    }
+
     #[must_use]
     pub fn fidelity(&self, source_bits: u32) -> Fidelity {
         if !self.loaded || self.in_sample_rate == 0 {
@@ -276,14 +314,12 @@ impl PlaybackStatus {
         let Some(out_bits) = format_bits(out_format) else {
             return Fidelity::Unknown;
         };
-        let source_bits = if source_bits > 0 {
-            source_bits
-        } else {
-            match format_bits(&self.in_format) {
-                Some(b) => b,
-                None => return Fidelity::Unknown,
-            }
-        };
+        // Zero means the width is not known from either end, which is not a
+        // verdict about anything.
+        let source_bits = self.decoded_format(source_bits).bits;
+        if source_bits == 0 {
+            return Fidelity::Unknown;
+        }
 
         if out_rate != self.in_sample_rate {
             return Fidelity::Altered(Alteration::Resampled);
@@ -984,6 +1020,62 @@ mod tests {
             });
             assert_eq!(s.fidelity(24), verdict, "format {fmt}");
         }
+    }
+
+    #[test]
+    fn the_track_the_graph_is_compared_against_falls_back_to_the_container() {
+        // Goal: the graph's nodes are judged against the same source the badge
+        // is, or the two would disagree about the same track. That includes the
+        // rule that makes the badge honest - a declared depth wins, and only
+        // when there is none does the container width stand in for it.
+        let s = playing(44_100, 44_100, "s32", "s32");
+        assert_eq!(
+            s.decoded_format(24),
+            SourceFormat {
+                rate_hz: 44_100,
+                bits: 24
+            }
+        );
+        assert_eq!(
+            s.decoded_format(0),
+            SourceFormat {
+                rate_hz: 44_100,
+                bits: 32
+            },
+            "with nothing declared the container is the only upper bound there is"
+        );
+
+        let s = playing(44_100, 44_100, "unknowable", "s32");
+        assert_eq!(
+            s.decoded_format(0),
+            SourceFormat {
+                rate_hz: 44_100,
+                bits: 0
+            },
+            "zero means do not compare, not zero bits"
+        );
+    }
+
+    #[test]
+    fn only_a_rebuilt_sample_stream_is_something_the_graph_can_be_asked_about() {
+        // Goal: the attribution takes what was graded and looks for the node
+        // that did it. A volume control is not a node, and handing one over
+        // would have the chain asked to account for something it never
+        // publishes.
+        assert_eq!(Fidelity::Unknown.alteration(), None);
+        assert_eq!(Fidelity::BitPerfect.alteration(), None);
+        assert_eq!(
+            Fidelity::NearBitPerfect(Alteration::VolumeScaled).alteration(),
+            None
+        );
+        assert_eq!(
+            Fidelity::Altered(Alteration::Resampled).alteration(),
+            Some(Alteration::Resampled)
+        );
+        assert_eq!(
+            Fidelity::Altered(Alteration::Truncated).alteration(),
+            Some(Alteration::Truncated)
+        );
     }
 
     #[test]
