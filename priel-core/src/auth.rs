@@ -101,13 +101,6 @@ impl Credentials {
         format!("{}/credentials.json", state_dir())
     }
 
-    /// Where a user may place an identity of their own, overriding whatever
-    /// priel obtained. Config, because this one *is* a deliberate setting.
-    #[must_use]
-    pub fn override_path() -> String {
-        format!("{}/credentials.json", config_dir())
-    }
-
     /// Read the client identity from disk.
     ///
     /// # Errors
@@ -161,8 +154,8 @@ pub const UPSTREAM_SOURCES: &[&str] = &[
 /// Where a client identity came from, so the interface can say so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialSource {
-    /// The user's own `credentials.json`.
-    Configured,
+    /// The `credentials.json` priel keeps in its state directory.
+    Saved,
     /// A Python `tidalapi` installed on this machine.
     LocalPackage,
     /// Downloaded from the upstream project.
@@ -212,22 +205,20 @@ pub fn config_dir() -> String {
     format!("{base}/priel")
 }
 
-/// A client identity from the first of `paths` that has one, falling back to a
-/// locally installed Python package.
+/// A client identity from `path`, falling back to a locally installed Python
+/// package.
 ///
-/// The paths are passed in rather than resolved here so the caller decides the
-/// order - normally the user's override first, then whatever priel obtained for
-/// itself - and so a test is not at the mercy of what happens to exist on the
-/// machine running it.
+/// The path is passed in rather than resolved here so a test is not at the mercy
+/// of what happens to exist on the machine running it - resolving it from a
+/// global inside the lookup is a hidden dependency that broke three tests before
+/// it was removed.
 ///
 /// Never touches the network: fetching is a separate action the user has to ask
 /// for, so priel does not quietly reach out on first start.
 #[must_use]
-pub fn local_credentials(paths: &[&str]) -> Option<(Credentials, CredentialSource)> {
-    for path in paths {
-        if let Ok(creds) = Credentials::load(path) {
-            return Some((creds, CredentialSource::Configured));
-        }
+pub fn local_credentials(path: &str) -> Option<(Credentials, CredentialSource)> {
+    if let Ok(creds) = Credentials::load(path) {
+        return Some((creds, CredentialSource::Saved));
     }
     discover_credentials().map(|c| (c, CredentialSource::LocalPackage))
 }
@@ -494,7 +485,7 @@ struct TokenResponse {
 ///
 /// The field names follow the convention other OAuth clients for this service
 /// use, so a session file is recognisable, but priel keeps its own under
-/// `~/.config/priel/` and never writes to another application's.
+/// `~/.local/state/priel/` and never writes to another application's.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredToken {
     pub access_token: String,
@@ -1168,9 +1159,9 @@ mod tests {
         std::fs::write(&path, r#"{"client_id":"configured"}"#).expect("write");
 
         let (creds, source) =
-            local_credentials(&[path.to_str().expect("path")]).expect("should find the file");
+            local_credentials(path.to_str().expect("path")).expect("should find the file");
         assert_eq!(creds.client_id, "configured");
-        assert_eq!(source, CredentialSource::Configured);
+        assert_eq!(source, CredentialSource::Saved);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1238,43 +1229,31 @@ mod tests {
     }
 
     #[test]
-    fn the_lookup_order_is_the_callers_to_decide() {
-        // Goal: an explicit override must outrank whatever priel obtained for
-        // itself, and the order is passed in rather than resolved here - a
-        // hidden global location made this untestable and surprised three tests
-        // before it was removed.
+    fn the_lookup_path_is_the_callers_to_decide() {
+        // Goal: the path is passed in rather than resolved here - a hidden
+        // global location made this untestable and surprised three tests before
+        // it was removed.
         let dir = std::env::temp_dir().join(format!("priel-order-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmp");
-        let first = dir.join("override.json");
-        let second = dir.join("obtained.json");
-        std::fs::write(&first, r#"{"client_id":"mine"}"#).expect("write");
-        std::fs::write(&second, r#"{"client_id":"downloaded"}"#).expect("write");
+        let saved = dir.join("obtained.json");
+        std::fs::write(&saved, r#"{"client_id":"downloaded"}"#).expect("write");
 
-        let (creds, _) = local_credentials(&[
-            first.to_str().expect("path"),
-            second.to_str().expect("path"),
-        ])
-        .expect("should find one");
-        assert_eq!(creds.client_id, "mine", "the override comes first");
-
-        std::fs::remove_file(&first).expect("remove");
-        let (creds, _) = local_credentials(&[
-            first.to_str().expect("path"),
-            second.to_str().expect("path"),
-        ])
-        .expect("should fall through");
+        let (creds, source) =
+            local_credentials(saved.to_str().expect("path")).expect("should find one");
         assert_eq!(creds.client_id, "downloaded");
+        assert_eq!(source, CredentialSource::Saved);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn state_and_config_are_kept_apart() {
+    fn an_obtained_identity_is_state_and_not_config() {
         // Goal: a session and an obtained identity are runtime state, not
-        // settings. Only the user's override belongs in the config directory.
+        // settings - fetched rather than authored, regenerable, meaningless on
+        // another machine. The config directory is only somewhere to migrate
+        // out of.
         assert!(state_dir().contains("state"), "{}", state_dir());
         assert!(Credentials::default_path().starts_with(&state_dir()));
-        assert!(Credentials::override_path().starts_with(&config_dir()));
-        assert_ne!(Credentials::default_path(), Credentials::override_path());
+        assert!(!Credentials::default_path().starts_with(&config_dir()));
     }
 
     #[test]

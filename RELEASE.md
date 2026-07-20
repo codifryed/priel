@@ -168,8 +168,10 @@ uploading. What it catches:
   The fix is `{ path = "priel-core", version = "0.2.0" }` in the workspace
   dependency table - both, not either. Cargo uses the path locally and strips it
   on publish, so the two must be bumped together at step 2 from then on.
-- **`repository` is read by more than people.** cargo warns without it; scanners
-  and packagers rely on it.
+- **Each crate must opt into the inherited metadata.** `repository` lives in
+  `[workspace.package]`, and a member that does not say `repository.workspace =
+  true` publishes without it - cargo warns rather than fails, so it is easy to
+  miss.
 
 Two things that only bite once:
 
@@ -192,11 +194,8 @@ Two things that only bite once:
 
 ## Preconditions this repo has not met yet
 
-Neither blocks a tag; both block step 8, and both would be embarrassing to
-discover during a release rather than before one:
+This blocks step 8, not a tag, and would be embarrassing to discover during a
+release rather than before one:
 
-- **`repository` in the root `Cargo.toml` is empty.** It is what a packager, a
-  security scanner and `cargo metadata` all read to find the source, and
-  `cargo publish` warns about its absence.
 - **The workspace path dependencies carry no version**, so `cargo publish` on
   anything but `priel-core` fails outright. See step 8.

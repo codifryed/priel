@@ -4,6 +4,7 @@ version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Unofficial hi-res terminal client for TIDAL (mouse + VIM)"
 # The asset generator is a second binary in this crate, which otherwise makes
 # `cargo run` ambiguous even though its required-features are off by default.

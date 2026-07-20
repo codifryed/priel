@@ -225,7 +225,6 @@ pub struct App {
     credentials_path: Option<String>,
     /// Where to look for a client identity, in order: the user's override
     /// first, then whatever priel obtained for itself.
-    credentials_lookup: Vec<String>,
     /// Kept so the worker can be rebuilt once credentials arrive, rather than
     /// asking the user to restart.
     token_path: Option<String>,
@@ -262,16 +261,12 @@ impl App {
     ) -> anyhow::Result<Self> {
         let player = Player::with_config(player)?;
         let creds_path = Credentials::default_path();
-        let lookup = vec![Credentials::override_path(), creds_path.clone()];
-        let has_credentials =
-            priel_core::auth::local_credentials(&[&Credentials::override_path(), &creds_path])
-                .is_some();
+        let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
         let worker = worker::spawn(token_path.clone(), creds_path.clone());
         let mut app = Self::with(player, worker);
         app.recent = recent;
         let has_session = priel_core::auth::StoredToken::load(&token_path).is_ok();
         app.credentials_path = Some(creds_path.clone());
-        app.credentials_lookup = lookup;
         app.token_path = Some(token_path.clone());
         // The screens chain: a client key is needed before signing in, and a
         // session before anything can load. Each step leads to the next rather
@@ -338,7 +333,6 @@ impl App {
             log_scroll: 0,
             last_sig: RenderSig::default(),
             credentials_path: None,
-            credentials_lookup: Vec::new(),
             token_path: None,
             credential_status: None,
             fetching: None,
@@ -573,16 +567,14 @@ impl App {
 
     /// A client identity from wherever this app was told to look.
     fn read_credentials(&self) -> Option<(Credentials, priel_core::auth::CredentialSource)> {
-        let paths: Vec<&str> = self.credentials_lookup.iter().map(String::as_str).collect();
-        priel_core::auth::local_credentials(&paths)
+        priel_core::auth::local_credentials(self.credentials_path.as_deref()?)
     }
 
     /// Point the app at token and credential files, for tests.
     #[cfg(test)]
     pub fn set_paths_for_test(&mut self, token: String, credentials: String) {
         self.token_path = Some(token);
-        self.credentials_path = Some(credentials.clone());
-        self.credentials_lookup = vec![credentials];
+        self.credentials_path = Some(credentials);
     }
 
     /// Drive the post-credentials step, for tests.

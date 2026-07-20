@@ -15,13 +15,9 @@ members = ["priel-core", "priel-player", "priel-tui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# The lowest toolchain that actually builds, which is what this field promises.
-# Two independent things set it: the source uses let chains, stable from 1.88 in
-# edition 2024, and seven crates in the tree declare 1.88 themselves. Nothing
-# wants newer, so nothing here is newer - raising it excludes packagers for free.
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
-repository = ""
+repository = "https://codeberg.org/codifryed/priel"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -34,9 +30,6 @@ ring = "0.17"
 getrandom = "0.2"
 percent-encoding = "2.3"
 regex = "1"
-# The logging facade only: no sink, no dependencies of its own, and no work at
-# all when the level is off. The sink is written in-house in priel-tui, so a
-# future GUI frontend installs its own and the libraries stay UI-free.
 log = { version = "0.4", features = ["std"] }
 # Already in the tree: libmpv2 is a thin wrapper over it and nothing else, so
 # naming it directly costs no new crate and no new system library. It is here
