@@ -133,6 +133,9 @@ pub enum Hit {
     /// been.
     Back,
     Shuffle,
+    /// Carry on with the service's radio when the queue runs out, or stop
+    /// there. Beside [`Hit::Shuffle`] because both are answers to "and then?".
+    Continue,
     VolUp,
     VolDown,
     VolUnity,
@@ -350,6 +353,14 @@ fn seconds(micros: i64) -> f64 {
     micros as f64 / 1_000_000.0
 }
 
+/// The most tracks a queue may hold.
+///
+/// A queue built from a listing is bounded by the listing, but one the radio
+/// keeps extending is bounded by nothing at all: it runs out, asks again, and
+/// grows every time. This is the bound that makes it finite - about a day of
+/// music, after which the queue ends and says so, like any other queue.
+const QUEUE_MAX: usize = 500;
+
 /// How long a playlist name may be typed.
 ///
 /// A bound because the box grows from keystrokes and nothing else would stop
@@ -522,6 +533,33 @@ pub struct App {
     next_intended: Option<u64>,
     metas: HashMap<u64, StreamMeta>,
     advanced: bool,
+
+    /// Whether the queue running out should be followed by the radio.
+    ///
+    /// **Off unless it is turned on**, which is the whole design: a player that
+    /// carries on by itself past the last track the listener chose is a player
+    /// playing music nobody asked for, unattended, for hours. Silence is the
+    /// honest end of a snapshot somebody took on purpose.
+    ///
+    /// Session state rather than a setting, in the sense
+    /// `docs/adr/0004-a-settings-file-that-is-edited-never-rewritten.md` means
+    /// it: the file holds what a flag can already set, and its own exclusion
+    /// list names the shuffle flag - the toggle beside this one - as the kind of
+    /// thing that stays out.
+    pub continue_radio: bool,
+    /// The track whose radio has already been asked about, whatever the answer.
+    ///
+    /// The preload decision fires on every tick for as long as nothing is queued
+    /// behind the current track, which at the end of a queue is every tick of
+    /// the last one. Without this, that is ten requests a second - and ten
+    /// notices a second for a track that has no mix to ask for.
+    radio_asked: Option<u64>,
+    /// Where in the queue the radio took over, if it has.
+    ///
+    /// An index rather than a flag so a skip back into what the listener
+    /// actually chose stops claiming to be a suggestion. Cleared whenever the
+    /// queue is rebuilt, because that is a fresh choice.
+    radio_from: Option<usize>,
 
     /// Tracks priel knows are in the user's favorites.
     ///
@@ -784,6 +822,9 @@ impl App {
             next_intended: None,
             metas: HashMap::new(),
             advanced: false,
+            continue_radio: false,
+            radio_asked: None,
+            radio_from: None,
             favorite_ids: HashSet::new(),
             bus: None,
             published: Snapshot::default(),
@@ -1222,6 +1263,12 @@ impl App {
         self.mode = mode;
     }
 
+    /// Say where the radio took the queue over, for renderer tests.
+    #[cfg(test)]
+    pub fn set_radio_from_for_test(&mut self, from: Option<usize>) {
+        self.radio_from = from;
+    }
+
     /// The line under the consent screen's buttons.
     #[must_use]
     pub fn credential_status(&self) -> Option<&str> {
@@ -1458,8 +1505,11 @@ impl App {
             // how much of a list has been fetched.
             // Neither does a playlist edit: it changes one row, or makes one,
             // or takes one away. None of that is a page of a listing.
+            // A radio belongs to no listing either: it extends the play queue,
+            // which has no page and no offset to latch.
             Task::Startup
             | Task::Resolve
+            | Task::Radio { .. }
             | Task::SetFavorite { .. }
             | Task::CreatePlaylist
             | Task::RenamePlaylist { .. }
@@ -1929,6 +1979,7 @@ impl App {
                     offset,
                     page,
                 } => self.on_mix_tracks_page(&mix_id, offset, page),
+                FromWorker::Radio { mix_id, page } => self.on_radio_page(&mix_id, page),
                 FromWorker::SearchResults {
                     query,
                     offset,
@@ -2387,9 +2438,20 @@ impl App {
             }
             vis.iter().filter_map(|&i| items.get(i).cloned()).collect()
         };
-        self.queue = tracks;
+        self.set_queue(tracks);
         let p = vis_index.min(self.queue.len() - 1);
         self.load_fresh(p);
+    }
+
+    /// Replace the queue, and with it everything that was true of the last one.
+    ///
+    /// The one place a queue is built from scratch, so that what the radio added
+    /// to the last one - and the mark that said so - cannot outlive it. Growing
+    /// a queue is a different thing and goes through [`App::on_radio_page`].
+    fn set_queue(&mut self, tracks: Vec<Track>) {
+        self.queue = tracks;
+        self.radio_from = None;
+        self.radio_asked = None;
     }
 
     fn load_fresh(&mut self, pos: usize) {
@@ -2419,14 +2481,117 @@ impl App {
         } else {
             None
         };
-        match next {
-            Some(p) => {
-                let id = self.queue[p].id;
-                self.next_intended = Some(id);
-                self.ask(ToWorker::Resolve(id));
-            }
-            None => self.next_intended = None,
+        if let Some(p) = next {
+            let id = self.queue[p].id;
+            self.next_intended = Some(id);
+            self.ask(ToWorker::Resolve(id));
+        } else {
+            // Nothing follows this track. Shuffle never reaches here - it always
+            // has somewhere to go - so this is the ordered end of a queue, and
+            // the one moment the radio has anything to answer.
+            self.next_intended = None;
+            self.extend_with_radio();
         }
+    }
+
+    /// Ask for the radio of whatever is playing, once.
+    ///
+    /// Called from the preload path rather than from the end-of-track fallback,
+    /// and that is the point: the request goes out while the last track is still
+    /// playing, so the answer is normally in the queue in time for the ordinary
+    /// gapless preload to take it. Nothing here loads or plays anything.
+    fn extend_with_radio(&mut self) {
+        if !self.continue_radio {
+            return;
+        }
+        let Some(seed) = self.queue.get(self.queue_pos) else {
+            return;
+        };
+        // Once per track, whatever the answer was. See `radio_asked`.
+        if self.radio_asked == Some(seed.id) {
+            return;
+        }
+        self.radio_asked = Some(seed.id);
+        if seed.mix_id.is_empty() {
+            let title = seed.title.clone();
+            log::info!("no radio mix on track {}; the queue ends here", seed.id);
+            self.notice = Some(format!("No radio for “{title}”. The queue ends here."));
+            return;
+        }
+        if self.queue.len() >= QUEUE_MAX {
+            self.notice = Some("The queue is as long as it goes. Play something to go on.".into());
+            return;
+        }
+        self.ask(ToWorker::LoadRadio {
+            mix_id: seed.mix_id.clone(),
+            limit: worker::RADIO_PAGE,
+        });
+    }
+
+    /// Put a radio's tracks on the end of the queue.
+    ///
+    /// The queue is a snapshot and a page landing does not join it - that rule
+    /// is untouched, and this is not a page. It is the listener's standing
+    /// answer to "and then?", applied at the one moment there is no other
+    /// answer, and it is marked as the service's suggestion for as long as it
+    /// plays.
+    fn on_radio_page(&mut self, mix_id: &str, page: priel_core::Page<Track>) {
+        let Some(seed) = self.queue.get(self.queue_pos).cloned() else {
+            return;
+        };
+        // Correlated by what the reply is for, never by it having arrived. A
+        // radio asked for at the end of one queue can land after the listener
+        // has started another, and appending it there extends a queue nobody
+        // asked to extend, with a mix built round a track that is not playing.
+        if seed.mix_id != mix_id {
+            log::debug!("dropping the radio for {mix_id}: it is not what is playing");
+            return;
+        }
+        let room = QUEUE_MAX.saturating_sub(self.queue.len());
+        let added: Vec<Track> = page
+            .items
+            .into_iter()
+            // A track's own mix leads with that track, and replaying what just
+            // finished reads as a fault rather than as a suggestion.
+            .filter(|t| t.id != seed.id)
+            .take(room)
+            .collect();
+        if added.is_empty() {
+            self.notice = Some("The radio had nothing to add. The queue ends here.".into());
+            return;
+        }
+        if self.radio_from.is_none() {
+            self.radio_from = Some(self.queue.len());
+        }
+        self.queue.extend(added);
+        self.notice = Some(format!(
+            "The radio for “{}” follows it: the service's suggestion, not yours.",
+            seed.title
+        ));
+        self.dirty = true;
+        // The ordinary preload, which is what carries every other track change.
+        self.schedule_next();
+        // If the track ran out before this arrived, the end-of-track fallback
+        // has already fired and set the guard that stops it firing again. The
+        // thing it was waiting for has now turned up, so the guard is cleared
+        // and the *existing* decision starts the radio on the next tick.
+        // Loading a track from here instead would be the second mechanism this
+        // feature must not grow.
+        //
+        // Unconditional, deliberately: whether audio is still flowing is
+        // `decide`'s question and it already asks it. Asking it here as well
+        // would be a second place that has to be right about the same thing.
+        self.advanced = false;
+    }
+
+    /// Is what is playing the service's suggestion rather than the listener's
+    /// choice?
+    ///
+    /// Positional, so skipping back into what was actually chosen stops saying
+    /// it was suggested.
+    #[must_use]
+    pub fn playing_from_radio(&self) -> bool {
+        self.radio_from.is_some_and(|start| self.queue_pos >= start)
     }
 
     fn advance_fresh(&mut self) {
@@ -2933,6 +3098,28 @@ impl App {
         self.set_shuffle(!self.shuffle);
     }
 
+    /// Turn carrying on past the end of the queue on, or off.
+    ///
+    /// The one implementation behind the `c` key and the header control, so the
+    /// two cannot drift. Turning it off governs whether the queue is *extended*
+    /// again; it does not reach into what is already loaded, because the next
+    /// entry is in mpv's playlist by then and a second path into that is the
+    /// one thing the gapless pipeline must not grow.
+    fn toggle_continue(&mut self) {
+        self.continue_radio = !self.continue_radio;
+        // Asking again is the point of turning it back on, so the record of
+        // what was already asked goes with it.
+        self.radio_asked = None;
+        self.notice = Some(
+            if self.continue_radio {
+                "Radio ON: the queue carries on with the service's suggestions."
+            } else {
+                "Radio OFF: the queue ends where it ends."
+            }
+            .into(),
+        );
+    }
+
     /// Turn shuffle on, or off.
     ///
     /// Absolute rather than a toggle because MPRIS's `Shuffle` is, and there is
@@ -2957,7 +3144,7 @@ impl App {
                 vis.iter().filter_map(|&i| items.get(i).cloned()).collect()
             };
             if !tracks.is_empty() {
-                self.queue = tracks;
+                self.set_queue(tracks);
                 let p = rand::thread_rng().gen_range(0..self.queue.len());
                 self.load_fresh(p);
             }
@@ -3626,6 +3813,7 @@ impl App {
             KeyCode::Enter => self.on_enter(),
             KeyCode::Char(' ') => self.player.toggle_pause(),
             KeyCode::Char('s') => self.toggle_shuffle(),
+            KeyCode::Char('c') => self.toggle_continue(),
             KeyCode::Char('n' | 'L') => self.user_next(),
             KeyCode::Char('p' | 'H') => self.user_prev(),
             KeyCode::Char('h') | KeyCode::Left => self.player.seek_relative(-5.0),
@@ -3877,6 +4065,7 @@ impl App {
             Hit::Enter => self.on_enter(),
             Hit::Back => self.go_back(),
             Hit::Shuffle => self.toggle_shuffle(),
+            Hit::Continue => self.toggle_continue(),
             Hit::VolUp => self.volume_step(5.0),
             Hit::VolDown => self.volume_step(-5.0),
             Hit::VolUnity => self.volume_unity(),
@@ -8255,6 +8444,349 @@ mod tests {
         r.app.queue = vec![track(1, "A", "X"), track(2, "B", "Y")];
         r.app.queue_pos = 1;
         assert_eq!(r.app.queue_indicator().unwrap(), "2/2");
+    }
+
+    // ---- carrying on past the end of the queue ----
+
+    /// A track that names the radio mix the service builds around it.
+    fn track_with_radio(id: u64, mix_id: &str) -> Track {
+        Track {
+            mix_id: mix_id.into(),
+            ..track(id, "T", "A")
+        }
+    }
+
+    /// The last track of a queue, playing and settled: the one moment at which
+    /// "what comes after this?" has no answer.
+    fn on_the_last_track(r: &mut Rig, tracks: Vec<Track>) {
+        let last = tracks.len() - 1;
+        let playing = tracks[last].clone();
+        r.app.queue = tracks;
+        r.app.queue_pos = last;
+        r.app.expected_id = playing.id;
+        r.app.status.current_id = playing.id;
+        r.app.now_playing = Some(playing);
+        r.app.status.playing = true;
+        let _ = requests(r);
+    }
+
+    /// What was asked of the radio this tick.
+    fn radios_asked(r: &Rig) -> Vec<String> {
+        requests(r)
+            .into_iter()
+            .filter_map(|c| match c {
+                ToWorker::LoadRadio { mix_id, .. } => Some(mix_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn radio_page(mix_id: &str, ids: std::ops::Range<u64>) -> FromWorker {
+        FromWorker::Radio {
+            mix_id: mix_id.into(),
+            page: track_page(ids, 0),
+        }
+    }
+
+    #[test]
+    fn nothing_follows_the_last_track_until_the_listener_asks_for_it() {
+        // Goal: the whole reason this is a toggle. A player that carries on by
+        // itself after the last track the listener chose is a player playing
+        // music nobody asked for, and it does that unattended, for hours. So
+        // off is the default and silence is the honest end of a queue.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        assert!(!r.app.continue_radio, "off until it is turned on");
+        r.app.refresh_for_test();
+        assert!(radios_asked(&r).is_empty());
+    }
+
+    #[test]
+    fn the_end_of_the_queue_asks_for_the_radio_of_the_track_that_ended_it() {
+        // Goal: the mix is the one built around the track that just played, not
+        // one chosen from a listing, which is why every row has to carry its own
+        // id for it.
+        let mut r = rig();
+        on_the_last_track(
+            &mut r,
+            vec![track(1, "T", "A"), track_with_radio(2, "0016d")],
+        );
+        r.app.on_key(key('c'));
+        r.app.refresh_for_test();
+        assert_eq!(radios_asked(&r), vec!["0016d".to_string()]);
+    }
+
+    #[test]
+    fn the_radio_is_asked_for_once_however_many_ticks_the_track_lasts() {
+        // Goal: the preload decision fires on every tick for as long as nothing
+        // is queued behind the current track - which at the end of a queue is
+        // every tick of the last one. Without a guard that is ten requests a
+        // second for the length of a track.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.continue_radio = true;
+        for _ in 0..5 {
+            r.app.refresh_for_test();
+        }
+        assert_eq!(radios_asked(&r).len(), 1);
+    }
+
+    #[test]
+    fn a_track_with_no_radio_ends_the_queue_and_says_why() {
+        // Goal: absence is an ordinary answer - a mix's own rows are a shorter
+        // shape than the other listings send - and stopping without a word
+        // looks like the failure it is not.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track(1, "So What", "A")]);
+        r.app.continue_radio = true;
+        r.app.refresh_for_test();
+        assert!(radios_asked(&r).is_empty(), "there is nothing to ask for");
+        let said = r.app.notice.clone().unwrap_or_default();
+        assert!(said.contains("So What"), "it names the track: {said}");
+        assert!(said.contains("radio"), "and says what is missing: {said}");
+    }
+
+    #[test]
+    fn the_radio_extends_the_queue_and_the_preload_path_takes_it_from_there() {
+        // Goal: the transition into the radio is the gapless transition that
+        // already exists. The queue grows, and the next entry goes into mpv's
+        // playlist through the same preload that carries every other track
+        // change - not through a second mechanism beside it.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.continue_radio = true;
+        r.app.refresh_for_test();
+        let _ = requests(&r);
+
+        r.to_app.send(radio_page("0016d", 20..23)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(
+            ids(&r.app.queue),
+            vec![1, 20, 21, 22],
+            "the queue grew rather than being replaced"
+        );
+        assert_eq!(r.app.next_intended, Some(20));
+        assert_eq!(
+            resolved_ids(&requests(&r)),
+            vec![20],
+            "the ordinary preload"
+        );
+    }
+
+    #[test]
+    fn the_track_the_radio_was_built_around_does_not_play_twice() {
+        // Goal: a track's own mix leads with that track. Appending it unchanged
+        // replays what just finished, which reads as a bug rather than as a
+        // suggestion.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(7, "0016d")]);
+        r.app.continue_radio = true;
+        r.app.refresh_for_test();
+        r.to_app
+            .send(FromWorker::Radio {
+                mix_id: "0016d".into(),
+                page: priel_core::Page {
+                    items: vec![track(7, "T", "A"), track(8, "T", "A")],
+                    total: 0,
+                },
+            })
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.queue), vec![7, 8]);
+    }
+
+    #[test]
+    fn what_the_radio_added_is_marked_as_a_suggestion_and_the_rest_is_not() {
+        // Goal: the interface has to say that what is playing is the service's
+        // idea rather than the listener's. The mark is positional - everything
+        // from where the queue was extended onwards - so it survives a skip
+        // backwards into what was actually chosen.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.continue_radio = true;
+        r.app.refresh_for_test();
+        r.to_app.send(radio_page("0016d", 20..22)).unwrap();
+        r.app.drain_worker();
+
+        assert!(!r.app.playing_from_radio(), "still on what was chosen");
+        r.app.queue_pos = 1;
+        assert!(r.app.playing_from_radio(), "and now on what was suggested");
+        r.app.queue_pos = 0;
+        assert!(!r.app.playing_from_radio(), "back on what was chosen");
+    }
+
+    #[test]
+    fn a_radio_that_lands_after_the_music_stopped_still_starts_it() {
+        // Goal: the request goes out while the last track is still playing, so
+        // it normally arrives in time to be preloaded. When it does not, the
+        // queue has grown behind a fallback that has already fired and set its
+        // guard. Clearing that guard is what lets the *existing* end-of-track
+        // decision start the radio on the next tick; reaching past it to load a
+        // track here would be the second mechanism this must not grow.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.continue_radio = true;
+        r.app.refresh_for_test();
+
+        r.app.status.playing = false;
+        r.app.status.ended = true;
+        r.app.refresh_for_test();
+        assert_eq!(r.app.queue_pos, 0, "nowhere to go yet");
+
+        r.to_app.send(radio_page("0016d", 20..22)).unwrap();
+        r.app.drain_worker();
+        r.app.refresh_for_test();
+        assert_eq!(r.app.queue_pos, 1, "the fallback took the new track");
+        assert_eq!(r.app.now_playing.as_ref().map(|t| t.id), Some(20));
+    }
+
+    #[test]
+    fn a_radio_that_could_not_be_fetched_says_so_and_does_not_spin() {
+        // Goal: a failure here is not worth retrying ten times a second for the
+        // rest of the track. It is reported once and the queue ends, which is
+        // exactly what it would have done without the toggle.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.continue_radio = true;
+        r.app.refresh_for_test();
+        let _ = requests(&r);
+
+        r.to_app
+            .send(FromWorker::Failed {
+                task: Task::Radio {
+                    mix_id: "0016d".into(),
+                },
+                fault: Fault::Unreachable,
+                detail: "the connection died".into(),
+            })
+            .unwrap();
+        r.app.drain_worker();
+        assert!(r.app.notice.is_some());
+        for _ in 0..5 {
+            r.app.refresh_for_test();
+        }
+        assert!(radios_asked(&r).is_empty(), "it does not ask again");
+    }
+
+    #[test]
+    fn a_radio_for_a_track_that_is_no_longer_playing_is_dropped() {
+        // Goal: replies are correlated by what they answer, never by the order
+        // they arrive in. A radio asked for at the end of one queue can land
+        // after the listener has started another, and appending it there
+        // extends a queue nobody asked to extend, with a mix built round a
+        // track that stopped playing before it turned up.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.continue_radio = true;
+        r.app.refresh_for_test();
+
+        on_the_last_track(&mut r, vec![track_with_radio(2, "0099f")]);
+        r.to_app.send(radio_page("0016d", 20..23)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.queue), vec![2], "the stale radio is dropped");
+    }
+
+    #[test]
+    fn turning_it_off_and_on_again_asks_the_radio_again() {
+        // Goal: a radio is asked about once per track, and turning the toggle
+        // back on is a listener asking for the thing that did not work. Holding
+        // the old answer would make a failed radio unretryable without either
+        // skipping a track or restarting priel.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.on_key(key('c'));
+        r.app.refresh_for_test();
+        assert_eq!(radios_asked(&r).len(), 1);
+        r.app.refresh_for_test();
+        assert!(radios_asked(&r).is_empty(), "not while it stays on");
+
+        r.app.on_key(key('c'));
+        r.app.on_key(key('c'));
+        r.app.refresh_for_test();
+        assert_eq!(radios_asked(&r).len(), 1, "asked for again");
+    }
+
+    #[test]
+    fn a_queue_the_radio_built_is_not_endless() {
+        // Goal: everything that grows from what arrives from outside gets a
+        // bound. This one grows every time it runs out, so without a ceiling a
+        // player left running overnight holds a vector nobody will ever reach
+        // the end of.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.continue_radio = true;
+        r.app.queue = (1..=QUEUE_MAX as u64).map(|i| track(i, "T", "A")).collect();
+        r.app.queue[QUEUE_MAX - 1].mix_id = "0016d".into();
+        r.app.queue_pos = QUEUE_MAX - 1;
+        r.app.refresh_for_test();
+        assert!(
+            radios_asked(&r).is_empty(),
+            "a full queue does not ask for what it cannot hold"
+        );
+        assert!(
+            r.app.notice.is_some(),
+            "and it says so rather than stopping silently"
+        );
+
+        // And a page that was already in flight when it filled up cannot get
+        // past the ceiling either.
+        r.to_app.send(radio_page("0016d", 9000..9010)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(r.app.queue.len(), QUEUE_MAX, "there was no room left");
+    }
+
+    #[test]
+    fn a_new_queue_is_a_new_choice_and_forgets_the_radio() {
+        // Goal: the queue is a snapshot taken when the listener pressed Enter.
+        // Building a new one throws away what the last one was extended with,
+        // and the mark that said so with it.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.continue_radio = true;
+        r.app.refresh_for_test();
+        r.to_app.send(radio_page("0016d", 20..22)).unwrap();
+        r.app.drain_worker();
+        r.app.queue_pos = 1;
+        assert!(r.app.playing_from_radio());
+
+        // The same track chosen again, with two ahead of it this time, so a
+        // mark left over from the last queue would call this row a suggestion.
+        r.app.favorites = vec![
+            track(5, "A", "X"),
+            track(6, "B", "Y"),
+            track_with_radio(1, "0016d"),
+        ];
+        r.app.view = View::Favorites;
+        r.app.selected = 2;
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(ids(&r.app.queue), vec![5, 6, 1]);
+        assert_eq!(r.app.queue_pos, 2);
+        assert!(!r.app.playing_from_radio(), "nothing here was suggested");
+
+        // And the same track is asked about again: what was already asked is
+        // part of the queue that asked it.
+        r.app.current_target = None;
+        r.app.status.playing = true;
+        r.app.status.current_id = 1;
+        let _ = requests(&r);
+        r.app.refresh_for_test();
+        assert_eq!(radios_asked(&r), vec!["0016d".to_string()]);
+    }
+
+    #[test]
+    fn carrying_on_answers_to_a_click_and_to_its_key_alike() {
+        // Goal: parity runs both ways, and the only way to keep the two paths
+        // from drifting is for both to run the same method.
+        let mut r = rig();
+        r.app.on_key(key('c'));
+        assert!(r.app.continue_radio, "the key turns it on");
+        r.app.dispatch(Hit::Continue);
+        assert!(!r.app.continue_radio, "and the control turns it back off");
+        assert!(
+            r.app.notice.clone().unwrap_or_default().contains("adio"),
+            "each says which way it went: {:?}",
+            r.app.notice
+        );
     }
 
     #[test]

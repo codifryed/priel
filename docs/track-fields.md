@@ -100,7 +100,8 @@ and `/v1/pages/mix`. Status is one of **read** (reaches `Track`), **discarded**
 | `payToStream`, `upload`, `spotlighted`, `editable` | bool | discarded | |
 | `accessType` | str/null | discarded | `"PUBLIC"` or null |
 | `audioModes` | list | discarded | `["STEREO"]`, or Atmos / 360 |
-| `mixes.TRACK_MIX` | str | discarded | the id of this track's own radio mix |
+| `mixes.TRACK_MIX` | str | **read (new)** | `Track::mix_id`; the id of this track's own radio mix |
+| `mixes.MASTER_TRACK_MIX` and the rest of `mixes` | str | discarded | ids of screens there is no view for |
 | `type` | str | discarded on purpose | `Track` or `Video`; see `ItemRow`'s note - dropping video rows would desynchronise the caller's offset from the service's |
 | **a favourite flag** | | **absent** | see below |
 
@@ -199,6 +200,13 @@ Added to `Track`: `version`, `explicit`, `isrc`, `copyright`, `artists`,
 `streamable`. Each answers something a listener can read off a screen made of
 characters, and `artists` closes an outright loss - a collaboration credits
 several names and this crate kept one, so the rest were unrecoverable above it.
+
+Added later, and the one field here that is not for reading: `mix_id`, from
+`mixes.TRACK_MIX`. It passes the same test for a different reason - it is not
+something a listener reads, it is the only key that turns the end of a queue
+into more music, and `Client::mix_tracks` was already there to spend it on.
+Only that one of the `mixes` ids is taken: the others key screens no frontend
+here has a view for, and they are a line away the day one does.
 
 Added to `ResolvedStream`: `replay_gain_db` and `peak`, reported and never
 applied. Scaling the samples is the one thing a bit-perfect path may not do, so
