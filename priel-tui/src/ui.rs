@@ -4397,4 +4397,149 @@ mod tests {
             per_frame * 30.0 * 100.0
         );
     }
+
+    // ---- editing playlists ----
+
+    fn with_two_playlists(sc: &mut Screen) {
+        sc.app.playlists = vec![
+            priel_core::Playlist {
+                uuid: "a1".into(),
+                title: "Morning".into(),
+                num_tracks: 12,
+                duration_secs: 900,
+            },
+            priel_core::Playlist {
+                uuid: "b2".into(),
+                title: "Evening".into(),
+                num_tracks: 3,
+                duration_secs: 400,
+            },
+        ];
+        sc.app.view = View::Playlists;
+    }
+
+    #[test]
+    fn the_confirmation_names_what_it_will_destroy_and_says_it_is_final() {
+        // Goal: this is the one screen where saying yes cannot be walked back,
+        // so the question has to be checkable by the person answering it. A
+        // uuid, an index, or a bare "are you sure" would all be answered out of
+        // habit.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        press(&mut sc.app, 'X');
+        let out = text(&mut sc.app, 90, 26);
+        assert!(out.contains("Morning"), "it names the playlist: {out}");
+        assert!(
+            out.contains("no way to bring it back"),
+            "and says it is final: {out}"
+        );
+        assert!(
+            out.contains("delete it"),
+            "the control says what it does, not OK: {out}"
+        );
+        assert!(out.contains("keep it"), "and so does the other one: {out}");
+    }
+
+    #[test]
+    fn the_confirmations_controls_are_clickable_exactly_where_they_were_painted() {
+        // Goal: the hit box and the painted cells are built in one walk, so a
+        // click cannot land on "delete it" while the pointer is over "keep it".
+        // On this screen that difference is a playlist.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        press(&mut sc.app, 'X');
+        assert_eq!(painted(&mut sc.app, 90, 26, Hit::ConfirmYes), "y");
+        assert_eq!(painted(&mut sc.app, 90, 26, Hit::ConfirmNo), "n");
+    }
+
+    #[test]
+    fn a_confirmation_too_short_to_draw_its_controls_registers_none() {
+        // Goal: a control clipped off the box must not still answer to a click
+        // at the place it would have been - which on this screen would be a
+        // delete nobody could see they were agreeing to.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        press(&mut sc.app, 'X');
+        let _ = text(&mut sc.app, 90, 5);
+        assert!(
+            !sc.app.hits.iter().any(|(_, h)| *h == Hit::ConfirmYes),
+            "nothing was painted, so nothing may be clicked"
+        );
+    }
+
+    #[test]
+    fn the_name_prompt_shows_what_has_been_typed() {
+        // Goal: it is a text box, and a text box that does not echo is one
+        // nobody can check before pressing Enter.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        press(&mut sc.app, 'N');
+        for c in "Late night".chars() {
+            press(&mut sc.app, c);
+        }
+        let out = text(&mut sc.app, 90, 26);
+        assert!(out.contains("Name the new playlist"), "{out}");
+        assert!(out.contains("Late night"), "{out}");
+        assert_eq!(painted(&mut sc.app, 90, 26, Hit::SubmitPrompt), "Enter");
+    }
+
+    #[test]
+    fn the_picker_lists_the_playlists_a_track_can_go_into() {
+        // Goal: the choice has to be readable before it is made, and a row's hit
+        // box has to be the row that was drawn - adding a track to the wrong
+        // playlist is a mess somebody has to clean up by hand.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        sc.app.view = View::Favorites;
+        sc.app.favorites = vec![track(1, "One")];
+        press(&mut sc.app, 'a');
+        let out = text(&mut sc.app, 90, 26);
+        assert!(out.contains("Add to playlist"), "{out}");
+        assert!(out.contains("Morning"), "{out}");
+        assert!(out.contains("Evening"), "{out}");
+        assert!(
+            out.contains("Enter add"),
+            "it says what choosing does: {out}"
+        );
+
+        let rows = sc.app.add_rows.clone();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1].1, 1,
+            "the second box stands for the second playlist"
+        );
+    }
+
+    #[test]
+    fn the_picker_says_it_is_still_fetching_rather_than_showing_an_empty_list() {
+        // Goal: somebody who has never opened the playlists tab has none loaded,
+        // and an empty picker would read as "you have no playlists".
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "One")];
+        press(&mut sc.app, 'a');
+        let out = text(&mut sc.app, 90, 26);
+        assert!(out.contains("Fetching your playlists"), "{out}");
+        assert!(sc.app.add_rows.is_empty(), "and nothing to click yet");
+    }
+
+    #[test]
+    fn a_modal_of_this_feature_covers_the_list_behind_it() {
+        // Goal: all three are modal. What is behind must not show through, and
+        // - more to the point - the header's controls registered earlier in the
+        // frame must not still be reachable.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        sc.app.favorites = vec![track(1, "Hidden Title")];
+        for (open, name) in [('N', "prompt"), ('X', "confirmation")] {
+            sc.app.view = View::Playlists;
+            sc.app.mode = Mode::Normal;
+            press(&mut sc.app, open);
+            let out = text(&mut sc.app, 90, 26);
+            assert!(!out.contains("Hidden Title"), "the {name} covers it: {out}");
+            assert!(
+                !sc.app.hits.iter().any(|(_, h)| *h == Hit::Quit),
+                "and nothing behind the {name} is clickable"
+            );
+        }
+    }
 }
