@@ -254,6 +254,13 @@ Typing is the one thing the mouse is not asked to do: the filter box, the search
 query and the pasted sign-in address are text, so the keys that accept or cancel
 them belong to the box being typed in and have no control of their own.
 
+The line along the top of the list says where you are and how much of the list
+is here — `Favorites — 42 of 417 tracks`, and `Playlists › Deep Cuts — 18 tracks`
+when you have opened one, so the way back out is named rather than remembered.
+The second figure appears only while there is more still to page in. It names no
+keys: the bottom row and the `?` reference are where those are, and the hints
+that used to sit here were clipped mid-word on an eighty-column terminal.
+
 A track row spends the width the terminal actually has. The title and the
 duration are on every row, the duration against the right-hand edge so the times
 read as a column; the artist, the album and the quality tier appear as the width

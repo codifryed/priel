@@ -1619,7 +1619,7 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
 fn list(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
     let vis = app.visible();
-    let title = list_title(app, vis.len());
+    let title = list_title(app, vis.len(), area.width as usize);
     let block = Block::default()
         .borders(Borders::ALL)
         .style(t.surface())
@@ -1665,47 +1665,81 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn list_title(app: &App, count: usize) -> String {
-    // Rows loaded against rows there are, while those differ. Without it a list
-    // that has only paged in its first hundred reads as the whole thing, and
-    // the user has no reason to keep scrolling.
+/// The line the list box wears: which list this is, and how much of it is here.
+///
+/// It used to carry per-view key hints as well, and they were about eighty-five
+/// cells in a seventy-eight cell box, so an eighty-column terminal - the
+/// commonest width there is - deleted a binding mid-word. That is the same
+/// silent clip `push_hints` was hardened against. They were also five different
+/// grammars for what the bottom row and the `?` reference already say, and since
+/// the reference became a complete clickable menu, nothing became unreachable
+/// when they went.
+///
+/// What is left is the one thing only this line can say: where you are, the
+/// trail if you are a level down, and the figure the row below cannot repeat.
+/// `width` is the whole box, so the name is cut to fit rather than the count
+/// being clipped off the end of it.
+fn list_title(app: &App, count: usize, width: usize) -> String {
+    let (place, typing) = title_place(app);
+    let tail = title_count(app, count);
+    // The two corners the border draws, then one space either side of the text.
+    let inside = width.saturating_sub(2);
+    let room = inside.saturating_sub(2 + cells(&tail));
+    if room == 0 {
+        // No room for both. The count is the half that would be clipped, so on
+        // a box this narrow the name goes and the line stays inside its border.
+        return trunc(&place, inside);
+    }
+    // A query is cut from the front: the caret and the letters just typed are
+    // what a cut from the back would take, and they are the whole point of it.
+    let place = if typing {
+        trunc_start(&place, room)
+    } else {
+        trunc(&place, room)
+    };
+    format!(" {place}{tail} ")
+}
+
+/// Where you are, and whether the user is typing into it.
+fn title_place(app: &App) -> (String, bool) {
+    match app.view {
+        View::Favorites => ("Favorites".to_string(), false),
+        View::Playlists => ("Playlists".to_string(), false),
+        View::PlaylistTracks => {
+            let name = app.open_playlist.as_ref().map_or("", |(_, t)| t.as_str());
+            (format!("Playlists › {name}"), false)
+        }
+        View::Mixes => ("Mixes".to_string(), false),
+        View::MixTracks => {
+            let name = app.open_mix.as_ref().map_or("", |(_, t)| t.as_str());
+            (format!("Mixes › {name}"), false)
+        }
+        View::Search if app.mode == Mode::Search => {
+            (format!("Search › {}▏", app.search_query), true)
+        }
+        View::Search if app.search_query.is_empty() => ("Search".to_string(), false),
+        View::Search => (format!("Search › {}", app.search_query), false),
+    }
+}
+
+/// How much of the list is here, and how much of it there is.
+///
+/// The second figure only while the two differ: a list that has paged in its
+/// first hundred must not read as the whole library, or there is no reason to
+/// keep scrolling, and once it has all arrived the total only repeats the count
+/// beside it.
+fn title_count(app: &App, count: usize) -> String {
+    if app.view == View::Search && (app.mode == Mode::Search || app.search_query.is_empty()) {
+        return String::new();
+    }
     let of_total = app
         .rows_available()
         .map_or(String::new(), |total| format!(" of {total}"));
     match app.view {
-        View::Favorites => format!(
-            "Favorites — {count}{of_total} tracks   \
-             (Tab views · j/k move · Enter play · / filter · s shuffle)"
-        ),
-        View::Playlists => {
-            format!("Playlists — {count}{of_total}   (Enter to open · j/k move)")
-        }
-        View::PlaylistTracks => {
-            let name = app.open_playlist.as_ref().map_or("", |(_, t)| t.as_str());
-            format!("▸ {name} — {count}{of_total} tracks   (Esc back · Enter play)")
-        }
-        View::Mixes => {
-            format!("Mixes — {count}{of_total}   (Enter to open · r refresh · j/k move)")
-        }
-        View::MixTracks => {
-            let name = app.open_mix.as_ref().map_or("", |(_, t)| t.as_str());
-            format!("▸ {name} — {count}{of_total} tracks   (Esc back · Enter play)")
-        }
-        View::Search => {
-            if app.mode == Mode::Search {
-                format!(
-                    "Search: {}▏   (Enter to search · Esc cancel)",
-                    app.search_query
-                )
-            } else if app.search_query.is_empty() {
-                "Search   (i or type to search TIDAL)".to_string()
-            } else {
-                format!(
-                    "Search: {} — {count}{of_total} results   (i to edit)",
-                    app.search_query
-                )
-            }
-        }
+        // Neither noun adds anything the word before it has not just said.
+        View::Playlists | View::Mixes => format!(" — {count}{of_total}"),
+        View::Search => format!(" — {count}{of_total} results"),
+        _ => format!(" — {count}{of_total} tracks"),
     }
 }
 
@@ -2499,6 +2533,33 @@ fn trunc(s: &str, n: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// Cut `s` down to its last `n` display cells, marking the cut at the front.
+///
+/// The mirror of `trunc`, for a field whose end is the part that matters: a
+/// query being typed, where a cut from the back takes the caret and the letters
+/// that were just entered.
+fn trunc_start(s: &str, n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    if cells(s) <= n {
+        return s.to_string();
+    }
+    // One cell is spoken for by the ellipsis that says the rest was cut.
+    let budget = n - 1;
+    let mut used = 0;
+    let mut start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    format!("…{}", &s[start..])
 }
 
 /// How many cells a string paints, the way ratatui measures it to draw it.
@@ -4957,6 +5018,133 @@ mod tests {
             assert_eq!(drawn(&super::field(s, 20)), 20, "{s:?}");
             assert_eq!(drawn(&super::field(s, 6)), 6, "{s:?}");
         }
+    }
+
+    /// The box's own line: the top border, with the list title on it.
+    fn title_line(app: &mut App, w: u16) -> String {
+        draw(app, w, 12).remove(1)
+    }
+
+    #[test]
+    fn the_list_title_carries_no_key_hints() {
+        // Goal: the hints were about eighty-five cells in a seventy-eight cell
+        // box, so an eighty-column terminal deleted a binding mid-word - the
+        // failure class `push_hints` was hardened against, on the commonest
+        // terminal width there is. They were also five different grammars for
+        // what the bottom row and the `?` reference already say, and since the
+        // reference became a complete clickable menu nothing is lost with them.
+        let mut sc = screen();
+        sc.app.playlists = vec![Playlist {
+            uuid: "u".into(),
+            title: "Deep Cuts".into(),
+            num_tracks: 18,
+            duration_secs: 60,
+        }];
+        sc.app.open_playlist = Some(("u".into(), "Deep Cuts".into()));
+        sc.app.open_mix = Some(("m".into(), "My Mix 1".into()));
+        sc.app.search_query = "blue".into();
+        sc.app.search_tracks = vec![track(9, "Blue in Green")];
+        for view in [
+            View::Favorites,
+            View::Playlists,
+            View::PlaylistTracks,
+            View::Mixes,
+            View::MixTracks,
+            View::Search,
+        ] {
+            sc.app.view = view;
+            for mode in ["Normal", "Search"] {
+                sc.app.mode = if mode == "Search" {
+                    Mode::Search
+                } else {
+                    Mode::Normal
+                };
+                for w in [60u16, 80, 120] {
+                    let line = title_line(&mut sc.app, w);
+                    for hint in ["j/k", "Enter", "Esc", "(", "refresh", "shuffle"] {
+                        assert!(
+                            !line.contains(hint),
+                            "{view:?} {mode} at {w}: the title still names {hint}: {line}"
+                        );
+                    }
+                }
+            }
+        }
+        sc.app.mode = Mode::Normal;
+    }
+
+    #[test]
+    fn an_opened_playlist_names_the_list_it_was_opened_from() {
+        // Goal: opening a playlist used to change one character at the far left
+        // of the title and nothing else, so the tab strip highlighted the same
+        // tab one level up and one level down. The title carries the trail.
+        let mut sc = screen();
+        sc.app.view = View::PlaylistTracks;
+        sc.app.open_playlist = Some(("u".into(), "Deep Cuts".into()));
+        sc.app.playlist_tracks = vec![track(1, "One"), track(2, "Two")];
+        sc.app.playlist_tracks_paging.total = 18;
+        let line = title_line(&mut sc.app, 120);
+        assert!(
+            line.contains("Playlists › Deep Cuts — 2 of 18 tracks"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_opened_mix_names_the_list_it_was_opened_from() {
+        // Goal: the same trail from the other drill-down, so `Esc` has a
+        // visible destination rather than one the user has to remember.
+        let mut sc = screen();
+        sc.app.view = View::MixTracks;
+        sc.app.open_mix = Some(("m".into(), "My Mix 1".into()));
+        sc.app.mix_tracks = vec![track(1, "One")];
+        let line = title_line(&mut sc.app, 120);
+        assert!(line.contains("Mixes › My Mix 1 — 1 tracks"), "{line}");
+    }
+
+    #[test]
+    fn a_long_name_in_the_title_is_cut_so_the_count_survives() {
+        // Goal: the title is the thing that was being clipped, and what a clip
+        // takes is whatever is on the right - which is the count. Cut the name,
+        // which the row below repeats, rather than the figure only this line
+        // carries.
+        let mut sc = screen();
+        sc.app.view = View::PlaylistTracks;
+        sc.app.open_playlist = Some((
+            "u".into(),
+            "A Playlist Whose Name Nobody Could Reasonably Have Expected To Fit".into(),
+        ));
+        sc.app.playlist_tracks = vec![track(1, "One")];
+        sc.app.playlist_tracks_paging.total = 312;
+        for w in [60u16, 80, 120] {
+            let line = title_line(&mut sc.app, w);
+            assert_eq!(drawn(&line), usize::from(w), "{w}: the box lost a cell");
+            assert!(line.starts_with('┌') && line.ends_with('┐'), "{w}: {line}");
+            assert!(
+                line.contains("1 of 312 tracks"),
+                "{w}: the count was clipped away: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_query_being_typed_keeps_its_caret_however_long_it_is() {
+        // Goal: the title doubles as the search box, so what a clip takes is
+        // the caret and the characters just typed. A text field cut from the
+        // front keeps the end, which is where the typing is.
+        let mut sc = screen();
+        sc.app.view = View::Search;
+        sc.app.mode = Mode::Search;
+        sc.app.search_query = "a very long query that nobody would type but which must not \
+             lose the cursor off the right hand end of the box"
+            .into();
+        let line = title_line(&mut sc.app, 60);
+        assert_eq!(drawn(&line), 60, "the box lost a cell");
+        assert!(
+            line.contains("box ▏") || line.contains("box▏"),
+            "the caret and the last words typed are gone: {line}"
+        );
+        assert!(line.contains('…'), "the cut is not marked: {line}");
     }
 
     #[test]
