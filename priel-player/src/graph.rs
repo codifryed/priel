@@ -56,6 +56,14 @@
 //! [`DeviceHolder::lines`] gives the change that would free the card - all of it
 //! read through [`GraphNode::id`], which was kept for exactly this.
 //!
+//! The fourth is the volume on that sink, which is the one stage nothing else
+//! can see: mpv reports its own stream's level and the device's own parameters
+//! say nothing about a mixer upstream of them. [`SinkVolume`] reads it and
+//! [`SinkVolume::stage`] judges it, and the reason it takes two fields to do so
+//! is the whole of the finding - `channelVolumes` is the control and
+//! `softVolumes` is what the server actually multiplies by, and on a real
+//! machine they disagree.
+//!
 //! [`NodeRole`] separates the hops that sit between the stream and the device,
 //! which is where a second application holding the device would show up.
 //!
@@ -110,7 +118,10 @@ pub struct GraphNode {
 }
 
 /// The chain from priel's stream to the device that plays it, in order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// `Eq` deliberately absent: the sink's volume is a set of `f64` gains read off
+/// a JSON dump, and there is no exact equality worth claiming over one.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AudioGraph {
     /// The stream first, the device last. Never empty when this is `Ok`.
     pub path: Vec<GraphNode>,
@@ -120,6 +131,193 @@ pub struct AudioGraph {
     /// What has the device at the end of the chain open, from the same dump for
     /// the same reason.
     pub holder: DeviceHolder,
+    /// What the sink at the end of the chain is doing to the level, from the
+    /// same dump for the same reason.
+    pub volume: SinkVolume,
+}
+
+/// The volume the sound server has on the sink at the end of the chain.
+///
+/// The third stage that can alter the samples, after priel's own volume and the
+/// server's volume for priel's own stream. It is the one nothing looked at, and
+/// the one that cannot be read from mpv at all: mpv sees its own stream, not the
+/// device everything on the machine is mixed into.
+///
+/// The three arms are three different things and none of them may stand in for
+/// another. [`Absent`](Self::Absent) is a stage that cannot exist - the chain
+/// reaches no sink - and counts as fully evidenced. [`Unread`](Self::Unread) is
+/// a sink that is there and said nothing, which is an admission. Only
+/// [`Read`](Self::Read) is a reading.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum SinkVolume {
+    /// The chain reaches no sink, so there is no volume of one to read.
+    ///
+    /// Also what the direct path reports, told rather than parsed: priel holds
+    /// the card itself and there is no server sink between it and the DAC.
+    #[default]
+    Absent,
+    /// A sink is at the end of the chain and what its volume is doing could not
+    /// be read - the dump published no `Props`, or published one without the
+    /// field the verdict rests on.
+    ///
+    /// Also what a reader that has not asked yet holds, which is the same
+    /// statement: there is a stage here and priel cannot say what it did.
+    Unread,
+    /// What the sink's `Props` said.
+    Read(SinkLevels),
+}
+
+/// The two volume figures a sink publishes, which are not the same figure.
+///
+/// This is the whole point of the reading. `channelVolumes` is the *control* -
+/// what a mixer shows and what the listener set - and says nothing about where
+/// it is applied. `softVolumes` is what the server's own conversion stage
+/// multiplies every sample by, and that is the only one that costs resolution.
+///
+/// Measured on a real machine, they disagree: a USB DAC sink sat at
+/// `channelVolumes: [0.027, 0.027]` with `softVolumes: [1.0, 1.0]`, on a card
+/// exposing no ALSA volume control at all. The server was multiplying nothing;
+/// the control had been routed away from the software stage and, on that
+/// profile, to nothing at all. Reading only the first would have reported a
+/// 31 dB loss that was not happening, and reading only the second would have
+/// hidden the control entirely.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SinkLevels {
+    /// `channelVolumes`, per channel: the value of the control.
+    pub set: Vec<f64>,
+    /// `softVolumes`, per channel: the factor the server's own stage applies.
+    pub software: Vec<f64>,
+    /// `softMute`: the server's own stage is passing silence, whatever the
+    /// figures beside it say.
+    pub silenced: bool,
+}
+
+/// What one volume stage is doing to the samples, and how well that is known.
+///
+/// Pure over a reading, so the whole of the judgement is a table of tests rather
+/// than something only a live sound server can show - the same shape
+/// [`AudioGraph::attribute`] and [`ClockRates::advise`] already have.
+///
+/// Two of the six arms are admissions rather than findings, and keeping them
+/// apart is the point. [`Absent`](Self::Absent) counts as fully evidenced;
+/// [`Unread`](Self::Unread) and [`Elsewhere`](Self::Elsewhere) are gaps, and
+/// what rests on them has to say so.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SinkStage {
+    /// There is no such stage here, so there is nothing it could have done.
+    Absent,
+    /// The stage is there and what it is doing could not be read.
+    Unread,
+    /// Read: nothing is set and nothing is applied. The one clean answer.
+    Unity,
+    /// Read: the server's own stage is passing silence.
+    ///
+    /// Its own arm rather than a gain of zero, because zero has no decibel
+    /// figure and no bit count, and a screen reading `-inf dB` is worse than a
+    /// word.
+    Silenced,
+    /// Read: the server's own stage multiplies every sample by `gain`.
+    ///
+    /// The worst channel where they differ - the one that loses the most bits
+    /// is the one the verdict has to be made on.
+    InSoftware { gain: f64 },
+    /// Read: the control is away from unity and the server is *not* applying
+    /// it.
+    ///
+    /// Where it lands is not in this dump. A hardware mixer on the card would
+    /// take it and cost nothing; a profile that routes volume nowhere - which
+    /// is what was measured - drops it entirely. priel cannot tell those apart
+    /// from here, so it says so rather than picking the flattering one.
+    Elsewhere { set: f64 },
+}
+
+/// How much attenuation costs a bit of resolution, in decibels.
+///
+/// The rule the README already records. Six is the round number people use;
+/// the exact figure is 6.02, and no display here is precise enough to care.
+const DB_PER_BIT: f64 = 6.0;
+
+impl SinkStage {
+    /// A linear gain as decibels. Negative for attenuation, as a mixer writes
+    /// it.
+    #[must_use]
+    pub fn db(gain: f64) -> f64 {
+        20.0 * gain.log10()
+    }
+
+    /// Roughly how many bits of resolution a software gain costs.
+    ///
+    /// Zero for unity, for a gain above it, and for silence: only attenuation
+    /// discards low bits, and silence has no bits left to count. Rounded down,
+    /// because claiming a bit that is only partly gone would be the flattering
+    /// direction of the two.
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "display-only: the quotient is bounded above by the guard and non-negative"
+    )]
+    pub fn bits_lost(gain: f64) -> u32 {
+        if gain <= 0.0 || gain >= 1.0 {
+            return 0;
+        }
+        (-Self::db(gain) / DB_PER_BIT) as u32
+    }
+}
+
+/// Is a gain far enough from unity to have altered anything?
+///
+/// The figures arrive as `f64` from a JSON dump and a control set to exactly
+/// unity arrives as exactly `1.0`, so this is a guard against arithmetic noise
+/// rather than a tolerance for a volume that is nearly right.
+fn is_unity(gain: f64) -> bool {
+    (gain - 1.0).abs() <= f64::EPSILON
+}
+
+/// The worst of a set of per-channel gains: the one that alters the samples
+/// most.
+///
+/// `None` for an empty list, which is not a reading of anything.
+fn worst(gains: &[f64]) -> Option<f64> {
+    gains
+        .iter()
+        .copied()
+        .filter(|g| !is_unity(*g))
+        .fold(None, |worst: Option<f64>, g| {
+            Some(match worst {
+                Some(w) if (w - 1.0).abs() >= (g - 1.0).abs() => w,
+                _ => g,
+            })
+        })
+}
+
+impl SinkVolume {
+    /// What this stage did to the samples.
+    ///
+    /// Pure and table-tested. The order is what makes it honest: what the
+    /// server *applies* is decided first and from `softVolumes` alone, and the
+    /// control is only consulted to explain a stage that applied nothing.
+    #[must_use]
+    pub fn stage(&self) -> SinkStage {
+        let levels = match self {
+            Self::Absent => return SinkStage::Absent,
+            Self::Unread => return SinkStage::Unread,
+            Self::Read(levels) => levels,
+        };
+        if levels.silenced || levels.software.contains(&0.0) {
+            return SinkStage::Silenced;
+        }
+        if let Some(gain) = worst(&levels.software) {
+            return SinkStage::InSoftware { gain };
+        }
+        // Nothing is being applied here. A control still away from unity has
+        // gone somewhere this dump does not name, which is a gap rather than a
+        // clean bill.
+        match worst(&levels.set) {
+            Some(set) => SinkStage::Elsewhere { set },
+            None => SinkStage::Unity,
+        }
+    }
 }
 
 /// The rates the sound server is permitted to clock its graph at.
@@ -846,9 +1044,66 @@ pub fn parse(dump: &str, pid: u32) -> Result<AudioGraph, GraphError> {
     }
     Ok(AudioGraph {
         holder: holder_of(&objects, &path),
+        volume: sink_volume_of(&objects, &path),
         path,
         clock: clock_of(&objects),
     })
+}
+
+/// What the sink at the end of the path is doing to the level.
+///
+/// A per-concern extractor over the already-parsed object list, like
+/// [`clock_of`] and [`holder_of`]: pure, so the whole of it is a table of tests
+/// over recorded dumps rather than something only a live sound server can show.
+///
+/// Every failure to answer stops at [`SinkVolume::Unread`] rather than falling
+/// through to unity. A sink that published nothing is not a sink at unity, and
+/// the difference is the whole of the grade the badge rests on.
+fn sink_volume_of(objects: &[Value], path: &[GraphNode]) -> SinkVolume {
+    let Some(sink) = path.last().filter(|n| n.role == NodeRole::Device) else {
+        return SinkVolume::Absent;
+    };
+    let Some(node) = object_at(objects, "PipeWire:Interface:Node", sink.id) else {
+        return SinkVolume::Unread;
+    };
+    // A sink publishes more than one `Props`: the conversion stage's, which
+    // carries the volumes, and the ALSA device's, which carries the PCM. Found
+    // by the field that is wanted rather than by position, because which comes
+    // first is the server's business and not a thing to depend on.
+    let Some(props) = node
+        .pointer("/info/params/Props")
+        .and_then(Value::as_array)
+        .and_then(|all| all.iter().find(|p| p.get("softVolumes").is_some()))
+    else {
+        return SinkVolume::Unread;
+    };
+    let (Some(set), Some(software)) = (gains(props, "channelVolumes"), gains(props, "softVolumes"))
+    else {
+        return SinkVolume::Unread;
+    };
+    SinkVolume::Read(SinkLevels {
+        set,
+        software,
+        silenced: props
+            .get("softMute")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// One per-channel gain list out of a `Props` object.
+///
+/// `None` for anything that is not a list of numbers, and for an empty one: no
+/// channels is not a reading of a volume, and defaulting it to unity would hand
+/// out a clean tick from data that was never published.
+fn gains(props: &Value, key: &str) -> Option<Vec<f64>> {
+    let list: Vec<f64> = props
+        .get(key)?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_f64)
+        .collect();
+    (!list.is_empty()).then_some(list)
 }
 
 /// What has the device at the end of the path open.
@@ -1038,7 +1293,8 @@ fn as_u32(v: &Value) -> Option<u32> {
 mod tests {
     use super::{
         Attribution, AudioGraph, ClockRates, DeviceHolder, GraphError, HeldDevice, NodeRole,
-        RateAdvice, SourceFormat, parse, parse_clock, parse_sinks,
+        RateAdvice, SinkLevels, SinkStage, SinkVolume, SourceFormat, parse, parse_clock,
+        parse_sinks,
     };
     use crate::Alteration;
 
@@ -2096,6 +2352,207 @@ mod tests {
                 .contains("alsa_card.usb-Example_Audio_Interface-00"),
             "the name survived the layout: {lines:?}"
         );
+    }
+
+    // ---- the sink's own volume ----
+
+    fn levels(set: &[f64], software: &[f64]) -> SinkVolume {
+        SinkVolume::Read(SinkLevels {
+            set: set.to_vec(),
+            software: software.to_vec(),
+            silenced: false,
+        })
+    }
+
+    #[test]
+    fn the_sinks_volume_is_read_from_the_same_dump_as_the_chain() {
+        // Goal: the fourth thing the dump carries, and the one this whole slice
+        // exists for. The captured sink is set to 2.7% and its software stage
+        // is at unity, which is the reading that has to survive parsing intact
+        // - collapsing the two fields into one number is the mistake the whole
+        // feature is written against.
+        let g = path_of(DUMP, PID);
+        assert_eq!(
+            g.volume,
+            SinkVolume::Read(SinkLevels {
+                set: vec![0.027_001, 0.027_001],
+                software: vec![1.0, 1.0],
+                silenced: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_chain_with_no_device_on_it_has_no_sink_volume_rather_than_an_unread_one() {
+        // Goal: the distinction the badge is graded on. A stage that cannot
+        // exist is fully evidenced; only a stage that is there and could not be
+        // read earns a question mark. A stream linked to nothing reaches no
+        // sink at all.
+        let unlinked: String = DUMP.replace(
+            "\"PipeWire:Interface:Link\"",
+            "\"PipeWire:Interface:Other\"",
+        );
+        let g = path_of(&unlinked, PID);
+        assert_eq!(g.volume, SinkVolume::Absent);
+        assert_eq!(g.volume.stage(), SinkStage::Absent);
+    }
+
+    #[test]
+    fn a_sink_that_publishes_no_volume_is_admitted_rather_than_assumed_to_be_at_unity() {
+        // Goal: "say unknown rather than guess". The synthetic chains carry no
+        // Props at all, which is what an older server - or a node that has not
+        // published one yet - looks like. Reading that as unity would hand out
+        // a clean tick from data that was never there.
+        let g = path_of(RESAMPLING, SYNTHETIC_PID);
+        assert_eq!(g.volume, SinkVolume::Unread);
+        assert_eq!(g.volume.stage(), SinkStage::Unread);
+    }
+
+    #[test]
+    fn a_sink_attenuating_in_software_is_read_from_the_field_that_says_so() {
+        // Goal: the finding this issue exists to make. `softVolumes` is the
+        // only field that says the server is multiplying our samples, and a
+        // sink with no hardware mixer mirrors the control onto it.
+        let dump = r#"[
+          {"id": 1, "type": "PipeWire:Interface:Client",
+           "info": {"props": {"application.process.id": 42}}},
+          {"id": 2, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"client.id": 1, "media.class": "Stream/Output/Audio",
+                              "node.name": "mpv"}}},
+          {"id": 3, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"media.class": "Audio/Sink", "node.name": "dac"},
+                    "params": {"Props": [
+                      {"device": "hw:1,0"},
+                      {"volume": 1.0, "mute": false,
+                       "channelVolumes": [0.5, 0.5], "softMute": false,
+                       "softVolumes": [0.5, 0.5]}]}}},
+          {"id": 4, "type": "PipeWire:Interface:Link",
+           "info": {"output-node-id": 2, "input-node-id": 3}}
+        ]"#;
+        let g = path_of(dump, 42);
+        assert_eq!(g.volume, levels(&[0.5, 0.5], &[0.5, 0.5]));
+        assert_eq!(g.volume.stage(), SinkStage::InSoftware { gain: 0.5 });
+    }
+
+    #[test]
+    fn what_one_volume_stage_is_doing_is_decided_by_a_table() {
+        // Goal: the per-stage verdict, pure and in one place, the way
+        // `attribute` and `advise` already are. Five answers, and the two that
+        // are not findings are the ones that matter: a stage that cannot exist
+        // is not a stage that went unread, and a control set away from unity
+        // that the server is *not* applying has gone somewhere this dump does
+        // not show.
+        let cases: [(SinkVolume, SinkStage); 9] = [
+            (SinkVolume::Absent, SinkStage::Absent),
+            (SinkVolume::Unread, SinkStage::Unread),
+            // Nothing set anywhere: the one arm that is a clean bill.
+            (levels(&[1.0, 1.0], &[1.0, 1.0]), SinkStage::Unity),
+            // The server is multiplying. Costs resolution, whatever the control
+            // says it was set to.
+            (
+                levels(&[0.5, 0.5], &[0.5, 0.5]),
+                SinkStage::InSoftware { gain: 0.5 },
+            ),
+            // Above unity multiplies every sample too; it is not a clean pass.
+            (
+                levels(&[1.0, 1.0], &[1.5, 1.5]),
+                SinkStage::InSoftware { gain: 1.5 },
+            ),
+            // Channels that disagree are graded on the worst of them, which is
+            // the one that loses the most bits.
+            (
+                levels(&[1.0, 0.25], &[1.0, 0.25]),
+                SinkStage::InSoftware { gain: 0.25 },
+            ),
+            // The measured machine: set to 2.7% with the software stage at
+            // unity. The server is not touching the samples and priel cannot
+            // see what is.
+            (
+                levels(&[0.027_001, 0.027_001], &[1.0, 1.0]),
+                SinkStage::Elsewhere { set: 0.027_001 },
+            ),
+            // Silence is not a fidelity finding with a decibel figure attached;
+            // it is its own answer, and it keeps -inf off the screen.
+            (
+                SinkVolume::Read(SinkLevels {
+                    set: vec![0.0, 0.0],
+                    software: vec![0.0, 0.0],
+                    silenced: true,
+                }),
+                SinkStage::Silenced,
+            ),
+            // Muted with the volumes left at unity: still silence.
+            (
+                SinkVolume::Read(SinkLevels {
+                    set: vec![1.0, 1.0],
+                    software: vec![1.0, 1.0],
+                    silenced: true,
+                }),
+                SinkStage::Silenced,
+            ),
+        ];
+        for (reading, expected) in cases {
+            assert_eq!(reading.stage(), expected, "reading {reading:?}");
+        }
+    }
+
+    #[test]
+    fn a_volume_with_no_channels_on_it_says_nothing_rather_than_unity() {
+        // Goal: an empty list is not a reading. Averaging or defaulting an
+        // absent channel list to 1.0 is exactly the guess the indicator may not
+        // make.
+        let dump = r#"[
+          {"id": 1, "type": "PipeWire:Interface:Client",
+           "info": {"props": {"application.process.id": 42}}},
+          {"id": 2, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"client.id": 1, "media.class": "Stream/Output/Audio",
+                              "node.name": "mpv"}}},
+          {"id": 3, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"media.class": "Audio/Sink", "node.name": "dac"},
+                    "params": {"Props": [
+                      {"channelVolumes": [], "softVolumes": []}]}}},
+          {"id": 4, "type": "PipeWire:Interface:Link",
+           "info": {"output-node-id": 2, "input-node-id": 3}}
+        ]"#;
+        assert_eq!(path_of(dump, 42).volume, SinkVolume::Unread);
+    }
+
+    #[test]
+    fn a_control_read_without_the_field_that_says_where_it_lands_is_no_reading_at_all() {
+        // Goal: the control alone cannot be graded - it says what was set, not
+        // whether the samples moved. Without `softVolumes` there is no verdict
+        // to reach, and inventing one from `channelVolumes` is the
+        // overstatement this issue is about.
+        let dump = r#"[
+          {"id": 1, "type": "PipeWire:Interface:Client",
+           "info": {"props": {"application.process.id": 42}}},
+          {"id": 2, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"client.id": 1, "media.class": "Stream/Output/Audio",
+                              "node.name": "mpv"}}},
+          {"id": 3, "type": "PipeWire:Interface:Node",
+           "info": {"props": {"media.class": "Audio/Sink", "node.name": "dac"},
+                    "params": {"Props": [{"channelVolumes": [0.5, 0.5]}]}}},
+          {"id": 4, "type": "PipeWire:Interface:Link",
+           "info": {"output-node-id": 2, "input-node-id": 3}}
+        ]"#;
+        assert_eq!(path_of(dump, 42).volume, SinkVolume::Unread);
+    }
+
+    #[test]
+    fn a_level_is_reported_in_decibels_and_in_the_bits_it_costs() {
+        // Goal: the figure that answers "how much did I lose", by the
+        // one-bit-per-6-dB rule the README already records. 0.027 linear is
+        // about -31 dB, which is about five bits - and nothing says so today.
+        assert!((SinkStage::db(0.027_001) + 31.37).abs() < 0.01);
+        assert_eq!(SinkStage::bits_lost(0.027_001), 5);
+        assert_eq!(SinkStage::bits_lost(0.5), 1, "half is one bit");
+        assert_eq!(SinkStage::bits_lost(1.0), 0, "unity costs nothing");
+        assert_eq!(
+            SinkStage::bits_lost(1.5),
+            0,
+            "gain above unity costs no resolution, whatever else it risks"
+        );
+        assert_eq!(SinkStage::bits_lost(0.0), 0, "silence is not a bit count");
     }
 
     #[test]
