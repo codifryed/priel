@@ -26,6 +26,7 @@
 //!   --log-file <path>       default: `~/.local/state/priel/priel.log`
 
 mod app;
+mod bus;
 mod cli;
 mod logging;
 mod ui;
