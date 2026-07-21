@@ -21,7 +21,10 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
 
-use priel_player::{Alteration, Fidelity, OutputAccess};
+use std::fmt::Write as _;
+
+use priel_player::graph::{SinkStage, SinkVolume};
+use priel_player::{Alteration, Fidelity, OutputAccess, StreamVolume, Verdict};
 
 use crate::app::{App, GraphRow, GraphRowKind, Hit, Mode, View};
 
@@ -655,7 +658,7 @@ fn graph_overlay(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Audio graph ");
+        .title(" Output ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     if inner.height == 0 {
@@ -1273,10 +1276,8 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     // then the keyboard reference. The clickable controls live in the header.
     let (act_text, act_color) = activity(app);
     let (verdict_text, verdict_color) = verdict_badge(app);
-    let (access_text, access_color) = access_badge(&app.status);
     let mut bar = ControlBar::new(l2);
     bar.label(dac_badge(&app.status), Style::default().fg(Color::Green));
-    bar.label(access_text, Style::default().fg(access_color));
     // The verdict says *whether*; clicking it says *why*, through the same
     // method `[D]` runs. Registered in the walk that lays it out, like every
     // other control, and only when there is a word to click on.
@@ -1536,25 +1537,126 @@ fn source_badge(app: &App) -> String {
 /// terminal and the red/green deficiency the grades already lean on.
 fn verdict_badge(app: &App) -> (String, Color) {
     let verdict = app.verdict();
+    (verdict_words(verdict), verdict_colour(verdict.fidelity))
+}
+
+/// The verdict in words, shared by the row and the report so the two cannot
+/// come to different conclusions about one moment.
+pub(crate) fn verdict_words(verdict: Verdict) -> String {
     let tick = if verdict.needs_qualifying() {
         "✓?"
     } else {
         "✓"
     };
     match verdict.fidelity {
-        Fidelity::Unknown => (String::new(), Color::DarkGray),
-        Fidelity::BitPerfect => (format!("{tick} bit-perfect"), Color::Green),
+        Fidelity::Unknown => String::new(),
+        Fidelity::BitPerfect => format!("{tick} bit-perfect"),
         // Every level change reads the same, whichever stage made it. Naming
         // the stage here would need the width the row does not have, and the
-        // report is where the three of them are laid out side by side.
+        // report's volume section is where the three of them are laid out side
+        // by side.
         Fidelity::NearBitPerfect(_)
         | Fidelity::Altered(
             Alteration::VolumeScaled
             | Alteration::ServerVolumeScaled
             | Alteration::SinkVolumeScaled,
-        ) => ("≈ near bit-perfect".to_string(), Color::Yellow),
-        Fidelity::Altered(Alteration::Resampled) => ("⚠ resampled".to_string(), Color::Red),
-        Fidelity::Altered(Alteration::Truncated) => ("⚠ truncated".to_string(), Color::Red),
+        ) => "≈ near bit-perfect".to_string(),
+        Fidelity::Altered(Alteration::Resampled) => "⚠ resampled".to_string(),
+        Fidelity::Altered(Alteration::Truncated) => "⚠ truncated".to_string(),
+    }
+}
+
+/// The colour that goes with a grade. Never the only carrier of a meaning: the
+/// glyph in front of each word says the same thing on a monochrome terminal.
+fn verdict_colour(fidelity: Fidelity) -> Color {
+    match fidelity {
+        Fidelity::Unknown => Color::DarkGray,
+        Fidelity::BitPerfect => Color::Green,
+        Fidelity::Altered(Alteration::Resampled | Alteration::Truncated) => Color::Red,
+        // Every level change, whichever stage made it and whichever grade it
+        // arrived under. A rebuilt sample stream is the only thing that gets
+        // red here.
+        Fidelity::NearBitPerfect(_) | Fidelity::Altered(_) => Color::Yellow,
+    }
+}
+
+/// One level as the report writes it: the unit it was set in, and - only where
+/// something was actually multiplied in software - what it cost.
+///
+/// The decibel figure is the one that compares between stages, and the bits are
+/// the answer to "how much did I lose", by the one-bit-per-6-dB rule the README
+/// records. Below one bit the count is dropped rather than printed as zero,
+/// which reads as a finding when it is the absence of one.
+fn level_words(gain: f64) -> String {
+    if (gain - 1.0).abs() <= f64::EPSILON {
+        return "100%".to_string();
+    }
+    let mut out = format!("{}  {:.0} dB", fmt_pct(gain), SinkStage::db(gain));
+    let bits = SinkStage::bits_lost(gain);
+    if bits > 0 {
+        let _ = write!(out, "  ~{bits} bits");
+    }
+    out
+}
+
+/// A linear gain as the percentage a mixer shows, with a decimal only where it
+/// carries something.
+fn fmt_pct(gain: f64) -> String {
+    let pct = gain * 100.0;
+    if (pct - pct.round()).abs() < 0.05 {
+        format!("{pct:.0}%")
+    } else {
+        format!("{pct:.1}%")
+    }
+}
+
+/// priel's own volume, which is a percentage already.
+pub(crate) fn own_volume_words(volume_pct: f64) -> String {
+    level_words(volume_pct / 100.0)
+}
+
+/// The sound server's level for priel's own stream.
+pub(crate) fn stream_volume_words(s: &priel_player::PlaybackStatus) -> String {
+    match s.stream_volume() {
+        StreamVolume::Absent => "none in this chain".to_string(),
+        StreamVolume::Unread => "unknown".to_string(),
+        StreamVolume::Read(pct) => level_words(pct / 100.0),
+    }
+}
+
+/// The sound server's level on the sink everything is mixed into.
+///
+/// The figure shown is the control - the number the listener set and a mixer
+/// displays - and a loss is only ever quoted where the server was found to be
+/// applying it. Quoting 31 dB of loss against a control the server is not
+/// applying would invent a fault; showing nothing at all would hide a control
+/// that was plainly set.
+pub(crate) fn sink_volume_words(sink: &SinkVolume) -> String {
+    match sink.stage() {
+        SinkStage::Absent => "none in this chain".to_string(),
+        SinkStage::Unread => "unknown".to_string(),
+        SinkStage::Unity => "100%".to_string(),
+        SinkStage::Silenced => "muted".to_string(),
+        SinkStage::InSoftware { gain } => level_words(gain),
+        SinkStage::Elsewhere { set } => fmt_pct(set),
+    }
+}
+
+/// Where the sink's level is being applied, where that is worth a line.
+///
+/// The whole finding in one sentence. `channelVolumes` is the control and
+/// `softVolumes` is what the server multiplies by, and on a real machine they
+/// disagree - a sink at 2.7% whose software stage sits at unity, on a card with
+/// no volume control in ALSA at all. Saying which of the two was read is the
+/// difference between a measurement and a guess.
+pub(crate) fn sink_volume_note(sink: &SinkVolume) -> Option<String> {
+    match sink.stage() {
+        SinkStage::InSoftware { .. } => Some("in software, by the server".to_string()),
+        SinkStage::Elsewhere { .. } => {
+            Some("not applied by the server; where is not in the graph".to_string())
+        }
+        SinkStage::Silenced => Some("the server is passing silence".to_string()),
+        SinkStage::Absent | SinkStage::Unread | SinkStage::Unity => None,
     }
 }
 
@@ -1567,16 +1669,21 @@ fn verdict_badge(app: &App) -> (String, Color) {
 /// device rate means reading the graph, which is a separate piece of work.
 /// Is any output actually open?
 ///
-/// Asked by both the device badge and the access badge, so the row cannot say
-/// `OUT —` and name an access mode in the same breath.
+/// Asked by both the device readout and the access line, so the report cannot
+/// say `OUT —` and name an access mode in the same breath. The player owns the
+/// question, so both of them read the same answer as the volume stages do.
 fn has_output(s: &priel_player::PlaybackStatus) -> bool {
-    let (rate_hz, format) = s.effective_output();
-    rate_hz > 0 || !format.is_empty()
+    s.output_is_open()
 }
 
 fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
+    format!(" {}", device_readout(s))
+}
+
+/// What is being played into, in the same words on the row and in the report.
+pub(crate) fn device_readout(s: &priel_player::PlaybackStatus) -> String {
     if !has_output(s) {
-        return " OUT —".into();
+        return "OUT —".into();
     }
     let (rate_hz, format) = s.effective_output();
     // `DAC` only when the numbers came from the ALSA device itself. Otherwise
@@ -1601,25 +1708,28 @@ fn dac_badge(s: &priel_player::PlaybackStatus) -> String {
 
 /// How the output device is being held.
 ///
-/// A separate arm per state rather than a condition inside [`dac_badge`],
+/// A separate function rather than a condition inside [`device_readout`],
 /// because the judgement is the player's and this only names it.
 ///
 /// **Every state is named, including the ordinary shared one.** Leaving the
-/// default silent made the badge a thing you had to know the absence of: a
-/// listener who saw no word for it could not tell a shared device from a
-/// version that did not report access at all. The shared arm is drawn dim
-/// rather than green, so the row still reads at a glance as the plain case.
-fn access_badge(s: &priel_player::PlaybackStatus) -> (String, Color) {
+/// default silent made it a thing you had to know the absence of: a listener
+/// who saw no word for it could not tell a shared device from a version that
+/// did not report access at all.
+///
+/// It reads in the report rather than on the bottom row, because it is a
+/// session-long setting rather than something that changes per track - and the
+/// row it used to sit on had no width left to spare.
+pub(crate) fn access_words(s: &priel_player::PlaybackStatus) -> String {
     // `OUT —` already says there is no output; naming an access mode beside it
-    // would claim priel holds a device it does not hold. Both badges ask
+    // would claim priel holds a device it does not hold. Both lines ask
     // `has_output`, so they cannot contradict each other.
     if !has_output(s) {
-        return (String::new(), Color::DarkGray);
+        return "nothing open".to_string();
     }
     match s.access {
-        OutputAccess::Shared => ("  · shared".to_string(), Color::DarkGray),
-        OutputAccess::Exclusive => ("  · exclusive".to_string(), Color::Green),
-        OutputAccess::Refused => ("  ⚠ shared · exclusive refused".to_string(), Color::Yellow),
+        OutputAccess::Shared => "shared".to_string(),
+        OutputAccess::Exclusive => "exclusive".to_string(),
+        OutputAccess::Refused => "shared - exclusive was refused".to_string(),
     }
 }
 
@@ -2417,8 +2527,8 @@ mod tests {
             },
         );
         sc.app.mode = Mode::Graph;
-        let out = text(&mut sc.app, 100, 26);
-        assert!(out.contains("Audio graph"), "{out}");
+        let out = text(&mut sc.app, 100, 36);
+        assert!(out.contains("Output"), "{out}");
         assert!(out.contains("Loopback"), "the middle hop is shown: {out}");
         assert!(out.contains("Studio DAC"), "{out}");
         assert!(out.contains("44.1 kHz"), "the stream's rate: {out}");
@@ -2964,16 +3074,21 @@ mod tests {
     }
 
     #[test]
-    fn the_badge_always_says_how_the_device_is_held() {
+    fn the_report_always_says_how_the_device_is_held() {
         // Goal: the whole reason for taking a device is that the chain is then
-        // priel's alone, and an indicator that could not say so would leave the
+        // priel's alone, and an interface that could not say so would leave the
         // listener no way to tell they got what they asked for. The shared case
-        // is named too, so the state is read off the badge rather than inferred
+        // is named too, so the state is read off the line rather than inferred
         // from a word being absent.
+        //
+        // It reads here rather than on the bottom row: access is a session-long
+        // setting rather than something that changes per track, and the row had
+        // no width left to spare.
         let mut sc = screen();
         chain(&mut sc, 24, 96_000, 96_000, "s32");
+        sc.app.set_mode_for_test(Mode::Graph);
 
-        let shared = text(&mut sc.app, 140, 12);
+        let shared = text(&mut sc.app, 140, 24);
         assert!(
             shared.contains("shared"),
             "how the device is held is always on screen, not only when it is \
@@ -2985,7 +3100,7 @@ mod tests {
         );
 
         sc.app.status.access = OutputAccess::Exclusive;
-        let out = text(&mut sc.app, 140, 12);
+        let out = text(&mut sc.app, 140, 24);
         assert!(out.contains("exclusive"), "{out}");
     }
 
@@ -2996,24 +3111,30 @@ mod tests {
         // is holding none, which is the same overstatement the `DAC`/`OUT`
         // distinction exists to avoid.
         let mut sc = screen();
+        sc.app.set_mode_for_test(Mode::Graph);
 
-        let out = text(&mut sc.app, 140, 12);
+        let out = text(&mut sc.app, 140, 24);
         assert!(
             !out.contains("shared"),
             "an idle player holds nothing, so it names no access: {out}"
+        );
+        assert!(
+            out.contains("nothing open"),
+            "and says so, rather than leaving the line blank: {out}"
         );
     }
 
     #[test]
     fn a_refused_exclusive_open_is_reported_as_shared_output() {
         // Goal: the indicator never claims exclusivity it did not get. A player
-        // that fell back to the mixer while the badge still implied a direct
+        // that fell back to the mixer while the report still implied a direct
         // connection would be worse than not offering the path at all.
         let mut sc = screen();
         chain(&mut sc, 24, 96_000, 96_000, "s32");
         sc.app.status.access = OutputAccess::Refused;
+        sc.app.set_mode_for_test(Mode::Graph);
 
-        let out = text(&mut sc.app, 140, 12);
+        let out = text(&mut sc.app, 140, 24);
         assert!(out.contains("shared"), "it has to say what it got: {out}");
         assert!(
             out.contains("refused"),
