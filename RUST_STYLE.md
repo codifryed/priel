@@ -135,8 +135,16 @@ async would buy nothing at the one boundary where it would have to earn its keep
   `mpv_request_log_messages` call whose `// SAFETY:` comment covers the handle's lifetime and the
   C string's. The first is `Protocol::new`, whose comment covers the three things that make it
   sound: the callbacks capture nothing and receive an `Arc` that outlives them, all shared state is
-  behind mutexes so concurrent calls from mpv's threads are fine, and `protocol` is declared after
-  `mpv` so it unregisters first. Keep that comment true if the code around it moves.
+  behind mutexes so concurrent calls from mpv's threads are fine, and **the registration is never
+  dropped**. Keep that comment true if the code around it moves.
+- **A registration handed to libmpv is leaked deliberately, and must stay leaked.** libmpv has
+  `mpv_stream_cb_add_ro` and no remove: a protocol lives as long as the handle. libmpv2's
+  `Protocol` frees the callback data in `Drop` regardless, and borrows the `Mpv`, so the borrow
+  checker forces it to drop *first* - freeing that data while mpv's demuxer threads can still call
+  `open`. `std::mem::forget` is the fix and the leak is one small box per handle. This is not
+  theoretical: it produced six SIGSEGV core dumps in a day, every one faulting in `Mutex::lock`
+  inside `open`, called from mpv's `open_demux_thread`. An earlier version of this guide advised
+  the opposite ordering, which is how it survived.
 - Any new `unsafe` needs a `// SAFETY:` comment naming the invariant that makes it sound.
 - Nothing reachable from an FFI callback may panic. That constraint is why the poison-tolerant
   `lock`/`wait` helpers exist; do not reintroduce a panicking path there.

@@ -690,8 +690,16 @@ pub fn spawn(
         //  - all shared state sits behind mutexes, so concurrent calls from
         //    mpv's threads are sound, and `lock`/`wait` above are poison-tolerant
         //    so no callback can unwind across the FFI boundary;
-        //  - `protocol` is declared after `mpv` and so is dropped *before* it,
-        //    unregistering while the handle is still alive; both outlive the loop.
+        //  - the registration is **never dropped**, and that is the whole of the
+        //    contract. libmpv has `mpv_stream_cb_add_ro` and no remove: a
+        //    protocol stays registered for the life of the handle. libmpv2's
+        //    `Protocol` frees the callback data in `Drop` anyway, and borrows
+        //    the `Mpv`, so the borrow checker *forces* it to drop first - which
+        //    frees that data while mpv's demuxer threads can still call `open`.
+        //    That is a use-after-free, and it was one: six core dumps in a day,
+        //    every one faulting in `Mutex::lock` inside `open`, called from
+        //    mpv's `open_demux_thread`. `forget` is the fix, and the leak it
+        //    costs is one small box per handle, freed by the process exiting.
         let protocol = unsafe {
             Protocol::new(
                 &mpv,
@@ -723,6 +731,8 @@ pub fn spawn(
             log::error!("the prielseg protocol would not register, so there is no playback: {e}");
             return;
         }
+        // Deliberately never dropped; see the SAFETY note above.
+        std::mem::forget(protocol);
 
         let mut entries: Vec<Entry> = Vec::new();
         let mut seq: u64 = 0;
@@ -1919,6 +1929,9 @@ mod tests {
             )
         };
         protocol.register().expect("the protocol should register");
+        // Never dropped, for the reason in `spawn`: dropping it frees the
+        // callback data while mpv can still call back into it.
+        std::mem::forget(protocol);
 
         spawn_downloader(vec![one_shot(media)], &sh);
         command(&mpv, "loadfile", &["prielseg://1", "replace"]);
@@ -3499,6 +3512,9 @@ mod tests {
             )
         };
         protocol.register().expect("the protocol should register");
+        // Never dropped, for the reason in `spawn`: dropping it frees the
+        // callback data while mpv can still call back into it.
+        std::mem::forget(protocol);
 
         command(&mpv, "loadfile", &["prielseg://1", "replace"]);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -3644,6 +3660,8 @@ mod tests {
             )
         };
         protocol.register().ok()?;
+        // Never dropped; see `spawn`.
+        std::mem::forget(protocol);
 
         // Feed at a fixed rate, as a download would. `at` is an offset into the
         // file, which is the stream offset too: the buffer releases bytes at the
