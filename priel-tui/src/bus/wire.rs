@@ -36,15 +36,6 @@
 //!
 //! Specification: D-Bus 0.43.
 
-// The wire format is landing on its own, ahead of the connection that speaks it
-// and the interfaces that fill it in, so that the padding rules can be pinned
-// against captures from a real bus before anything depends on them. Until those
-// arrive the only callers are the tests.
-#![allow(
-    dead_code,
-    reason = "the connection and the interfaces above it are the callers, and land next"
-)]
-
 use std::fmt;
 
 #[cfg(test)]
@@ -356,6 +347,10 @@ impl Message {
         .with_body(vec![Arg::Value(Value::Str(text.to_owned()))])
     }
 
+    #[allow(
+        dead_code,
+        reason = "the interfaces above the connection are the callers, and land next"
+    )]
     pub(crate) fn signal(serial: u32, path: &str, interface: &str, member: &str) -> Self {
         Self {
             kind: MessageType::Signal,
@@ -419,6 +414,10 @@ impl Message {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "the interfaces above the connection are the callers, and land next"
+    )]
     pub(crate) fn destination(&self) -> Option<&str> {
         self.fields.iter().find_map(|field| match field {
             Field::Destination(value) => Some(value.as_str()),

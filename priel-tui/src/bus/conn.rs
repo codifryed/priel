@@ -33,8 +33,8 @@
 
 // The connection lands ahead of the interfaces that fill it in, so that the
 // handshake and the dispatch loop can be pinned against a scripted session
-// before anything depends on them. Until those arrive the only callers are the
-// tests.
+// before anything depends on them. Nothing calls `start` until they do, and
+// with no caller at the top every item below it reads as dead.
 #![allow(
     dead_code,
     reason = "the interfaces above it are the callers, and land next"
