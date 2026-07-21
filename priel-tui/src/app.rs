@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use rand::Rng;
+use rand::seq::SliceRandom;
 use ratatui::layout::Rect;
 
 use priel_core::auth::{Credentials, Pkce};
@@ -189,11 +189,12 @@ pub enum Click {
     Seek(f64),
     /// A loaded list row, by index into the visible list.
     Row(usize),
-    /// A queue entry in the queue's own column, by index into the queue.
+    /// A queue entry in the queue's own column, by row of the play order.
     ///
-    /// An index into `queue` rather than into a visible list: the queue has no
-    /// filter of its own, and it is the one list on screen whose order is the
-    /// order it will be played in.
+    /// A row rather than an index into a visible list: the queue has no filter
+    /// of its own. It is a row of the *order* rather than of the queue, because
+    /// that is what the panel draws, and [`App::queue_at`] is the one place
+    /// that turns one into the other.
     QueueRow(usize),
     /// Bare surface, or a bar with nothing playing to seek within.
     Nothing,
@@ -656,10 +657,11 @@ pub struct App {
     /// Which list the keyboard was last asked for, which is not the same thing
     /// as which list has it: see [`App::focus`].
     focus_wanted: Focus,
-    /// The queue entry under the queue's own cursor.
+    /// The row of the play order under the queue's own cursor, which is a row
+    /// of the panel and not an index into `queue`: see [`App::queue_at`].
     pub queue_selected: usize,
-    /// The first queue entry on screen, maintained by the renderer exactly as
-    /// `list_offset` is.
+    /// The first row of the play order on screen, maintained by the renderer
+    /// exactly as `list_offset` is.
     pub queue_offset: usize,
 
     pub now_playing: Option<Track>,
@@ -669,6 +671,18 @@ pub struct App {
     // Play queue + gapless pipeline state.
     pub queue: Vec<Track>,
     pub queue_pos: usize,
+    /// The order the queue is played in: a permutation of indices into
+    /// [`Self::queue`], and never a reordering of the queue itself.
+    ///
+    /// **Two structures on purpose.** The queue is what the listener chose, in
+    /// the order they chose it; this says what follows what. Keeping them apart
+    /// is what lets the shuffle be turned off with the track still playing -
+    /// shuffling the queue in place would have thrown the listing order away,
+    /// leaving nothing to go back to.
+    ///
+    /// Honoured only while it is as long as the queue, and the listing order is
+    /// what a queue without one reads back as. See [`Self::queue_at`].
+    order: Vec<usize>,
     expected_id: u64,
     current_target: Option<u64>,
     next_intended: Option<u64>,
@@ -983,6 +997,7 @@ impl App {
             status: PlaybackStatus::default(),
             queue: Vec::new(),
             queue_pos: 0,
+            order: Vec::new(),
             expected_id: 0,
             current_target: None,
             next_intended: None,
@@ -2589,8 +2604,8 @@ impl App {
     /// where it is now. Going back through what has played is what makes the
     /// history above the current track navigation rather than a readout.
     fn play_queue_selected(&mut self) {
-        if self.queue_selected < self.queue.len() {
-            self.load_fresh(self.queue_selected);
+        if let Some(p) = self.queue_at(self.queue_selected) {
+            self.load_fresh(p);
         }
     }
 
@@ -2725,6 +2740,15 @@ impl App {
         };
         self.set_queue(tracks);
         let p = vis_index.min(self.queue.len() - 1);
+        if self.shuffle {
+            // The row that was pointed at starts, and the rest follows it
+            // dealt: a track the listener chose must not be dealt into the
+            // middle of the order with rows above it that never played.
+            self.deal_order_from(0);
+            if let Some(row) = self.order.iter().position(|&i| i == p) {
+                self.order.swap(0, row);
+            }
+        }
         self.load_fresh(p);
     }
 
@@ -2739,6 +2763,10 @@ impl App {
         self.queue_offset = 0;
         self.radio_from = None;
         self.radio_asked = None;
+        // A queue and its order are made together. The callers that want a
+        // shuffled one deal this one again, which is a different decision from
+        // "what is in the queue" and belongs to them.
+        self.lay_listing_order();
     }
 
     fn load_fresh(&mut self, pos: usize) {
@@ -2757,6 +2785,85 @@ impl App {
         self.ask(ToWorker::Resolve(t.id));
     }
 
+    /// The queue entry at this row of the play order, or `None` past the end.
+    ///
+    /// **The one translation from a row to a track.** The panel, the preload
+    /// and every key that names a place rather than a direction all ask it, so
+    /// no two of them can come to disagree about what is where.
+    ///
+    /// The listing order is the answer whenever the order does not fit the
+    /// queue. An order a different queue's length is an order built for a
+    /// different queue, and falling back to the listing is defined behaviour
+    /// where indexing on through it is not.
+    #[must_use]
+    pub fn queue_at(&self, row: usize) -> Option<usize> {
+        if self.order.len() == self.queue.len() {
+            self.order.get(row).copied()
+        } else {
+            (row < self.queue.len()).then_some(row)
+        }
+    }
+
+    /// Which row of the play order the music is on.
+    ///
+    /// Derived from `queue_pos` rather than stored beside it. Two fields that
+    /// have to move together are two fields that one day will not, and this
+    /// file already keeps the queue in lockstep with mpv's playlist - a third
+    /// copy of where the music is would be the one to get wrong.
+    #[must_use]
+    pub fn playing_row(&self) -> usize {
+        if self.order.len() == self.queue.len() {
+            self.order
+                .iter()
+                .position(|&i| i == self.queue_pos)
+                .unwrap_or(self.queue_pos)
+        } else {
+            self.queue_pos
+        }
+    }
+
+    /// Deal the play order again from this row on, leaving the rows above it
+    /// exactly where they are.
+    ///
+    /// **What is behind the listener stays behind them.** The rows above the
+    /// one playing are what has already played in this order, which is what the
+    /// panel dims and what `H` walks back through; dealing them again would
+    /// move played tracks under the current one, where the panel says they are
+    /// still to come.
+    fn deal_order_from(&mut self, row: usize) {
+        if row < self.order.len() {
+            self.order[row..].shuffle(&mut rand::thread_rng());
+        }
+    }
+
+    /// Lay the listing order over the queue: row *n* is queue entry *n*.
+    ///
+    /// The order every queue starts with, and the one the shuffle is turned off
+    /// back to. It can be gone back to at all because the queue was never
+    /// reordered - which is the reason the order is a second structure.
+    fn lay_listing_order(&mut self) {
+        self.order = (0..self.queue.len()).collect();
+    }
+
+    /// Take the entries the queue has just grown by into the play order.
+    ///
+    /// They go on the end of it, dealt among themselves under the shuffle,
+    /// rather than into a fresh deal of everything still to come: a radio page
+    /// landing must not rearrange the rows the listener is already reading.
+    fn extend_order(&mut self, grown_from: usize) {
+        // An order the wrong length was built for a different queue, and is not
+        // one to extend. Laying the listing order over what was there is what
+        // `queue_at` would have fallen back to anyway.
+        if self.order.len() != grown_from {
+            self.order = (0..grown_from).collect();
+        }
+        let mut added: Vec<usize> = (grown_from..self.queue.len()).collect();
+        if self.shuffle {
+            added.shuffle(&mut rand::thread_rng());
+        }
+        self.order.extend(added);
+    }
+
     /// Keep the queue's cursor on what is playing, unless the listener has the
     /// keyboard there.
     ///
@@ -2766,10 +2873,18 @@ impl App {
     /// from under their fingers.
     fn follow_queue_cursor(&mut self) {
         if self.focus() != Focus::Queue {
-            self.queue_selected = self.queue_pos;
+            self.queue_selected = self.playing_row();
         }
     }
 
+    /// Ask for the entry after this one, so mpv has it before it is needed.
+    ///
+    /// **What is asked for here is what will play.** It used to be a guess: the
+    /// shuffle picked afresh at the advance, so the track fetched during the
+    /// last minute of the current one was almost never the track that turned
+    /// up - a whole track downloaded for nothing, and a gap exactly where the
+    /// gapless handover should have been. The order is laid out in advance, so
+    /// this and the advance now ask the same question and get the same answer.
     fn schedule_next(&mut self) {
         if self.queue.is_empty() {
             self.next_intended = None;
@@ -2783,10 +2898,9 @@ impl App {
             self.next_intended = Some(id);
             self.ask(ToWorker::Resolve(id));
         } else {
-            // Nothing follows this track. Neither the shuffle nor a repeat ever
-            // reaches here - both always have somewhere to go - so this is the
-            // ordered end of a queue that is not repeating, and the one moment
-            // the radio has anything to answer.
+            // Nothing follows this track: the end of the play order, the
+            // shuffled one exactly as the listing one, with no repeat to start
+            // it again. The one moment the radio has anything to answer.
             self.next_intended = None;
             self.extend_with_radio();
         }
@@ -2861,7 +2975,9 @@ impl App {
         if self.radio_from.is_none() {
             self.radio_from = Some(self.queue.len());
         }
+        let grown_from = self.queue.len();
         self.queue.extend(added);
+        self.extend_order(grown_from);
         self.notice = Some(format!(
             "The radio for “{}” follows it: the service's suggestion, not yours.",
             seed.title
@@ -2934,50 +3050,38 @@ impl App {
     /// [`Repeat::skipped`].
     ///
     /// **The shuffle says what the play order is; the repeat says whether that
-    /// order ends.** The two are answers to different questions, which is what
-    /// keeps this readable as the shuffle changes shape underneath it.
+    /// order ends.** The two are answers to different questions, and only one
+    /// of them is answered here. The shuffle has no branch in this function at
+    /// all any more: it decides what the order *is*, laid out in advance, and
+    /// this asks the same question of a shuffled order as of a listing one.
+    ///
+    /// The comment this replaced predicted that a real order would return
+    /// `None` from the shuffle's branch and fall through to the repeat question
+    /// the ordered end asks. It does - and the branch that would have returned
+    /// it turned out not to be needed, because "the row after this one" already
+    /// says everything the shuffle had to say.
     fn next_pos(&self, repeat: Repeat) -> Option<usize> {
         if self.queue.is_empty() {
             return None;
         }
-        // Repeat-one is about *this* track, so it outranks the shuffle under
+        // Repeat-one is about *this* track, so it outranks the order under
         // either shape: there is no next track to pick when the answer is "this
         // one again".
         if repeat == Repeat::One {
             return Some(self.queue_pos);
         }
-        // The shuffle's own answer to "what next?".
-        //
-        // Today it is a fresh pick on every advance rather than an order, so it
-        // never runs out and there is no end for repeat-all to start again from:
-        // with the shuffle on, repeat-all changes nothing, and that is the
-        // consequence of the shuffle having no order rather than a rule of its
-        // own. When the shuffle gains a real order, an exhausted order returns
-        // `None` from here and falls through to the same repeat question the
-        // ordered end below asks. Nothing about repeat-all changes then - only
-        // whether that branch is ever reached.
-        if self.shuffle {
-            return Some(self.rand_other());
-        }
-        if self.queue_pos + 1 < self.queue.len() {
-            return Some(self.queue_pos + 1);
+        let row = self.playing_row();
+        if let Some(next) = self.queue_at(row + 1) {
+            return Some(next);
         }
         // The end of the order. Repeat-all starts it again - and in a queue of
         // one that lands on the track already playing, which is what makes
         // repeat-all and repeat-one the same thing there on purpose rather than
         // by accident.
-        (repeat == Repeat::All).then_some(0)
-    }
-
-    fn rand_other(&self) -> usize {
-        if self.queue.len() <= 1 {
-            return self.queue_pos.min(self.queue.len().saturating_sub(1));
+        if repeat == Repeat::All {
+            return self.queue_at(0);
         }
-        let mut r = rand::thread_rng().gen_range(0..self.queue.len());
-        if r == self.queue_pos {
-            r = (r + 1) % self.queue.len();
-        }
-        r
+        None
     }
 
     fn goto_top(&mut self) {
@@ -3458,11 +3562,12 @@ impl App {
             self.player.seek(0.0);
             return;
         }
-        let p = if self.shuffle {
-            self.rand_other()
-        } else {
-            self.queue_pos.saturating_sub(1)
-        };
+        // Back up the play order, which is the row the panel draws above this
+        // one. One rule under both orders: the shuffle used to answer this with
+        // another random pick, so "previous" was a track that had not played.
+        let p = self
+            .queue_at(self.playing_row().saturating_sub(1))
+            .unwrap_or(self.queue_pos);
         self.load_fresh(p);
     }
 
@@ -3555,6 +3660,12 @@ impl App {
     /// one implementation with two callers rather than two implementations: the
     /// `s` key asks for the opposite of what is in force, and the desktop asks
     /// for what it wants.
+    ///
+    /// **Both ways lay a play order over the queue, and neither touches the
+    /// queue.** Turning it off is a return to the listing order with the track
+    /// still playing, which is only possible because the listing order was
+    /// never overwritten; turning it on again deals the rows that have not
+    /// played yet, and leaves what is behind the listener behind them.
     fn set_shuffle(&mut self, on: bool) {
         self.shuffle = on;
         self.notice = Some(
@@ -3565,8 +3676,18 @@ impl App {
             }
             .into(),
         );
+        if self.shuffle {
+            self.deal_order_from(self.playing_row() + 1);
+        } else {
+            self.lay_listing_order();
+        }
+        // The track playing has a new row, and the cursor is a readout of where
+        // the music is until somebody starts driving it.
+        self.follow_queue_cursor();
         if self.shuffle && self.now_playing.is_none() {
-            // Build a queue from the current track view and start randomly.
+            // Build a queue from the current track view and start at the head
+            // of a freshly dealt order - which is where the randomness lives
+            // now that there is an order to be random in.
             let tracks: Vec<Track> = {
                 let vis = self.visible();
                 let items = self.current_tracks();
@@ -3574,8 +3695,10 @@ impl App {
             };
             if !tracks.is_empty() {
                 self.set_queue(tracks);
-                let p = rand::thread_rng().gen_range(0..self.queue.len());
-                self.load_fresh(p);
+                self.deal_order_from(0);
+                if let Some(p) = self.queue_at(0) {
+                    self.load_fresh(p);
+                }
             }
         }
     }
@@ -4678,7 +4801,7 @@ impl App {
         if self.queue.is_empty() {
             None
         } else {
-            Some(format!("{}/{}", self.queue_pos + 1, self.queue.len()))
+            Some(format!("{}/{}", self.playing_row() + 1, self.queue.len()))
         }
     }
 
@@ -6587,10 +6710,19 @@ mod tests {
         // The last track of a queue with nothing preloaded behind it.
         on.rig.app.queue_pos = 2;
         assert!(!on.rig.app.bus_snapshot().now.can_go_next);
+        // And the shuffle does not change that. It says what the play order is,
+        // not that there is always more of it: the last row of a shuffled order
+        // is as much the end of the queue as the last row of the listing, which
+        // is what "no track repeats until every other has played" means.
         on.rig.app.shuffle = true;
         assert!(
+            !on.rig.app.bus_snapshot().now.can_go_next,
+            "the end of an order is the end of an order"
+        );
+        on.rig.app.queue_pos = 1;
+        assert!(
             on.rig.app.bus_snapshot().now.can_go_next,
-            "shuffle always has somewhere to go"
+            "with a row still under it, there is somewhere to go"
         );
     }
 
@@ -8899,24 +9031,6 @@ mod tests {
     }
 
     #[test]
-    fn shuffle_never_picks_the_track_already_playing() {
-        // Goal: a random pick that lands on the current track looks like a
-        // freeze. With one track there is nothing else to choose.
-        let mut r = rig();
-        r.app.queue = (1..=4).map(|i| track(i, "T", "A")).collect();
-        r.app.shuffle = true;
-        for pos in 0..4 {
-            r.app.queue_pos = pos;
-            for _ in 0..25 {
-                assert_ne!(r.app.rand_other(), pos, "must move somewhere else");
-            }
-        }
-        r.app.queue.truncate(1);
-        r.app.queue_pos = 0;
-        assert_eq!(r.app.rand_other(), 0, "a single-track queue stays put");
-    }
-
-    #[test]
     fn a_gapless_handover_follows_mpv_to_the_new_track() {
         // Goal: mpv advances on its own, so the app learns about it from
         // current_id. Missing this leaves the now-playing bar on the old track.
@@ -9493,6 +9607,417 @@ mod tests {
         r.app.set_repeat(Repeat::One);
         r.app.refresh_for_test();
         assert!(preloaded(&r).is_empty(), "mpv has one ready already");
+    }
+
+    // ---- the shuffle's play order ----
+
+    /// The queue in the order it will be played, by track id.
+    fn play_order(app: &App) -> Vec<u64> {
+        (0..app.queue.len())
+            .filter_map(|row| app.queue_at(row))
+            .filter_map(|i| app.queue.get(i).map(|t| t.id))
+            .collect()
+    }
+
+    /// The ids of a queue of `n` tracks in the order they were listed in.
+    fn listing(n: u64) -> Vec<u64> {
+        (1..=n).collect()
+    }
+
+    /// A queue of `n` tracks playing the first of them with the shuffle on:
+    /// the two keys a listener presses, in the order they press them.
+    fn playing_shuffled(n: u64) -> Rig {
+        let mut r = rig();
+        r.app.favorites = (1..=n).map(|i| track(i, "T", "A")).collect();
+        r.app.on_key(code(KeyCode::Enter));
+        r.app.on_key(key('s'));
+        // The resolve for the first track has landed, so nothing is in flight.
+        r.app.current_target = None;
+        let _ = requests(&r);
+        r
+    }
+
+    /// The same, but with the shuffle already on when a row further down the
+    /// listing is chosen - so the head of the order is not queue entry zero and
+    /// a row of the order cannot be mistaken for an index into the listing.
+    fn playing_shuffled_from(n: u64, chosen: usize) -> Rig {
+        let mut r = rig();
+        r.app.favorites = (1..=n).map(|i| track(i, "T", "A")).collect();
+        r.app.shuffle = true;
+        r.app.selected = chosen;
+        r.app.on_key(code(KeyCode::Enter));
+        r.app.current_target = None;
+        let _ = requests(&r);
+        r
+    }
+
+    /// Take the next entry of the order, as an advance does. `false` where the
+    /// order has nothing left.
+    fn play_on(r: &mut Rig) -> bool {
+        let Some(p) = r.app.next_pos(Repeat::Off) else {
+            return false;
+        };
+        r.app.load_fresh(p);
+        r.app.current_target = None;
+        let _ = requests(r);
+        true
+    }
+
+    #[test]
+    fn the_shuffle_lays_an_order_beside_the_queue_rather_than_reordering_it() {
+        // Goal: the permutation is the whole design. The queue stays the set of
+        // tracks the listener chose in the order they chose it - which is what
+        // there is to go back to when the shuffle is turned off - and a second
+        // structure says what follows what.
+        let r = playing_shuffled(12);
+        assert_eq!(
+            r.app.queue.iter().map(|t| t.id).collect::<Vec<_>>(),
+            listing(12),
+            "the queue itself was not touched"
+        );
+
+        let order = play_order(&r.app);
+        let mut covered = order.clone();
+        covered.sort_unstable();
+        assert_eq!(covered, listing(12), "every track exactly once: {order:?}");
+        assert_eq!(order[0], 1, "the track playing stays at the head of it");
+        assert_ne!(order, listing(12), "and the rest is not the listing");
+    }
+
+    #[test]
+    fn no_track_repeats_until_every_other_one_has_played() {
+        // Goal: the fresh draw at every advance was random *with replacement*,
+        // so a ten-track queue would usually repeat several tracks before
+        // covering them all. Walking an order cannot: it ends when it is spent.
+        let mut r = playing_shuffled(8);
+        let mut played = vec![r.app.queue[r.app.queue_pos].id];
+        for _ in 0..8 {
+            if !play_on(&mut r) {
+                break;
+            }
+            played.push(r.app.queue[r.app.queue_pos].id);
+            assert_eq!(
+                r.app.queue_indicator(),
+                Some(format!("{}/8", played.len())),
+                "the counter counts rows of the order, not of the listing"
+            );
+        }
+        let mut covered = played.clone();
+        covered.sort_unstable();
+        assert_eq!(covered, listing(8), "each one once, none twice: {played:?}");
+    }
+
+    #[test]
+    fn the_order_stands_still_between_advances_so_the_panel_can_show_it() {
+        // Goal: what the queue panel draws below the current track has to be
+        // what will play. A pick drawn afresh at every advance would make the
+        // row under the current one a different track each time it was asked.
+        let r = playing_shuffled(10);
+        let next = r
+            .app
+            .next_pos(Repeat::Off)
+            .expect("nine rows still to play");
+        for _ in 0..25 {
+            assert_eq!(
+                r.app.next_pos(Repeat::Off),
+                Some(next),
+                "asking again must not draw again"
+            );
+        }
+        assert_eq!(
+            r.app.queue_at(r.app.playing_row() + 1),
+            Some(next),
+            "and it is the row the panel puts under the current one"
+        );
+    }
+
+    #[test]
+    fn the_preload_asks_for_the_track_the_order_will_actually_play() {
+        // Goal: the preload used to be a guess. The shuffle picked afresh at the
+        // advance, so the track fetched during the last minute of the current
+        // one was usually not the track that turned up - a whole track
+        // downloaded for nothing, and a gap where the gapless handover should
+        // have been. With an order the two are the same question.
+        let mut r = playing_shuffled(10);
+        for round in 0..3 {
+            let expected = r
+                .app
+                .queue_at(r.app.playing_row() + 1)
+                .and_then(|p| r.app.queue.get(p).map(|t| t.id));
+            r.app.status.playing = true;
+            r.app.status.ended = false;
+            r.app.refresh_for_test();
+            let asked = preloaded(&r);
+            assert_eq!(asked, expected.into_iter().collect::<Vec<_>>(), "{round}");
+
+            // The track ends before mpv took the preload, so the fallback loads
+            // the next one from scratch: the same one, or it was a guess.
+            r.app.status.ended = true;
+            r.app.status.playing = false;
+            r.app.refresh_for_test();
+            r.app.current_target = None;
+            let _ = requests(&r);
+            assert_eq!(
+                r.app.now_playing.as_ref().map(|t| t.id),
+                asked.first().copied(),
+                "what was preloaded is what plays, round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn turning_the_shuffle_off_goes_back_to_the_listing_still_playing() {
+        // Goal: the one thing shuffling the queue in place cannot do. The
+        // listing order is still there because it was never overwritten, so `s`
+        // returns to it without the music stopping or changing track.
+        let mut r = playing_shuffled(10);
+        play_on(&mut r);
+        play_on(&mut r);
+        assert_ne!(play_order(&r.app), listing(10), "shuffled while it is on");
+        let playing = r.app.now_playing.as_ref().map(|t| t.id);
+
+        r.app.on_key(key('s'));
+        assert!(!r.app.shuffle);
+        assert_eq!(
+            r.app.now_playing.as_ref().map(|t| t.id),
+            playing,
+            "the same track is still in the speakers"
+        );
+        assert_eq!(play_order(&r.app), listing(10), "back to the listing");
+        assert_eq!(
+            r.app.playing_row(),
+            r.app.queue_pos,
+            "and the panel finds it where the listing puts it"
+        );
+    }
+
+    #[test]
+    fn re_shuffling_deals_again_only_what_has_not_played_yet() {
+        // Goal: what is behind the listener stays behind them. Re-dealing the
+        // whole order would move tracks that have already played to the front
+        // of it, where the panel says they are still to come. Asked for through
+        // the session bus, because the desktop's `Shuffle` has to reach the very
+        // same method the key does.
+        let mut r = playing_shuffled(12);
+        play_on(&mut r);
+        play_on(&mut r);
+        let mut before = play_order(&r.app);
+        let behind = before[..=r.app.playing_row()].to_vec();
+
+        // Five deals rather than one: a single deal that wrongly moved the
+        // played rows could put them back where they were by luck.
+        for deal in 0..5 {
+            r.app.apply(BusCommand::Shuffle(true));
+            let after = play_order(&r.app);
+            assert_eq!(
+                &after[..behind.len()],
+                &behind[..],
+                "what has played, and what is playing, do not move (deal {deal}): {after:?}"
+            );
+            assert_eq!(
+                r.app.queue_selected,
+                r.app.playing_row(),
+                "and the cursor follows the track to its new row"
+            );
+            let mut covered = after.clone();
+            covered.sort_unstable();
+            assert_eq!(covered, listing(12), "still every track exactly once");
+            assert_ne!(after, before, "and the rest was dealt again");
+            before = after;
+        }
+    }
+
+    #[test]
+    fn a_row_chosen_with_the_shuffle_on_is_where_the_order_starts() {
+        // Goal: Enter names a track, and the shuffle does not get to overrule
+        // that. It plays, at the head of a freshly dealt order - dealt into the
+        // middle of one instead, the rows above it would read as history that
+        // never played. Five choices, because one landing at the head by luck
+        // would prove nothing.
+        let mut r = rig();
+        r.app.favorites = (1..=10).map(|i| track(i, "T", "A")).collect();
+        r.app.shuffle = true;
+        for chosen in [0usize, 3, 9, 5, 7] {
+            r.app.selected = chosen;
+            r.app.on_key(code(KeyCode::Enter));
+            let order = play_order(&r.app);
+            assert_eq!(
+                r.app.now_playing.as_ref().map(|t| t.id),
+                Some(chosen as u64 + 1),
+                "the row that was pointed at plays"
+            );
+            assert_eq!(r.app.playing_row(), 0, "at the head of the order");
+            assert_eq!(order[0], chosen as u64 + 1);
+            let mut covered = order.clone();
+            covered.sort_unstable();
+            assert_eq!(covered, listing(10), "with the rest behind it, once each");
+            assert_ne!(order, listing(10), "and the rest of it dealt");
+        }
+    }
+
+    #[test]
+    fn a_spent_order_ends_the_queue_exactly_as_the_listing_does() {
+        // Goal: the shuffle's answer is what the order is, and the repeat's is
+        // whether it ends - so a spent order asks the repeat the same question
+        // the bottom of the listing asks, and repeat-all is answered from the
+        // head of the order rather than from the head of the queue.
+        let mut r = playing_shuffled_from(6, 3);
+        for _ in 0..6 {
+            if !play_on(&mut r) {
+                break;
+            }
+        }
+        assert_eq!(r.app.playing_row(), 5, "the order ran to its end");
+        assert_eq!(r.app.next_pos(Repeat::Off), None, "and stops where it ends");
+        assert_eq!(
+            r.app.next_pos(Repeat::All),
+            Some(3),
+            "repeat-all starts that order again: its head, not the listing's"
+        );
+    }
+
+    #[test]
+    fn an_order_that_does_not_fit_the_queue_is_not_half_used() {
+        // Goal: the fallback is all or nothing. Taking the rows from an order
+        // built for a different queue but the current position from the listing
+        // - or the other way about - puts the cursor and the music on different
+        // tracks, which is the one thing the panel must never do.
+        let mut r = rig();
+        r.app.queue = (1..=5).map(|i| track(i, "T", "A")).collect();
+        r.app.order = vec![2, 0, 1]; // built for a queue of three
+        r.app.queue_pos = 1;
+
+        assert_eq!(r.app.queue_at(0), Some(0), "the listing, row for row");
+        assert_eq!(r.app.playing_row(), 1, "and where the listing puts it");
+        assert_eq!(
+            r.app.queue_at(r.app.playing_row()),
+            Some(r.app.queue_pos),
+            "the row and the track always agree"
+        );
+    }
+
+    #[test]
+    fn an_empty_queue_and_a_queue_of_one_have_a_defined_order() {
+        // Goal: the two degenerate queues. Neither has anywhere to go, and both
+        // used to be a modulo away from a panic or from standing still.
+        let mut r = rig();
+        r.app.shuffle = true;
+        assert_eq!(r.app.queue_at(0), None, "no rows to draw");
+        assert_eq!(r.app.playing_row(), 0);
+        assert_eq!(r.app.next_pos(Repeat::Off), None);
+        assert_eq!(r.app.next_pos(Repeat::All), None, "nothing to start again");
+
+        let mut r = playing_shuffled(1);
+        assert_eq!(play_order(&r.app), vec![1], "an order of one");
+        assert_eq!(r.app.next_pos(Repeat::Off), None, "which is spent at once");
+        assert_eq!(r.app.next_pos(Repeat::All), Some(0), "and starts again");
+        r.app.on_key(key('p'));
+        assert_eq!(r.app.queue_pos, 0, "with nowhere behind it either");
+    }
+
+    #[test]
+    fn previous_walks_back_up_the_order_the_panel_shows() {
+        // Goal: going back is going up the panel. The shuffle used to answer
+        // `H` with another random pick, so the track above the current row was
+        // not the track that had just played and the history read as a lie.
+        let mut r = playing_shuffled(10);
+        let mut played = vec![r.app.queue[r.app.queue_pos].id];
+        for _ in 0..3 {
+            play_on(&mut r);
+            played.push(r.app.queue[r.app.queue_pos].id);
+        }
+        while played.len() > 1 {
+            played.pop();
+            r.app.on_key(key('H'));
+            assert_eq!(
+                r.app.now_playing.as_ref().map(|t| t.id),
+                played.last().copied(),
+                "back through what actually played: {played:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_queue_that_grows_keeps_the_order_already_laid_out() {
+        // Goal: the radio extends the queue while it plays, and the rows the
+        // listener is looking at must not rearrange under them when the page
+        // lands. The new entries go on the end of the order, dealt among
+        // themselves.
+        let mut r = rig();
+        r.app.favorites = (1..=8).map(|i| track_with_radio(i, "0016d")).collect();
+        r.app.on_key(code(KeyCode::Enter));
+        r.app.on_key(key('s'));
+        r.app.current_target = None;
+        r.app.continue_radio = true;
+        for _ in 0..8 {
+            if !play_on(&mut r) {
+                break;
+            }
+        }
+        let before = play_order(&r.app);
+        assert_ne!(before, listing(8), "shuffled before the queue grew");
+
+        r.app.status.playing = true;
+        r.app.refresh_for_test();
+        assert_eq!(radios_asked(&r), vec!["0016d".to_string()]);
+        r.to_app
+            .send(radio_page("0016d", 20..28))
+            .expect("the app holds the other end");
+        r.app.drain_worker();
+
+        let after = play_order(&r.app);
+        assert_eq!(&after[..before.len()], &before[..], "nothing already laid");
+        assert_eq!(after.len(), r.app.queue.len(), "and every new row is in it");
+        let mut covered = after.clone();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(
+            covered.len(),
+            after.len(),
+            "each queue entry once: {after:?}"
+        );
+        assert_ne!(
+            after[before.len()..],
+            (20..28).collect::<Vec<_>>()[..],
+            "and the new rows were dealt among themselves"
+        );
+    }
+
+    #[test]
+    fn a_queue_that_grew_without_an_order_is_given_one() {
+        // Goal: the order is honoured only while it fits the queue, so one that
+        // has fallen behind is laid again rather than extended - extending it
+        // would build a permutation of a queue that no longer exists, and the
+        // rows would name tracks other than the ones under them.
+        let mut r = rig();
+        r.app.queue = (1..=8).map(|i| track_with_radio(i, "0016d")).collect();
+        r.app.queue_pos = 7;
+        r.app.now_playing = r.app.queue.last().cloned();
+        r.app.expected_id = 8;
+        r.app.status.playing = true;
+        r.app.shuffle = true;
+        r.app.continue_radio = true;
+        let _ = requests(&r);
+
+        r.app.refresh_for_test();
+        assert_eq!(radios_asked(&r), vec!["0016d".to_string()]);
+        r.to_app
+            .send(radio_page("0016d", 20..28))
+            .expect("the app holds the other end");
+        r.app.drain_worker();
+
+        let after = play_order(&r.app);
+        assert_eq!(after.len(), r.app.queue.len(), "one row per entry");
+        assert_eq!(
+            &after[..8],
+            &listing(8)[..],
+            "what was there keeps its place"
+        );
+        assert_ne!(
+            after[8..],
+            (20..28).collect::<Vec<_>>()[..],
+            "and what arrived was dealt"
+        );
     }
 
     #[test]

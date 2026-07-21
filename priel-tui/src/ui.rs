@@ -783,7 +783,7 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
                 &[("n", Some(Hit::Next)), ("p", Some(Hit::Prev))],
                 "next / previous track",
             ),
-            row(&[("s", Some(Hit::Shuffle))], "shuffle this view"),
+            row(&[("s", Some(Hit::Shuffle))], "shuffle the play order"),
             row(&[("e", Some(Hit::Repeat))], "repeat: off / all / one"),
             row(&[("c", Some(Hit::Continue))], "keep playing at the end"),
             // The vocabulary, not an action: the three marks the one control
@@ -2355,9 +2355,14 @@ fn focus_ring(app: &App, focused: bool, t: &Theme) -> (Style, BorderType) {
 /// Two cells rather than one, and that is the point. Position and provenance
 /// are independent - the radio's suggestions get played and become history like
 /// anything else - so they are two columns and never one blended glyph.
-fn queue_marks(app: &App, index: usize) -> String {
-    let playing = if index == app.queue_pos { '♪' } else { ' ' };
-    let source = if app.suggested(index) { '~' } else { ' ' };
+///
+/// Asked of a *row of the play order*, like everything else in the panel. The
+/// mark for where the entry came from is still a fact about the entry, which is
+/// what `queue_at` is for.
+fn queue_marks(app: &App, row: usize) -> String {
+    let playing = if row == app.playing_row() { '♪' } else { ' ' };
+    let suggested = app.queue_at(row).is_some_and(|index| app.suggested(index));
+    let source = if suggested { '~' } else { ' ' };
     format!("{playing}{source} ")
 }
 
@@ -2371,11 +2376,13 @@ fn queue_heading(app: &App) -> Vec<Span<'static>> {
     let t = app.theme();
     // A counter needs something to count. `1/0` is what a position taken from
     // an empty queue reads as, and it says the music is on an entry that is not
-    // there.
+    // there. The figure is the *row of the play order*, not the queue index -
+    // with a shuffle dealt they are different numbers, and the row is the one
+    // the panel below is drawing.
     let counted = if app.queue.is_empty() {
         " Queue ".to_string()
     } else {
-        format!(" Queue {}/{} ", app.queue_pos + 1, app.queue.len())
+        format!(" Queue {}/{} ", app.playing_row() + 1, app.queue.len())
     };
     let mut spans = vec![Span::styled(counted, Style::default().fg(t.queue))];
     if app.queue_has_suggestions() {
@@ -2452,20 +2459,21 @@ fn queue_column(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let width = inner.width as usize;
-    for (i, qi) in (app.queue_offset..(app.queue_offset + h).min(app.queue.len())).enumerate() {
-        let Some(entry) = app.queue.get(qi) else {
+    let playing_row = app.playing_row();
+    for (i, row) in (app.queue_offset..(app.queue_offset + h).min(app.queue.len())).enumerate() {
+        let Some(entry) = app.queue_at(row).and_then(|index| app.queue.get(index)) else {
             break;
         };
-        let lead = queue_marks(app, qi);
+        let lead = queue_marks(app, row);
         let line = trunc(&format!("{lead}{}", entry.title), width);
         // The cursor owns the row it is on, exactly as it does in the browse
         // list: a row that was both the cursor and the one in the speakers
         // would otherwise be asked to wear two foregrounds.
-        let style = if qi == app.queue_selected {
+        let style = if row == app.queue_selected {
             t.cursor(focused)
-        } else if qi == app.queue_pos {
+        } else if row == playing_row {
             t.on(t.active)
-        } else if qi < app.queue_pos {
+        } else if row < playing_row {
             t.on(t.faint)
         } else {
             t.on(t.text)
@@ -6978,6 +6986,92 @@ mod tests {
             rows.iter().any(|r| r.contains("Track 5")),
             "what is still to come is below it: {rows:?}"
         );
+    }
+
+    /// A queue built the way a listener builds one, with the shuffle on: Enter
+    /// on the browse list, then `s`. The order only exists when the queue was
+    /// made through the code that lays one.
+    fn shuffled(n: u64) -> Screen {
+        let mut sc = screen();
+        sc.app.favorites = (1..=n).map(|i| track(i, &format!("Track {i}"))).collect();
+        sc.app
+            .on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        sc.app
+            .on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        sc
+    }
+
+    /// What the panel painted, with the two lead cells taken off each row.
+    fn queue_titles(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        queue_rows(app, w, h)
+            .into_iter()
+            .map(|r| r.trim_start_matches(['♪', '~', ' ']).to_string())
+            .filter(|r| !r.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn the_panel_draws_the_play_order_rather_than_the_listing_behind_it() {
+        // Goal: the panel is a readout of what will play. With the shuffle on
+        // that is the order, not the queue it is laid over - drawing the queue
+        // would put a track under the current row that is not the one coming
+        // next, which is the whole complaint. Method: build a shuffled queue
+        // through the keys and read the rows back out of a real frame.
+        let mut sc = shuffled(9);
+        let expected: Vec<String> = (0..9)
+            .filter_map(|row| sc.app.queue_at(row))
+            .filter_map(|index| sc.app.queue.get(index).map(|t| t.title.clone()))
+            .collect();
+        let drawn = queue_titles(&mut sc.app, WIDE_COLS, 30);
+        assert!(drawn.len() >= 5, "too few rows to tell: {drawn:?}");
+        assert_eq!(drawn, expected[..drawn.len()], "the panel walks the order");
+        let listing: Vec<String> = sc.app.queue.iter().map(|t| t.title.clone()).collect();
+        assert_ne!(drawn, listing[..drawn.len()], "and it was dealt: {drawn:?}");
+    }
+
+    #[test]
+    fn history_in_the_panel_means_played_in_this_order() {
+        // Goal: with an order, everything the panel says about position has to
+        // be said about the row - "above the current track" means "already
+        // played in this order" and not "earlier in the listing", the ♪ is on
+        // the row the music is on, and the counter counts rows. Method: advance
+        // twice through the order and read the whole column, five queues over:
+        // one listing index that happened to equal its row would prove nothing.
+        for deal in 0..5 {
+            let mut sc = shuffled(9);
+            for _ in 0..2 {
+                sc.app
+                    .on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+            }
+            let t = sc.app.theme();
+            let mut term = Terminal::new(TestBackend::new(WIDE_COLS, 30)).expect("backend");
+            term.draw(|f| render(f, &mut sc.app)).expect("render");
+            let playing_row = sc.app.playing_row();
+            assert_eq!(playing_row, 2, "two rows into the order");
+
+            let inner = sc.app.queue_inner;
+            let buf = term.backend().buffer().clone();
+            let drawn = usize::from(inner.height).min(9);
+            for row in (0..drawn).filter(|row| *row != playing_row) {
+                let y = inner.y + u16::try_from(row).unwrap_or(0);
+                let want = if row < playing_row { t.faint } else { t.text };
+                assert_eq!(
+                    buf[(inner.x + 3, y)].fg,
+                    want,
+                    "row {row} of deal {deal} is on the wrong side of the music"
+                );
+                assert_ne!(buf[(inner.x, y)].symbol(), "♪", "one mark, on one row");
+            }
+            assert_eq!(
+                buf[(inner.x, inner.y + 2)].symbol(),
+                "♪",
+                "and it is on the row the music is on"
+            );
+            assert!(
+                text(&mut sc.app, WIDE_COLS, 30).contains("Queue 3/9"),
+                "the counter counts rows of the order"
+            );
+        }
     }
 
     #[test]
