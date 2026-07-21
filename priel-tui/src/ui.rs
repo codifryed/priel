@@ -2621,7 +2621,7 @@ mod tests {
     use super::{
         ControlBar, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, hint_width, push_hints, render,
     };
-    use crate::app::{App, Hit, Mode, View};
+    use crate::app::{App, Click, Hit, Mode, View};
     use crate::theme::Theme;
     use crate::worker::{FromWorker, ToWorker};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3853,6 +3853,27 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert_eq!(sc.app.selected, 2, "the third visible row");
+    }
+
+    #[test]
+    fn a_click_on_the_painted_bar_seeks_to_the_fraction_it_landed_on() {
+        // Goal: `progress_rect` is written by the renderer and read by the click
+        // handler, and a click that lands on the wrong seconds is invisible in a
+        // screenshot. Method: render a real frame, ask what a click on a known
+        // cell of the painted bar means, and check the seconds it names.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "Blue in Green"));
+        sc.app.status.duration = 200.0;
+        let _ = draw(&mut sc.app, 80, 24);
+
+        let pr = sc.app.progress_rect;
+        assert!(pr.width > 0, "the bar must have been given a rect");
+        assert_eq!(sc.app.click_at(pr.x, pr.y), Click::Seek(0.0));
+        assert_eq!(
+            sc.app.click_at(pr.x + pr.width / 2, pr.y),
+            Click::Seek(100.0),
+            "halfway along the bar is halfway through the track"
+        );
     }
 
     #[test]
