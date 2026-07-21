@@ -18,6 +18,7 @@
 
 //! Rendering. Also records list/progress rects into `App` for mouse hit-testing.
 
+use crossterm::event::KeyCode;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -76,6 +77,45 @@ const OVERLAY_NARROW: u16 = 64;
 /// Cells kept clear each side, so an overlay never touches the screen edge.
 const OVERLAY_MARGIN: u16 = 2;
 
+/// One piece of an overlay's footer: a key that can be clicked, or the prose
+/// between the keys.
+enum Foot {
+    /// What is printed, and the key it presses. The two are separate because
+    /// `Esc` is four cells and one key, and `g G` reads as a pair.
+    Key(&'static str, KeyCode),
+    Text(&'static str),
+}
+
+/// Draw an overlay's footer with every key in it live.
+///
+/// The bottom row's rule - **every key printed is itself the button** - applied
+/// to the overlays, which printed theirs as flat dim text. That was not a parity
+/// defect, since every action in these boxes is reachable with the mouse by
+/// other means, but in two of them it was worse than dead: any click closed the
+/// overlay, so clicking `j k scroll` did the opposite of what the words said.
+///
+/// The hit boxes come out of the same left-to-right walk that paints the spans,
+/// like every other control here, and the hit is [`Hit::Key`] - so a click here
+/// runs the key handler rather than a parallel implementation of it.
+///
+/// The caller must have cleared the frame's own hit boxes first: an overlay is
+/// modal, and the header behind it must not answer to a click that lands on the
+/// box drawn over it.
+fn overlay_footer(f: &mut Frame, app: &mut App, area: Rect, parts: &[Foot]) {
+    let t = app.theme();
+    let mut bar = ControlBar::new(area);
+    for part in parts {
+        match part {
+            Foot::Key(label, code) => {
+                bar.button(*label, Hit::Key(*code), Style::default().fg(t.text));
+            }
+            Foot::Text(text) => bar.label(*text, Style::default().fg(t.faint)),
+        }
+    }
+    app.hits.extend(bar.hits);
+    f.render_widget(Paragraph::new(Line::from(bar.spans)), area);
+}
+
 /// How wide an overlay is on this terminal: its bucket, or the room there is.
 fn overlay_width(area: Rect, cap: u16) -> u16 {
     area.width
@@ -127,10 +167,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
         help_overlay(f, app, area);
     }
     if app.mode == Mode::Log {
-        log_overlay(f, f.area(), app);
+        let area = f.area();
+        log_overlay(f, area, app);
     }
     if app.mode == Mode::Graph {
-        graph_overlay(f, f.area(), app);
+        let area = f.area();
+        graph_overlay(f, area, app);
     }
     if app.mode == Mode::Devices {
         device_overlay(f, f.area(), app);
@@ -332,16 +374,31 @@ fn add_to_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         add_to_rows(f, app, body);
     }
 
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "  j k move · g G ends · Enter add · click · Esc or q to close",
-            Style::default().fg(t.faint),
-        ))),
+    overlay_footer(
+        f,
+        app,
         Rect {
             y: inner.y + inner.height.saturating_sub(1),
             height: 1,
             ..inner
         },
+        &[
+            Foot::Text("  "),
+            Foot::Key("j", KeyCode::Char('j')),
+            Foot::Text(" "),
+            Foot::Key("k", KeyCode::Char('k')),
+            Foot::Text(" move \u{b7} "),
+            Foot::Key("g", KeyCode::Char('g')),
+            Foot::Text(" "),
+            Foot::Key("G", KeyCode::Char('G')),
+            Foot::Text(" ends \u{b7} "),
+            Foot::Key("Enter", KeyCode::Enter),
+            Foot::Text(" add \u{b7} click \u{b7} "),
+            Foot::Key("Esc", KeyCode::Esc),
+            Foot::Text(" or "),
+            Foot::Key("q", KeyCode::Char('q')),
+            Foot::Text(" to close"),
+        ],
     );
 }
 
@@ -992,8 +1049,12 @@ fn help_column(
 /// Modal and deliberately plain. This is the answer to "something just went
 /// wrong and I do not want to leave the player to find out what" - the same
 /// lines that are in the log file, without going to look for it.
-fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
+fn log_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme();
+    // Modal: whatever the header and the key row registered this frame is behind
+    // this box, and must not answer to a click that lands on the box drawn over
+    // it. Cleared before the footer registers its own.
+    app.hits.clear();
     let width = overlay_width(area, OVERLAY_WIDE);
     let height = area.height.saturating_sub(2);
     let rect = Rect {
@@ -1041,16 +1102,31 @@ fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), body);
 
     if inner.height > 0 {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "  j k scroll · g G oldest / newest · M, Esc or q to close",
-                Style::default().fg(t.faint),
-            ))),
+        overlay_footer(
+            f,
+            app,
             Rect {
                 y: inner.y + inner.height.saturating_sub(1),
                 height: 1,
                 ..inner
             },
+            &[
+                Foot::Text("  "),
+                Foot::Key("j", KeyCode::Char('j')),
+                Foot::Text(" "),
+                Foot::Key("k", KeyCode::Char('k')),
+                Foot::Text(" scroll · "),
+                Foot::Key("g", KeyCode::Char('g')),
+                Foot::Text(" "),
+                Foot::Key("G", KeyCode::Char('G')),
+                Foot::Text(" oldest / newest · "),
+                Foot::Key("M", KeyCode::Char('M')),
+                Foot::Text(", "),
+                Foot::Key("Esc", KeyCode::Esc),
+                Foot::Text(" or "),
+                Foot::Key("q", KeyCode::Char('q')),
+                Foot::Text(" to close"),
+            ],
         );
     }
 }
@@ -1069,8 +1145,11 @@ fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
 ///
 /// Modal and scrolled like the log overlay, and for the same reason - a second
 /// idiom for the same gesture is its own bug.
-fn graph_overlay(f: &mut Frame, area: Rect, app: &App) {
+fn graph_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme();
+    // Modal, like the log: the frame's own hit boxes go before the footer
+    // registers the keys it prints.
+    app.hits.clear();
     let rows = app.graph_rows();
     let width = overlay_width(area, OVERLAY_MEDIUM);
     // Two for the border, one for the way out. Sized to the content rather than
@@ -1113,16 +1192,31 @@ fn graph_overlay(f: &mut Frame, area: Rect, app: &App) {
         .collect();
     f.render_widget(Paragraph::new(lines), body);
 
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "  j k scroll · g G top / bottom · D, Esc or q to close",
-            Style::default().fg(t.faint),
-        ))),
+    overlay_footer(
+        f,
+        app,
         Rect {
             y: inner.y + inner.height.saturating_sub(1),
             height: 1,
             ..inner
         },
+        &[
+            Foot::Text("  "),
+            Foot::Key("j", KeyCode::Char('j')),
+            Foot::Text(" "),
+            Foot::Key("k", KeyCode::Char('k')),
+            Foot::Text(" scroll \u{b7} "),
+            Foot::Key("g", KeyCode::Char('g')),
+            Foot::Text(" "),
+            Foot::Key("G", KeyCode::Char('G')),
+            Foot::Text(" top / bottom \u{b7} "),
+            Foot::Key("D", KeyCode::Char('D')),
+            Foot::Text(", "),
+            Foot::Key("Esc", KeyCode::Esc),
+            Foot::Text(" or "),
+            Foot::Key("q", KeyCode::Char('q')),
+            Foot::Text(" to close"),
+        ],
     );
 }
 
@@ -1180,6 +1274,9 @@ const DEVICE_NAME_SHARE: u16 = 2;
 /// both directions.
 fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme();
+    // Modal, like the log. The rows are hit-tested by rect rather than by hit
+    // box, so what this clears is only what the frame behind registered.
+    app.hits.clear();
     let width = overlay_width(area, OVERLAY_WIDE);
     let height = area.height.saturating_sub(2);
     let rect = Rect {
@@ -1225,7 +1322,6 @@ fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         None => device_rows(f, app, body),
     }
 
-    let footer = Style::default().fg(t.faint);
     exclusive_toggle(
         f,
         app,
@@ -1235,16 +1331,35 @@ fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
             ..inner
         },
     );
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "  j k move · g G ends · Enter choose · x exclusive · click · d, Esc or q to close",
-            footer,
-        ))),
+    overlay_footer(
+        f,
+        app,
         Rect {
             y: inner.y + inner.height.saturating_sub(1),
             height: 1,
             ..inner
         },
+        &[
+            Foot::Text("  "),
+            Foot::Key("j", KeyCode::Char('j')),
+            Foot::Text(" "),
+            Foot::Key("k", KeyCode::Char('k')),
+            Foot::Text(" move \u{b7} "),
+            Foot::Key("g", KeyCode::Char('g')),
+            Foot::Text(" "),
+            Foot::Key("G", KeyCode::Char('G')),
+            Foot::Text(" ends \u{b7} "),
+            Foot::Key("Enter", KeyCode::Enter),
+            Foot::Text(" choose \u{b7} "),
+            Foot::Key("x", KeyCode::Char('x')),
+            Foot::Text(" exclusive \u{b7} click \u{b7} "),
+            Foot::Key("d", KeyCode::Char('d')),
+            Foot::Text(", "),
+            Foot::Key("Esc", KeyCode::Esc),
+            Foot::Text(" or "),
+            Foot::Key("q", KeyCode::Char('q')),
+            Foot::Text(" to close"),
+        ],
     );
 }
 
@@ -1351,6 +1466,8 @@ const THEME_NAME_FIELD: usize = 15;
 /// picker is for.
 fn theme_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme();
+    // Modal, like the picker it is modelled on.
+    app.hits.clear();
     let current = app.theme_name();
     let selected = app.theme_selected();
     let width = overlay_width(area, OVERLAY_MEDIUM);
@@ -1400,16 +1517,33 @@ fn theme_overlay(f: &mut Frame, area: Rect, app: &mut App) {
             ..inner
         },
     );
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "  j k move · g G ends · Enter choose · click · t, Esc or q to close",
-            footer,
-        ))),
+    overlay_footer(
+        f,
+        app,
         Rect {
             y: inner.y + inner.height.saturating_sub(1),
             height: 1,
             ..inner
         },
+        &[
+            Foot::Text("  "),
+            Foot::Key("j", KeyCode::Char('j')),
+            Foot::Text(" "),
+            Foot::Key("k", KeyCode::Char('k')),
+            Foot::Text(" move \u{b7} "),
+            Foot::Key("g", KeyCode::Char('g')),
+            Foot::Text(" "),
+            Foot::Key("G", KeyCode::Char('G')),
+            Foot::Text(" ends \u{b7} "),
+            Foot::Key("Enter", KeyCode::Enter),
+            Foot::Text(" choose \u{b7} click \u{b7} "),
+            Foot::Key("t", KeyCode::Char('t')),
+            Foot::Text(", "),
+            Foot::Key("Esc", KeyCode::Esc),
+            Foot::Text(" or "),
+            Foot::Key("q", KeyCode::Char('q')),
+            Foot::Text(" to close"),
+        ],
     );
 }
 
@@ -1562,21 +1696,44 @@ fn help_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         // The way out is always shown, and so is the way down when there is
         // more below: a reference that silently ended would be a reference that
         // silently lost bindings.
-        let footer = if furthest > 0 {
-            "  j k scroll · g G ends · ?, Esc or q to close"
+        // The scrolling keys are only printed where there is something below
+        // to scroll to, so they are only clickable there either - a live key
+        // that did nothing would be worse than the dim text it replaced.
+        let scrolling = [
+            Foot::Text("  "),
+            Foot::Key("j", KeyCode::Char('j')),
+            Foot::Text(" "),
+            Foot::Key("k", KeyCode::Char('k')),
+            Foot::Text(" scroll \u{b7} "),
+            Foot::Key("g", KeyCode::Char('g')),
+            Foot::Text(" "),
+            Foot::Key("G", KeyCode::Char('G')),
+            Foot::Text(" ends \u{b7} "),
+        ];
+        let closing = [
+            Foot::Key("?", KeyCode::Char('?')),
+            Foot::Text(", "),
+            Foot::Key("Esc", KeyCode::Esc),
+            Foot::Text(" or "),
+            Foot::Key("q", KeyCode::Char('q')),
+            Foot::Text(" to close"),
+        ];
+        let mut parts: Vec<Foot> = Vec::new();
+        if furthest > 0 {
+            parts.extend(scrolling);
         } else {
-            "  ?, Esc or q to close"
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                footer,
-                Style::default().fg(t.faint),
-            ))),
+            parts.push(Foot::Text("  "));
+        }
+        parts.extend(closing);
+        overlay_footer(
+            f,
+            app,
             Rect {
                 y: inner.y + inner.height.saturating_sub(1),
                 height: 1,
                 ..inner
             },
+            &parts,
         );
     }
 }
@@ -4368,10 +4525,22 @@ mod tests {
             .filter(|(_, h)| h.is_some())
             .count();
         let _ = draw(&mut sc.app, 120, 40);
+        // The footer's own keys are counted separately below: they are
+        // `Hit::Key`, they press a key rather than name an action, and they are
+        // not rows of the reference.
+        let rows = sc
+            .app
+            .hits
+            .iter()
+            .filter(|(_, h)| !matches!(h, Hit::Key(_)))
+            .count();
         assert_eq!(
-            sc.app.hits.len(),
-            wanted,
+            rows, wanted,
             "every action in the reference has to publish a hit box"
+        );
+        assert!(
+            sc.app.hits.iter().any(|(_, h)| matches!(h, Hit::Key(_))),
+            "and the footer's own keys are buttons too"
         );
 
         for (hit, glyph) in [
@@ -5278,6 +5447,71 @@ mod tests {
             return (left, right, line);
         }
         panic!("{name} drew no overlay at {w}x{h}")
+    }
+
+    #[test]
+    fn a_key_printed_in_an_overlay_footer_is_the_button_for_it() {
+        // Goal: audit finding 12. The bottom row's rule is that every key
+        // printed is itself the button, and the overlay footers printed theirs
+        // as flat text. In the log and the report that was worse than dead:
+        // *any* click closed them, so clicking `j k scroll` did the opposite of
+        // what the words said. Method: open the report with enough rows to
+        // scroll, click the `j` that was painted, and check what moved.
+        let mut sc = screen();
+        sc.app.mode = Mode::Graph;
+        let _ = draw(&mut sc.app, 100, 12);
+        let before = sc.app.graph_offset();
+
+        click_hit(&mut sc.app, Hit::Key(KeyCode::Char('j')));
+        assert_eq!(sc.app.mode, Mode::Graph, "the click closed the report");
+        assert_eq!(
+            sc.app.graph_offset(),
+            before + 1,
+            "the click on `j` did not scroll the way `j` does"
+        );
+
+        // And the way out still works, from the word that names it.
+        let _ = draw(&mut sc.app, 100, 12);
+        click_hit(&mut sc.app, Hit::Key(KeyCode::Esc));
+        assert_eq!(sc.app.mode, Mode::Normal, "Esc is not the button for Esc");
+    }
+
+    #[test]
+    fn a_click_off_the_footer_still_closes_the_overlay() {
+        // Goal: the footer going live must not cost the overlays the way out
+        // they already had - a click anywhere closes them, and that is how a
+        // listener dismisses one without aiming. Method: click a cell inside
+        // the box that is not a key.
+        let mut sc = screen();
+        sc.app.mode = Mode::Graph;
+        let _ = draw(&mut sc.app, 100, 12);
+        sc.app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 50,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(sc.app.mode, Mode::Normal, "a click off a key must close it");
+    }
+
+    #[test]
+    fn an_overlay_swallows_a_click_meant_for_what_is_behind_it() {
+        // Goal: an overlay is modal, so the header's controls underneath must
+        // not answer a click that lands on the box drawn over them. The four
+        // that went live now clear the frame's hit boxes to make room for their
+        // own, and clearing is what makes this true. Method: open one and read
+        // back what is clickable.
+        for mode in [Mode::Graph, Mode::Log, Mode::Devices, Mode::Themes] {
+            let mut sc = screen();
+            let name = format!("{mode:?}");
+            sc.app.mode = mode;
+            let _ = draw(&mut sc.app, 120, 30);
+            assert!(
+                sc.app.hits.iter().all(|(_, h)| matches!(h, Hit::Key(_))),
+                "{name} left the frame behind it clickable: {:?}",
+                sc.app.hits
+            );
+        }
     }
 
     #[test]

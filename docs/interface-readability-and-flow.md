@@ -61,7 +61,7 @@ and web typography and does not transfer; I have not cited it where it does not.
 | 9 | Overlay body text hugs the border, footers do not | low | none | guidance | **done** |
 | 10 | Overlay widths are an arbitrary ladder | low | low | taste | **done** |
 | 11 | The report and the device picker are both "Output" | low | low | taste | **done** |
-| 12 | Overlay footers are dead text | low | medium | taste | propose |
+| 12 | Overlay footers are dead text | low | medium | taste | **done** |
 | 13 | Small wording and spacing inconsistencies | low | none | mixed | **done** |
 
 "guidance" means I can point at a rule I consulted or at a rule this repository
@@ -489,7 +489,7 @@ The empty heading is fixed too, and was never taste: the report substitutes
 The substitution is in the *report*, not in `verdict_words`, because that empty
 string is what suppresses the badge on the bottom row and must keep doing so.
 
-## 12. Overlay footers are dead text where the bottom row's keys are live
+## 12. Overlay footers are dead text where the bottom row's keys are live — **done**
 
 **Taste**, and the weakest item here.
 
@@ -508,6 +508,36 @@ hit box) - so the keyboard-only rule is satisfied. It is a consistency question
 about idiom, and making five footers into `ControlBar` walks is a medium change
 for a small gain. I would leave it, and note it here so it is a decision rather
 than an oversight.
+
+**Settled against that recommendation: all of them are live**, six rather than
+five - the keyboard reference's own footer was in the same state as the others,
+even though its rows were not.
+
+Reading the code turned up something the audit had missed, and it changes the
+weight of the finding. In the log and the report, **any** click closes the
+overlay. So the footer's keys were not merely dead: clicking `j k scroll` did
+the *opposite* of what the words said. That is not a consistency question.
+
+Two things made it small after all:
+
+- **One hit, `Hit::Key(KeyCode)`, rather than a vocabulary per overlay.** It
+  dispatches by feeding the key into `on_key`, so the click **is** the key
+  press, through the same door, in whatever mode is up. That is the house rule
+  about a key and a click running the same code taken literally, and it means a
+  new footer key costs one line and no plumbing.
+- **The footers became data** - a slice of `Foot::Key` and `Foot::Text` - drawn
+  by one renderer that registers each hit box in the same left-to-right walk
+  that paints its span.
+
+Four overlays had to start clearing the frame's hit boxes first, which they had
+never needed to do while nothing in them was clickable. Without it a modal box
+would let the header behind it answer a click that landed on the box itself.
+That has its own test, over all four.
+
+A click **off** a key still closes, so the way out that needed no aim is intact,
+and that has a test too. Verified by mutation: disabling the footer route fails
+the first test and nothing else; dropping one overlay's hit clearing fails the
+modality test and nothing else.
 
 ## 13. Small wording and spacing — **done**
 

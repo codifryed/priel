@@ -313,6 +313,15 @@ pub enum Hit {
     SubmitPrompt,
     /// Abandon the name prompt.
     CancelPrompt,
+    /// A key, made clickable where it is printed.
+    ///
+    /// The overlays print their keys in a footer, and those footers were flat
+    /// text while the bottom row's keys were buttons - so clicking `j k scroll`
+    /// in the report closed it, which is the opposite of what it says. This is
+    /// how they became live without giving each overlay its own vocabulary of
+    /// hits: the click **is** the key press, fed to the same handler through the
+    /// same door, so the two can never come to mean different things.
+    Key(KeyCode),
     /// Go through with the change the confirmation is asking about.
     ///
     /// The only control in priel that destroys something, which is why it is a
@@ -4474,7 +4483,36 @@ impl App {
     /// Each overlay owns the pointer while it is on screen: nothing behind one
     /// may be reached through it, and the two that ask a question answer only
     /// where their own controls were painted.
+    /// A click on a key an overlay printed in its footer, if that is what it is.
+    ///
+    /// The bottom row's rule - every key printed is itself the button - applied
+    /// to the overlays. Asked before anything else those overlays do with a
+    /// click, because two of them answer *any* click by closing: before this,
+    /// clicking `j k scroll` in the report closed the report.
+    ///
+    /// Only these five. The consent, sign-in, prompt and confirm screens already
+    /// route every click through their own hit boxes, and asking twice would
+    /// dispatch one click as two.
+    fn footer_key_clicked(&mut self, m: MouseEvent) -> bool {
+        if !matches!(
+            self.mode,
+            Mode::Log | Mode::Graph | Mode::Devices | Mode::Themes | Mode::AddTo
+        ) || !matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            return false;
+        }
+        let Some(h @ Hit::Key(_)) = self.hit_at(m.column, m.row) else {
+            return false;
+        };
+        self.dispatch(h);
+        self.dirty = true;
+        true
+    }
+
     fn on_mouse_overlay(&mut self, m: MouseEvent) -> bool {
+        if self.footer_key_clicked(m) {
+            return true;
+        }
         // The picker answers like the other two: a row chooses, anything else
         // closes it. Adding a track to a playlist takes nothing away, so a
         // click that misses can safely mean "never mind".
@@ -4646,6 +4684,9 @@ impl App {
             Hit::Next => self.user_next(),
             Hit::SeekBack => self.player.seek_relative(-5.0),
             Hit::SeekFwd => self.player.seek_relative(5.0),
+            // Straight back through the front door: whatever the key does in
+            // whatever mode is up, this does, because it is that key.
+            Hit::Key(code) => self.on_key(KeyEvent::new(code, KeyModifiers::NONE)),
             Hit::MoveUp => self.move_up(1),
             Hit::MoveDown => self.move_down(1),
             Hit::HalfPageUp => self.move_up(self.half_page()),
