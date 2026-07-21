@@ -3256,6 +3256,20 @@ mod tests {
     }
 
     #[test]
+    fn the_row_that_is_both_playing_and_selected_reads_as_selected() {
+        // Goal: the two states meet on one row whenever you press play and
+        // leave the cursor where it was, which is the ordinary way to start a
+        // track. The cursor has to win there too, or the row you are pointing
+        // at stops looking pointed at for as long as it plays. Method: put
+        // both on the same striped row and read the backing back.
+        let mut sc = listing(6);
+        sc.app.now_playing = Some(track(4, "Track 4"));
+        sc.app.selected = 3;
+        let t = sc.app.theme();
+        assert_eq!(one_backing(&mut sc.app, 120, 12, 3), t.selection_bg);
+    }
+
+    #[test]
     fn the_stripe_belongs_to_the_track_and_not_to_the_screen_row() {
         // Goal: striping by screen row would repaint every row of the list on
         // a one-row scroll, which reads as the whole list flickering rather
