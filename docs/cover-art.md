@@ -1,13 +1,20 @@
 # Album cover art in a terminal
 
-The settled design for drawing the album cover in the now-playing box. Recorded
-here rather than in the issue thread because `tea` truncates every comment body
-at about 80 characters, so a design that lives only in a comment cannot be read
-by anyone working from the tracker.
+The design for drawing the album cover in the now-playing box, and now the
+record of what was built. Recorded here rather than in the issue thread because
+`tea` truncates every comment body at about 80 characters, so a design that
+lives only in a comment cannot be read by anyone working from the tracker.
 
 Every heading below was settled with the maintainer question by question. Where
 the answer went against a recommendation, both the answer and the recommendation
 are recorded, so the choice reads as made rather than as overlooked.
+
+**Status: built.** The renderer, the layout and the fold are in `art.rs` and
+`ui.rs`; the cover id and byte fetch are in `priel-core`; the fetch, decode and
+wiring are in `worker.rs` and `app.rs`. The one thing that could not be verified
+here - the cover URL pattern - is called out again under *Open* at the foot, and
+is isolated in `priel_core::cover_url` so that a correction touches one function
+and nothing downstream.
 
 ## The technique: half blocks, not a terminal protocol
 
@@ -165,12 +172,41 @@ document predicted. The inventory needs updating when it lands.
 - **A cover that fails to fetch or decode is absent, not an error banner.** The
   box renders exactly as it does today with the art folded away.
 
-## Open, and deliberately not settled here
+## Open, still
 
-- **The cover URL pattern.** There are no API captures in this repository, so
-  the exact form was not verified. It must be confirmed against a real response
-  before being written down as fact.
-- **The row breakpoint's actual number**, which wants measuring against a real
-  list rather than guessing.
-- **What goes in the free rows** beside the art's upper half. That is the
-  separate "more track detail" request and should be settled on its own terms.
+- **The cover URL pattern is unverified.** `priel_core::cover_url` builds the
+  documented public form - the cover id with its dashes turned into path
+  separators, under `resources.tidal.com/images`, at a square size - but there
+  are no API captures in this repository to check it against a live response.
+  It **must be confirmed on real hardware**. Its shape is pinned by a test, so a
+  correction keeps everything that test asserts; a wrong host or path template
+  is a one-line change in that one function, and every stage downstream of it -
+  fetch, decode, draw - is proven independently. A cover that will not fetch or
+  decode is drawn as absent, so getting this wrong degrades to today's
+  behaviour rather than to an error.
+- **The row breakpoint** is `COVER_MIN_HEIGHT = 30` and the block size is
+  `COVER_ROWS = 8`, both in `ui.rs`. Chosen rather than measured; they want a
+  look on a real terminal, and each is one constant in one place.
+- **What goes in the free rows** beside the art's upper half is still open. The
+  art takes a column on the left and the three facts sit bottom-aligned beside
+  it, so the rows above them are empty for now. That space is the separate
+  "more track detail" request and should be settled on its own terms.
+
+## What was built, in one place
+
+- `art.rs` - `Image`, `decode_jpeg` (zune-jpeg, RGB), `draw` (half blocks, box
+  filter). Pure and fully unit-tested, including a real embedded JPEG.
+- `priel-core` - `Track::cover` (the id, off the wire at last), `cover_url` (the
+  unverified pattern, isolated), `fetch_bytes` (an unauthenticated capped GET of
+  an absolute URL).
+- `worker.rs` - `ToWorker::FetchCover` / `FromWorker::Cover`: the fetch and the
+  decode both happen here, off the render thread, and only a success is sent.
+- `app.rs` - `poll_cover` asks once per track however the track started;
+  `on_cover` keeps a reply only while its track still plays; `cover_for_now_playing`
+  answers the renderer.
+- `ui.rs` - `now_playing_rows` / `cover_wanted` size the box; `cover_column`
+  draws the art and bottom-aligns the text; a header control (`▣`) and the `C`
+  key fold it, gated to a tall enough terminal.
+
+zune-jpeg is the workspace's first genuinely new dependency; its justification
+lives in the workspace `Cargo.toml` beside the entry.
