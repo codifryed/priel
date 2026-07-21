@@ -58,6 +58,18 @@ pub(crate) const PLAYER_INTERFACE: &str = "org.mpris.MediaPlayer2.Player";
 /// `Introspect`.
 pub(crate) const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 
+/// No consumer calls this - all four use generated or hardcoded definitions,
+/// and Chromium answers it with an empty `<node></node>` that Plasma renders
+/// fine. It is implemented anyway, because `busctl`, `gdbus` and `d-feet` are
+/// how this gets debugged.
+const INTROSPECTABLE_INTERFACE: &str = "org.freedesktop.DBus.Introspectable";
+
+/// The errors the property interface answers with, spelled as `dbus-broker`
+/// spells them so that `busctl` prints something a reader recognises.
+const ERROR_INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
+const ERROR_UNKNOWN_PROPERTY: &str = "org.freedesktop.DBus.Error.UnknownProperty";
+const ERROR_READ_ONLY: &str = "org.freedesktop.DBus.Error.PropertyReadOnly";
+
 /// What priel calls itself on the desktop.
 ///
 /// **Never empty.** Plasma discards a player with an empty `Identity` as
@@ -81,6 +93,81 @@ pub(crate) const POSITION: &str = "Position";
 /// The app refreshes about ten times a second, so a whole second and a half of
 /// slack costs nothing and covers a tick that was held up by a redraw.
 const SEEK_JUMP_US: i64 = 1_500_000;
+
+/// What `Introspect` answers with: exactly what priel implements, and nothing
+/// it does not.
+///
+/// A constant rather than something generated, because it describes a
+/// specification that has not moved since 2006 and because no consumer reads
+/// it. `busctl introspect priel /org/mpris/MediaPlayer2` is what this is for.
+const INTROSPECTION: &str = r#"<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+ <interface name="org.freedesktop.DBus.Introspectable">
+  <method name="Introspect"><arg name="xml_data" type="s" direction="out"/></method>
+ </interface>
+ <interface name="org.freedesktop.DBus.Peer">
+  <method name="Ping"/>
+  <method name="GetMachineId"><arg name="machine_uuid" type="s" direction="out"/></method>
+ </interface>
+ <interface name="org.freedesktop.DBus.Properties">
+  <method name="Get">
+   <arg name="interface_name" type="s" direction="in"/>
+   <arg name="property_name" type="s" direction="in"/>
+   <arg name="value" type="v" direction="out"/>
+  </method>
+  <method name="GetAll">
+   <arg name="interface_name" type="s" direction="in"/>
+   <arg name="properties" type="a{sv}" direction="out"/>
+  </method>
+  <method name="Set">
+   <arg name="interface_name" type="s" direction="in"/>
+   <arg name="property_name" type="s" direction="in"/>
+   <arg name="value" type="v" direction="in"/>
+  </method>
+  <signal name="PropertiesChanged">
+   <arg name="interface_name" type="s"/>
+   <arg name="changed_properties" type="a{sv}"/>
+   <arg name="invalidated_properties" type="as"/>
+  </signal>
+ </interface>
+ <interface name="org.mpris.MediaPlayer2">
+  <method name="Quit"/>
+  <property name="CanQuit" type="b" access="read"/>
+  <property name="CanRaise" type="b" access="read"/>
+  <property name="HasTrackList" type="b" access="read"/>
+  <property name="Identity" type="s" access="read"/>
+  <property name="DesktopEntry" type="s" access="read"/>
+  <property name="SupportedUriSchemes" type="as" access="read"/>
+  <property name="SupportedMimeTypes" type="as" access="read"/>
+ </interface>
+ <interface name="org.mpris.MediaPlayer2.Player">
+  <method name="Next"/>
+  <method name="Previous"/>
+  <method name="Pause"/>
+  <method name="PlayPause"/>
+  <method name="Play"/>
+  <method name="Seek"><arg name="Offset" type="x" direction="in"/></method>
+  <method name="SetPosition">
+   <arg name="TrackId" type="o" direction="in"/>
+   <arg name="Position" type="x" direction="in"/>
+  </method>
+  <signal name="Seeked"><arg name="Position" type="x"/></signal>
+  <property name="PlaybackStatus" type="s" access="read"/>
+  <property name="Metadata" type="a{sv}" access="read"/>
+  <property name="Position" type="x" access="read"/>
+  <property name="Rate" type="d" access="read"/>
+  <property name="MinimumRate" type="d" access="read"/>
+  <property name="MaximumRate" type="d" access="read"/>
+  <property name="Volume" type="d" access="readwrite"/>
+  <property name="Shuffle" type="b" access="readwrite"/>
+  <property name="CanGoNext" type="b" access="read"/>
+  <property name="CanGoPrevious" type="b" access="read"/>
+  <property name="CanPlay" type="b" access="read"/>
+  <property name="CanPause" type="b" access="read"/>
+  <property name="CanSeek" type="b" access="read"/>
+  <property name="CanControl" type="b" access="read"/>
+ </interface>
+</node>"#;
 
 /// The queue entry playing now.
 ///
@@ -311,6 +398,306 @@ pub(crate) fn properties_changed(interface: &str, changed: Vec<(String, Variant)
 pub(crate) fn seeked_signal(position_us: i64) -> Message {
     Message::signal(0, OBJECT_PATH, PLAYER_INTERFACE, "Seeked")
         .with_body(vec![Arg::Value(Value::Int64(position_us))])
+}
+
+/// What a transport method asks the app to do.
+///
+/// **Every one of these runs a method the keyboard and the mouse already
+/// call.** MPRIS is a third caller of actions that exist, never a back door
+/// through which one arrives with no way to reach it from the terminal - which
+/// is why there is no `Stop` here, and no `OpenUri`: priel has neither action.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BusCommand {
+    Next,
+    Previous,
+    Play,
+    Pause,
+    PlayPause,
+    /// Move to this many microseconds into the current track. Already resolved
+    /// against both ends of it - see [`seek`] and [`set_position`], which are
+    /// not symmetric.
+    SeekTo(i64),
+    Shuffle(bool),
+    /// The volume as a fraction of unity, which is the scale MPRIS carries.
+    Volume(f64),
+    Quit,
+}
+
+/// The answer to one method call: a reply, an action, or both.
+///
+/// Two independent answers and not a priority chain, for the same reason `Plan`
+/// has three: a transport method both does something *and* has to be
+/// acknowledged, and collapsing them leaves either a consumer waiting or a
+/// button that does nothing.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Answer {
+    pub(crate) reply: Option<Message>,
+    pub(crate) command: Option<BusCommand>,
+}
+
+impl Answer {
+    /// A call answered with a value and nothing else.
+    fn said(reply: Message) -> Self {
+        Self {
+            reply: Some(reply),
+            command: None,
+        }
+    }
+
+    /// A call acknowledged, whether or not it came to anything: a `SetPosition`
+    /// naming a track that has already finished is answered and then ignored.
+    fn did(call: &Message, command: Option<BusCommand>) -> Self {
+        Self {
+            reply: Some(Message::method_return(0, call)),
+            command,
+        }
+    }
+}
+
+/// Where a seek lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seek {
+    /// This many microseconds into the current track.
+    To(i64),
+    /// Past the end of it, which spec 2.2 says is the next track.
+    Next,
+    /// Nowhere at all.
+    Nothing,
+}
+
+/// The answer to one call on one of priel's interfaces, or `None` where the
+/// call is not for priel to answer.
+///
+/// Pure, in the shape `App::decide` established: the connection mints the
+/// serial and writes the reply, and the app runs the command. `None` falls
+/// through to the connection's own `UnknownMethod`, which is what a consumer
+/// probing for `TrackList` gets.
+pub(crate) fn answer(call: &Message, snapshot: &Snapshot) -> Option<Answer> {
+    // priel publishes exactly one object. `Peer` lives at every path and is
+    // answered below this; nothing here does.
+    if call.path() != Some(OBJECT_PATH) {
+        return None;
+    }
+    let member = call.member().unwrap_or_default();
+    match (call.interface(), member) {
+        (Some(INTROSPECTABLE_INTERFACE), "Introspect") => Some(Answer::said(
+            Message::method_return(0, call)
+                .with_body(vec![Arg::Value(Value::Str(INTROSPECTION.to_owned()))]),
+        )),
+        (Some(PROPERTIES_INTERFACE), "Get") => Some(get(call, snapshot)),
+        (Some(PROPERTIES_INTERFACE), "GetAll") => Some(get_all(call, snapshot)),
+        (Some(PROPERTIES_INTERFACE), "Set") => Some(set(call)),
+        (Some(ROOT_INTERFACE), "Quit") => Some(Answer::did(call, Some(BusCommand::Quit))),
+        (Some(PLAYER_INTERFACE), _) => transport(call, snapshot),
+        _ => None,
+    }
+}
+
+/// One property, as the variant a `Get` answers with.
+///
+/// This is how Plasma's seek bar and playerctl read `Position`, so it has to
+/// answer for a property that `PropertiesChanged` may never carry.
+fn get(call: &Message, snapshot: &Snapshot) -> Answer {
+    let (Some(interface), Some(property)) = (text_at(&call.body, 0), text_at(&call.body, 1)) else {
+        return Answer::said(invalid(call, "Get takes an interface and a property"));
+    };
+    match properties_of(interface, snapshot)
+        .into_iter()
+        .find(|(name, _)| name == property)
+    {
+        Some((_, value)) => {
+            Answer::said(Message::method_return(0, call).with_body(vec![Arg::Variant(value)]))
+        }
+        None => Answer::said(Message::error(
+            0,
+            call,
+            ERROR_UNKNOWN_PROPERTY,
+            &format!("priel publishes no \"{property}\" on \"{interface}\""),
+        )),
+    }
+}
+
+/// A whole interface at once, which is how every consumer reads state.
+///
+/// An interface priel does not implement is answered with an empty set rather
+/// than an error: Plasma treats an error from a `GetAll` as a defect and drops
+/// the player, and a consumer optimistically probing for `TrackList` must not
+/// be able to cost priel its place on the panel.
+fn get_all(call: &Message, snapshot: &Snapshot) -> Answer {
+    let Some(interface) = text_at(&call.body, 0) else {
+        return Answer::said(invalid(call, "GetAll takes an interface"));
+    };
+    Answer::said(
+        Message::method_return(0, call)
+            .with_body(vec![Arg::Dict(properties_of(interface, snapshot))]),
+    )
+}
+
+/// The two properties a consumer may write.
+///
+/// Both are absolute where priel has a toggle, which is the whole reason
+/// `Player::set_paused` and `App::set_shuffle` exist. The change is announced by
+/// the next tick's diff, so there is no second path that emits one.
+fn set(call: &Message) -> Answer {
+    let (Some(interface), Some(property)) = (text_at(&call.body, 0), text_at(&call.body, 1)) else {
+        return Answer::said(invalid(
+            call,
+            "Set takes an interface, a property and a value",
+        ));
+    };
+    let Some(Arg::Variant(Variant::Value(value))) = call.body.get(2) else {
+        return Answer::said(invalid(call, "Set takes its value in a variant"));
+    };
+    let command = match (interface, property, value) {
+        (PLAYER_INTERFACE, "Volume", Value::Double(volume)) => {
+            // Spec 2.2: a negative volume is the same as silence, not an error.
+            BusCommand::Volume(volume.max(0.0))
+        }
+        (PLAYER_INTERFACE, "Shuffle", Value::Bool(on)) => BusCommand::Shuffle(*on),
+        (PLAYER_INTERFACE, "Volume" | "Shuffle", _) => {
+            return Answer::said(invalid(call, "that property is not of that type"));
+        }
+        _ => {
+            let known = properties_of(interface, &Snapshot::default())
+                .iter()
+                .any(|(name, _)| name == property);
+            let (error, text) = if known {
+                (ERROR_READ_ONLY, "priel does not let that property be set")
+            } else {
+                (ERROR_UNKNOWN_PROPERTY, "priel publishes no such property")
+            };
+            return Answer::said(Message::error(0, call, error, text));
+        }
+    };
+    Answer::did(call, Some(command))
+}
+
+/// The methods that move playback.
+fn transport(call: &Message, snapshot: &Snapshot) -> Option<Answer> {
+    let command = match call.member().unwrap_or_default() {
+        "Next" => BusCommand::Next,
+        "Previous" => BusCommand::Previous,
+        // **Absolute, never a toggle.** Answering `Play` with a toggle pauses a
+        // playing track when a panel applet's play button is pressed twice.
+        "Play" => BusCommand::Play,
+        "Pause" => BusCommand::Pause,
+        "PlayPause" => BusCommand::PlayPause,
+        "Seek" => {
+            let Some(offset_us) = int_at(&call.body, 0) else {
+                return Some(Answer::said(invalid(call, "Seek takes microseconds")));
+            };
+            let length = snapshot
+                .now
+                .track
+                .as_ref()
+                .map_or(0, |track| track.length_us);
+            return Some(Answer::did(
+                call,
+                landing(seek(snapshot.position_us, length, offset_us)),
+            ));
+        }
+        "SetPosition" => {
+            let (Some(asked), Some(position_us)) = (path_at(&call.body, 0), int_at(&call.body, 1))
+            else {
+                return Some(Answer::said(invalid(
+                    call,
+                    "SetPosition takes a track id and microseconds",
+                )));
+            };
+            return Some(Answer::did(
+                call,
+                landing(set_position(
+                    snapshot.now.track.as_ref(),
+                    asked,
+                    position_us,
+                )),
+            ));
+        }
+        _ => return None,
+    };
+    Some(Answer::did(call, Some(command)))
+}
+
+/// Where a *relative* seek lands.
+///
+/// **Not symmetric with [`set_position`], and the difference is easy to miss:**
+/// a negative overshoot clamps to the start of the track and a positive one is
+/// the next track, where an absolute seek out of range does nothing at all.
+fn seek(position_us: i64, length_us: i64, offset_us: i64) -> Seek {
+    let target = position_us.saturating_add(offset_us);
+    if target < 0 {
+        return Seek::To(0);
+    }
+    // A length of zero is one that is not known yet rather than a track of no
+    // duration, so there is no end to have overshot.
+    if length_us > 0 && target > length_us {
+        return Seek::Next;
+    }
+    Seek::To(target)
+}
+
+/// Where an *absolute* seek lands.
+///
+/// **Ignored when its track id is stale, which is the entire reason spec 2.2
+/// gives this method one:** a consumer that clicked its seek bar as the track
+/// changed would otherwise scrub the track that replaced it. Out of range it
+/// does nothing, where a relative seek clamps or skips.
+fn set_position(current: Option<&Entry>, asked: &str, position_us: i64) -> Seek {
+    let Some(track) = current else {
+        return Seek::Nothing;
+    };
+    if track.path != asked {
+        return Seek::Nothing;
+    }
+    if position_us < 0 || (track.length_us > 0 && position_us > track.length_us) {
+        return Seek::Nothing;
+    }
+    Seek::To(position_us)
+}
+
+fn landing(seek: Seek) -> Option<BusCommand> {
+    match seek {
+        Seek::To(position_us) => Some(BusCommand::SeekTo(position_us)),
+        Seek::Next => Some(BusCommand::Next),
+        Seek::Nothing => None,
+    }
+}
+
+/// Whichever interface was asked for, or an empty set for one priel does not
+/// implement.
+fn properties_of(interface: &str, snapshot: &Snapshot) -> Vec<(String, Variant)> {
+    match interface {
+        ROOT_INTERFACE => root_properties(),
+        PLAYER_INTERFACE => player_properties(snapshot),
+        _ => Vec::new(),
+    }
+}
+
+fn invalid(call: &Message, text: &str) -> Message {
+    Message::error(0, call, ERROR_INVALID_ARGS, text)
+}
+
+fn text_at(body: &[Arg], index: usize) -> Option<&str> {
+    match body.get(index) {
+        Some(Arg::Value(Value::Str(value))) => Some(value),
+        _ => None,
+    }
+}
+
+/// An object path argument, which is a distinct wire type from a string: a
+/// consumer sending `SetPosition` spells the track id `o`.
+fn path_at(body: &[Arg], index: usize) -> Option<&str> {
+    match body.get(index) {
+        Some(Arg::Value(Value::Path(value))) => Some(value),
+        _ => None,
+    }
+}
+
+fn int_at(body: &[Arg], index: usize) -> Option<i64> {
+    match body.get(index) {
+        Some(Arg::Value(Value::Int64(value))) => Some(*value),
+        _ => None,
+    }
 }
 
 fn boolean(name: &str, value: bool) -> (String, Variant) {
@@ -777,6 +1164,430 @@ mod tests {
         assert_eq!(signal.member(), Some("Seeked"));
         assert_eq!(signal.signature(), "x");
         assert_eq!(signal.body, vec![Arg::Value(Value::Int64(90_000_000))]);
+    }
+
+    // ---- what a consumer may ask for ----
+
+    /// A call arriving from a consumer, at the one object priel publishes.
+    fn call(interface: &str, member: &str, body: Vec<Arg>) -> Message {
+        Message {
+            kind: crate::bus::wire::MessageType::MethodCall,
+            flags: 0,
+            serial: 7,
+            fields: vec![
+                crate::bus::wire::Field::Path(OBJECT_PATH.to_owned()),
+                crate::bus::wire::Field::Interface(interface.to_owned()),
+                crate::bus::wire::Field::Member(member.to_owned()),
+                crate::bus::wire::Field::Sender(":1.99".to_owned()),
+            ],
+            body: Vec::new(),
+        }
+        .with_body(body)
+    }
+
+    fn string(value: &str) -> Arg {
+        Arg::Value(Value::Str(value.to_owned()))
+    }
+
+    /// The command a call produced, having checked it was acknowledged too.
+    fn ran(call: &Message, snapshot: &Snapshot) -> Option<BusCommand> {
+        let answered = answer(call, snapshot).expect("priel answers its own interfaces");
+        let reply = answered.reply.expect("every call is acknowledged");
+        assert_eq!(
+            reply.error_name(),
+            None,
+            "a transport method is not an error"
+        );
+        assert_eq!(reply.reply_serial(), Some(7));
+        answered.command
+    }
+
+    /// Goal: **`GetAll` plus `PropertiesChanged` is the actual wire contract** -
+    /// all four major consumers read state that way, and Plasma issues one
+    /// `GetAll` per interface and drops the player if either errors. Method:
+    /// both interfaces, checking neither answers with an error.
+    #[test]
+    fn both_interfaces_answer_get_all_without_erroring() {
+        let snapshot = playing();
+        for interface in [ROOT_INTERFACE, PLAYER_INTERFACE] {
+            let call = call(PROPERTIES_INTERFACE, "GetAll", vec![string(interface)]);
+            let answered = answer(&call, &snapshot).expect("priel implements this interface");
+            let reply = answered.reply.expect("a value comes back");
+            assert_eq!(reply.error_name(), None, "{interface} must not error");
+            assert_eq!(reply.signature(), "a{sv}");
+            let Some(Arg::Dict(properties)) = reply.body.first() else {
+                panic!("GetAll answers with a{{sv}}");
+            };
+            assert!(!properties.is_empty(), "{interface} published nothing");
+            assert_eq!(answered.command, None, "reading state does nothing");
+        }
+    }
+
+    /// Goal: an interface priel does not implement is answered with an empty
+    /// set and never an error, because Plasma treats an error from a `GetAll`
+    /// as a defect and drops the player - a consumer probing for `TrackList`
+    /// must not be able to cost priel its place on the panel. Method: the two
+    /// optional interfaces that are permanently out of scope.
+    #[test]
+    fn an_interface_priel_does_not_have_is_empty_rather_than_an_error() {
+        for interface in [
+            "org.mpris.MediaPlayer2.TrackList",
+            "org.mpris.MediaPlayer2.Playlists",
+        ] {
+            let call = call(PROPERTIES_INTERFACE, "GetAll", vec![string(interface)]);
+            let answered = answer(&call, &playing()).expect("GetAll is always answered");
+            let reply = answered.reply.expect("a value comes back");
+            assert_eq!(reply.error_name(), None, "{interface}");
+            assert_eq!(reply.body, vec![Arg::Dict(Vec::new())]);
+        }
+    }
+
+    /// Goal: **`Position` must answer a plain `Get`** - that is how Plasma's
+    /// seek bar and playerctl read it, and it is the one property that can
+    /// never arrive through a signal. Method: read it, and a property from the
+    /// root interface too.
+    #[test]
+    fn a_single_property_is_readable_and_the_position_above_all() {
+        let position = call(
+            PROPERTIES_INTERFACE,
+            "Get",
+            vec![string(PLAYER_INTERFACE), string(POSITION)],
+        );
+        let answered = answer(&position, &playing()).expect("Get is answered");
+        let reply = answered.reply.expect("a value comes back");
+        assert_eq!(reply.signature(), "v");
+        assert_eq!(
+            reply.body,
+            vec![Arg::Variant(Variant::Value(Value::Int64(42_000_000)))]
+        );
+
+        let identity = call(
+            PROPERTIES_INTERFACE,
+            "Get",
+            vec![string(ROOT_INTERFACE), string("Identity")],
+        );
+        let reply = answer(&identity, &playing())
+            .and_then(|answered| answered.reply)
+            .expect("a value comes back");
+        assert_eq!(
+            reply.body,
+            vec![Arg::Variant(Variant::Value(Value::Str("priel".into())))]
+        );
+    }
+
+    /// Goal: a property priel does not publish is an error rather than a
+    /// silence, so a consumer sees a service that answered. Method: a property
+    /// priel deliberately leaves out.
+    #[test]
+    fn a_property_priel_does_not_publish_says_so() {
+        let call = call(
+            PROPERTIES_INTERFACE,
+            "Get",
+            vec![string(PLAYER_INTERFACE), string("LoopStatus")],
+        );
+        let reply = answer(&call, &playing())
+            .and_then(|answered| answered.reply)
+            .expect("a reply either way");
+        assert_eq!(reply.error_name(), Some(ERROR_UNKNOWN_PROPERTY));
+    }
+
+    /// Goal: every transport method runs the action a key already runs, and is
+    /// acknowledged. Method: the whole set, mapped to the command each becomes.
+    #[test]
+    fn every_transport_method_runs_an_action_that_already_has_a_key() {
+        let snapshot = playing();
+        for (member, expected) in [
+            ("Next", BusCommand::Next),
+            ("Previous", BusCommand::Previous),
+            ("Play", BusCommand::Play),
+            ("Pause", BusCommand::Pause),
+            ("PlayPause", BusCommand::PlayPause),
+        ] {
+            let call = call(PLAYER_INTERFACE, member, Vec::new());
+            assert_eq!(ran(&call, &snapshot), Some(expected), "{member}");
+        }
+    }
+
+    /// Goal: `Play` and `Pause` are absolute where priel has a toggle. A
+    /// toggle answering `Play` pauses a playing track when a panel applet's
+    /// play button is pressed twice, which is the standard version of this bug.
+    /// Method: the three are three different commands.
+    #[test]
+    fn play_and_pause_are_not_the_toggle() {
+        let snapshot = playing();
+        let of = |member| ran(&call(PLAYER_INTERFACE, member, Vec::new()), &snapshot);
+        assert_ne!(of("Play"), of("Pause"));
+        assert_ne!(of("Play"), of("PlayPause"));
+        assert_ne!(of("Pause"), of("PlayPause"));
+    }
+
+    /// Goal: priel implements no action the terminal does not already have, so
+    /// `Stop` and `OpenUri` are absent rather than invented, and `TrackList` is
+    /// permanently out of scope. Method: `None` is what falls through to the
+    /// connection's own `UnknownMethod`.
+    #[test]
+    fn a_member_priel_has_no_action_for_is_left_to_the_unknown_method_reply() {
+        for (interface, member) in [
+            (PLAYER_INTERFACE, "Stop"),
+            (PLAYER_INTERFACE, "OpenUri"),
+            (ROOT_INTERFACE, "Raise"),
+            ("org.mpris.MediaPlayer2.TrackList", "GetTracksMetadata"),
+            ("org.mpris.MediaPlayer2.Playlists", "ActivatePlaylist"),
+        ] {
+            assert_eq!(
+                answer(&call(interface, member, Vec::new()), &playing()),
+                None,
+                "{interface}.{member}"
+            );
+        }
+    }
+
+    /// Goal: priel publishes one object, so a call at another path is not
+    /// priel's to answer. `Peer` lives at every path and is answered below
+    /// this. Method: a good call at a path priel publishes nothing at.
+    #[test]
+    fn a_call_at_another_object_path_is_not_answered() {
+        let mut elsewhere = call(PLAYER_INTERFACE, "Next", Vec::new());
+        elsewhere.fields = vec![
+            crate::bus::wire::Field::Path("/org/mpris/MediaPlayer2/TrackList".to_owned()),
+            crate::bus::wire::Field::Interface(PLAYER_INTERFACE.to_owned()),
+            crate::bus::wire::Field::Member("Next".to_owned()),
+        ];
+        assert_eq!(answer(&elsewhere, &playing()), None);
+    }
+
+    /// Goal: **`Seek` clamps a negative overshoot to 0 and treats a positive
+    /// one as `Next`.** Method: a table over both ends and the ordinary case,
+    /// including a track whose length is not known yet.
+    #[test]
+    fn a_relative_seek_clamps_backwards_and_skips_forwards() {
+        assert_eq!(
+            seek(10_000_000, 300_000_000, 5_000_000),
+            Seek::To(15_000_000)
+        );
+        assert_eq!(
+            seek(10_000_000, 300_000_000, -5_000_000),
+            Seek::To(5_000_000)
+        );
+        assert_eq!(
+            seek(10_000_000, 300_000_000, -60_000_000),
+            Seek::To(0),
+            "a negative overshoot is the start of the track"
+        );
+        assert_eq!(
+            seek(10_000_000, 300_000_000, 600_000_000),
+            Seek::Next,
+            "a positive overshoot is the next track"
+        );
+        assert_eq!(
+            seek(10_000_000, 0, 600_000_000),
+            Seek::To(610_000_000),
+            "a length of zero is one that is not known, not a track of no length"
+        );
+        assert_eq!(
+            seek(10_000_000, 300_000_000, i64::MIN),
+            Seek::To(0),
+            "and it may not overflow on the way"
+        );
+    }
+
+    /// Goal: **`SetPosition` does nothing when the position is out of range,
+    /// and is ignored when its track id is stale** - which is the entire reason
+    /// it takes one. Method: a table over both, against the entry playing now.
+    #[test]
+    fn an_absolute_seek_is_ignored_rather_than_clamped() {
+        let track = entry(1, "A Title");
+        let asked = track.path.clone();
+        assert_eq!(
+            set_position(Some(&track), &asked, 30_000_000),
+            Seek::To(30_000_000)
+        );
+        assert_eq!(
+            set_position(Some(&track), &asked, -1),
+            Seek::Nothing,
+            "out of range does nothing, where a relative seek clamps"
+        );
+        assert_eq!(
+            set_position(Some(&track), &asked, 600_000_000),
+            Seek::Nothing,
+            "and past the end is not the next track either"
+        );
+        assert_eq!(
+            set_position(Some(&track), &track_path(2), 30_000_000),
+            Seek::Nothing,
+            "a stale id is what this method's argument exists to catch"
+        );
+        assert_eq!(set_position(None, &asked, 30_000_000), Seek::Nothing);
+    }
+
+    /// Goal: both seeks reach the app as one command, and a seek that lands
+    /// nowhere is still acknowledged - a consumer waiting on a reply that never
+    /// comes is a hung panel. Method: through the whole dispatch, in
+    /// microseconds, which is the unit both take.
+    #[test]
+    fn a_seek_that_lands_nowhere_is_still_answered() {
+        let snapshot = playing();
+        let stale = call(
+            PLAYER_INTERFACE,
+            "SetPosition",
+            vec![
+                Arg::Value(Value::Path(track_path(99))),
+                Arg::Value(Value::Int64(1_000_000)),
+            ],
+        );
+        assert_eq!(ran(&stale, &snapshot), None);
+
+        let good = call(
+            PLAYER_INTERFACE,
+            "SetPosition",
+            vec![
+                Arg::Value(Value::Path(track_path(1))),
+                Arg::Value(Value::Int64(1_000_000)),
+            ],
+        );
+        assert_eq!(ran(&good, &snapshot), Some(BusCommand::SeekTo(1_000_000)));
+
+        let over = call(
+            PLAYER_INTERFACE,
+            "Seek",
+            vec![Arg::Value(Value::Int64(600_000_000))],
+        );
+        assert_eq!(
+            ran(&over, &snapshot),
+            Some(BusCommand::Next),
+            "past the end is the next track"
+        );
+    }
+
+    /// Goal: the two writable properties are the two priel has an absolute for,
+    /// and a write is acknowledged with an empty reply. The change itself is
+    /// announced by the next tick's diff, so there is no second path that emits
+    /// one. Method: both, plus the refusals.
+    #[test]
+    fn the_volume_and_the_shuffle_are_the_two_a_consumer_may_write() {
+        let snapshot = playing();
+        let set = |property: &str, value: Value| {
+            call(
+                PROPERTIES_INTERFACE,
+                "Set",
+                vec![
+                    string(PLAYER_INTERFACE),
+                    string(property),
+                    Arg::Variant(Variant::Value(value)),
+                ],
+            )
+        };
+        assert_eq!(
+            ran(&set("Volume", Value::Double(0.5)), &snapshot),
+            Some(BusCommand::Volume(0.5))
+        );
+        assert_eq!(
+            ran(&set("Volume", Value::Double(-2.0)), &snapshot),
+            Some(BusCommand::Volume(0.0)),
+            "spec 2.2 makes a negative volume silence rather than an error"
+        );
+        assert_eq!(
+            ran(&set("Shuffle", Value::Bool(true)), &snapshot),
+            Some(BusCommand::Shuffle(true))
+        );
+
+        let refused = |call: &Message| {
+            answer(call, &snapshot)
+                .and_then(|answered| answered.reply)
+                .and_then(|reply| reply.error_name().map(str::to_owned))
+        };
+        assert_eq!(
+            refused(&set("PlaybackStatus", Value::Str("Playing".into()))).as_deref(),
+            Some(ERROR_READ_ONLY),
+            "a property priel publishes but will not be told"
+        );
+        assert_eq!(
+            refused(&set("LoopStatus", Value::Str("Track".into()))).as_deref(),
+            Some(ERROR_UNKNOWN_PROPERTY)
+        );
+        assert_eq!(
+            refused(&set("Shuffle", Value::Str("yes".into()))).as_deref(),
+            Some(ERROR_INVALID_ARGS),
+            "the right property of the wrong type"
+        );
+    }
+
+    /// Goal: a body that is not the shape the member declares is an error
+    /// rather than a panic or a silent guess. Method: each member that takes
+    /// arguments, given none.
+    #[test]
+    fn a_call_with_the_wrong_body_is_refused_rather_than_guessed_at() {
+        let snapshot = playing();
+        for (interface, member) in [
+            (PROPERTIES_INTERFACE, "Get"),
+            (PROPERTIES_INTERFACE, "GetAll"),
+            (PROPERTIES_INTERFACE, "Set"),
+            (PLAYER_INTERFACE, "Seek"),
+            (PLAYER_INTERFACE, "SetPosition"),
+        ] {
+            let answered = answer(&call(interface, member, Vec::new()), &snapshot)
+                .expect("priel answers its own members");
+            let reply = answered.reply.expect("a reply either way");
+            assert_eq!(
+                reply.error_name(),
+                Some(ERROR_INVALID_ARGS),
+                "{interface}.{member}"
+            );
+            assert_eq!(answered.command, None, "and nothing happened");
+        }
+    }
+
+    /// Goal: `Quit` is on the bus because `q` is on the keyboard - `CanQuit`
+    /// would otherwise be a promise priel could not keep. Method: the command
+    /// it becomes.
+    #[test]
+    fn quit_is_offered_because_a_key_already_does_it() {
+        assert_eq!(
+            ran(&call(ROOT_INTERFACE, "Quit", Vec::new()), &playing()),
+            Some(BusCommand::Quit)
+        );
+        assert_eq!(boolean_at(&root_properties(), "CanQuit"), Some(true));
+    }
+
+    /// Goal: `Introspect` is what `busctl`, `gdbus` and `d-feet` use, and it
+    /// must describe what priel actually implements rather than the whole
+    /// specification. Method: check the members that exist are named and the
+    /// ones that do not are not.
+    #[test]
+    fn introspection_describes_what_priel_implements_and_no_more() {
+        let call = call(INTROSPECTABLE_INTERFACE, "Introspect", Vec::new());
+        let reply = answer(&call, &playing())
+            .and_then(|answered| answered.reply)
+            .expect("a value comes back");
+        assert_eq!(reply.signature(), "s");
+        let Some(Arg::Value(Value::Str(xml))) = reply.body.first() else {
+            panic!("Introspect answers with a string");
+        };
+        for named in [
+            "org.mpris.MediaPlayer2.Player",
+            "\"Seeked\"",
+            "\"SetPosition\"",
+            "\"Position\"",
+            "\"CanPlay\"",
+        ] {
+            assert!(
+                xml.contains(named),
+                "{named} is implemented but not described"
+            );
+        }
+        for absent in [
+            "MediaPlayer2.TrackList",
+            "MediaPlayer2.Playlists",
+            "\"Stop\"",
+            "\"OpenUri\"",
+            "\"Raise\"",
+            "LoopStatus",
+        ] {
+            assert!(
+                !xml.contains(absent),
+                "{absent} is described but not implemented"
+            );
+        }
     }
 
     /// Goal: the volume is a fraction of unity on the bus, where priel's own is
