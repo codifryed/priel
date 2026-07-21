@@ -133,6 +133,12 @@ pub enum ThemeName {
     OneDark,
     /// Dark on pure black, for an OLED panel.
     TrueBlack,
+    /// Dark, pastel.
+    Catppuccin,
+    /// Dark, indigo.
+    TokyoNight,
+    /// Light, indigo.
+    TokyoNightDay,
     /// Your terminal's own sixteen colours
     Terminal,
 }
