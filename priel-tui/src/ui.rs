@@ -5475,7 +5475,12 @@ mod tests {
         // Wide enough for the bottom row to still be carrying `[D] graph`,
         // which is the point: the badge is a second way in, never a
         // replacement for the labelled key that makes it discoverable.
-        let _ = text(&mut sc.app, 220, 12);
+        //
+        // 230, measured, not guessed. The figure rises whenever a hint is added
+        // ahead of this one - the repeat and radio keys pushed it up from 220 -
+        // because `push_hints` stops at the first hint that will not fit and
+        // `[D]` is deliberately last.
+        let _ = text(&mut sc.app, 230, 12);
         let boxes: Vec<Rect> = sc
             .app
             .hits
@@ -7148,8 +7153,12 @@ mod tests {
         // Wide enough is wider than it was: the readouts are back on this row,
         // and this hint is deliberately the first one the row gives up. `?` and
         // the heavy border are what make it findable at ordinary widths.
+        //
+        // 250, measured. This one sits past the end of `HINTS`, so every hint
+        // added ahead of it raises the figure - the repeat and radio keys took
+        // it from 210 to here.
         let mut sc = queued(6, 0);
-        assert_eq!(painted(&mut sc.app, 210, 30, Hit::CycleFocus), "Ctrl-W");
+        assert_eq!(painted(&mut sc.app, 250, 30, Hit::CycleFocus), "Ctrl-W");
         click_hit(&mut sc.app, Hit::CycleFocus);
         assert_eq!(sc.app.focus(), Focus::Queue);
     }
