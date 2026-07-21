@@ -1538,11 +1538,24 @@ fn heart_style(favorite: bool, t: &Theme) -> Style {
     }
 }
 
+/// The tab strip is a strip: every tab carries a backing, and the one you are
+/// on is lifted out of the others rather than being the only one with a colour
+/// behind it.
+///
+/// `nav-state-active` says where you are must be visually highlighted, and it
+/// was - but only the active tab had a background, so the other three were four
+/// words in a faint grey with the surface showing through, and the strip did
+/// not read as a strip at all. Sitting them on the stripe is what makes the
+/// difference between the two states a background rather than a text colour,
+/// and it costs no new role: it is the same whisper the list alternates with.
+///
+/// `terminal` has no stripe, so under it the tabs look exactly as they always
+/// did. That is the same deferral the rest of that palette makes.
 fn tab_style(active: bool, t: &Theme) -> Style {
     if active {
         t.selection().add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(t.faint)
+        t.stripe(true).fg(t.faint)
     }
 }
 
@@ -3336,6 +3349,77 @@ mod tests {
         assert!(
             !out.contains("tracks"),
             "there is no count to show, so none is claimed: {out}"
+        );
+    }
+
+    /// The one backing every cell of a control's hit box carries, or a panic
+    /// naming the control that came out in two colours.
+    fn painted_backing(app: &mut App, w: u16, h: u16, wanted: Hit) -> Color {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let rect = app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == wanted)
+            .map_or_else(|| panic!("{wanted:?} has no hit box"), |(r, _)| *r);
+        let buf = term.backend().buffer().clone();
+        let cells: Vec<Color> = (rect.x..rect.x.saturating_add(rect.width))
+            .map(|x| buf[(x, rect.y)].bg)
+            .collect();
+        let first = *cells.first().expect("a control of at least one cell");
+        assert!(
+            cells.iter().all(|c| *c == first),
+            "{wanted:?} is backed by {cells:?}, not one colour"
+        );
+        first
+    }
+
+    #[test]
+    fn each_tab_carries_a_backing_and_the_one_you_are_on_is_lifted_out_of_it() {
+        // Goal: the tab strip is where "you are here" is read, and it said so
+        // with a colour on the active tab and nothing at all behind the other
+        // three - so the state was carried by the text of the idle tabs rather
+        // than by the strip. Now every tab has a backing: the three you are
+        // not on sit on the stripe, and the one you are on is lifted off it.
+        //
+        // Method: read the backings of the tabs' own hit boxes out of a frame,
+        // which is the only place the two can be compared as painted.
+        let mut sc = screen();
+        let t = sc.app.theme();
+        assert_eq!(
+            painted_backing(&mut sc.app, 120, 12, Hit::View(View::Favorites)),
+            t.selection_bg,
+            "the tab you are on is not lifted"
+        );
+        for idle in [View::Playlists, View::Search, View::Mixes] {
+            assert_eq!(
+                painted_backing(&mut sc.app, 120, 12, Hit::View(idle)),
+                t.stripe_bg,
+                "{idle:?} is a tab with nothing behind it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lifted_tab_follows_the_view_rather_than_the_first_slot() {
+        // Goal: the same guard from the other end. A backing hard-wired to the
+        // leftmost tab would pass the test above and be wrong the moment
+        // anything moved. Method: change view by clicking a tab, and check the
+        // two backings have swapped.
+        let mut sc = screen();
+        let t = sc.app.theme();
+        // A click lands on the hit boxes the last frame registered, so there
+        // has to have been one.
+        draw(&mut sc.app, 120, 12);
+        click_hit(&mut sc.app, Hit::View(View::Playlists));
+        assert_eq!(sc.app.view, View::Playlists);
+        assert_eq!(
+            painted_backing(&mut sc.app, 120, 12, Hit::View(View::Playlists)),
+            t.selection_bg
+        );
+        assert_eq!(
+            painted_backing(&mut sc.app, 120, 12, Hit::View(View::Favorites)),
+            t.stripe_bg
         );
     }
 
