@@ -530,7 +530,11 @@ pub(crate) enum Cmd {
     Append(u64, PlayableSource),
     /// Skip to the preloaded next entry.
     Next,
-    TogglePause,
+    /// Pause, or resume. Absolute rather than a cycle, because the callers that
+    /// are not a keystroke - a media key, a panel applet - say which one they
+    /// mean, and answering them with a cycle pauses a playing track when the
+    /// play button is pressed twice.
+    SetPaused(bool),
     Seek(f64),         // absolute seconds
     SeekRelative(f64), // +/- seconds
     SetVolume(f64),
@@ -646,8 +650,21 @@ impl Player {
     pub fn skip_next(&self) {
         self.send(Cmd::Next);
     }
+    /// Pause, or resume, whichever the player is not doing.
+    ///
+    /// The other way round from every other control here: it reads the snapshot
+    /// and sends the absolute, so that there is one way to change the pause
+    /// state rather than one for a keystroke and another for a remote control.
     pub fn toggle_pause(&self) {
-        self.send(Cmd::TogglePause);
+        self.set_paused(!self.status().paused);
+    }
+
+    /// Pause, or resume, whichever was asked for.
+    ///
+    /// Absolute because MPRIS is: `Play` on an already-playing track must leave
+    /// it playing.
+    pub fn set_paused(&self, paused: bool) {
+        self.send(Cmd::SetPaused(paused));
     }
     pub fn seek(&self, seconds: f64) {
         self.send(Cmd::Seek(seconds));
@@ -953,6 +970,24 @@ mod tests {
         p.seek_relative(-5.0);
         p.stop();
         assert!(wait_for(&p, |_| true), "the thread is still answering");
+    }
+
+    // Drives the player thread, which only the real backend runs: the stub
+    // applies no command and never moves the snapshot.
+    #[cfg(feature = "libmpv")]
+    #[test]
+    fn the_toggle_and_the_absolute_are_one_path_to_the_pause_state() {
+        // Goal: priel has a toggle where a remote control has absolutes, and
+        // there must be one implementation rather than two that can drift. The
+        // toggle reads the snapshot and sends the absolute; asking for a state
+        // that is already in force leaves it there.
+        let p = silent();
+        p.toggle_pause();
+        assert!(wait_for(&p, |s| s.paused), "the toggle reached mpv");
+        p.set_paused(true);
+        assert!(wait_for(&p, |s| s.paused), "asking again is not a cycle");
+        p.toggle_pause();
+        assert!(wait_for(&p, |s| !s.paused), "and back the other way");
     }
 
     #[test]
