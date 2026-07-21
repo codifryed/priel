@@ -1,8 +1,11 @@
 # Interface readability and flow: an audit and a proposal
 
-Status: proposed. Nothing here is settled; the ranked list below is for the
-maintainer to choose from. A small subset marked **done** was implemented
-alongside this document because it needed no decision.
+Status: **settled and implemented, all thirteen findings.** This began as a
+proposal with a small subset marked **done**; the rest was worked through with
+the maintainer, finding by finding, and the four marked "taste" were each
+answered by a question put to them rather than by me choosing. Every entry below
+keeps its original text, with what was settled recorded underneath it, so the
+reasoning and the outcome can be read against each other.
 
 Raised by issue #15, which asks for a pass on layout, readability and
 information architecture rather than a feature, and which says to propose before
@@ -550,7 +553,9 @@ modality test and nothing else.
 
 ## What I did not change and why
 
-Everything in the table marked "propose". In particular I did not touch: the
+**Nothing is marked "propose" any more**: all thirteen findings are settled, the
+four taste ones question by question with the maintainer. What follows is what
+the audit itself deliberately left alone, and still leaves alone: the
 verdict badge's words, glyphs or colours (ADR-0002); anything about how access
 is reported (ADR-0001); the header control cluster's contents or order; which
 keys exist; where any action lives; the hint row's reservation logic; or the
