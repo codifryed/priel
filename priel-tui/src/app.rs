@@ -34,9 +34,9 @@ use priel_core::{Fault, Playlist, Track};
 use priel_player::Alteration;
 use priel_player::graph::{
     Attribution, AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, NodeRole, RateAdvice,
-    SourceFormat,
+    SinkVolume, SourceFormat,
 };
-use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig};
+use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig, Verdict};
 
 #[cfg(test)]
 use std::sync::mpsc::Sender;
@@ -207,6 +207,13 @@ struct Plan {
     /// Playback stopped with nothing preloaded. Load the next from scratch.
     advance_fresh: bool,
 }
+
+/// How often the sink's own volume is re-read while something is playing.
+///
+/// Long, because reading it forks `pw-dump` and the tick that asks runs ten
+/// times a second, and short enough that a volume changed in the system mixer
+/// shows up in the verdict while the listener is still looking at it.
+const SINK_VOLUME_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long the picker says it is still looking before it says there is
 /// nothing to look at.
@@ -393,6 +400,20 @@ pub struct App {
     /// The last chain the worker read, or the reason it could not. `None` while
     /// a read is in flight, which is what the overlay says it is doing.
     audio_graph: Option<Result<AudioGraph, GraphError>>,
+    /// What the sink at the end of the chain is doing to the level.
+    ///
+    /// Kept apart from `audio_graph`, which the overlay clears every time it
+    /// opens so that no stale chain is ever shown as current. This one outlives
+    /// that: the bottom row is graded on it on every frame, and it is the last
+    /// thing that was read rather than the last thing that was asked for.
+    /// [`SinkVolume::Unread`] until something says otherwise, which is the
+    /// modest answer rather than the flattering one.
+    sink_volume: SinkVolume,
+    /// When the sink's volume was last asked for, or `None` for never.
+    ///
+    /// Reading it runs `pw-dump`, and the tick that would ask runs ten times a
+    /// second, so the request is spaced by [`SINK_VOLUME_INTERVAL`].
+    sink_volume_asked: Option<Instant>,
     /// How far down the audio-graph overlay is scrolled, from the top.
     graph_scroll: usize,
     /// The output devices the player last published. Kept only while the picker
@@ -553,6 +574,8 @@ impl App {
             recent: crate::logging::Recent::default(),
             log_scroll: 0,
             audio_graph: None,
+            sink_volume: SinkVolume::Unread,
+            sink_volume_asked: None,
             graph_scroll: 0,
             devices: Vec::new(),
             device_selected: 0,
@@ -1391,6 +1414,7 @@ impl App {
                 } => self.on_search_page(&query, offset, page),
                 FromWorker::Resolved(id, r) => self.on_resolved(id, &r),
                 FromWorker::AudioGraph(read) => {
+                    self.note_sink_volume(&read);
                     self.audio_graph = Some(read);
                     // The reply can be longer than the request that opened the
                     // overlay left room for, so the scroll starts again rather
@@ -1533,6 +1557,7 @@ impl App {
     fn refresh_from_status(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         self.report_device_error();
+        self.poll_sink_volume();
 
         let sig = self.render_sig();
         if sig != self.last_sig {
@@ -1889,6 +1914,56 @@ impl App {
         self.recent.lines().len().saturating_sub(1)
     }
 
+    /// The whole chain's verdict: what is happening to the samples, and what
+    /// that rests on.
+    ///
+    /// The one place the row and the report both read, so the word on the row
+    /// and the section headed `Verdict` cannot come to different conclusions.
+    #[must_use]
+    pub fn verdict(&self) -> Verdict {
+        self.status
+            .verdict(self.now_meta.bit_depth, &self.sink_volume)
+    }
+
+    /// Take the sink's volume out of a chain reading, whatever it turned out to
+    /// be.
+    ///
+    /// Each arm is a different statement and none may stand in for another. A
+    /// bypassed graph is a chain with no server sink on it at all, which counts
+    /// as fully evidenced; any other failure read nothing, which does not.
+    fn note_sink_volume(&mut self, read: &Result<AudioGraph, GraphError>) {
+        self.sink_volume = match read {
+            Ok(g) => g.volume.clone(),
+            Err(GraphError::Bypassed) => SinkVolume::Absent,
+            Err(_) => SinkVolume::Unread,
+        };
+    }
+
+    /// Keep the sink's volume current enough for the row to be graded on it.
+    ///
+    /// Reading it means running `pw-dump` and waiting for it, so the request
+    /// goes to the worker like every other one and is spaced out rather than
+    /// made on every tick. Nothing is asked for while nothing is playing, and
+    /// nothing is asked for on the direct path - there is no server sink there
+    /// to have a volume, which is a reading in itself.
+    fn poll_sink_volume(&mut self) {
+        if self.status.bypasses_sound_server() {
+            self.sink_volume = SinkVolume::Absent;
+            return;
+        }
+        if !self.status.loaded {
+            return;
+        }
+        if self
+            .sink_volume_asked
+            .is_some_and(|t| t.elapsed() < SINK_VOLUME_INTERVAL)
+        {
+            return;
+        }
+        self.sink_volume_asked = Some(Instant::now());
+        let _ = self.worker.tx.send(ToWorker::ReadAudioGraph);
+    }
+
     /// Open the audio-graph overlay and ask the worker to read the chain.
     ///
     /// Shared by the key press and the click so the two paths cannot drift.
@@ -1906,7 +1981,9 @@ impl App {
         // Asking anyway would answer "priel has no stream in the graph", which
         // reads as "nothing is playing yet" - the opposite of what is true.
         if self.status.bypasses_sound_server() {
-            self.audio_graph = Some(Err(GraphError::Bypassed));
+            let bypassed = Err(GraphError::Bypassed);
+            self.note_sink_volume(&bypassed);
+            self.audio_graph = Some(bypassed);
             return;
         }
         let _ = self.worker.tx.send(ToWorker::ReadAudioGraph);
@@ -1941,46 +2018,114 @@ impl App {
         self.graph_scroll
     }
 
-    /// The lines of the audio-graph overlay, top to bottom.
+    /// The output report, top to bottom.
+    ///
+    /// **Every section renders what it can, independently of the rest.** This
+    /// used to short-circuit on the first thing that could not be read, so a
+    /// direct output - which has no graph by design - produced two sentences
+    /// and nothing else, hiding the volume stages from the listeners with the
+    /// cleanest chain on the machine and the strongest reason to check it.
     #[must_use]
     pub fn graph_rows(&self) -> Vec<GraphRow> {
+        let source = self.status.decoded_format(self.now_meta.bit_depth);
+        let mut rows = self.verdict_rows();
+        rows.extend(self.device_rows());
+        rows.extend(self.volume_rows());
+        rows.extend(self.chain_rows(source));
         match &self.audio_graph {
-            None => vec![note("Reading the graph…")],
-            Some(Err(e)) => {
-                let mut rows = vec![note(&e.to_string())];
-                rows.extend(e.hint().map(note));
-                // The one failure that is not a failure: there is no graph
-                // because priel has the device itself. That is the only thing
-                // the ownership section can say without a dump, and the player
-                // knows which device it is holding.
-                if matches!(e, GraphError::Bypassed) {
-                    rows.extend(holder_rows(&DeviceHolder::Direct {
-                        device: self.status.audio_device.clone(),
-                    }));
-                }
-                rows
-            }
             Some(Ok(g)) => {
-                // The same two readings the badge is built from, so the row and
-                // the overlay cannot disagree about one track.
-                let source = self.status.decoded_format(self.now_meta.bit_depth);
-                let observed = self.status.fidelity(self.now_meta.bit_depth).alteration();
-                let blame = g.attribute(source, observed);
-                let mut rows = path_rows(g, blame);
-                rows.extend(blame_row(g, blame, observed));
-                // After the blame sentence, because it is the answer to it:
-                // a rate the server was never permitted to use is refused
-                // before any node on the path sees a sample, which is how the
-                // chain can diverge nowhere and something still move.
+                // After the chain, because it is the answer to it: a rate the
+                // server was never permitted to use is refused before any node
+                // on the path sees a sample, which is how the chain can diverge
+                // nowhere and something still move.
                 rows.extend(clock_rows(&g.clock, source));
                 // Last, because it is the one section that is true whatever the
                 // rest of them found: a chain that alters nothing is still a
                 // chain the sound server owns and can reshape when the next
                 // application starts.
                 rows.extend(holder_rows(&g.holder));
-                rows
+            }
+            // The one failure that is not a failure: there is no graph because
+            // priel has the device itself. The player knows which device it is
+            // holding, so this section is told rather than left to infer it.
+            Some(Err(GraphError::Bypassed)) => rows.extend(holder_rows(&DeviceHolder::Direct {
+                device: self.status.audio_device.clone(),
+            })),
+            None | Some(Err(_)) => {}
+        }
+        rows
+    }
+
+    /// The grade, and what it rests on. The same one the row carries.
+    ///
+    /// Drawn as plain prose rather than in the grade's colour, because the
+    /// glyph in front of the word is what carries the meaning - on a light
+    /// theme, a dark one, a monochrome terminal, and to the red/green
+    /// deficiency these grades already lean on.
+    fn verdict_rows(&self) -> Vec<GraphRow> {
+        vec![reading(
+            "  Verdict",
+            crate::ui::verdict_words(self.verdict()),
+        )]
+    }
+
+    /// What is being played into, and how it is being held.
+    ///
+    /// Access lives here rather than on the bottom row: it is a session-long
+    /// setting rather than something that changes per track, and the row it
+    /// used to sit on had no width left to spare.
+    fn device_rows(&self) -> Vec<GraphRow> {
+        let mut rows = vec![note(""), note("  Device")];
+        rows.push(reading(
+            "    output",
+            crate::ui::device_readout(&self.status),
+        ));
+        rows.push(reading("    access", crate::ui::access_words(&self.status)));
+        rows
+    }
+
+    /// Every stage that can change the level, in the order the samples meet
+    /// them.
+    ///
+    /// All three are always listed, including the ones that are absent and the
+    /// ones that could not be read - a stage missing from this list would read
+    /// as a stage at unity, which is the guess this whole section exists to
+    /// stop.
+    fn volume_rows(&self) -> Vec<GraphRow> {
+        vec![
+            note(""),
+            note("  Volume"),
+            reading("    priel", crate::ui::own_volume_words(self.status.volume)),
+            reading("    stream", crate::ui::stream_volume_words(&self.status)),
+            reading("    sink", crate::ui::sink_volume_words(&self.sink_volume)),
+        ]
+        .into_iter()
+        .chain(
+            crate::ui::sink_volume_note(&self.sink_volume)
+                .map(|words| reading("    applied", words)),
+        )
+        .collect()
+    }
+
+    /// What sits between priel and the device, or why there is nothing to draw.
+    fn chain_rows(&self, source: SourceFormat) -> Vec<GraphRow> {
+        let mut rows = vec![note(""), note("  Chain")];
+        match &self.audio_graph {
+            None => rows.push(note("    Reading the graph…")),
+            Some(Err(e)) => {
+                rows.push(note(&format!("    {e}")));
+                rows.extend(e.hint().map(|hint| note(&format!("    {hint}"))));
+            }
+            Some(Ok(g)) => {
+                // The same reading the row is graded from, so the report and
+                // the verdict above it cannot disagree about one track.
+                let observed = self.status.fidelity(self.now_meta.bit_depth).alteration();
+                let blame = g.attribute(source, observed);
+                rows.extend(path_rows(g, blame));
+                rows.extend(blame_row(g, blame, observed));
             }
         }
+        rows
     }
 
     /// The diagnostics to show, oldest first.
@@ -2842,8 +2987,9 @@ fn row_matches(primary: &str, secondary: &str, filter_lower: &str) -> bool {
 mod tests {
     use super::*;
     use priel_core::{PlayableSource, ResolvedStream};
-    use priel_player::graph::HeldDevice;
+    use priel_player::graph::{HeldDevice, SinkLevels};
     use priel_player::hw::HwParams;
+    use priel_player::{Fidelity, OutputAccess};
 
     struct Rig {
         app: App,
@@ -4087,9 +4233,15 @@ mod tests {
             matches!(r.from_app.try_recv(), Ok(ToWorker::ReadAudioGraph)),
             "the read has to go to the worker"
         );
-        let rows = r.app.graph_rows();
-        assert_eq!(rows.len(), 1, "nothing to show until the reply arrives");
-        assert_eq!(rows[0].kind, GraphRowKind::Note);
+        let text = overlay_text(&r.app);
+        assert!(
+            text.contains("Reading the graph"),
+            "the chain section says what it is waiting for: {text}"
+        );
+        assert!(
+            text.contains("Verdict") && text.contains("Volume"),
+            "and every other section answers for itself meanwhile: {text}"
+        );
     }
 
     #[test]
@@ -4155,6 +4307,222 @@ mod tests {
         );
     }
 
+    // ---- the output report ----
+
+    /// The report's rows as one blob, for asserting what it says.
+    fn report(app: &App) -> String {
+        app.graph_rows()
+            .iter()
+            .map(|r| format!("{}  {}", r.label, r.detail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_section_of_the_report_renders_what_it_can_on_its_own() {
+        // Goal: the overlay used to short-circuit entirely on the direct path,
+        // which hid the volume section from exclusive users - the people who
+        // care most, and the ones with the cleanest chain to show. Each section
+        // now answers for itself: there is no chain to draw and everything else
+        // is still true.
+        let mut r = rig();
+        r.app.status = PlaybackStatus {
+            audio_device: "alsa/hw:CARD=AUDIO,DEV=0".into(),
+            ao_volume: None,
+            access: OutputAccess::Exclusive,
+            ..through_server()
+        };
+        r.app.on_key(key('D'));
+        let out = report(&r.app);
+
+        assert!(out.contains("Verdict"), "{out}");
+        assert!(out.contains("bit-perfect"), "{out}");
+        assert!(out.contains("Device"), "{out}");
+        assert!(out.contains("exclusive"), "the access moved here: {out}");
+        assert!(out.contains("Volume"), "the section that was hidden: {out}");
+        assert!(out.contains("priel"), "{out}");
+        assert!(out.contains("Chain"), "{out}");
+        assert!(out.contains("no graph"), "{out}");
+    }
+
+    #[test]
+    fn a_sink_attenuating_in_software_is_reported_in_percent_decibels_and_bits() {
+        // Goal: "how much did I lose" is the question nothing on screen answers
+        // today. The percentage is the unit the listener set it in, the decibel
+        // figure is the one that compares, and the bits are what it cost - by
+        // the one-bit-per-6-dB rule the README already records.
+        let mut r = rig();
+        r.app.status = through_server();
+        let mut g = chain();
+        g.volume = SinkVolume::Read(SinkLevels {
+            set: vec![0.027_001, 0.027_001],
+            software: vec![0.027_001, 0.027_001],
+            silenced: false,
+        });
+        r.app.on_key(key('D'));
+        r.to_app.send(FromWorker::AudioGraph(Ok(g))).expect("send");
+        r.app.drain_worker();
+        let out = report(&r.app);
+
+        assert!(out.contains("2.7%"), "the unit it was set in: {out}");
+        assert!(out.contains("-31 dB"), "the unit that compares: {out}");
+        assert!(out.contains("5 bits"), "what it cost: {out}");
+        assert!(out.contains("in software"), "where it happened: {out}");
+    }
+
+    #[test]
+    fn a_level_the_server_is_not_applying_is_shown_without_a_loss_it_did_not_cause() {
+        // Goal: the reading measured on a real machine, and the reason this
+        // needs two fields rather than one. The control is at 2.7% and the
+        // server is multiplying nothing, so quoting 31 dB of loss there would
+        // invent a fault - and saying nothing at all would hide a control the
+        // listener plainly did set.
+        let mut r = rig();
+        r.app.status = through_server();
+        let mut g = chain();
+        g.volume = SinkVolume::Read(SinkLevels {
+            set: vec![0.027_001, 0.027_001],
+            software: vec![1.0, 1.0],
+            silenced: false,
+        });
+        r.app.on_key(key('D'));
+        r.to_app.send(FromWorker::AudioGraph(Ok(g))).expect("send");
+        r.app.drain_worker();
+        let out = report(&r.app);
+
+        assert!(out.contains("2.7%"), "the control is still shown: {out}");
+        assert!(!out.contains("bits"), "no loss is claimed: {out}");
+        assert!(
+            out.contains("not applied by the server"),
+            "and the reader is told why not: {out}"
+        );
+    }
+
+    #[test]
+    fn a_stage_that_could_not_be_read_says_unknown_in_the_report_too() {
+        // Goal: the same rule the row's mark follows, spelled out where there
+        // is room for it. An empty cell would read as nothing being set.
+        let mut r = rig();
+        r.app.status = PlaybackStatus {
+            ao_volume: None,
+            ..through_server()
+        };
+        r.app.on_key(key('D'));
+        let out = report(&r.app);
+        assert!(out.contains("unknown"), "{out}");
+    }
+
+    // ---- the sink's volume, which the row is graded on ----
+
+    /// A status playing through the sound server, with everything mpv can see
+    /// at unity, so a test only has to move the stage it is about.
+    fn through_server() -> PlaybackStatus {
+        PlaybackStatus {
+            loaded: true,
+            playing: true,
+            volume: 100.0,
+            ao_volume: Some(100.0),
+            sample_rate: 44_100,
+            out_format: "s32".into(),
+            in_sample_rate: 44_100,
+            in_format: "s32".into(),
+            audio_device: "pipewire/alsa_output.usb-x".into(),
+            ..PlaybackStatus::default()
+        }
+    }
+
+    #[test]
+    fn the_row_is_graded_on_the_sink_volume_the_worker_last_read() {
+        // Goal: the verdict on the bottom row has to include the stage nothing
+        // else can see. The reading arrives through the same reply the overlay
+        // is built from, so the two cannot disagree about one moment.
+        let mut r = rig();
+        r.app.status = through_server();
+        assert!(
+            r.app.verdict().needs_qualifying(),
+            "before any reading the sink is a stage that went unread"
+        );
+
+        let mut g = chain();
+        g.volume = SinkVolume::Read(SinkLevels {
+            set: vec![0.5, 0.5],
+            software: vec![0.5, 0.5],
+            silenced: false,
+        });
+        r.to_app.send(FromWorker::AudioGraph(Ok(g))).expect("send");
+        r.app.drain_worker();
+        assert_eq!(
+            r.app.verdict().fidelity,
+            Fidelity::NearBitPerfect(Alteration::SinkVolumeScaled),
+            "a sink attenuating in software is no longer reported as clean"
+        );
+    }
+
+    #[test]
+    fn the_direct_path_has_no_sink_stage_to_have_missed() {
+        // Goal: decision nine. priel holding the card itself is the cleanest
+        // chain there is, and a permanent question mark on it would teach the
+        // reader to ignore the mark everywhere it means something.
+        let mut r = rig();
+        r.app.status = PlaybackStatus {
+            audio_device: "alsa/hw:CARD=AUDIO,DEV=0".into(),
+            ao_volume: None,
+            ..through_server()
+        };
+        r.app.refresh_for_test();
+        let v = r.app.verdict();
+        assert_eq!(v.fidelity, Fidelity::BitPerfect);
+        assert!(!v.needs_qualifying(), "nothing here went unread");
+        assert!(
+            r.from_app.try_recv().is_err(),
+            "and there is no graph to ask pw-dump about"
+        );
+    }
+
+    #[test]
+    fn the_sink_volume_is_re_read_on_a_cadence_rather_than_every_tick() {
+        // Goal: reading it runs pw-dump, and the tick that would ask for it
+        // runs ten times a second. A request per tick would fork a subprocess
+        // per tick and hold the worker off the listener's own requests.
+        let mut r = rig();
+        r.app.status = through_server();
+        r.app.refresh_for_test();
+        assert!(
+            matches!(r.from_app.try_recv(), Ok(ToWorker::ReadAudioGraph)),
+            "the first tick with something playing asks"
+        );
+        r.app.refresh_for_test();
+        r.app.refresh_for_test();
+        assert!(
+            r.from_app.try_recv().is_err(),
+            "and the ones straight after it do not"
+        );
+    }
+
+    #[test]
+    fn nothing_is_asked_for_while_nothing_is_playing() {
+        // Goal: an idle priel has no chain to read and no verdict to reach, so
+        // it must not run a subprocess every few seconds for the whole session
+        // it is left open.
+        let mut r = rig();
+        r.app.refresh_for_test();
+        assert!(r.from_app.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_graph_that_could_not_be_read_leaves_the_sink_unread_rather_than_clean() {
+        // Goal: "say unknown rather than guess". pw-dump missing says nothing
+        // about the sink's volume, and treating a failed read as unity would
+        // hand out the flattering answer on every machine without the tools.
+        let mut r = rig();
+        r.app.status = through_server();
+        r.to_app
+            .send(FromWorker::AudioGraph(Err(GraphError::NotInstalled)))
+            .expect("send");
+        r.app.drain_worker();
+        assert!(r.app.verdict().needs_qualifying());
+    }
+
     #[test]
     fn the_chain_the_worker_read_is_what_the_overlay_lists() {
         // Goal: the whole point - every node between priel and the device, in
@@ -4191,10 +4559,19 @@ mod tests {
             .send(FromWorker::AudioGraph(Err(GraphError::NotInstalled)))
             .expect("send");
         r.app.drain_worker();
-        let rows = r.app.graph_rows();
-        assert!(rows.iter().all(|r| r.kind == GraphRowKind::Note));
-        assert!(rows[0].label.contains("pw-dump"), "{}", rows[0].label);
-        assert_eq!(rows.len(), 2, "the sentence and what to do about it");
+        let text = overlay_text(&r.app);
+        assert!(text.contains("pw-dump was not found"), "{text}");
+        assert!(
+            text.contains("ships with PipeWire"),
+            "and what to do about it: {text}"
+        );
+        assert!(
+            !r.app
+                .graph_rows()
+                .iter()
+                .any(|row| row.kind == GraphRowKind::Node && row.label.contains("  (device)")),
+            "there is no chain to draw: {text}"
+        );
     }
 
     #[test]
@@ -4378,13 +4755,14 @@ mod tests {
             "nothing is accused: {}",
             overlay_text(&r.app)
         );
-        assert_eq!(
-            r.app.graph_rows().len(),
-            // Two nodes, the connector, and the ownership section, which is
-            // drawn whatever the chain found - and nothing else.
-            3 + 4,
-            "{}",
-            overlay_text(&r.app)
+        let text = overlay_text(&r.app);
+        assert!(
+            !text.contains("nothing on this path did it"),
+            "no admission about a comparison that was never asked for: {text}"
+        );
+        assert!(
+            !text.contains("Not enough was negotiated"),
+            "and no admission about a track there is none of: {text}"
         );
     }
 
@@ -4641,10 +5019,9 @@ mod tests {
             matches!(r.from_app.try_recv(), Ok(ToWorker::ReadAudioGraph)),
             "opening it again asks again"
         );
-        assert_eq!(
-            r.app.graph_rows().len(),
-            1,
-            "and shows nothing until the new answer lands"
+        assert!(
+            overlay_text(&r.app).contains("Reading the graph"),
+            "and shows no chain until the new answer lands"
         );
     }
 
@@ -4763,7 +5140,16 @@ mod tests {
             text.contains("no output device"),
             "the chain reaches none: {text}"
         );
-        assert!(!text.contains("unknown"), "which is not the same: {text}");
+        let held = r
+            .app
+            .graph_rows()
+            .into_iter()
+            .find(|row| row.label.trim() == "held by")
+            .expect("the ownership section names a holder");
+        assert_ne!(
+            held.detail, "unknown",
+            "which is not the same finding: {text}"
+        );
     }
 
     #[test]

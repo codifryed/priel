@@ -382,6 +382,34 @@
             ]
           }
         ],
+        "Props": [
+          {
+            "volume": 1.0,
+            "mute": false,
+            "channelVolumes": [
+              0.027001,
+              0.027001
+            ],
+            "channelMap": [
+              "AUX0",
+              "AUX1"
+            ],
+            "softMute": false,
+            "softVolumes": [
+              1.0,
+              1.0
+            ],
+            "monitorMute": false,
+            "monitorVolumes": [
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "device": "hw:2,0",
+            "deviceName": ""
+          }
+        ],
         "Format": [
           {
             "mediaType": "audio",

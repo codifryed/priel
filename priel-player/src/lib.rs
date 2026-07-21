@@ -31,7 +31,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use priel_core::PlayableSource;
 
-use crate::graph::SourceFormat;
+use crate::graph::{SinkStage, SinkVolume, SourceFormat};
 use crate::hw::HwParams;
 
 pub mod graph;
@@ -177,6 +177,66 @@ impl Fidelity {
     }
 }
 
+/// A grade, and how much of the chain it was reached from.
+///
+/// The two travel together because neither is usable alone. A grade with no
+/// account of what it rests on is the overstatement this indicator exists to
+/// avoid - today's tick already means "as far as I looked" and nothing says so -
+/// and an account with no grade is a diagnostic nobody asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Verdict {
+    pub fidelity: Fidelity,
+    pub evidence: Evidence,
+}
+
+/// How much of the chain a [`Verdict`] was reached from.
+///
+/// **A stage that cannot exist counts as fully evidenced.** The direct path has
+/// no server stage and no sink stage at all, and marking it would put a
+/// permanent question mark on the cleanest chain the player can produce - which
+/// would teach the reader to ignore the mark everywhere it does mean something.
+/// It is the same distinction [`ClockRates`](graph::ClockRates) already draws
+/// between a permitted-rate list that is empty and one that could not be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evidence {
+    /// Every stage that exists here was read.
+    Complete,
+    /// At least one stage exists and could not be read. The grade still stands -
+    /// it is what everything that *was* read says - and says so.
+    Partial,
+}
+
+impl Verdict {
+    /// Does this grade have to say what it rests on?
+    ///
+    /// Only where the missing evidence could have changed the answer, which is
+    /// the clean tick and nothing else: every other grade is already at least
+    /// as bad as an unread volume stage could have made it, so marking those
+    /// would cost a column and say nothing.
+    #[must_use]
+    pub fn needs_qualifying(&self) -> bool {
+        self.evidence == Evidence::Partial && self.fidelity == Fidelity::BitPerfect
+    }
+}
+
+/// The sound server's volume for priel's own stream.
+///
+/// The middle of the three stages, and the one mpv can answer for. Three arms
+/// for the same reason [`SinkVolume`] has three: mpv reports no `ao-volume`
+/// both when there is no sound server to have one and when there is one it
+/// could not ask, and those are not the same statement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StreamVolume {
+    /// No sound server sits between priel and the device, so there is no such
+    /// stage. Also what an idle player reports: nothing is open to be scaled.
+    Absent,
+    /// A sound server is in the chain and its level for our stream could not be
+    /// read.
+    Unread,
+    /// The level, as a percentage, where 100 is unity.
+    Read(f64),
+}
+
 /// Why playback is not bit-perfect, most damaging first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Alteration {
@@ -194,6 +254,14 @@ pub enum Alteration {
     /// resolution the same way - unless the sink maps volume onto a hardware
     /// mixer control on the DAC itself, which priel cannot tell from here.
     ServerVolumeScaled,
+    /// The audio server is attenuating the *sink* everything on the machine is
+    /// mixed into, which is a stage above our own stream and one nothing else
+    /// can see.
+    ///
+    /// Graded from `softVolumes` and never from the control beside it: the
+    /// control says what was set, and only that field says whether the server
+    /// multiplied a sample. See [`SinkVolume`](graph::SinkVolume).
+    SinkVolumeScaled,
 }
 
 /// Bits of resolution a sample format name carries, endianness already removed.
@@ -280,6 +348,92 @@ impl PlaybackStatus {
     #[must_use]
     pub fn verdict_is_from_hardware(&self) -> bool {
         self.hw.is_some()
+    }
+
+    /// Is any output actually open?
+    ///
+    /// Asked wherever a statement about the output would otherwise be made with
+    /// nothing behind it: the device readout, the access badge, and the two
+    /// volume stages below, which cannot be missing from a chain that does not
+    /// exist yet.
+    #[must_use]
+    pub fn output_is_open(&self) -> bool {
+        let (rate_hz, format) = self.effective_output();
+        rate_hz > 0 || !format.is_empty()
+    }
+
+    /// The sound server's level for priel's own stream, and whether there was
+    /// one to read.
+    #[must_use]
+    pub fn stream_volume(&self) -> StreamVolume {
+        // Nothing open, or nothing between priel and the card: either way there
+        // is no such stage, which is not the same as one that went unread.
+        if !self.output_is_open() || self.bypasses_sound_server() {
+            return StreamVolume::Absent;
+        }
+        match self.ao_volume {
+            Some(level) => StreamVolume::Read(level),
+            None => StreamVolume::Unread,
+        }
+    }
+
+    /// The whole chain: what it is doing to the samples, and what that rests on.
+    ///
+    /// `sink` is the third stage, which only the graph dump carries - mpv can
+    /// see its own stream and the device's own parameters, and neither of them
+    /// says anything about the mixer everything on the machine shares. It is
+    /// passed in rather than reached for, like every other lookup path in this
+    /// workspace, so the grading stays pure and table-testable.
+    ///
+    /// Builds on [`fidelity`](Self::fidelity) rather than restating it: that is
+    /// the half mpv can answer for, and it is also what the graph is asked to
+    /// attribute, so the two cannot come to different conclusions about one
+    /// track.
+    #[must_use]
+    pub fn verdict(&self, source_bits: u32, sink: &SinkVolume) -> Verdict {
+        let stage = sink.stage();
+        Verdict {
+            fidelity: self.graded(source_bits, stage),
+            evidence: self.evidence(stage),
+        }
+    }
+
+    /// The grade with the sink folded in.
+    ///
+    /// Only a chain that was otherwise clean can be moved by it: every other
+    /// answer already names something at least as damaging, and the order they
+    /// are named in is settled - priel's own volume first, because it is the one
+    /// a keypress clears.
+    fn graded(&self, source_bits: u32, sink: SinkStage) -> Fidelity {
+        let graded = self.fidelity(source_bits);
+        if graded != Fidelity::BitPerfect {
+            return graded;
+        }
+        match sink {
+            SinkStage::InSoftware { .. } | SinkStage::Silenced => {
+                Fidelity::NearBitPerfect(Alteration::SinkVolumeScaled)
+            }
+            SinkStage::Absent
+            | SinkStage::Unread
+            | SinkStage::Unity
+            | SinkStage::Elsewhere { .. } => graded,
+        }
+    }
+
+    /// Was there a stage that exists here and could not be read?
+    ///
+    /// A control set away from unity that the server is not applying counts:
+    /// something is attenuating and this dump does not say what. That is a gap
+    /// in the evidence even though the server's own stage was read perfectly
+    /// well.
+    fn evidence(&self, sink: SinkStage) -> Evidence {
+        let unread = matches!(self.stream_volume(), StreamVolume::Unread)
+            || matches!(sink, SinkStage::Unread | SinkStage::Elsewhere { .. });
+        if unread {
+            Evidence::Partial
+        } else {
+            Evidence::Complete
+        }
     }
 
     /// The track as the decoder produced it, for comparing a graph's nodes
@@ -613,6 +767,7 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::SinkLevels;
     use crate::hw::HwParams;
     use std::time::{Duration, Instant};
 
@@ -1119,6 +1274,171 @@ mod tests {
         ] {
             assert_eq!(format_bits(fmt), bits, "format {fmt}");
         }
+    }
+
+    // ---- the whole chain, and what the grade rests on ----
+
+    /// A sink reading with the same figure set and applied, which is what a
+    /// sink with no hardware mixer publishes.
+    fn sink_at(gain: f64) -> SinkVolume {
+        SinkVolume::Read(SinkLevels {
+            set: vec![gain, gain],
+            software: vec![gain, gain],
+            silenced: false,
+        })
+    }
+
+    /// A status playing through the sound server with both readable stages read
+    /// and at unity, so a test only has to move the one it is about.
+    fn through_server(in_rate: u32, out_rate: u32) -> PlaybackStatus {
+        PlaybackStatus {
+            ao_volume: Some(100.0),
+            audio_device: "pipewire/alsa_output.usb-x".into(),
+            ..playing(in_rate, out_rate, "s32", "s32")
+        }
+    }
+
+    #[test]
+    fn a_sink_turned_down_in_software_is_no_longer_reported_as_bit_perfect() {
+        // Goal: the whole issue. priel at unity and its own stream at unity say
+        // nothing about the sink everything on the machine is mixed into, and
+        // reporting a clean chain there is the overstatement this indicator
+        // exists to avoid.
+        let s = through_server(96_000, 96_000);
+        assert_eq!(
+            s.verdict(24, &sink_at(0.5)),
+            Verdict {
+                fidelity: Fidelity::NearBitPerfect(Alteration::SinkVolumeScaled),
+                evidence: Evidence::Complete,
+            }
+        );
+        assert_eq!(
+            s.verdict(24, &sink_at(1.0)).fidelity,
+            Fidelity::BitPerfect,
+            "a sink at unity alters nothing and must not cry wolf"
+        );
+    }
+
+    #[test]
+    fn a_sink_set_below_unity_that_the_server_is_not_applying_keeps_the_tick_and_marks_it() {
+        // Goal: the reading measured on a real machine - the control at 2.7%
+        // with `softVolumes` at unity, on a card with no ALSA volume control at
+        // all. The server is multiplying nothing, so the samples are intact;
+        // where that 2.7% is applied is not in the dump, so the grade may not
+        // be handed out unqualified either.
+        let s = through_server(96_000, 96_000);
+        let measured = SinkVolume::Read(SinkLevels {
+            set: vec![0.027_001, 0.027_001],
+            software: vec![1.0, 1.0],
+            silenced: false,
+        });
+        let v = s.verdict(24, &measured);
+        assert_eq!(v.fidelity, Fidelity::BitPerfect);
+        assert_eq!(v.evidence, Evidence::Partial);
+        assert!(v.needs_qualifying(), "the tick has to say what it rests on");
+    }
+
+    #[test]
+    fn a_stage_that_cannot_exist_counts_as_fully_evidenced() {
+        // Goal: the direct path is the cleanest chain the player can produce -
+        // no server stage and no sink stage at all - and a permanent question
+        // mark on it would make the mark meaningless everywhere else. Absent is
+        // not unread.
+        let s = PlaybackStatus {
+            audio_device: "alsa/hw:CARD=AUDIO,DEV=0".into(),
+            ao_volume: None,
+            ..playing(96_000, 96_000, "s32", "s32")
+        };
+        let v = s.verdict(24, &SinkVolume::Absent);
+        assert_eq!(v.fidelity, Fidelity::BitPerfect);
+        assert_eq!(v.evidence, Evidence::Complete);
+        assert!(!v.needs_qualifying(), "a clean chain gets a clean tick");
+    }
+
+    #[test]
+    fn a_sink_that_could_not_be_read_is_marked_rather_than_assumed_clean() {
+        // Goal: "say unknown rather than guess". A sink is there, priel has not
+        // read what its volume is doing, and the tick may not silently mean
+        // "as far as I looked".
+        let s = through_server(96_000, 96_000);
+        let v = s.verdict(24, &SinkVolume::Unread);
+        assert_eq!(v.fidelity, Fidelity::BitPerfect);
+        assert_eq!(v.evidence, Evidence::Partial);
+    }
+
+    #[test]
+    fn only_a_grade_an_unread_stage_could_have_changed_is_qualified() {
+        // Goal: the mark costs a column and must earn it. A resample is already
+        // worse than any volume stage could make it, so marking that answer
+        // says nothing; only the clean tick can be falsified by a stage nobody
+        // looked at.
+        let mut s = through_server(44_100, 48_000);
+        s.ao_volume = None;
+        let v = s.verdict(24, &SinkVolume::Unread);
+        assert_eq!(v.evidence, Evidence::Partial, "the gap is still recorded");
+        assert!(!v.needs_qualifying(), "but the finding does not need it");
+    }
+
+    #[test]
+    fn the_stream_stage_is_absent_on_the_direct_path_and_unread_only_when_it_should_be_there() {
+        // Goal: the same absent-versus-unread distinction one stage up. mpv
+        // reports no `ao-volume` both when there is no sound server to have one
+        // and when there is one it could not ask, and treating those alike
+        // would mark every exclusive session.
+        let mut s = through_server(96_000, 96_000);
+        assert_eq!(s.stream_volume(), StreamVolume::Read(100.0));
+
+        s.ao_volume = None;
+        assert_eq!(s.stream_volume(), StreamVolume::Unread);
+
+        s.audio_device = "alsa/hw:CARD=AUDIO,DEV=0".into();
+        assert_eq!(s.stream_volume(), StreamVolume::Absent);
+
+        assert_eq!(
+            PlaybackStatus::default().stream_volume(),
+            StreamVolume::Absent,
+            "nothing is open, so there is no stage to have missed"
+        );
+    }
+
+    #[test]
+    fn priels_own_volume_is_still_named_ahead_of_the_two_below_it() {
+        // Goal: the precedence the row already had must survive a third cause.
+        // The one the listener can clear with a keypress is the one to name.
+        let mut s = through_server(96_000, 96_000);
+        s.volume = 50.0;
+        assert_eq!(
+            s.verdict(24, &sink_at(0.5)).fidelity,
+            Fidelity::NearBitPerfect(Alteration::VolumeScaled)
+        );
+
+        s.volume = 100.0;
+        s.ao_volume = Some(50.0);
+        assert_eq!(
+            s.verdict(24, &sink_at(0.5)).fidelity,
+            Fidelity::NearBitPerfect(Alteration::ServerVolumeScaled)
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_sample_stream_outranks_every_volume_stage() {
+        // Goal: a level change and a resample are different kinds of thing, and
+        // a new cause at the bottom of the list must not displace the one that
+        // rebuilds every sample.
+        let s = through_server(44_100, 48_000);
+        assert_eq!(
+            s.verdict(24, &sink_at(0.5)).fidelity,
+            Fidelity::Altered(Alteration::Resampled)
+        );
+    }
+
+    #[test]
+    fn an_unknown_chain_stays_unknown_however_the_sink_reads() {
+        // Goal: a false green light is worse than no light, and so is a false
+        // warning. With nothing playing there is no verdict to qualify.
+        let s = PlaybackStatus::default();
+        assert_eq!(s.verdict(24, &sink_at(0.5)).fidelity, Fidelity::Unknown);
+        assert!(!s.verdict(24, &SinkVolume::Unread).needs_qualifying());
     }
 
     #[test]

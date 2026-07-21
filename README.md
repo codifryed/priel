@@ -31,14 +31,30 @@ water in and out of the flats twice a day, on the pull of the moon.*
   samples. `≈ near bit-perfect` when only the *level* changed — digital
   attenuation costs about one bit per 6 dB, which most people trade for a volume
   key, and lumping it in with a resample would make the indicator useless.
-  `⚠ resampled 44→48 kHz` or `⚠ truncated to S16` when the stream is being
-  rebuilt. A wider container is not a fault: 24-bit content in an `S32` frame is
-  exactly how a USB DAC expects it, so that reads green.
+  `⚠ resampled` or `⚠ truncated` when the stream is being rebuilt. A wider
+  container is not a fault: 24-bit content in an `S32` frame is exactly how a USB
+  DAC expects it, so that reads green. The row carries the word and nothing else;
+  the numbers behind it are in the `D` report.
+- **The grade says what it rests on.** `✓?` rather than `✓` when a stage exists
+  and could not be read. A tick that quietly means "as far as I looked" is the
+  one failure this indicator exists to avoid, and a stage that *cannot* exist —
+  there is no sound server between priel and a directly held card — counts as
+  fully evidenced rather than unread, so the cleanest chain on the machine gets a
+  clean tick. It is a glyph rather than a colour, so it survives a light theme, a
+  dark one, a monochrome terminal, and the red/green deficiency the grades
+  already lean on.
 - **Unity gain is a first-class state.** Any software volume below 100%
   multiplies every sample. The header shows `100%` in green at unity and yellow
-  otherwise, `0` restores it, and both stages are watched — priel's own volume
-  and the audio server's volume for our stream. Enthusiasts: leave both at unity
-  and set level on the DAC.
+  otherwise, `0` restores it, and **all three stages are watched** — priel's own
+  volume, the audio server's volume for our stream, and the volume on the sink
+  everything on the machine is mixed into, which nothing else can see. That third
+  one is read from the graph dump, and from the field that says whether the
+  server actually multiplied a sample rather than the one that says what the
+  control was set to: those two disagree, and a level applied by a hardware mixer
+  costs no bits where the same figure applied in software costs about one per
+  6 dB. Where a level is applied in software the `D` report gives the percentage,
+  the decibels, and the bits. Enthusiasts: leave all three at unity and set level
+  on the DAC.
 - **Mouse-first, and it shows.** Clickable view tabs and transport controls, a
   scrubbable progress bar, wheel scrolling, double-click to play — and every key
   shown in the bottom hint row is itself a button. If an action cannot be done by
@@ -158,7 +174,7 @@ holds it, priel says so, records it in the log, and keeps playing. There is no
 shared spelling of a `hw:` device — the card is the whole of it — so the fallback
 is the sound server's own entry for **the same card**: the same physical DAC,
 just shared. Failing that, the system default sink. The track restarts from the
-beginning, and the badge reads `⚠ shared · exclusive refused` rather than
+beginning, and the `D` report reads `shared - exclusive was refused` rather than
 claiming a connection it does not have. See
 [ADR-0001](docs/adr/0001-exclusive-output-is-asked-for-never-assumed.md).
 
@@ -176,7 +192,7 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 |---|---|---|
 | Full key reference | `?` | click `[?]` |
 | Recent log messages | `M` | `[?]`, then `M` |
-| Audio graph to the device | `D` | click `[D]`, or `[?]` then `D` |
+| Output report | `D` | click the verdict, click `[D]`, or `[?]` then `D` |
 | Choose the output device | `d` | click `◎`, then a row in the picker |
 | Exclusive output on/off | `x` in the picker | click the toggle |
 | Sign in again | `A` | `[?]`, then `A` |
@@ -212,17 +228,32 @@ filtering; hi-res resolution and playback (24/192 via progressive segment
 streaming); a gapless
 play queue with a preloaded next track; shuffle with auto-advance; play, pause,
 seek, skip and volume; a now-playing bar with a scrubbable progress bar, a live
-DAC badge and a bit-perfect indicator; the `?` reference overlay; a diagnostic
-log with an `M` overlay for reading it without leaving the player; a `D` overlay
-listing the PipeWire nodes between priel and the device with the rate and format
-each one negotiated, marking the node where the track's rate or width is first
-lost with a `⚠`, reporting the rates the sound server is permitted to clock
-at with the change to make when the track's rate is not one of them, and naming
-what has the output device open with what it would take to reserve it; a `d`
-picker for moving the output between devices, with an `x` toggle for taking a
-device exclusively.
+DAC badge and a bit-perfect verdict; the `?` reference overlay; a diagnostic
+log with an `M` overlay for reading it without leaving the player; a `D` output
+report, in sections that each answer for themselves — the verdict, the device
+and how it is held, every volume stage that can alter the samples, and the chain
+of PipeWire nodes between priel and the device with the rate and format each one
+negotiated, marking the node where the track's rate or width is first lost with a
+`⚠`, reporting the rates the sound server is permitted to clock at with the
+change to make when the track's rate is not one of them, and naming what has the
+output device open with what it would take to reserve it; a `d` picker for moving
+the output between devices, with an `x` toggle for taking a device exclusively.
 
-The `D` overlay names a node only when the chain accounts for what was measured.
+Each section renders on its own evidence, so a directly held card — which has no
+graph by design — still gets its verdict, its device readout and its volume
+stages rather than one sentence saying there is nothing to show.
+
+The volume section lists every stage, including the ones that are absent and the
+ones that could not be read, because a stage missing from a list reads as a stage
+at unity. The sink's level is quoted as the control shows it, and a loss is only
+ever claimed where the server was found to be applying it: measured on a real
+machine, a USB DAC sink sat at 2.7% with the server multiplying nothing at all,
+on a card exposing no ALSA volume control. Quoting 31 dB of loss there would have
+invented a fault; saying nothing would have hidden a control that was plainly
+set. So it shows the control, says the server is not applying it, and marks the
+tick — because where it *is* applied is not in the graph.
+
+The `D` report names a node only when the chain accounts for what was measured.
 Where the device is clocked elsewhere and every node on the path still reports
 the track's own rate — a resample the sound server did inside a node rather than
 between two of them — it says the change is unaccounted for rather than blaming
