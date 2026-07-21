@@ -205,9 +205,21 @@ property set - is a pure function from a snapshot, in the shape `App::decide`
 already established, so the interop rules above are a table of tests rather than
 comments pleading with the reader.
 
+**`TrackList` and `Playlists` are permanently out of scope.** Decided by the
+maintainer, and it is what makes this tractable: the write side needs only
+`a{sv}` with an `as` inside, so the marshaller is built for a closed set of
+signatures and never has to grow `ao`, `aa{sv}`, `(oss)` or `a(oss)`. Every
+container it does not implement is a padding bug it cannot have - and a padding
+bug is invisible, because the spec's prescribed response to a malformed message
+is to drop the connection without notice. Build for the closed set and resist
+generalising it; there is nothing coming that needs the general case.
+
+Note that this couples to features that do exist: playlist editing and the
+service's generated mixes are in the backlog, and neither will be reachable from
+a desktop applet. That is accepted. The major consumers publish neither optional
+interface either.
+
 **What would change this decision.** If MPRIS needs to ship in weeks rather than
-months, or if `TrackList` or `Playlists` ever comes into scope - both of which
-need a general implementation rather than a closed set of shapes - then rustbus
-is the better trade, and its dormancy is a vendorable problem rather than an
+months, then rustbus and its dormancy is a vendorable problem rather than an
 architectural one. And if the no-async-runtime rule is ever relaxed for a reason
 of its own, zbus wins outright on volume of code. Neither is true today.
