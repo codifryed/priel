@@ -282,6 +282,7 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 | Scroll the `?` reference | `j`/`k`, `g`/`G` | `[?]`, then the same keys |
 | Search the catalogue | `3`, type, `Enter`; `i` to re-edit | click the `3` tab; `[?]` then `i` |
 | Shuffle the current view | `s` | click `⇄` |
+| Keep playing when the queue ends | `c` | click `∞` |
 | Favorite the selected track | `f` | click `[f]` |
 | Favorite the playing track | `F` | click the `♥` beside the title |
 | Volume | `+` / `-` | click `-` / `+` |
@@ -374,7 +375,10 @@ each paged in as the selection nears the end of the loaded rows and reloadable
 with `r`; local
 filtering; hi-res resolution and playback (24/192 via progressive segment
 streaming); a gapless
-play queue with a preloaded next track; shuffle with auto-advance; play, pause,
+play queue with a preloaded next track; shuffle with auto-advance; an optional
+`c` toggle that carries the queue on with the service's radio for the track that
+ended it, off unless it is asked for and saying `radio` in place of `queue` for
+as long as what is playing is a suggestion rather than a choice; play, pause,
 seek, skip and volume; a now-playing bar with a scrubbable progress bar, a live
 DAC badge and a bit-perfect verdict; the `?` reference overlay; a diagnostic
 log with an `M` overlay for reading it without leaving the player; a `D` output
