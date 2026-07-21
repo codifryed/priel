@@ -1186,6 +1186,8 @@ pub(crate) fn parse(frame: &[u8]) -> Result<Message> {
         .collect();
     reader.pad_to(8)?;
 
+    // Assembled before the body so that the header checks and the signature can
+    // be read through the same accessors everything above this uses.
     let message = Message {
         kind,
         flags,
@@ -1196,8 +1198,8 @@ pub(crate) fn parse(frame: &[u8]) -> Result<Message> {
     require_fields(&message)?;
 
     let mut body = Vec::new();
-    for kind in parse_signature(message.signature())? {
-        body.push(reader.arg(kind)?);
+    for declared in parse_signature(message.signature())? {
+        body.push(reader.arg(declared)?);
     }
     if reader.at != frame.len() {
         return Err(bad("a body that does not fill its own declared length"));
@@ -1209,20 +1211,15 @@ pub(crate) fn parse(frame: &[u8]) -> Result<Message> {
 /// that leaves one out has sent something priel cannot answer. Checked once
 /// here so that everything above can read them without a second opinion.
 fn require_fields(message: &Message) -> Result<()> {
-    let missing = match message.kind {
-        MessageType::MethodCall => {
-            [message.path().is_none(), message.member().is_none()].contains(&true)
+    let complete = match message.kind {
+        MessageType::MethodCall => message.path().is_some() && message.member().is_some(),
+        MessageType::MethodReturn => message.reply_serial().is_some(),
+        MessageType::Error => message.reply_serial().is_some() && message.error_name().is_some(),
+        MessageType::Signal => {
+            message.path().is_some() && message.interface().is_some() && message.member().is_some()
         }
-        MessageType::MethodReturn => message.reply_serial().is_none(),
-        MessageType::Error => message.reply_serial().is_none() || message.error_name().is_none(),
-        MessageType::Signal => [
-            message.path().is_none(),
-            message.interface().is_none(),
-            message.member().is_none(),
-        ]
-        .contains(&true),
     };
-    if missing {
+    if !complete {
         return Err(bad("a message missing a header field its type requires"));
     }
     Ok(())
@@ -1694,6 +1691,29 @@ mod tests {
         }
     }
 
+    /// Goal: every supported shape survives a round trip at every offset
+    /// modulo 8, in both byte orders. Method: the ten-value sample body behind
+    /// a leading string of length 0 to 7 - which is the same body the golden
+    /// comparison pins the bytes of, so this adds the reader to a layout that
+    /// is already known to be right rather than testing the two against each
+    /// other alone.
+    #[test]
+    fn every_shape_round_trips_at_all_eight_phases() {
+        for pad in 0..8 {
+            let message = Message::signal(1, "/priel", "org.priel.Wire", "Sample")
+                .with_body(alignment_body(pad));
+            for endian in [Endian::Little, Endian::Big] {
+                let bytes = marshal(&message, endian)
+                    .unwrap_or_else(|error| panic!("phase {pad} marshals: {error}"));
+                assert_eq!(
+                    parse(&bytes),
+                    Ok(message.clone()),
+                    "phase {pad} did not survive the round trip"
+                );
+            }
+        }
+    }
+
     /// Goal: parsing means what it says, not merely something reversible.
     /// Method: read the header and the body out of three captures and check
     /// them against what the tools reported at capture time. A round trip alone
@@ -1948,6 +1968,78 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// Replace the four prologue bytes of a header field - its code, and the
+    /// one-character signature that follows - in a capture.
+    fn retype_field(bytes: &[u8], from: [u8; 4], to: [u8; 4]) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        let at = out
+            .windows(4)
+            .position(|window| window == from)
+            .expect("the field is in the capture");
+        out[at..at + 4].copy_from_slice(&to);
+        out
+    }
+
+    /// Goal: a header field priel does not know is stepped over rather than
+    /// refused, which spec 0.43 requires of every receiver, and a field whose
+    /// type is not the one it is defined as is refused rather than read.
+    /// Method: rewrite one field's code and type in real captures.
+    ///
+    /// The ignored field does not come back out again, so such a message is the
+    /// one case that does not re-marshal to the bytes it arrived as. No
+    /// implementation on this machine's bus sends one.
+    #[test]
+    fn a_header_field_priel_does_not_know_is_stepped_over() {
+        // SENDER, renumbered to a code nobody has defined. Still a string, so
+        // its length is known and it can be skipped.
+        let unknown = retype_field(vectors::SEEKED_SIGNAL, [7, 1, b's', 0], [20, 1, b's', 0]);
+        let message = parse(&unknown).expect("an unknown field is not an error");
+        assert_eq!(message.sender(), None);
+        assert_eq!(message.member(), Some("Seeked"));
+
+        // The same code carrying a type that cannot be stepped over at all.
+        let unsteppable = retype_field(vectors::SEEKED_SIGNAL, [7, 1, b's', 0], [20, 1, b'x', 0]);
+        assert!(parse(&unsteppable).is_err());
+
+        // A field priel does know, carrying the wrong type. Reading a `u` where
+        // the specification says `s` is how a reply gets correlated to the
+        // wrong call.
+        let mistyped = retype_field(vectors::SEEK_CALL, [9, 1, b'u', 0], [9, 1, b's', 0]);
+        assert!(parse(&mistyped).is_err());
+    }
+
+    /// Goal: a variant nested deeper than MPRIS defines is refused, not
+    /// followed. Method: relabel a variant's own signature in two real
+    /// captures - one at the top of a body, one inside `Metadata` - leaving
+    /// every length intact so that only the type has changed.
+    #[test]
+    fn a_variant_nested_deeper_than_metadata_is_refused() {
+        let mut inside_a_variant = vectors::GET_POSITION_REPLY.to_vec();
+        // The body is the variant's own signature and then its `x`.
+        let body_at = inside_a_variant.len() - usize::from(inside_a_variant[4]);
+        assert_eq!(inside_a_variant[body_at + 1], b'x');
+        inside_a_variant[body_at + 1] = b'v';
+        assert!(parse(&inside_a_variant).is_err(), "a `v` inside a `v`");
+
+        let mut inside_metadata = vectors::PROPERTIES_CHANGED.to_vec();
+        let at = inside_metadata
+            .windows(12)
+            .position(|window| window.starts_with(b"xesam:title\0"))
+            .expect("the title is in the capture")
+            + 13;
+        assert_eq!(inside_metadata[at], b's');
+        inside_metadata[at] = b'v';
+        assert!(parse(&inside_metadata).is_err(), "a `v` inside `Metadata`");
+    }
+
+    /// Goal: a wire error says which half it is when it is written down, since
+    /// that is the difference between a lost connection and a lost message.
+    #[test]
+    fn a_wire_error_says_which_half_it_is() {
+        assert_eq!(WireError::Framing("no").to_string(), "bus framing: no");
+        assert_eq!(bad("no").to_string(), "bus message: no");
     }
 
     /// Goal: a message missing a field its type requires is refused once, here,
