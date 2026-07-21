@@ -270,7 +270,8 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 | Page up/down | `J`/`K` full, `Ctrl-U`/`Ctrl-D` half | `[?]`, then the same keys |
 | Open playlist or mix / back | `Enter` / `Esc` | double-click |
 | Play selected | `Enter` | double-click a row |
-| Play a queue entry | `Ctrl-W`, then `Enter` on it | double-click it in the panel |
+| Play a queue entry | `Ctrl-W`, then `Enter` on it | double-click it in the column |
+| Show / hide the queue column | `W` | click `▤` |
 | Play / pause | `Space` | click `▷` / `‖` |
 | Seek ±5s | `h`/`l`, `←`/`→` | click or drag the progress bar |
 | Previous / next track | `H`/`L`, or `p`/`n` | click `|◁` / `▷|` |
@@ -310,19 +311,20 @@ allows and are given up in that order — the album first, then the artist, then
 the tier — as it shrinks. A column is either wide enough to read or it is not
 drawn, so nothing is clipped away without the row changing shape to say so.
 
-On a terminal 120 columns or wider, what is playing moves out of the three rows
-along the bottom and into a panel down the right-hand side: the track and the
-artist, the progress bar and the two times, what it is being played into, and
-the verdict on what arrives there. The bottom row is then the keyboard reference
-and nothing else, which gives the list two more rows to use — and the bar is
-still click-and-drag to seek, in its new place. Below 120 columns the three rows
-along the bottom are exactly as they were. That one width is the only
-breakpoint; the list simply has less room once the panel is there, and the row
-gives its columns up in the order above.
+**What is playing is always the three rows along the bottom**, whatever the
+terminal is: the track and the artist, the progress bar and the two times, what
+it is being played into, and the verdict on what arrives there, with the
+keyboard reference beside it. It does not move with the width, because the four
+facts there are the ones you glance at without looking for them and a fact that
+moves has to be looked for. The bar is click-and-drag to seek at every width.
 
-Under those readouts the panel carries **the play queue**, with the tracks
-already played above the current one and dimmed, and what is still to come below
-it. It is a second focusable region: `Ctrl-W` moves the keyboard between the
+On a terminal 120 columns or wider **the play queue takes a column of its own**
+down the right-hand side, full height beside the list, with the tracks already
+played above the current one and dimmed and what is still to come below it. That
+one width is the only breakpoint; the list simply has less room once the column
+is there, and the row gives its columns up in the order above.
+
+The queue is a second focusable region: `Ctrl-W` moves the keyboard between the
 browse list and the queue — vim's own window key — and clicking into either box
 does the same thing with the pointer. Whichever box holds the keyboard is drawn
 with a heavier border, so which one `j`/`k`, `g`/`G` and `Enter` will act on is
@@ -330,6 +332,14 @@ readable with no colour at all; the box that does not hold it still shows where
 its cursor is, in a quieter backing of its own. `Enter` on a queue entry plays
 it, forwards or back, which is what makes the history above the current track
 navigation rather than a picture of it.
+
+The column is shown without being asked for, and **`W` folds it away and brings
+it back** — the shifted sibling of the key that moves between the two regions,
+so the pair names the window rather than teaching a second idiom. The `▤` in the
+header does the same thing with the pointer, and appears only at the widths that
+have a column to fold. While it is folded the list has the whole width and the
+queue is not there to be focused or clicked, exactly as on a narrow terminal;
+`Ctrl-W` then says which key brings it back.
 
 `F` still favorites the playing track and the `♥` beside the title is still
 clickable, whichever box has the keyboard.
@@ -353,21 +363,21 @@ preload, so pressing `e` while a track plays takes effect at the end of it: the
 entry after this one is already in mpv's playlist, and a second path into that
 playlist is the one thing the gapless pipeline must not grow.
 
-Entries the radio added when the queue ran out are marked `~`, and the heading
-above the queue says so — `Queue 4/9  ~ radio` — for as long as there is a mark
-to explain. Music you chose and music the service suggested are never blurred
+Entries the radio added when the queue ran out are marked `~`, and the line
+along the top of the column says so — `Queue 4/9 ~ radio` — for as long as there
+is a mark to explain. Music you chose and music the service suggested are never blurred
 together: the mark is a column of its own, so an entry can be a suggestion and
 be in the history at the same time and say both.
 
 The queue is the snapshot taken when you pressed `Enter`, and showing it makes
 that visible: a page of the listing that lands later does not join it, and
-pressing `Enter` again in the list is how you take the larger set. The panel
+pressing `Enter` again in the list is how you take the larger set. The column
 draws straight from that one queue every frame, so what is on screen and what
 plays next cannot disagree.
 
-**Below 120 columns there is no panel and so no queue view.** That is the
+**Below 120 columns there is no column and so no queue view.** That is the
 decision rather than an omission: it is one breakpoint for the whole interface,
-and a queue squeezed into a narrow terminal would be taking rows from the list
+and a queue squeezed into a narrow terminal would be taking cells from the list
 that is the reason for the narrow terminal. `Ctrl-W` there says which width
 brings the queue back, and the queue itself is still driven by `H`/`L`, `s` and
 `c` exactly as before.

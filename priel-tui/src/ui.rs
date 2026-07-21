@@ -797,7 +797,7 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
             row(&[("radio", None)], "suggested, not chosen"),
             // The vocabulary again: the mark the queue puts on the entries the
             // radio added, so the glyph is explained where the keys are read as
-            // well as in the panel it appears in.
+            // well as in the column it appears in.
             row(&[("~", None)], "the radio queued it"),
             row(
                 &[("f", Some(Hit::FavoriteSelected))],
