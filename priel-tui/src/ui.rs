@@ -821,6 +821,11 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
             row(&[("A", Some(Hit::SignIn))], "sign in again"),
             row(&[("t", Some(Hit::Themes))], "colour theme"),
             row(&[("q", Some(Hit::Quit))], "quit priel"),
+            // Not an action, and the only place the running program says where
+            // a remembered palette, device or exclusivity actually goes. The
+            // path is the XDG default; $XDG_CONFIG_HOME moves it, which is what
+            // the man page is for.
+            row(&[("settings.conf", None)], "in ~/.config/priel"),
         ],
     ),
     (
@@ -1112,9 +1117,10 @@ const DEVICE_NAME_SHARE: u16 = 2;
 /// The output device picker.
 ///
 /// Modal like the log overlay and scrolled with the same keys. Two things it
-/// must always say: which device is in use, and that a choice made here lasts
-/// for this session only - priel reads no configuration file, so `--device` is
-/// the only way to make one permanent.
+/// must always say: which device is in use, and that a choice made here is kept
+/// for the next start - with the flags that override it for one run, because a
+/// setting that is remembered has to be answerable from the command line in
+/// both directions.
 fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme();
     let width = area.width.saturating_sub(4).min(110);
@@ -1206,7 +1212,7 @@ fn exclusive_toggle(f: &mut Frame, app: &mut App, row: Rect) {
         t.toggle(on),
     ));
     bar.label(
-        "  this session only — --device and --exclusive make a choice permanent",
+        "  kept for next time — --device and --shared override it for one run",
         Style::default().fg(t.faint),
     );
     // Do not offer a control the row was too narrow to draw.
@@ -1277,8 +1283,8 @@ const THEME_NAME_FIELD: usize = 15;
 ///
 /// Modal like the output picker and scrolled with the same keys. Two things it
 /// must always say, for the same reason that one does: which palette is in use,
-/// and that a choice made here lasts for this session only - priel reads no
-/// configuration file, so `--theme` is the only way to keep one.
+/// and that a choice made here is kept for the next start, with `--theme` as the
+/// way to override it for one run.
 ///
 /// **Each row previews the palette it offers rather than the one in force.**
 /// The three fidelity grades are the reason a palette is a decision and not a
@@ -1328,7 +1334,7 @@ fn theme_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let footer = Style::default().fg(t.faint);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "  this session only — --theme makes a choice permanent",
+            "  kept for next time — --theme overrides it for one run",
             footer,
         ))),
         Rect {
@@ -4029,6 +4035,18 @@ mod tests {
     }
 
     #[test]
+    fn the_reference_says_where_a_remembered_setting_is_kept() {
+        // Goal: the pickers say a choice is kept; this is the one place in the
+        // interface that says *where*. Without it the answer lives only in the
+        // man page, which is not where someone looks while priel is running.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 120, 40);
+        assert!(out.contains("settings.conf"), "{out}");
+        assert!(out.contains("~/.config/priel"), "{out}");
+    }
+
+    #[test]
     fn a_word_the_reference_only_explains_offers_nothing_to_click() {
         // Goal: half of the Output section is the vocabulary of the badges, not
         // actions. Making those clickable would promise a control that could not
@@ -4404,17 +4422,20 @@ mod tests {
     }
 
     #[test]
-    fn the_device_picker_says_the_choice_lasts_for_this_session() {
-        // Goal: priel reads no configuration file, deliberately. A picker that
-        // did not say so would look broken on the next start.
+    fn the_device_picker_says_the_choice_is_kept_and_what_overrides_it() {
+        // Goal: this footer used to apologise - the choice was for the session
+        // and a flag was the only way to keep one. It is kept now, and the
+        // footer owes the reader both halves of the new rule: that it outlives
+        // the session, and that a flag still wins for one run.
         let mut sc = screen();
         sc.app.set_devices_for_test(devices());
         sc.app.mode = Mode::Devices;
         let out = text(&mut sc.app, 100, 20);
-        assert!(out.contains("this session only"), "{out}");
+        assert!(!out.contains("this session only"), "{out}");
+        assert!(out.contains("kept"), "{out}");
         assert!(
-            out.contains("--device"),
-            "and it must say what does make it permanent: {out}"
+            out.contains("--device") && out.contains("--shared"),
+            "both directions are answerable from the command line: {out}"
         );
         assert!(out.contains("to close"), "{out}");
     }
@@ -5181,10 +5202,10 @@ mod tests {
     }
 
     #[test]
-    fn the_theme_picker_names_every_palette_and_how_long_a_choice_lasts() {
-        // Goal: priel reads no configuration file, so the overlay owes the
-        // reader the same promise the output picker makes - this is for the
-        // session, and the flag is what keeps it.
+    fn the_theme_picker_names_every_palette_and_says_a_choice_is_kept() {
+        // Goal: the overlay owes the reader the same promise the output picker
+        // makes - the palette is remembered, and `--theme` overrides it for a
+        // run.
         let mut sc = screen();
         sc.app.mode = Mode::Themes;
         let out = text(&mut sc.app, 100, 20);
@@ -5192,7 +5213,8 @@ mod tests {
             let label = crate::theme::label(*name);
             assert!(out.contains(&label), "{label} is not offered: {out}");
         }
-        assert!(out.contains("this session only"), "{out}");
+        assert!(!out.contains("this session only"), "{out}");
+        assert!(out.contains("kept"), "{out}");
         assert!(out.contains("--theme"), "{out}");
         assert!(out.contains("to close"), "an overlay must say the way out");
     }

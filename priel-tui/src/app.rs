@@ -45,6 +45,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use crate::bus::conn::Bus;
 use crate::bus::mpris::{self, BusCommand, Entry, Now, Snapshot};
 use crate::cli::ThemeName;
+use crate::settings::Settings;
 use crate::theme::{self, Theme};
 use crate::worker::{self, FromWorker, Task, ToWorker, Worker};
 
@@ -670,6 +671,13 @@ pub struct App {
     credential_status: Option<String>,
     fetching: Option<Receiver<Result<(), String>>>,
     login: Option<LoginFlow>,
+    /// What a picker chose this session, and nothing else.
+    ///
+    /// `main` writes it out once the loop has ended. **`App` holds no path and
+    /// never writes**: file I/O has no business on the render thread, and tests
+    /// build an `App`, so anything that could reach the user's home directory
+    /// from here would eventually reach a real one.
+    chosen: Settings,
 }
 
 /// Snapshot of the render-relevant state that moves on its own.
@@ -825,6 +833,7 @@ impl App {
             credential_status: None,
             fetching: None,
             login: None,
+            chosen: Settings::default(),
         }
     }
 
@@ -881,18 +890,22 @@ impl App {
         self.dirty = true;
     }
 
-    /// Repaint in the palette on this row, for this session.
+    /// Repaint in the palette on this row, and remember it.
     ///
     /// The one place a choice made in the picker lands: the Enter key and a
-    /// click on a row both arrive here. Nothing is written anywhere - priel
-    /// reads no configuration file, and `--theme` is what makes a choice
-    /// outlive the session, which is what the overlay says in words.
+    /// click on a row both arrive here. Recorded rather than written - `main`
+    /// writes the settings file once, on the way out, because a `write(2)` on
+    /// the render thread is exactly what the log has a writer thread to avoid.
     fn choose_theme(&mut self, index: usize) {
         let Some(name) = theme::OFFERED.get(index).copied() else {
             return;
         };
         self.set_theme(name);
-        self.notice = Some(format!("Theme: {} — this session only", theme::label(name)));
+        self.chosen.theme = Some(name);
+        self.notice = Some(format!(
+            "Theme: {} — kept for next time",
+            theme::label(name)
+        ));
         self.mode = Mode::Normal;
     }
 
@@ -3344,14 +3357,25 @@ impl App {
     fn toggle_exclusive(&mut self) {
         self.exclusive = !self.exclusive;
         self.player.set_exclusive(self.exclusive);
+        self.chosen.exclusive = Some(self.exclusive);
         self.notice = Some(if self.exclusive {
-            "Asking for the device exclusively — this session only, --exclusive makes it permanent"
+            "Asking for the device exclusively — kept for next time; --shared overrides it"
                 .to_string()
         } else {
-            "Sharing the output device again — this session only, --exclusive makes it permanent"
+            "Sharing the output device again — kept for next time; --exclusive overrides it"
                 .to_string()
         });
         self.dirty = true;
+    }
+
+    /// What the pickers chose this session, for `main` to write out.
+    ///
+    /// Empty unless a picker was actually used: a value that came from a flag is
+    /// for that run alone, and quietly making one permanent is the surprise the
+    /// settings file is designed to avoid.
+    #[must_use]
+    pub fn chosen(&self) -> &Settings {
+        &self.chosen
     }
 
     /// Has exclusive use of the device been asked for?
@@ -3363,12 +3387,13 @@ impl App {
         self.exclusive
     }
 
-    /// Move the output to the device on this row, for this session.
+    /// Move the output to the device on this row, and remember it.
     ///
     /// The one place that changes the output: the Enter key and a click on a
-    /// row both arrive here, so the two cannot drift apart. Nothing is written
-    /// anywhere - priel reads no configuration file, and `--device` is what
-    /// makes a choice outlive the session, which is what the overlay says.
+    /// row both arrive here, so the two cannot drift apart. What is remembered
+    /// is the **identifier**, never the description: only the first is what
+    /// `--device` and the settings file accept. Recorded rather than written,
+    /// for the reason `choose_theme` gives.
     fn choose_device(&mut self, index: usize) {
         let Some(device) = self.devices.get(index) else {
             return;
@@ -3380,7 +3405,8 @@ impl App {
             device.description.clone()
         };
         self.player.set_device(&name);
-        self.notice = Some(format!("Output: {label} — this session only"));
+        self.chosen.device = Some(name);
+        self.notice = Some(format!("Output: {label} — kept for next time"));
         self.mode = Mode::Normal;
         self.dirty = true;
     }
@@ -7240,17 +7266,25 @@ mod tests {
     }
 
     #[test]
-    fn asking_for_exclusive_access_says_it_lasts_for_this_session() {
-        // Goal: priel reads no configuration file, so a toggle that said
-        // nothing would look broken on the next start. --exclusive is what
-        // makes it permanent, exactly as --device is for the device.
+    fn the_exclusive_toggle_is_remembered_and_says_so() {
+        // Goal: taking a device from every other application on the machine is
+        // the one setting a user must never be surprised by on the next start,
+        // so the toggle says in words that it will be there. `x` settles on a
+        // value; that value is what is written, not each flip on the way.
         let mut r = with_picker("pipewire/dac");
         r.app.notice = None;
         r.app.on_key(key('x'));
+        assert_eq!(r.app.chosen().exclusive, Some(true));
         let notice = r.app.notice.clone().unwrap_or_default();
         assert!(
-            notice.contains("--exclusive"),
-            "the notice says what makes it permanent: {notice}"
+            notice.contains("kept"),
+            "the notice says the choice outlives the session: {notice}"
+        );
+        r.app.on_key(key('x'));
+        assert_eq!(
+            r.app.chosen().exclusive,
+            Some(false),
+            "giving the device back is remembered too"
         );
     }
 
@@ -7301,21 +7335,40 @@ mod tests {
     }
 
     #[test]
-    fn choosing_a_device_closes_the_picker_and_says_it_is_for_this_session() {
-        // Goal: the choice is not written anywhere - priel reads no
-        // configuration file - so the one moment it can be said is now.
+    fn choosing_a_device_closes_the_picker_and_remembers_the_choice() {
+        // Goal: the identifier is the thing nobody wants to type twice, so the
+        // picker records it for `main` to write out. It is the identifier that
+        // is kept, never the description - only the first is what --device and
+        // the file accept.
         let mut r = with_picker("auto");
         r.app.on_key(key('j'));
         r.app.on_key(code(KeyCode::Enter));
         assert_eq!(r.app.mode, Mode::Normal, "choosing closes the picker");
+        assert_eq!(r.app.chosen().device.as_deref(), Some("pipewire/dac"));
         let notice = r.app.notice.clone().unwrap_or_default();
         assert!(
             notice.contains("pipewire/dac description"),
             "the chosen device is named: {notice}"
         );
         assert!(
-            notice.contains("this session"),
-            "and the choice is temporary: {notice}"
+            notice.contains("kept"),
+            "and the choice outlives the session: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_session_that_used_no_picker_has_nothing_to_remember() {
+        // Goal: a value that came from a flag is for that run alone. Persisting
+        // it would quietly make a one-off permanent, which is the surprise this
+        // design exists to avoid - so `chosen` starts empty and only a picker
+        // fills it.
+        let mut r = rig();
+        r.app.set_theme(ThemeName::Dracula);
+        r.app.exclusive = true;
+        assert!(
+            r.app.chosen().is_empty(),
+            "nothing was chosen: {:?}",
+            r.app.chosen()
         );
     }
 
@@ -7393,18 +7446,20 @@ mod tests {
     }
 
     #[test]
-    fn choosing_a_theme_repaints_and_says_it_is_for_this_session() {
-        // Goal: priel reads no configuration file, so a choice made here lasts
-        // for the session and the picker must say so - as the device picker
-        // does. The notice is the only place that promise is made in words.
+    fn choosing_a_theme_repaints_and_remembers_the_choice() {
+        // Goal: the palette is the setting a listener changes once and expects
+        // to find again, so the picker records it and says so. Both halves
+        // matter: a picker that kept nothing used to have to apologise in its
+        // own footer.
         let mut r = with_themes();
         r.app.on_key(key('j'));
         r.app.on_key(code(KeyCode::Enter));
         assert_eq!(r.app.theme(), Theme::of(ThemeName::GruvboxDark));
         assert_eq!(r.app.mode, Mode::Normal, "choosing closes the picker");
+        assert_eq!(r.app.chosen().theme, Some(ThemeName::GruvboxDark));
         let notice = r.app.notice.clone().unwrap_or_default();
         assert!(notice.contains("gruvbox-dark"), "{notice}");
-        assert!(notice.contains("this session only"), "{notice}");
+        assert!(notice.contains("kept"), "{notice}");
     }
 
     #[test]
