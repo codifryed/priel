@@ -20,6 +20,7 @@
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use std::fmt::Write as _;
 
@@ -294,8 +295,8 @@ fn add_to_rows(f: &mut Frame, app: &mut App, body: Rect) {
     for (i, index) in (app.add_offset..(app.add_offset + h).min(total)).enumerate() {
         let p = &app.playlists[index];
         let text = format!(
-            "  {:name_width$}  {:>5} tracks",
-            trunc(&p.title, name_width),
+            "  {}  {:>5} tracks",
+            field(&p.title, name_width),
             p.num_tracks
         );
         let style = if index == selected {
@@ -1718,8 +1719,8 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
         if let Some(p) = app.playlists.get(idx) {
             return (
                 format!(
-                    "  {:<44} {:>4} tracks   {}",
-                    trunc(&p.title, 44),
+                    "  {} {:>4} tracks   {}",
+                    field(&p.title, 44),
                     p.num_tracks,
                     fmt_hms(p.duration_secs)
                 ),
@@ -1735,7 +1736,7 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
         // that instead of on two figures that would have to be invented.
         if let Some(m) = app.mixes.get(idx) {
             return (
-                format!("  {:<44} {}", trunc(&m.title, 44), trunc(&m.subtitle, 30)),
+                format!("  {} {}", field(&m.title, 44), trunc(&m.subtitle, 30)),
                 false,
             );
         }
@@ -1752,14 +1753,14 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
         let kept = heart(app.is_favorite(t.id));
         (
             format!(
-                "{mark}{kept} {:<32} {:<20} {:<8}{:>6}",
-                trunc(&t.title, 32),
-                trunc(&t.artist, 20),
+                "{mark}{kept} {} {} {}{:>6}",
+                field(&t.title, 32),
+                field(&t.artist, 20),
                 // The same spelling the badge beside the playing track uses.
                 // The raw wire token does not fit this column, so a row that
                 // printed it named the track's quality one way while the row
                 // above the progress bar named it another.
-                trunc(&short_quality(&t.quality), 8),
+                field(&short_quality(&t.quality), 8),
                 fmt_dur(t.duration_secs),
             ),
             is_now,
@@ -2330,6 +2331,29 @@ fn short_quality(q: &str) -> String {
     }
 }
 
+/// A column of exactly `n` cells: cut to fit, then padded out to the full width.
+///
+/// `format!("{:<n$}")` cannot do this. It pads to a *character* count, so a CJK
+/// title of sixteen characters was thirty-two cells wide and then had sixteen
+/// spaces added after it - forty-eight cells in a thirty-two cell column, with
+/// every column to its right pushed off the grid.
+fn field(s: &str, n: usize) -> String {
+    let mut out = trunc(s, n);
+    for _ in cells(&out)..n {
+        out.push(' ');
+    }
+    out
+}
+
+/// Cut `s` down to at most `n` display cells, marking the cut with an ellipsis.
+///
+/// Cells, not characters: a wide glyph paints two of them and a combining mark
+/// paints none, so a character count is not a width. Measured with
+/// `unicode-width`, which is the crate ratatui measures `Span::width` with, so
+/// what this reserves and what the renderer paints cannot disagree.
+///
+/// A wide glyph straddling the last cell is dropped rather than half-drawn, so
+/// the result is occasionally one cell short of `n`. Never longer.
 fn trunc(s: &str, n: usize) -> String {
     // A field with no room holds nothing. Returning the ellipsis alone made the
     // result one cell wider than the field it was asked to fit, which on a
@@ -2337,13 +2361,28 @@ fn trunc(s: &str, n: usize) -> String {
     if n == 0 {
         return String::new();
     }
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut r: String = s.chars().take(n.saturating_sub(1)).collect();
-        r.push('…');
-        r
+    if cells(s) <= n {
+        return s.to_string();
     }
+    // One cell is spoken for by the ellipsis that says the rest was cut.
+    let budget = n - 1;
+    let mut used = 0;
+    let mut out = String::with_capacity(s.len().min(n * 4));
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// How many cells a string paints, the way ratatui measures it to draw it.
+fn cells(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
 }
 
 /// Sample rates the way the people who care about them write them.
@@ -4734,5 +4773,117 @@ mod tests {
             assert!(out.contains(", Esc or q to close"), "{name}: {out}");
             assert!(!out.contains("press "), "{name} says it its own way: {out}");
         }
+    }
+
+    /// Display width, measured through ratatui rather than through the crate
+    /// `ui` measures with: an independent oracle for the same number.
+    fn drawn(s: &str) -> usize {
+        ratatui::text::Span::raw(s).width()
+    }
+
+    #[test]
+    fn truncation_cuts_at_a_cell_count_not_a_character_count() {
+        // Goal: a CJK title paints two cells per character, so a field asked
+        // for twelve cells was painting up to twenty-four and shifting every
+        // column to its right off the grid. Measured with `Span::width`, which
+        // is what ratatui itself draws with.
+        let wide = "夜に駆ける夜に駆ける夜に駆ける夜に駆ける";
+        let cut = super::trunc(wide, 12);
+        assert!(
+            drawn(&cut) <= 12,
+            "{cut:?} paints {} cells in a 12-cell field",
+            drawn(&cut)
+        );
+        assert!(cut.ends_with('…'), "a cut field says it was cut: {cut:?}");
+    }
+
+    #[test]
+    fn a_string_that_fits_in_cells_is_left_alone() {
+        // Goal: the other half of the same bug. Six wide characters are twelve
+        // cells, so a twelve-cell field holds them whole - and a character
+        // count would have kept sixteen of them.
+        let six = "夜に駆ける夜";
+        assert_eq!(drawn(six), 12);
+        assert_eq!(super::trunc(six, 12), six);
+        assert!(super::trunc(six, 11).ends_with('…'));
+    }
+
+    #[test]
+    fn combining_marks_cost_no_cells_of_their_own() {
+        // Goal: an accent is a separate character that paints on the letter
+        // before it. Counting characters would cut a name in half for accents
+        // that take no room at all.
+        let accented = "Bjo\u{308}rk Guðmundsdóttir";
+        assert!(accented.chars().count() > drawn(accented));
+        assert_eq!(super::trunc(accented, drawn(accented)), accented);
+    }
+
+    #[test]
+    fn a_two_cell_emoji_is_measured_as_two() {
+        // Goal: a title with an emoji in it is ordinary in a catalogue, and it
+        // paints two cells per glyph like any other wide character.
+        let s = "🎵🎵🎵🎵";
+        assert_eq!(drawn(&super::trunc(s, 5)), 5);
+        assert!(drawn(&super::trunc(s, 4)) <= 4);
+    }
+
+    #[test]
+    fn a_field_is_exactly_as_many_cells_as_it_was_asked_for() {
+        // Goal: `format!("{:<32}")` pads by character count, so a padded CJK
+        // title ran to sixty-four cells with thirty-two spaces after it. A
+        // column that pads by cells cannot push the column beside it along.
+        for s in ["Nude", "夜に駆ける夜に駆ける", "Bjo\u{308}rk", "🎵 mix", ""] {
+            assert_eq!(drawn(&super::field(s, 20)), 20, "{s:?}");
+            assert_eq!(drawn(&super::field(s, 6)), 6, "{s:?}");
+        }
+    }
+
+    /// The column an ASCII needle starts at on row `y`, scanned cell by cell.
+    ///
+    /// A character index into a joined line is not a column: a wide glyph fills
+    /// one cell and leaves the next one blank, so the two disagree by one per
+    /// wide glyph - which is the whole bug under test.
+    fn column_of(app: &mut App, w: u16, h: u16, y: u16, needle: &str) -> Option<u16> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let buf = term.backend().buffer().clone();
+        (0..w).find(|x| {
+            (*x..w)
+                .map(|i| buf[(i, y)].symbol())
+                .collect::<String>()
+                .starts_with(needle)
+        })
+    }
+
+    #[test]
+    fn a_wide_title_leaves_the_columns_beside_it_where_they_were() {
+        // Goal: read off a rendered frame, not asserted in the abstract. A CJK
+        // title is ordinary in a catalogue and paints two cells per character,
+        // and the row carrying one used to push the artist, the quality and the
+        // duration rightwards - off the edge of the box on a narrow terminal.
+        let mut sc = screen();
+        sc.app.favorites = vec![
+            track(1, "Nude"),
+            Track {
+                id: 2,
+                title: "夜に駆ける夜に駆ける夜に駆ける夜に駆ける".into(),
+                artist: "Artist".into(),
+                quality: "HI-RES".into(),
+                duration_secs: 245,
+                ..Track::default()
+            },
+        ];
+        let plain = column_of(&mut sc.app, 80, 24, 2, "HI-RES");
+        let wide = column_of(&mut sc.app, 80, 24, 3, "HI-RES");
+        assert!(plain.is_some(), "the plain row lost its quality column");
+        assert_eq!(wide, plain, "the wide row's quality column moved");
+    }
+
+    #[test]
+    fn a_field_with_no_room_holds_nothing() {
+        // Goal: a zero-width field once returned the ellipsis on its own, one
+        // cell wider than the field it was asked to fit.
+        assert_eq!(super::trunc("Nude", 0), "");
+        assert_eq!(super::field("Nude", 0), "");
     }
 }

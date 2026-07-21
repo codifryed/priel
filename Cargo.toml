@@ -37,6 +37,11 @@ log = { version = "0.4", features = ["std"] }
 # features leave bindgen out, so no clang at build time either.
 libmpv2-sys = "4"
 # ureq: blocking, rustls, no async runtime. No tokio/hyper anywhere in the tree.
+# Already in the tree: this is the crate ratatui measures with, so naming it
+# directly costs no new crate. Pinned to ratatui's own version, because a
+# truncation that measured differently from the renderer would put every hit
+# box one cell off what was painted.
+unicode-width = "0.2"
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
