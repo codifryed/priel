@@ -783,7 +783,7 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
                 &[("n", Some(Hit::Next)), ("p", Some(Hit::Prev))],
                 "next / previous track",
             ),
-            row(&[("s", Some(Hit::Shuffle))], "shuffle this view"),
+            row(&[("s", Some(Hit::Shuffle))], "shuffle the play order"),
             row(&[("e", Some(Hit::Repeat))], "repeat: off / all / one"),
             row(&[("c", Some(Hit::Continue))], "keep playing at the end"),
             // The vocabulary, not an action: the three marks the one control

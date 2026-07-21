@@ -284,7 +284,7 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 | Answer a confirmation | `y` do it, `n` or `Esc` don't | click `[y]` / `[n]` |
 | Scroll the `?` reference | `j`/`k`, `g`/`G` | `[?]`, then the same keys |
 | Search the catalogue | `3`, type, `Enter`; `i` to re-edit | click the `3` tab; `[?]` then `i` |
-| Shuffle the current view | `s` | click `⇄` |
+| Shuffle the play order | `s` | click `⇄` |
 | Repeat: off / all / one | `e` cycles | click `⟳-` / `⟳A` / `⟳1` |
 | Keep playing when the queue ends | `c` | click `∞` |
 | Favorite the selected track | `f` | click `[f]` |
@@ -349,16 +349,24 @@ the `∞` control goes dark to say so rather than claiming something that will n
 happen. Neither toggle changes the other: turn the repeat off and the radio is
 exactly as you left it.
 
+**The shuffle deals a play order over the queue; it never reorders the queue
+itself.** The queue stays the tracks you chose in the order you chose them, and
+a permutation beside it says what follows what — so the panel shows what is
+actually coming, the preload asks for the track that will really play, and no
+track comes round again until every other one has. Turning the shuffle off puts
+you back in the listing order with the same track still playing, which is only
+possible because that order was never overwritten. Turning it on again deals
+only what has not played yet: what is behind you stays behind you. A queue the
+radio extends keeps the rows already on screen where they are and deals the new
+ones onto the end.
+
 **The shuffle says what the play order is; the repeat says whether that order
 ends.** Repeat-one outranks the shuffle, because there is no next track to pick
-when the answer is this one again. Repeat-all defers to it: today the shuffle
-picks afresh on every advance rather than laying out an order, so it never runs
-out and there is no end for repeat-all to start again from — with the shuffle on,
-repeat-all changes nothing. That is a consequence of the shuffle having no order
-yet, not a rule of its own. Once it has one, the end of that order is exactly
-where repeat-all starts it again instead of stopping, and nothing about the
-repeat has to change to mean that. In a queue of one track the two
-repeat states are the same thing, deliberately. A repeat is answered at the next
+when the answer is this one again. Repeat-all starts the *order* again rather
+than the listing, and the last row of a dealt order is as much the end of the
+queue as the last row of a listing — which is what "no track twice until every
+other one has played" means. In a queue of one track the two repeat states are
+the same thing, deliberately. A repeat is answered at the next
 preload, so pressing `e` while a track plays takes effect at the end of it: the
 entry after this one is already in mpv's playlist, and a second path into that
 playlist is the one thing the gapless pipeline must not grow.
@@ -440,7 +448,9 @@ each paged in as the selection nears the end of the loaded rows and reloadable
 with `r`; local
 filtering; hi-res resolution and playback (24/192 via progressive segment
 streaming); a gapless
-play queue with a preloaded next track; shuffle with auto-advance; an `e` control
+play queue with a preloaded next track; a shuffle that deals a play order the
+queue panel shows, plays every track once before any of them twice, and can be
+turned off back into the listing order without stopping the music; an `e` control
 that cycles no repeat, repeat all and repeat one — the queue starting again at
 its top, or the one track playing again, both through the same preload that makes
 every other transition gapless; an optional
