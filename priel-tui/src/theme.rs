@@ -44,12 +44,15 @@
 //! ## Where the palettes come from
 //!
 //! Published palettes, not invented ones: they are cheaper to get right, and a
-//! terminal user often already knows them. One deviation is made deliberately
-//! and always in the same direction. Every one of these palettes puts its
-//! comment grey below the contrast floor, because in an editor that grey marks
-//! text you are meant to skip. In priel `faint` carries the keyboard reference
-//! along the bottom row, which is how bindings are discovered, so it is
-//! lightened on a dark theme and darkened on a light one until it clears.
+//! terminal user often already knows them. Every deviation from what a palette
+//! publishes is deliberate, and each is recorded on the palette that made it
+//! with the ratio that forced it. Nearly all of them are the same deviation:
+//! an editor palette puts its comment grey below the contrast floor, because
+//! there that grey marks text you are meant to skip. In priel `faint` carries
+//! the keyboard reference along the bottom row, which is how bindings are
+//! discovered, so it is lightened on a dark theme and darkened on a light one
+//! until it clears - and where a palette publishes no second grey at all,
+//! `muted` is lightened out of the same one rather than invented beside it.
 
 use clap::ValueEnum as _;
 use ratatui::style::{Color, Style};
@@ -58,8 +61,8 @@ use crate::cli::ThemeName;
 
 /// The colours priel paints, one field per role.
 ///
-/// Add a field rather than reaching for a literal: the four palettes below then
-/// stop compiling until each has answered for the new role, which is the only
+/// Add a field rather than reaching for a literal: every palette below then
+/// stops compiling until each has answered for the new role, which is the only
 /// way a theme set stays complete.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
@@ -118,6 +121,7 @@ pub const OFFERED: &[ThemeName] = &[
     ThemeName::GruvboxDark,
     ThemeName::GruvboxLight,
     ThemeName::OneLight,
+    ThemeName::Dracula,
     ThemeName::Terminal,
 ];
 
@@ -156,6 +160,7 @@ impl Theme {
             ThemeName::GruvboxDark => GRUVBOX_DARK,
             ThemeName::GruvboxLight => GRUVBOX_LIGHT,
             ThemeName::OneLight => ONE_LIGHT,
+            ThemeName::Dracula => DRACULA,
         }
     }
 
@@ -332,6 +337,44 @@ const ONE_LIGHT: Theme = Theme {
     verdict_near: Color::Rgb(0x98, 0x68, 0x01),
     verdict_altered: Color::Rgb(0xca, 0x12, 0x43),
     verdict_unknown: Color::Rgb(0x8a, 0x8c, 0x94),
+};
+
+/// Dracula, by Zeno Rocha. Dark, and the most saturated palette on offer.
+///
+/// Published as one background and eleven colours, with **one foreground and
+/// one comment grey and nothing in between** - so the two steps priel wants
+/// below `text` are the comment lightened along its own hue rather than a
+/// second grey invented from nothing. Comment `#6272a4` measures 3.03:1, which
+/// clears the mark floor by three hundredths and is the thinnest `faint` in the
+/// set; `muted` is prose and needs 4.5. So `muted` is that comment at 4.97:1
+/// and `faint` at 3.56:1, which is where nord's sits.
+///
+/// Dracula gives Selection and Current Line the same value, so the highlighted
+/// row takes the accent as gruvbox-dark's does and `#44475a` becomes the raised
+/// chip a control is drawn on. `notice` is Orange rather than Yellow: Dracula's
+/// Yellow is a lime at hue 65 and would be read next to its Green at hue 135,
+/// which is the one distinction the fidelity grades cannot afford to lose.
+const DRACULA: Theme = Theme {
+    background: Color::Rgb(0x28, 0x2a, 0x36),
+    text: Color::Rgb(0xf8, 0xf8, 0xf2),
+    muted: Color::Rgb(0x8c, 0x98, 0xbc),
+    faint: Color::Rgb(0x6f, 0x7e, 0xab),
+    accent: Color::Rgb(0xbd, 0x93, 0xf9),
+    selection_fg: Color::Rgb(0x28, 0x2a, 0x36),
+    selection_bg: Color::Rgb(0xbd, 0x93, 0xf9),
+    control_fg: Color::Rgb(0xbd, 0x93, 0xf9),
+    control_bg: Color::Rgb(0x44, 0x47, 0x5a),
+    toggle_on_fg: Color::Rgb(0x28, 0x2a, 0x36),
+    toggle_on_bg: Color::Rgb(0x50, 0xfa, 0x7b),
+    active: Color::Rgb(0x50, 0xfa, 0x7b),
+    notice: Color::Rgb(0xff, 0xb8, 0x6c),
+    error: Color::Rgb(0xff, 0x55, 0x55),
+    favorite: Color::Rgb(0xff, 0x79, 0xc6),
+    queue: Color::Rgb(0x8b, 0xe9, 0xfd),
+    verdict_clean: Color::Rgb(0x50, 0xfa, 0x7b),
+    verdict_near: Color::Rgb(0xff, 0xb8, 0x6c),
+    verdict_altered: Color::Rgb(0xff, 0x55, 0x55),
+    verdict_unknown: Color::Rgb(0x6f, 0x7e, 0xab),
 };
 
 #[cfg(test)]

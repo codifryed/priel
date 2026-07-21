@@ -127,6 +127,8 @@ pub enum ThemeName {
     GruvboxLight,
     /// Light, cool.
     OneLight,
+    /// Dark, vivid.
+    Dracula,
     /// Your terminal's own sixteen colours
     Terminal,
 }
