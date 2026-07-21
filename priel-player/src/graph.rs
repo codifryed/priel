@@ -274,21 +274,30 @@ fn is_unity(gain: f64) -> bool {
     (gain - 1.0).abs() <= f64::EPSILON
 }
 
-/// The worst of a set of per-channel gains: the one that alters the samples
-/// most.
+/// The worst of a set of per-channel gains: the one the verdict has to be made
+/// on.
 ///
-/// `None` for an empty list, which is not a reading of anything.
+/// Attenuation is the only thing that costs resolution, so the quietest channel
+/// decides wherever one is turned down. Where nothing is, a channel *above*
+/// unity has still multiplied every sample and is what is left to report -
+/// which is not the same finding and carries no bit count.
+///
+/// `None` when every channel is at unity, and for an empty list, which is not a
+/// reading of anything.
 fn worst(gains: &[f64]) -> Option<f64> {
-    gains
-        .iter()
-        .copied()
-        .filter(|g| !is_unity(*g))
-        .fold(None, |worst: Option<f64>, g| {
-            Some(match worst {
-                Some(w) if (w - 1.0).abs() >= (g - 1.0).abs() => w,
-                _ => g,
-            })
-        })
+    let mut quietest: Option<f64> = None;
+    let mut loudest: Option<f64> = None;
+    for &gain in gains {
+        if is_unity(gain) {
+            continue;
+        }
+        if gain < 1.0 {
+            quietest = Some(quietest.map_or(gain, |q: f64| q.min(gain)));
+        } else {
+            loudest = Some(loudest.map_or(gain, |l: f64| l.max(gain)));
+        }
+    }
+    quietest.or(loudest)
 }
 
 impl SinkVolume {
@@ -2445,7 +2454,7 @@ mod tests {
         // is not a stage that went unread, and a control set away from unity
         // that the server is *not* applying has gone somewhere this dump does
         // not show.
-        let cases: [(SinkVolume, SinkStage); 9] = [
+        let cases: [(SinkVolume, SinkStage); 10] = [
             (SinkVolume::Absent, SinkStage::Absent),
             (SinkVolume::Unread, SinkStage::Unread),
             // Nothing set anywhere: the one arm that is a clean bill.
@@ -2466,6 +2475,14 @@ mod tests {
             (
                 levels(&[1.0, 0.25], &[1.0, 0.25]),
                 SinkStage::InSoftware { gain: 0.25 },
+            ),
+            // One channel turned down and one turned up. Only the turned-down
+            // one costs resolution, so it is the one the verdict is made on -
+            // picking whichever is further from unity would report the louder
+            // channel and quote no loss at all.
+            (
+                levels(&[0.5, 2.0], &[0.5, 2.0]),
+                SinkStage::InSoftware { gain: 0.5 },
             ),
             // The measured machine: set to 2.7% with the software stage at
             // unity. The server is not touching the samples and priel cannot
