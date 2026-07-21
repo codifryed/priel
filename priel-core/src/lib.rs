@@ -93,6 +93,28 @@ pub struct Playlist {
     pub duration_secs: u32,
 }
 
+/// A mix the service builds for the listener.
+///
+/// Not a [`Playlist`] under another name, and the differences are the reason
+/// this is a type of its own rather than a flag on that one. A mix is keyed by
+/// an opaque string rather than a uuid; nobody can edit it; and it is rebuilt
+/// under the listener, so a copy of it goes stale in a way a playlist a person
+/// wrote does not.
+///
+/// **The wire carries no track count and no duration for a mix.** A playlist row
+/// says how long it is before a single track has been asked for; a mix row
+/// cannot, and the only way to learn a mix's length is to ask for its tracks.
+/// What a mix carries instead is a subtitle - what the service built it from -
+/// which is the nearest thing to a description of its contents there is.
+#[derive(Clone, Debug)]
+pub struct Mix {
+    /// The service's identifier for this mix. Opaque: not a number, not a uuid.
+    pub id: String,
+    pub title: String,
+    /// What the mix was built from, in the service's own words.
+    pub subtitle: String,
+}
+
 /// One page of a listing, plus how long the whole listing is.
 ///
 /// The total is the only honest end-of-list signal. A page shorter than the
@@ -167,15 +189,22 @@ struct SessionResp {
 
 #[derive(Deserialize)]
 struct FavTracksResp {
-    items: Vec<FavItem>,
+    items: Vec<ItemRow>,
     /// Sent by the service on every listing, and discarded here until paging
     /// needed it. Defaulted rather than required: an answer without it is still
     /// a usable page.
     #[serde(rename = "totalNumberOfItems", default)]
     total_number_of_items: u32,
 }
+/// The wrapper the service puts round a row it could have sent plainly.
+///
+/// Shared by the favorites and by a mix's tracks, which send the same shape. A
+/// row also carries a `type` saying whether it is a track or a video, and that
+/// is discarded on purpose: dropping the video rows here would leave the
+/// caller's next offset counting a different thing from the service's, and page
+/// some of the rows twice.
 #[derive(Deserialize)]
-struct FavItem {
+struct ItemRow {
     item: TrackBrief,
 }
 #[derive(Deserialize)]
@@ -238,6 +267,90 @@ impl PlaylistBrief {
         }
     }
 }
+#[derive(Deserialize)]
+struct MixBrief {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(rename = "subTitle", default)]
+    sub_title: String,
+}
+impl MixBrief {
+    fn into_mix(self) -> Mix {
+        Mix {
+            id: self.id,
+            title: self.title,
+            subtitle: self.sub_title,
+        }
+    }
+}
+
+/// A "page" answer: the rows of a screen rather than the rows of a listing.
+///
+/// Two of the calls here are served by an endpoint that describes a screen in
+/// the vendor's own web client - a list of rows, each holding modules, only some
+/// of which carry anything to read. That shape is the service's business and not
+/// a frontend's, so it is unwrapped into a [`Page`] here and never leaves the
+/// crate. Deserialised generically because the two callers differ only in what
+/// their list holds.
+//
+// The `bound` on each of these is load-bearing: `#[serde(default)]` on a field
+// whose type mentions `T` makes the derive ask for `T: Default` as well, and the
+// row types have no sensible default. Naming the bound keeps the requirement to
+// the one thing actually needed.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct ScreenResp<T> {
+    #[serde(default = "Vec::new")]
+    rows: Vec<ScreenRow<T>>,
+}
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct ScreenRow<T> {
+    #[serde(default = "Vec::new")]
+    modules: Vec<ScreenModule<T>>,
+}
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct ScreenModule<T> {
+    #[serde(rename = "pagedList", default = "Option::default")]
+    paged_list: Option<PagedList<T>>,
+}
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct PagedList<T> {
+    #[serde(default = "Vec::new")]
+    items: Vec<T>,
+    #[serde(rename = "totalNumberOfItems", default)]
+    total_number_of_items: u32,
+}
+
+impl<T> ScreenResp<T> {
+    /// The first list on the screen, and the length the service gave it.
+    ///
+    /// The *first*, not all of them joined: a screen can hold several lists and
+    /// each is paged separately, so pouring them into one sequence would make
+    /// one offset stand for several places at once - the same mistake
+    /// [`Client::search_tracks`] stopped making when it gave up asking for two
+    /// kinds of result at a time. The modules before it carry headers and links
+    /// and no list at all, which is why this looks for one rather than taking
+    /// the first module.
+    ///
+    /// A screen with no list on it is an empty page. That is a real answer: it
+    /// is what a listener with no mixes gets, and what an unknown mix gets.
+    fn first_list(self) -> (Vec<T>, u32) {
+        self.rows
+            .into_iter()
+            .flat_map(|row| row.modules)
+            .find_map(|module| module.paged_list)
+            .map_or_else(
+                || (Vec::new(), 0),
+                |list| (list.items, list.total_number_of_items),
+            )
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct ArtistBrief {
     #[serde(default)]
@@ -696,6 +809,84 @@ impl Client {
             items: r.items.into_iter().map(TrackBrief::into_track).collect(),
             total: r.total_number_of_items,
         })
+    }
+
+    /// A page of the mixes the service builds for this listener.
+    ///
+    /// The listing behind the vendor's own "my mixes" screen, which is why the
+    /// answer is a screen rather than a listing and is unwrapped here. Every
+    /// frontend would otherwise have to know that shape to read three fields out
+    /// of it.
+    ///
+    /// The rows are [`Mix`], not [`Playlist`]: no track count, no duration, an
+    /// opaque id, and contents that are rebuilt without anyone asking. A caller
+    /// that reloads a playlist to pick up an edit has to reload a mix to find
+    /// out what is in it today.
+    ///
+    /// # Errors
+    /// If [`Self::connect`] has not run, on a transport failure, or on a
+    /// non-success status.
+    pub fn user_mixes(&mut self, offset: u32, limit: u32) -> Result<Page<Mix>> {
+        let sess = self.session()?.clone();
+        let url = self.url("/v1/pages/my_collection_my_mixes");
+        let (off, lim) = (offset.to_string(), limit.to_string());
+        let mut resp = self.get_authed(
+            &url,
+            &[
+                ("countryCode", sess.country_code.as_str()),
+                // Required. The screen endpoints answer per client kind, and
+                // without this one they answer with nothing to show.
+                ("deviceType", "BROWSER"),
+                ("limit", lim.as_str()),
+                ("offset", off.as_str()),
+            ],
+        )?;
+        if !resp.status().is_success() {
+            bail!("mixes -> HTTP {}", resp.status());
+        }
+        let screen: ScreenResp<MixBrief> = resp.body_mut().read_json()?;
+        let (rows, total) = screen.first_list();
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(row.into_mix());
+        }
+        Ok(Page { items, total })
+    }
+
+    /// A page of the tracks in one mix.
+    ///
+    /// The only place a mix's length is knowable: the mix row itself carries no
+    /// count, so unlike [`Self::playlist_tracks`] the caller cannot know where
+    /// this listing ends before its first page arrives.
+    ///
+    /// # Errors
+    /// If [`Self::connect`] has not run, on a transport failure, or on a
+    /// non-success status. An id the service does not know answers with a screen
+    /// that has no list on it, which is an empty page rather than an error.
+    pub fn mix_tracks(&mut self, mix_id: &str, offset: u32, limit: u32) -> Result<Page<Track>> {
+        let sess = self.session()?.clone();
+        let url = self.url("/v1/pages/mix");
+        let (off, lim) = (offset.to_string(), limit.to_string());
+        let mut resp = self.get_authed(
+            &url,
+            &[
+                ("mixId", mix_id),
+                ("countryCode", sess.country_code.as_str()),
+                ("deviceType", "BROWSER"),
+                ("limit", lim.as_str()),
+                ("offset", off.as_str()),
+            ],
+        )?;
+        if !resp.status().is_success() {
+            bail!("mix tracks -> HTTP {}", resp.status());
+        }
+        let screen: ScreenResp<ItemRow> = resp.body_mut().read_json()?;
+        let (rows, total) = screen.first_list();
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(row.item.into_track());
+        }
+        Ok(Page { items, total })
     }
 
     /// A page of tracks matching a search.
@@ -1207,6 +1398,120 @@ mod tests {
         let s = stub(vec![ok(SESSION), (500, "boom".into())]);
         let err = connected(&s).user_playlists(0, 1).unwrap_err().to_string();
         assert!(err.contains("playlists") && err.contains("500"), "{err}");
+    }
+
+    // ---- mixes ----
+
+    #[test]
+    fn mixes_are_read_out_of_the_page_the_service_answers_with() {
+        // Goal: this listing does not answer with a listing. It answers with the
+        // rows of a screen, and the mixes are inside the first module that
+        // carries a list - so the unwrapping has to happen here rather than in
+        // every frontend. The paging arguments still have to reach the URL, and
+        // the device type is required or the page comes back empty.
+        let body = r#"{"rows":[{"modules":[{"type":"MIX_LIST","title":"My Mixes",
+            "pagedList":{"limit":15,"offset":30,"totalNumberOfItems":9,"items":[
+              {"id":"0007a","title":"My Mix 1","subTitle":"Miles Davis, Bill Evans",
+               "mixType":"DAILY_MIX","master":false,"shortSubtitle":"Created by TIDAL"}]}}]}]}"#;
+        let s = stub(vec![ok(SESSION), ok(body)]);
+        let page = connected(&s).user_mixes(30, 15).unwrap();
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, "0007a", "the id is opaque, not a uuid");
+        assert_eq!(page.items[0].title, "My Mix 1");
+        assert_eq!(
+            page.items[0].subtitle, "Miles Davis, Bill Evans",
+            "the subtitle is the only description of the contents on the wire"
+        );
+        assert_eq!(page.total, 9, "the count comes from inside the module");
+
+        let _ = s.seen.recv().unwrap();
+        let req = s.seen.recv().unwrap().line;
+        assert!(req.contains("/v1/pages/my_collection_my_mixes"), "{req}");
+        assert!(req.contains("deviceType=BROWSER"), "{req}");
+        assert!(req.contains("offset=30"), "{req}");
+        assert!(req.contains("limit=15"), "{req}");
+        assert!(req.contains("countryCode=DE"), "{req}");
+    }
+
+    #[test]
+    fn a_mixs_tracks_come_from_the_first_module_that_holds_a_list() {
+        // Goal: the page for one mix leads with a header module that carries no
+        // list at all, so taking the first module would return nothing. It is
+        // the first module *with* a list that holds the tracks, and they arrive
+        // in the nested envelope the favorites use rather than the flat one the
+        // playlist tracks use.
+        let body = r#"{"rows":[
+            {"modules":[{"type":"MIX_HEADER","mix":{"id":"0007a","title":"My Mix 1"}}]},
+            {"modules":[{"type":"TRACK_LIST","pagedList":{"totalNumberOfItems":42,
+              "items":[{"type":"track","item":{"id":5,"title":"So What","duration":545,
+                "artists":[{"name":"Miles Davis"}],"album":{"title":"Kind of Blue"},
+                "audioQuality":"LOSSLESS"}}]}}]}]}"#;
+        let s = stub(vec![ok(SESSION), ok(body)]);
+        let page = connected(&s).mix_tracks("0007a", 100, 50).unwrap();
+
+        assert_eq!(
+            page.items.len(),
+            1,
+            "the header module must be stepped over"
+        );
+        assert_eq!(page.items[0].id, 5);
+        assert_eq!(page.items[0].artist, "Miles Davis");
+        assert_eq!(page.items[0].duration_secs, 545);
+        assert_eq!(page.total, 42);
+
+        let _ = s.seen.recv().unwrap();
+        let req = s.seen.recv().unwrap().line;
+        assert!(req.contains("/v1/pages/mix"), "{req}");
+        assert!(req.contains("mixId=0007a"), "the mix names itself: {req}");
+        assert!(req.contains("offset=100"), "{req}");
+        assert!(req.contains("limit=50"), "{req}");
+    }
+
+    #[test]
+    fn a_page_with_no_list_on_it_is_an_empty_page_rather_than_an_error() {
+        // Goal: the negative space, and it is reachable - the service answers an
+        // unknown mix with a page that has no list module on it. A listener with
+        // no mixes yet gets the same answer. Neither is a failure to report.
+        let s = stub(vec![ok(SESSION), ok(r#"{"rows":[]}"#), ok("{}")]);
+        let mut c = connected(&s);
+        assert!(c.user_mixes(0, 20).unwrap().items.is_empty());
+        let page = c.mix_tracks("nope", 0, 20).unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.total, 0, "no count is zero, never a guess");
+    }
+
+    #[test]
+    fn a_mix_missing_its_optional_fields_still_yields_a_row() {
+        // Goal: a mix carries no track count and no duration, so the fields that
+        // are left are the whole row. One of them being absent must not throw
+        // away the listing it arrived in.
+        let body = r#"{"rows":[{"modules":[{"pagedList":{"items":[{"id":"z"}]}}]}]}"#;
+        let s = stub(vec![ok(SESSION), ok(body)]);
+        let page = connected(&s).user_mixes(0, 20).unwrap();
+        assert_eq!(page.items[0].id, "z");
+        assert_eq!(page.items[0].title, "");
+        assert_eq!(page.items[0].subtitle, "");
+    }
+
+    #[test]
+    fn a_failed_mix_listing_says_which_of_the_two_calls_failed() {
+        // Goal: both mix calls go to a page endpoint, so a message naming only
+        // the endpoint would not say whether the listing or one mix's tracks
+        // failed - and the interface puts that sentence on the notice line.
+        let s = stub(vec![
+            ok(SESSION),
+            (500, "boom".into()),
+            (500, "boom".into()),
+        ]);
+        let mut c = connected(&s);
+        let listing = c.user_mixes(0, 1).unwrap_err().to_string();
+        assert!(
+            listing.contains("mixes") && listing.contains("500"),
+            "{listing}"
+        );
+        let tracks = c.mix_tracks("0007a", 0, 1).unwrap_err().to_string();
+        assert!(tracks.contains("mix tracks"), "{tracks}");
     }
 
     // ---- writes ----

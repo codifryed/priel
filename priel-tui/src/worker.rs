@@ -23,7 +23,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use priel_core::auth::Credentials;
-use priel_core::{Client, Fault, Page, Playlist, Quality, ResolvedStream, Track};
+use priel_core::{Client, Fault, Mix, Page, Playlist, Quality, ResolvedStream, Track};
 use priel_player::graph::{self, AudioGraph, GraphError};
 
 /// Rows one favorites request asks for.
@@ -41,9 +41,18 @@ pub const PLAYLISTS_PAGE: u32 = 100;
 /// playlist is normally read from the top and played straight through.
 pub const PLAYLIST_TRACKS_PAGE: u32 = 200;
 
-/// Rows one search request asks for. The smallest of the four: a searcher looks
+/// Rows one search request asks for. The smallest of these: a searcher looks
 /// at the head of the results, and a wrong query should cost the least.
 pub const SEARCH_PAGE: u32 = 50;
+
+/// Rows one mixes request asks for. Sized like the playlists for the same
+/// reason - a listener has a handful of mixes, not a library of them - and this
+/// listing is asked for again on every visit, so the request wants to be cheap.
+pub const MIXES_PAGE: u32 = 100;
+
+/// Rows one request for a mix's tracks asks for. Sized like a playlist's: a mix
+/// is read from the top and played straight through.
+pub const MIX_TRACKS_PAGE: u32 = 200;
 
 /// A request for one page of a listing.
 ///
@@ -61,6 +70,15 @@ pub enum ToWorker {
     },
     LoadPlaylistTracks {
         uuid: String,
+        offset: u32,
+        limit: u32,
+    },
+    LoadMixes {
+        offset: u32,
+        limit: u32,
+    },
+    LoadMixTracks {
+        mix_id: String,
         offset: u32,
         limit: u32,
     },
@@ -111,6 +129,13 @@ pub enum Task {
         uuid: String,
         offset: u32,
     },
+    Mixes {
+        offset: u32,
+    },
+    MixTracks {
+        mix_id: String,
+        offset: u32,
+    },
     Search {
         query: String,
         offset: u32,
@@ -133,6 +158,8 @@ impl std::fmt::Display for Task {
             Self::Favorites { .. } => "favorites",
             Self::Playlists { .. } => "playlists",
             Self::PlaylistTracks { .. } => "playlist tracks",
+            Self::Mixes { .. } => "mixes",
+            Self::MixTracks { .. } => "mix tracks",
             Self::Search { .. } => "search",
             Self::Resolve => "resolve",
             // Named by what did not happen rather than by the endpoint: this is
@@ -156,6 +183,15 @@ pub enum FromWorker {
     },
     PlaylistTracks {
         uuid: String,
+        offset: u32,
+        page: Page<Track>,
+    },
+    Mixes {
+        offset: u32,
+        page: Page<Mix>,
+    },
+    MixTracks {
+        mix_id: String,
         offset: u32,
         page: Page<Track>,
     },
@@ -280,6 +316,22 @@ where
                 } => match client.playlist_tracks(&uuid, offset, limit) {
                     Ok(page) => FromWorker::PlaylistTracks { uuid, offset, page },
                     Err(e) => failed(Task::PlaylistTracks { uuid, offset }, &e),
+                },
+                ToWorker::LoadMixes { offset, limit } => match client.user_mixes(offset, limit) {
+                    Ok(page) => FromWorker::Mixes { offset, page },
+                    Err(e) => failed(Task::Mixes { offset }, &e),
+                },
+                ToWorker::LoadMixTracks {
+                    mix_id,
+                    offset,
+                    limit,
+                } => match client.mix_tracks(&mix_id, offset, limit) {
+                    Ok(page) => FromWorker::MixTracks {
+                        mix_id,
+                        offset,
+                        page,
+                    },
+                    Err(e) => failed(Task::MixTracks { mix_id, offset }, &e),
                 },
                 ToWorker::Search {
                     query,
@@ -406,6 +458,27 @@ mod tests {
                     };
                     format!(
                         r#"{{"manifestMimeType":"application/vnd.tidal.bts","manifest":"{b64}"}}"#
+                    )
+                } else if line.contains("my_collection_my_mixes") {
+                    // The mixes arrive inside a screen rather than a listing,
+                    // and varied by offset like the rest so the paging
+                    // arguments are proved to reach the URL.
+                    let n = if line.contains("offset=0") { 1 } else { 2 };
+                    format!(
+                        r#"{{"rows":[{{"modules":[{{"type":"MIX_LIST","pagedList":{{
+                          "totalNumberOfItems":2,"items":[{{"id":"m{n}","title":"Mix {n}",
+                          "subTitle":"Miles Davis"}}]}}}}]}}]}}"#
+                    )
+                } else if line.contains("/v1/pages/mix") {
+                    // A header module with no list on it comes first, exactly as
+                    // the service sends it: a stub that led with the tracks
+                    // would pass whether or not the header is stepped over.
+                    let id = if line.contains("offset=0") { 1 } else { 2 };
+                    format!(
+                        r#"{{"rows":[{{"modules":[{{"type":"MIX_HEADER","mix":{{"id":"m1"}}}}]}},
+                          {{"modules":[{{"type":"TRACK_LIST","pagedList":{{
+                            "totalNumberOfItems":2,
+                            "items":[{{"type":"track","item":{{"id":{id}}}}}]}}}}]}}]}}"#
                     )
                 } else if line.contains("/v1/search") {
                     // Varied by offset for the same reason the favorites are.
@@ -540,9 +613,71 @@ mod tests {
         .unwrap();
         assert!(matches!(next(&w), FromWorker::SearchResults { .. }));
 
+        w.tx.send(ToWorker::LoadMixes {
+            offset: 0,
+            limit: 10,
+        })
+        .unwrap();
+        assert!(matches!(next(&w), FromWorker::Mixes { .. }));
+
+        w.tx.send(ToWorker::LoadMixTracks {
+            mix_id: "m1".into(),
+            offset: 0,
+            limit: 10,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::MixTracks { mix_id, .. } => {
+                assert_eq!(mix_id, "m1", "the reply must name which mix it is for");
+            }
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+
         w.tx.send(ToWorker::Resolve(7)).unwrap();
         match next(&w) {
             FromWorker::Resolved(id, _) => assert_eq!(id, 7, "resolves are matched by id"),
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_mix_reply_names_the_page_and_the_mix_it_answers() {
+        // Goal: both mix calls are served by a screen endpoint that has to be
+        // unwrapped, so this is where the unwrapping is proved end to end - and
+        // where the paging arguments are proved to survive the trip through it.
+        let w = worker_on(origin());
+
+        w.tx.send(ToWorker::LoadMixes {
+            offset: 1,
+            limit: 1,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::Mixes { offset, page } => {
+                assert_eq!(offset, 1, "the reply names the page it answers");
+                assert_eq!(page.items[0].id, "m2", "the offset has to reach the URL");
+                assert_eq!(page.items[0].subtitle, "Miles Davis");
+                assert_eq!(page.total, 2, "and carries the length of the listing");
+            }
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+
+        w.tx.send(ToWorker::LoadMixTracks {
+            mix_id: "m1".into(),
+            offset: 1,
+            limit: 1,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::MixTracks {
+                mix_id,
+                offset,
+                page,
+            } => {
+                assert_eq!((mix_id.as_str(), offset), ("m1", 1));
+                assert_eq!(page.items[0].id, 2, "past the header module and paged");
+                assert_eq!(page.total, 2);
+            }
             other => panic!("wrong reply variant: {}", variant(&other)),
         }
     }
@@ -747,6 +882,8 @@ mod tests {
             FromWorker::Favorites { .. } => "Favorites",
             FromWorker::Playlists { .. } => "Playlists",
             FromWorker::PlaylistTracks { .. } => "PlaylistTracks",
+            FromWorker::Mixes { .. } => "Mixes",
+            FromWorker::MixTracks { .. } => "MixTracks",
             FromWorker::SearchResults { .. } => "SearchResults",
             FromWorker::Resolved(..) => "Resolved",
             FromWorker::AudioGraph(_) => "AudioGraph",

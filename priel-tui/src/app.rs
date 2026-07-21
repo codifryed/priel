@@ -17,8 +17,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Application state + input handling (VIM keys + first-class mouse), multiple
-//! views (favorites / playlists / playlist tracks / search) and the gapless
-//! play-queue orchestration.
+//! views (favorites / playlists / playlist tracks / mixes / mix tracks / search)
+//! and the gapless play-queue orchestration.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -30,7 +30,7 @@ use rand::Rng;
 use ratatui::layout::Rect;
 
 use priel_core::auth::{Credentials, Pkce};
-use priel_core::{Fault, Playlist, Track};
+use priel_core::{Fault, Mix, Playlist, Track};
 use priel_player::Alteration;
 use priel_player::graph::{
     Attribution, AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, NodeRole, RateAdvice,
@@ -51,6 +51,15 @@ pub enum View {
     Favorites,
     Playlists,
     PlaylistTracks,
+    /// The mixes the service builds for the listener.
+    ///
+    /// A view of its own rather than a section of the playlists, because the
+    /// two behave the same way only at the moment of pressing play. A mix
+    /// cannot be edited and is rebuilt without anyone asking, and putting the
+    /// two in one list would offer the listener a single row type with two sets
+    /// of rules.
+    Mixes,
+    MixTracks,
     Search,
 }
 
@@ -92,6 +101,13 @@ pub enum Hit {
     Top,
     Bottom,
     Enter,
+    /// Leave a drill-down for the list it was opened from.
+    ///
+    /// One control rather than one per parent list: `Esc` has to land back
+    /// where the listener came from, and a hit box naming a fixed destination
+    /// would send whoever clicked it in the reference somewhere they had never
+    /// been.
+    Back,
     Shuffle,
     VolUp,
     VolDown,
@@ -364,6 +380,9 @@ pub struct App {
     pub playlists: Vec<Playlist>,
     pub playlist_tracks: Vec<Track>,
     pub open_playlist: Option<(String, String)>, // (uuid, title)
+    pub mixes: Vec<Mix>,
+    pub mix_tracks: Vec<Track>,
+    pub open_mix: Option<(String, String)>, // (id, title)
     pub search_tracks: Vec<Track>,
     pub search_query: String,
     /// The query the loaded results answer, which is not `search_query`: that
@@ -376,6 +395,8 @@ pub struct App {
     pub favorites_paging: Paging,
     pub playlists_paging: Paging,
     pub playlist_tracks_paging: Paging,
+    pub mixes_paging: Paging,
+    pub mix_tracks_paging: Paging,
     pub search_paging: Paging,
 
     pub selected: usize,
@@ -578,12 +599,17 @@ impl App {
             playlists: Vec::new(),
             playlist_tracks: Vec::new(),
             open_playlist: None,
+            mixes: Vec::new(),
+            mix_tracks: Vec::new(),
+            open_mix: None,
             search_tracks: Vec::new(),
             search_query: String::new(),
             search_asked: String::new(),
             favorites_paging: Paging::default(),
             playlists_paging: Paging::default(),
             playlist_tracks_paging: Paging::default(),
+            mixes_paging: Paging::default(),
+            mix_tracks_paging: Paging::default(),
             search_paging: Paging::default(),
             selected: 0,
             list_offset: 0,
@@ -1136,6 +1162,12 @@ impl App {
                     self.load_playlist_tracks_from_the_top(uuid, known);
                 }
             }
+            View::Mixes => self.load_mixes_from_the_top(),
+            View::MixTracks => {
+                if let Some((id, _)) = self.open_mix.clone() {
+                    self.load_mix_tracks_from_the_top(id);
+                }
+            }
             View::Search => {
                 // The query the rows answer, not the text in the box: the box
                 // may be halfway through an edit the user has not run yet.
@@ -1157,6 +1189,32 @@ impl App {
         });
     }
 
+    /// Ask for the first page of the listener's mixes, discarding any loaded.
+    fn load_mixes_from_the_top(&mut self) {
+        self.mixes_paging.restart(0);
+        self.loading = true;
+        self.ask(ToWorker::LoadMixes {
+            offset: 0,
+            limit: worker::MIXES_PAGE,
+        });
+    }
+
+    /// Ask for the first page of a mix's tracks, discarding any loaded.
+    ///
+    /// No `known_total` to pass, unlike a playlist: a mix row carries no track
+    /// count, so this view learns its own length only when its first page of
+    /// tracks arrives.
+    fn load_mix_tracks_from_the_top(&mut self, mix_id: String) {
+        self.mix_tracks.clear();
+        self.mix_tracks_paging.restart(0);
+        self.loading = true;
+        self.ask(ToWorker::LoadMixTracks {
+            mix_id,
+            offset: 0,
+            limit: worker::MIX_TRACKS_PAGE,
+        });
+    }
+
     /// The paging state of the view on screen.
     ///
     /// One listing at a time is on screen, and only that listing's rows can be
@@ -1166,6 +1224,8 @@ impl App {
             View::Favorites => &self.favorites_paging,
             View::Playlists => &self.playlists_paging,
             View::PlaylistTracks => &self.playlist_tracks_paging,
+            View::Mixes => &self.mixes_paging,
+            View::MixTracks => &self.mix_tracks_paging,
             View::Search => &self.search_paging,
         }
     }
@@ -1175,6 +1235,8 @@ impl App {
             View::Favorites => &mut self.favorites_paging,
             View::Playlists => &mut self.playlists_paging,
             View::PlaylistTracks => &mut self.playlist_tracks_paging,
+            View::Mixes => &mut self.mixes_paging,
+            View::MixTracks => &mut self.mix_tracks_paging,
             View::Search => &mut self.search_paging,
         }
     }
@@ -1193,6 +1255,11 @@ impl App {
             Task::PlaylistTracks { uuid, offset } => {
                 let open = self.open_playlist.as_ref().is_some_and(|(u, _)| u == uuid);
                 open.then_some((&mut self.playlist_tracks_paging, *offset))
+            }
+            Task::Mixes { offset } => Some((&mut self.mixes_paging, *offset)),
+            Task::MixTracks { mix_id, offset } => {
+                let open = self.open_mix.as_ref().is_some_and(|(m, _)| m == mix_id);
+                open.then_some((&mut self.mix_tracks_paging, *offset))
             }
             Task::Search { query, offset } => {
                 (*query == self.search_asked).then_some((&mut self.search_paging, *offset))
@@ -1213,6 +1280,8 @@ impl App {
             View::Favorites => self.favorites.len(),
             View::Playlists => self.playlists.len(),
             View::PlaylistTracks => self.playlist_tracks.len(),
+            View::Mixes => self.mixes.len(),
+            View::MixTracks => self.mix_tracks.len(),
             View::Search => self.search_tracks.len(),
         }
     }
@@ -1234,6 +1303,15 @@ impl App {
                 uuid: self.open_playlist.as_ref()?.0.clone(),
                 offset,
                 limit: worker::PLAYLIST_TRACKS_PAGE,
+            },
+            View::Mixes => ToWorker::LoadMixes {
+                offset,
+                limit: worker::MIXES_PAGE,
+            },
+            View::MixTracks => ToWorker::LoadMixTracks {
+                mix_id: self.open_mix.as_ref()?.0.clone(),
+                offset,
+                limit: worker::MIX_TRACKS_PAGE,
             },
             View::Search if !self.search_asked.is_empty() => ToWorker::Search {
                 query: self.search_asked.clone(),
@@ -1357,6 +1435,43 @@ impl App {
         self.clamp_selection();
     }
 
+    /// A page of the listener's mixes arrived, matched by the offset it answers.
+    fn on_mixes_page(&mut self, offset: u32, page: priel_core::Page<Mix>) {
+        if self.mixes_paging.wanted != Some(offset) {
+            log::debug!("dropping a mixes page at offset {offset}: nothing is waiting for it");
+            return;
+        }
+        let mut rows = std::mem::take(&mut self.mixes);
+        self.mixes_paging.absorb(&mut rows, offset, page);
+        self.mixes = rows;
+        self.loading = false;
+        if self.view == View::Mixes {
+            self.clamp_selection();
+        }
+    }
+
+    /// A page of one mix's tracks arrived.
+    ///
+    /// Guarded on both halves of its identity for the reason the playlist
+    /// tracks are: a reply for a mix the listener has left, and a superseded
+    /// page of the mix that is open, are two different kinds of stale and only
+    /// one of them is about the offset.
+    fn on_mix_tracks_page(&mut self, mix_id: &str, offset: u32, page: priel_core::Page<Track>) {
+        if self.open_mix.as_ref().is_none_or(|(m, _)| m != mix_id) {
+            log::debug!("dropping tracks for {mix_id}: that mix is not open");
+            return;
+        }
+        if self.mix_tracks_paging.wanted != Some(offset) {
+            log::debug!("dropping {mix_id} tracks at offset {offset}: nothing is waiting for it");
+            return;
+        }
+        let mut rows = std::mem::take(&mut self.mix_tracks);
+        self.mix_tracks_paging.absorb(&mut rows, offset, page);
+        self.mix_tracks = rows;
+        self.loading = false;
+        self.clamp_selection();
+    }
+
     /// A page of search results arrived.
     ///
     /// The query is half the identity: both a new search and a reload ask for
@@ -1405,8 +1520,9 @@ impl App {
         match self.view {
             View::Favorites => &self.favorites,
             View::PlaylistTracks => &self.playlist_tracks,
+            View::MixTracks => &self.mix_tracks,
             View::Search => &self.search_tracks,
-            View::Playlists => &[],
+            View::Playlists | View::Mixes => &[],
         }
     }
 
@@ -1420,6 +1536,15 @@ impl App {
         if self.view == View::Playlists {
             for (i, p) in self.playlists.iter().enumerate() {
                 if row_matches(&p.title, "", &f) {
+                    row(i);
+                }
+            }
+        } else if self.view == View::Mixes {
+            // The subtitle is searched alongside the title because it is where
+            // a mix says what is in it - the artists it was built around are
+            // the thing a listener would think to type.
+            for (i, m) in self.mixes.iter().enumerate() {
+                if row_matches(&m.title, &m.subtitle, &f) {
                     row(i);
                 }
             }
@@ -1579,6 +1704,12 @@ impl App {
                 FromWorker::PlaylistTracks { uuid, offset, page } => {
                     self.on_playlist_tracks_page(&uuid, offset, page);
                 }
+                FromWorker::Mixes { offset, page } => self.on_mixes_page(offset, page),
+                FromWorker::MixTracks {
+                    mix_id,
+                    offset,
+                    page,
+                } => self.on_mix_tracks_page(&mix_id, offset, page),
                 FromWorker::SearchResults {
                     query,
                     offset,
@@ -1773,9 +1904,29 @@ impl App {
         self.paging_mut().stalled = false;
         match v {
             View::Playlists if self.playlists.is_empty() => self.load_playlists_from_the_top(),
+            // Fetched on every visit, where the playlists are fetched once. A
+            // playlist is still what the listener left it as; a mix is rebuilt
+            // by the service under them, so a copy held from the last visit is
+            // stale by construction rather than by bad luck. Arriving here is
+            // already a deliberate action, and it costs one request.
+            View::Mixes => self.load_mixes_from_the_top(),
             View::Search if self.search_tracks.is_empty() => {
                 self.mode = Mode::Search; // start typing a query
             }
+            _ => {}
+        }
+    }
+
+    /// Leave a drill-down for the list it was opened from.
+    ///
+    /// The one place that knows which parent a nested view belongs to. `Esc`
+    /// and the reference's own `Esc` both come through here, so the two cannot
+    /// come to disagree about where back is. Anywhere else it does nothing -
+    /// `Esc` has never quit and must not start.
+    fn go_back(&mut self) {
+        match self.view {
+            View::PlaylistTracks => self.switch_view(View::Playlists),
+            View::MixTracks => self.switch_view(View::Mixes),
             _ => {}
         }
     }
@@ -1799,7 +1950,8 @@ impl App {
         let next = match self.view {
             View::Favorites => View::Playlists,
             View::Playlists | View::PlaylistTracks => View::Search,
-            View::Search => View::Favorites,
+            View::Search => View::Mixes,
+            View::Mixes | View::MixTracks => View::Favorites,
         };
         self.switch_view(next);
     }
@@ -1821,9 +1973,24 @@ impl App {
         }
     }
 
+    fn open_selected_mix(&mut self) {
+        let vis = self.visible();
+        if let Some(&idx) = vis.get(self.selected)
+            && let Some(m) = self.mixes.get(idx).cloned()
+        {
+            self.open_mix = Some((m.id.clone(), m.title));
+            self.view = View::MixTracks;
+            self.selected = 0;
+            self.list_offset = 0;
+            self.filter.clear();
+            self.load_mix_tracks_from_the_top(m.id);
+        }
+    }
+
     fn on_enter(&mut self) {
         match self.view {
             View::Playlists => self.open_selected_playlist(),
+            View::Mixes => self.open_selected_mix(),
             _ => self.play_selected(),
         }
     }
@@ -2670,15 +2837,12 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc => {
-                if self.view == View::PlaylistTracks {
-                    self.switch_view(View::Playlists);
-                }
-            }
+            KeyCode::Esc => self.go_back(),
             KeyCode::Tab => self.cycle_view(),
             KeyCode::Char('1') => self.switch_view(View::Favorites),
             KeyCode::Char('2') => self.switch_view(View::Playlists),
             KeyCode::Char('3') => self.switch_view(View::Search),
+            KeyCode::Char('4') => self.switch_view(View::Mixes),
             KeyCode::Char('i') => self.edit_search(),
             KeyCode::Char('j') | KeyCode::Down => self.move_down(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(1),
@@ -2837,6 +3001,7 @@ impl App {
             Hit::Top => self.goto_top(),
             Hit::Bottom => self.goto_bottom(),
             Hit::Enter => self.on_enter(),
+            Hit::Back => self.go_back(),
             Hit::Shuffle => self.toggle_shuffle(),
             Hit::VolUp => self.volume_step(5.0),
             Hit::VolDown => self.volume_step(-5.0),
@@ -3287,6 +3452,14 @@ mod tests {
             title: title.into(),
             num_tracks: 2,
             duration_secs: 200,
+        }
+    }
+
+    fn mix(id: &str, title: &str) -> priel_core::Mix {
+        priel_core::Mix {
+            id: id.into(),
+            title: title.into(),
+            subtitle: "Miles Davis and more".into(),
         }
     }
 
@@ -6240,8 +6413,10 @@ mod tests {
             "a digit types, it does not switch"
         );
         r.app.on_key(code(KeyCode::Tab));
-        assert_eq!(r.app.view, View::Favorites, "Tab wraps around");
+        assert_eq!(r.app.view, View::Mixes, "the mixes are the fourth tab");
         assert_eq!(r.app.mode, Mode::Normal, "and leaves the input mode behind");
+        r.app.on_key(code(KeyCode::Tab));
+        assert_eq!(r.app.view, View::Favorites, "Tab wraps around");
     }
 
     #[test]
@@ -6285,6 +6460,188 @@ mod tests {
 
         r.app.on_key(code(KeyCode::Esc));
         assert_eq!(r.app.view, View::Playlists);
+    }
+
+    // ---- the mixes view ----
+
+    fn mixes_page(offset: u32, ids: &[&str], total: u32) -> FromWorker {
+        FromWorker::Mixes {
+            offset,
+            page: priel_core::Page {
+                items: ids.iter().map(|i| mix(i, i)).collect(),
+                total,
+            },
+        }
+    }
+
+    fn mix_tracks_page(
+        mix_id: &str,
+        offset: u32,
+        ids: std::ops::Range<u64>,
+        total: u32,
+    ) -> FromWorker {
+        FromWorker::MixTracks {
+            mix_id: mix_id.into(),
+            offset,
+            page: track_page(ids, total),
+        }
+    }
+
+    #[test]
+    fn the_fourth_key_opens_the_mixes_view_and_asks_for_its_first_page() {
+        // Goal: the mixes get a tab of their own rather than sharing the
+        // playlists, because they are not editable and they are rebuilt under
+        // the listener. A view nobody can reach is not a view.
+        let mut r = rig();
+        r.app.on_key(key('4'));
+        assert_eq!(r.app.view, View::Mixes);
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadMixes { offset: 0, .. }]
+        ));
+    }
+
+    #[test]
+    fn coming_back_to_the_mixes_asks_the_service_again() {
+        // Goal: the one place this listing differs from the others, and the
+        // reason it is a view of its own. A playlist the user wrote is still
+        // what they left, so it is fetched once; a mix is rebuilt by the service
+        // without anyone asking, so a copy held from the last visit is stale by
+        // construction. Leaving and coming back is the cheapest honest refresh
+        // there is, and it costs one request.
+        let mut r = rig();
+        r.app.on_key(key('4'));
+        r.to_app.send(mixes_page(0, &["m1"], 1)).unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+
+        r.app.on_key(key('1'));
+        r.app.on_key(key('4'));
+        assert!(
+            matches!(requests(&r)[..], [ToWorker::LoadMixes { offset: 0, .. }]),
+            "a mix listing is never reused across a visit"
+        );
+    }
+
+    #[test]
+    fn opening_a_mix_loads_its_tracks_and_escape_comes_back_to_the_mixes() {
+        // Goal: the second nested view, and Esc has to know which list it came
+        // from. Sending it back to the playlists - the only thing Esc used to do
+        // - would strand the listener somewhere they never were.
+        let mut r = rig();
+        r.app.mixes = vec![mix("0007a", "My Mix 1")];
+        r.app.view = View::Mixes;
+        r.app.on_key(code(KeyCode::Enter));
+
+        assert_eq!(r.app.view, View::MixTracks);
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadMixTracks { mix_id: ref m, offset: 0, .. }] if m == "0007a"
+        ));
+
+        r.to_app.send(mix_tracks_page("0007a", 0, 4..7, 3)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.mix_tracks), vec![4, 5, 6]);
+
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.view, View::Mixes);
+    }
+
+    #[test]
+    fn a_mix_that_is_not_open_has_its_tracks_dropped() {
+        // Goal: the identity guard the playlist tracks already have. A page for
+        // the mix the listener has just left would otherwise be poured into the
+        // one they have just opened.
+        let mut r = rig();
+        r.app.mixes = vec![mix("a", "A"), mix("b", "B")];
+        r.app.view = View::Mixes;
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        r.to_app.send(mix_tracks_page("b", 0, 1..3, 2)).unwrap();
+        r.app.drain_worker();
+        assert!(
+            r.app.mix_tracks.is_empty(),
+            "rows for another mix must not land here"
+        );
+    }
+
+    #[test]
+    fn playing_inside_a_mix_builds_the_queue_from_the_rows_on_screen() {
+        // Goal: a mix plays like any other listing. The queue comes from the
+        // *visible* rows, so a local filter has to narrow it here too - that
+        // indirection is the one this view could most easily get wrong, since
+        // its rows arrive from a listing nobody curated.
+        let mut r = rig();
+        r.app.mixes = vec![mix("0007a", "My Mix 1")];
+        r.app.view = View::Mixes;
+        r.app.on_key(code(KeyCode::Enter));
+        r.to_app.send(mix_tracks_page("0007a", 0, 1..4, 3)).unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+
+        r.app.selected = 1;
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(ids(&r.app.queue), vec![1, 2, 3]);
+        assert_eq!(r.app.queue_pos, 1, "and starts on the row that was chosen");
+    }
+
+    #[test]
+    fn a_failed_mix_page_stops_that_listing_and_leaves_the_others_alone() {
+        // Goal: the failure identity that #7 established. A mixes page that dies
+        // must latch the mixes and nothing else, or a service that is refusing
+        // one listing quietly stops another that is fine.
+        let mut r = rig();
+        r.app.on_key(key('4'));
+        let _ = requests(&r);
+        r.to_app
+            .send(FromWorker::Failed {
+                task: Task::Mixes { offset: 0 },
+                fault: Fault::Refused,
+                detail: "mixes: no".into(),
+            })
+            .unwrap();
+        r.app.drain_worker();
+
+        assert!(r.app.mixes_paging.stalled, "the mixes gave up");
+        assert!(
+            !r.app.favorites_paging.stalled,
+            "and took no other listing with them"
+        );
+
+        // `r` is the retry, and it has to clear the latch.
+        r.app.on_key(key('r'));
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadMixes { offset: 0, .. }]
+        ));
+        assert!(!r.app.mixes_paging.stalled);
+    }
+
+    #[test]
+    fn scrolling_a_mix_to_the_end_asks_for_the_next_page_and_appends_it() {
+        // Goal: a mix pages like every other listing. Its own row carries no
+        // track count, unlike a playlist's, so the total can only come from the
+        // first page of tracks - which makes the service's count the sole
+        // end-of-list signal here.
+        let mut r = rig();
+        r.app.mixes = vec![mix("0007a", "My Mix 1")];
+        r.app.view = View::Mixes;
+        r.app.on_key(code(KeyCode::Enter));
+        r.to_app.send(mix_tracks_page("0007a", 0, 0..3, 6)).unwrap();
+        r.app.drain_worker();
+        scrolled_to_the_end(&mut r.app);
+        let _ = requests(&r);
+
+        r.app.refresh();
+        assert!(matches!(
+            requests(&r)[..],
+            [ToWorker::LoadMixTracks { offset: 3, .. }]
+        ));
+
+        r.to_app.send(mix_tracks_page("0007a", 3, 3..6, 6)).unwrap();
+        r.app.drain_worker();
+        assert_eq!(ids(&r.app.mix_tracks), vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[test]

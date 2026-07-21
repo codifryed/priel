@@ -374,14 +374,15 @@ const HELP_LEFT: &[(&str, &[HelpRow])] = &[
                     ("1", Some(Hit::View(View::Favorites))),
                     ("2", Some(Hit::View(View::Playlists))),
                     ("3", Some(Hit::View(View::Search))),
+                    ("4", Some(Hit::View(View::Mixes))),
                 ],
                 "jump to a view",
             ),
-            row(&[("Enter", Some(Hit::Enter))], "open playlist"),
-            row(
-                &[("Esc", Some(Hit::View(View::Playlists)))],
-                "back to playlists",
-            ),
+            row(&[("Enter", Some(Hit::Enter))], "open playlist or mix"),
+            // Named for what it does rather than for one of the two lists it
+            // can land on: a control that promised the playlists would be wrong
+            // half the time it was clicked.
+            row(&[("Esc", Some(Hit::Back))], "back to the list"),
             row(&[("r", Some(Hit::Reload))], "reload this list"),
             row(&[("M", Some(Hit::Log))], "recent log messages"),
         ],
@@ -1210,10 +1211,12 @@ fn tab_style(active: bool, t: &Theme) -> Style {
 fn header(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
     let in_playlists = matches!(app.view, View::Playlists | View::PlaylistTracks);
+    let in_mixes = matches!(app.view, View::Mixes | View::MixTracks);
     let tabs = [
         ("1 Favorites", View::Favorites, app.view == View::Favorites),
         ("2 Playlists", View::Playlists, in_playlists),
         ("3 Search", View::Search, app.view == View::Search),
+        ("4 Mixes", View::Mixes, in_mixes),
     ];
     // Read what the bar needs up front: it borrows `app` mutably to record hits.
     let playing = app.status.playing;
@@ -1363,6 +1366,13 @@ fn list_title(app: &App, count: usize) -> String {
             let name = app.open_playlist.as_ref().map_or("", |(_, t)| t.as_str());
             format!("▸ {name} — {count}{of_total} tracks   (Esc back · Enter play)")
         }
+        View::Mixes => {
+            format!("Mixes — {count}{of_total}   (Enter to open · r refresh · j/k move)")
+        }
+        View::MixTracks => {
+            let name = app.open_mix.as_ref().map_or("", |(_, t)| t.as_str());
+            format!("▸ {name} — {count}{of_total} tracks   (Esc back · Enter play)")
+        }
         View::Search => {
             if app.mode == Mode::Search {
                 format!(
@@ -1396,6 +1406,19 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
                     p.num_tracks,
                     fmt_hms(p.duration_secs)
                 ),
+                false,
+            );
+        }
+        return (String::new(), false);
+    }
+    if app.view == View::Mixes {
+        // No track count and no running time to put in those columns: the wire
+        // carries neither for a mix. What it does carry is the subtitle, which
+        // says what the mix was built from - so the row spends the width on
+        // that instead of on two figures that would have to be invented.
+        if let Some(m) = app.mixes.get(idx) {
+            return (
+                format!("  {:<44} {}", trunc(&m.title, 44), trunc(&m.subtitle, 30)),
                 false,
             );
         }
@@ -2285,6 +2308,56 @@ mod tests {
         assert!(out.contains("Evening"), "{out}");
         assert!(out.contains("12"), "{out}");
         assert!(out.contains("1:02:05"), "hours format: {out}");
+    }
+
+    #[test]
+    fn the_mixes_view_shows_what_each_mix_was_built_from() {
+        // Goal: a mix row cannot show what a playlist row shows - the wire
+        // carries no track count and no duration for one - so it has to spend
+        // that width on the subtitle instead. A row that printed a count here
+        // would be printing a number nobody sent.
+        let mut sc = screen();
+        sc.app.mixes = vec![priel_core::Mix {
+            id: "0007a".into(),
+            title: "My Mix 1".into(),
+            subtitle: "Miles Davis, Bill Evans".into(),
+        }];
+        sc.app.view = View::Mixes;
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains("My Mix 1"), "{out}");
+        assert!(out.contains("Miles Davis, Bill Evans"), "{out}");
+        assert!(out.contains("Mixes"), "the heading names the view: {out}");
+        assert!(
+            !out.contains("tracks"),
+            "there is no count to show, so none is claimed: {out}"
+        );
+    }
+
+    #[test]
+    fn the_mixes_tab_is_painted_where_a_click_on_it_lands() {
+        // Goal: the fourth tab is a control like the other three, and the rule
+        // is that what was painted and what is clickable are the same cells.
+        let mut sc = screen();
+        assert_eq!(
+            painted(&mut sc.app, 120, 12, Hit::View(View::Mixes)),
+            " 4 Mixes ",
+        );
+        click_hit(&mut sc.app, Hit::View(View::Mixes));
+        assert_eq!(sc.app.view, View::Mixes);
+    }
+
+    #[test]
+    fn the_reference_offers_a_way_back_that_knows_which_list_it_came_from() {
+        // Goal: `Esc` is now the way out of two different drill-downs, so the
+        // control in the reference cannot name a destination. Clicking it from
+        // inside a mix has to land on the mixes, which is exactly what a hit box
+        // hard-wired to the playlists could not do.
+        let mut sc = screen();
+        sc.app.view = View::MixTracks;
+        sc.app.mode = Mode::Help;
+        assert_eq!(painted(&mut sc.app, 120, 40, Hit::Back), "Esc");
+        click_hit(&mut sc.app, Hit::Back);
+        assert_eq!(sc.app.view, View::Mixes);
     }
 
     #[test]
