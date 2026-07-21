@@ -2370,10 +2370,15 @@ fn queue_marks(app: &App, index: usize) -> String {
 /// entries.
 fn queue_heading(app: &App) -> Vec<Span<'static>> {
     let t = app.theme();
-    let mut spans = vec![Span::styled(
-        format!(" Queue {}/{} ", app.queue_pos + 1, app.queue.len()),
-        Style::default().fg(t.queue),
-    )];
+    // A counter needs something to count. `1/0` is what a position taken from
+    // an empty queue reads as, and it says the music is on an entry that is not
+    // there.
+    let counted = if app.queue.is_empty() {
+        " Queue ".to_string()
+    } else {
+        format!(" Queue {}/{} ", app.queue_pos + 1, app.queue.len())
+    };
+    let mut spans = vec![Span::styled(counted, Style::default().fg(t.queue))];
     if app.queue_has_suggestions() {
         // The colour the counter in the header already wears for music the
         // service chose, so the column and the header say it the same way.
@@ -5137,6 +5142,10 @@ mod tests {
         assert!(
             out.contains("Nothing queued yet"),
             "an empty column says nothing at all: {out}"
+        );
+        assert!(
+            !out.contains("1/0"),
+            "an empty queue claimed to be on its first entry: {out}"
         );
         assert_eq!(
             sc.app.queue_inner,
