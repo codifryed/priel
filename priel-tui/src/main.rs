@@ -149,6 +149,12 @@ fn session(args: cli::Cli, recent: logging::Recent) -> Result<()> {
     // home directory, and `App::new` is constructed by tests.
     priel_core::auth::migrate_from_config("token.json");
     priel_core::auth::migrate_from_config("credentials.json");
+    // Put priel on the desktop's media controls, if there is a desktop. `None`
+    // is the ordinary answer on a media-server box and costs no thread at all,
+    // and the reason is in the diagnostic log either way. Opened here rather
+    // than in `App::new` for the same reason as the migration above: it talks
+    // to the machine, and tests build an `App`.
+    let bus = bus::conn::start(bus::mpris::WELL_KNOWN_NAME);
     let mut terminal = setup().context("preparing the terminal")?;
     let theme = args.theme.unwrap_or_default();
     let player = priel_player::PlayerConfig {
@@ -161,6 +167,7 @@ fn session(args: cli::Cli, recent: logging::Recent) -> Result<()> {
         priel_core::Client::default_token_path(),
         recent,
         theme,
+        bus,
     )
     .and_then(|mut app| run(&mut terminal, &mut app, &mut TerminalEvents));
     restore(&mut terminal)?;

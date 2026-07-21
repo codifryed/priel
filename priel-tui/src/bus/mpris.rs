@@ -29,14 +29,6 @@
 //!
 //! Specifications: MPRIS D-Bus Interface Specification 2.2, D-Bus 0.43.
 
-// The translation lands ahead of the connection that reads it and the app that
-// fills it in, so that the interop rules can be pinned as a table of tests
-// before anything depends on them.
-#![allow(
-    dead_code,
-    reason = "the connection below it and the app above it are the callers, and land next"
-)]
-
 use super::wire::{Arg, Message, Value, Variant};
 
 /// The well-known name priel asks the session bus for.
@@ -406,7 +398,7 @@ pub(crate) fn seeked_signal(position_us: i64) -> Message {
 /// call.** MPRIS is a third caller of actions that exist, never a back door
 /// through which one arrives with no way to reach it from the terminal - which
 /// is why there is no `Stop` here, and no `OpenUri`: priel has neither action.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum BusCommand {
     Next,
     Previous,
