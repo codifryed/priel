@@ -1783,24 +1783,31 @@ fn title_place(app: &App) -> (String, bool) {
     }
 }
 
-/// How much of the list is here, and how much of it there is.
+/// How much of the list is here, how much of it there is, and which is which.
 ///
-/// The second figure only while the two differ: a list that has paged in its
-/// first hundred must not read as the whole library, or there is no reason to
-/// keep scrolling, and once it has all arrived the total only repeats the count
-/// beside it.
+/// This line has been wrong in both directions. It first printed the total only
+/// while rows were still missing, so completeness was carried by the *absence*
+/// of the second number - which says something only to a reader who already
+/// knows the convention. Keeping the total fixed that and not the rest: `42 of
+/// 417` still leaves the reader to work out that the first figure is what has
+/// arrived and the second is how long the listing is. Naming the relationship
+/// costs a few cells and removes the inference, and it costs the nouns that
+/// used to close the line - `42 loaded of 417 tracks` spends width saying what
+/// the tab and every row below already say.
+///
+/// Completeness is the two figures being *equal*, never the total being absent:
+/// `rows_available` answers `None` only when the service has never said how
+/// long the listing is, and a listing of unknown length can claim neither form.
 fn title_count(app: &App, count: usize) -> String {
     if app.view == View::Search && (app.mode == Mode::Search || app.search_query.is_empty()) {
         return String::new();
     }
-    let of_total = app
-        .rows_available()
-        .map_or(String::new(), |total| format!(" of {total}"));
-    match app.view {
-        // Neither noun adds anything the word before it has not just said.
-        View::Playlists | View::Mixes => format!(" — {count}{of_total}"),
-        View::Search => format!(" — {count}{of_total} results"),
-        _ => format!(" — {count}{of_total} tracks"),
+    match app.rows_available() {
+        Some(total) if usize::try_from(total).is_ok_and(|rows| rows == count) => {
+            format!(" — all {total} loaded")
+        }
+        Some(total) => format!(" — {count} loaded of {total}"),
+        None => format!(" — {count} loaded"),
     }
 }
 
@@ -3467,30 +3474,35 @@ mod tests {
     #[test]
     fn the_favorites_heading_separates_rows_loaded_from_rows_there_are() {
         // Goal: a list that has paged in its first hundred must not read as the
-        // whole library, or the user has no reason to keep scrolling. The total
-        // stays once everything is loaded: `2 of 2` says the list is complete,
-        // where a bare `2 tracks` only says so to a reader who knows that a
-        // missing total means finished. The same reason the access badge names
-        // the shared case rather than leaving it to be read off an absence.
+        // whole library, or the user has no reason to keep scrolling. Both
+        // figures are named rather than juxtaposed: `2 of 417` left the reader
+        // to work out that the first number is what has arrived and the second
+        // is how long the listing is, and `2 of 2` made completeness something
+        // to notice rather than something said.
         let mut sc = screen();
         sc.app.favorites = vec![track(1, "One"), track(2, "Two")];
         sc.app.favorites_paging.total = 417;
         let out = text(&mut sc.app, 120, 12);
-        assert!(out.contains("2 of 417 tracks"), "{out}");
+        assert!(out.contains("2 loaded of 417"), "{out}");
 
         sc.app.favorites_paging.total = 2;
         let out = text(&mut sc.app, 120, 12);
         assert!(
-            out.contains("2 of 2 tracks"),
-            "a complete list says so rather than leaving it to an absence: {out}"
+            out.contains("all 2 loaded"),
+            "a complete list says so in words: {out}"
+        );
+        assert!(
+            !out.contains("2 of 2"),
+            "and does not also print the pair it replaces: {out}"
         );
     }
 
     #[test]
     fn every_heading_separates_rows_loaded_from_rows_there_are() {
         // Goal: the same reason as above, on the three views that used to stop
-        // at their first page. A heading that hides the difference is a list
-        // the user has no reason to keep scrolling.
+        // at their first page, and in the same words. One grammar for all of
+        // them: a reader who has learnt the heading in one view has learnt it
+        // everywhere, which five wordings would not give them.
         let mut sc = screen();
         sc.app.view = View::Playlists;
         sc.app.playlists = vec![Playlist {
@@ -3500,21 +3512,55 @@ mod tests {
             duration_secs: 60,
         }];
         sc.app.playlists_paging.total = 40;
-        assert!(text(&mut sc.app, 120, 12).contains("1 of 40"));
+        assert!(text(&mut sc.app, 120, 12).contains("1 loaded of 40"));
 
         let mut sc = screen();
         sc.app.view = View::PlaylistTracks;
         sc.app.open_playlist = Some(("u".into(), "Late Night".into()));
         sc.app.playlist_tracks = vec![track(2, "Track")];
         sc.app.playlist_tracks_paging.total = 312;
-        assert!(text(&mut sc.app, 120, 12).contains("1 of 312 tracks"));
+        assert!(text(&mut sc.app, 120, 12).contains("1 loaded of 312"));
 
         let mut sc = screen();
         sc.app.view = View::Search;
         sc.app.search_query = "blue".into();
         sc.app.search_tracks = vec![track(3, "Kind of Blue")];
         sc.app.search_paging.total = 900;
-        assert!(text(&mut sc.app, 120, 12).contains("1 of 900 results"));
+        assert!(text(&mut sc.app, 120, 12).contains("1 loaded of 900"));
+
+        let mut sc = screen();
+        sc.app.view = View::Mixes;
+        sc.app.mixes = vec![priel_core::Mix {
+            id: "0007a".into(),
+            title: "My Mix 1".into(),
+            subtitle: "Miles Davis".into(),
+        }];
+        sc.app.mixes_paging.total = 6;
+        assert!(text(&mut sc.app, 120, 12).contains("1 loaded of 6"));
+
+        let mut sc = screen();
+        sc.app.view = View::MixTracks;
+        sc.app.open_mix = Some(("m".into(), "My Mix 1".into()));
+        sc.app.mix_tracks = vec![track(4, "One"), track(5, "Two")];
+        sc.app.mix_tracks_paging.total = 2;
+        assert!(text(&mut sc.app, 120, 12).contains("all 2 loaded"));
+    }
+
+    #[test]
+    fn a_heading_claims_no_total_the_service_never_gave() {
+        // Goal: the two forms both rest on a length the service reported, and a
+        // listing that has never been told one has neither a total to print nor
+        // any way to know it is complete. Printing the rows in hand as the
+        // total would be inventing the very figure the heading exists to show,
+        // and `all 2 loaded` off the back of it would be a claim nobody made.
+        let mut sc = screen();
+        sc.app.view = View::MixTracks;
+        sc.app.open_mix = Some(("m".into(), "My Mix 1".into()));
+        sc.app.mix_tracks = vec![track(1, "One"), track(2, "Two")];
+        let line = title_line(&mut sc.app, 120);
+        assert!(line.contains("— 2 loaded"), "{line}");
+        assert!(!line.contains(" of "), "a total was invented: {line}");
+        assert!(!line.contains("all "), "completeness was claimed: {line}");
     }
 
     #[test]
@@ -3529,7 +3575,10 @@ mod tests {
 
     #[test]
     fn the_search_view_prompts_before_and_reports_after() {
-        // Goal: the three states of the search title - empty, typing, results.
+        // Goal: the three states of the search title - empty, typing, and
+        // reporting what came back. The last one keeps the query, loses the
+        // caret and gains the count, worded as every other view words it: the
+        // noun `results` said what the rows below and the tab above already do.
         let mut sc = screen();
         sc.app.view = View::Search;
         assert!(text(&mut sc.app, 120, 12).contains("Search"));
@@ -3540,9 +3589,10 @@ mod tests {
 
         sc.app.mode = Mode::Normal;
         sc.app.search_tracks = vec![track(3, "Milestones")];
+        sc.app.search_paging.total = 312;
         let out = text(&mut sc.app, 120, 12);
         assert!(out.contains("Milestones"), "{out}");
-        assert!(out.contains("results"), "{out}");
+        assert!(out.contains("Search › miles — 1 loaded of 312"), "{out}");
     }
 
     #[test]
@@ -5872,7 +5922,7 @@ mod tests {
         sc.app.playlist_tracks_paging.total = 18;
         let line = title_line(&mut sc.app, 120);
         assert!(
-            line.contains("Playlists › Deep Cuts — 2 of 18 tracks"),
+            line.contains("Playlists › Deep Cuts — 2 loaded of 18"),
             "{line}"
         );
     }
@@ -5886,7 +5936,7 @@ mod tests {
         sc.app.open_mix = Some(("m".into(), "My Mix 1".into()));
         sc.app.mix_tracks = vec![track(1, "One")];
         let line = title_line(&mut sc.app, 120);
-        assert!(line.contains("Mixes › My Mix 1 — 1 tracks"), "{line}");
+        assert!(line.contains("Mixes › My Mix 1 — 1 loaded"), "{line}");
     }
 
     #[test]
@@ -5894,7 +5944,9 @@ mod tests {
         // Goal: the title is the thing that was being clipped, and what a clip
         // takes is whatever is on the right - which is the count. Cut the name,
         // which the row below repeats, rather than the figure only this line
-        // carries.
+        // carries. Naming the two numbers made the count longer, so the widths
+        // go down to one where the name is nearly all gone and the count is
+        // still whole.
         let mut sc = screen();
         sc.app.view = View::PlaylistTracks;
         sc.app.open_playlist = Some((
@@ -5903,12 +5955,12 @@ mod tests {
         ));
         sc.app.playlist_tracks = vec![track(1, "One")];
         sc.app.playlist_tracks_paging.total = 312;
-        for w in [60u16, 80, 120] {
+        for w in [30u16, 40, 60, 80, 120] {
             let line = title_line(&mut sc.app, w);
             assert_eq!(drawn(&line), usize::from(w), "{w}: the box lost a cell");
             assert!(line.starts_with('┌') && line.ends_with('┐'), "{w}: {line}");
             assert!(
-                line.contains("1 of 312 tracks"),
+                line.contains("1 loaded of 312"),
                 "{w}: the count was clipped away: {line}"
             );
         }

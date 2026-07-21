@@ -1694,8 +1694,11 @@ impl App {
 
     /// How long the current listing is, whenever the service has said.
     ///
-    /// Kept once everything is loaded, so a complete list says it is complete
-    /// rather than leaving that to be inferred from a missing number.
+    /// Kept once everything is loaded rather than dropped, because the heading
+    /// tells a complete listing from a partial one by comparing this figure
+    /// with the rows in hand. That is what fixes `None` to one meaning - the
+    /// service has never said - and it is the reverse of the older behaviour,
+    /// where the number went missing to signal that the list was finished.
     #[must_use]
     pub fn rows_available(&self) -> Option<u32> {
         rows_missing(self.loaded_rows(), self.paging().total)
@@ -4266,11 +4269,11 @@ fn negotiated(node: &GraphNode) -> String {
 /// that only have one searchable field.
 /// How long a listing is, whenever the service has said.
 ///
-/// Kept once `loaded` has caught up rather than dropped: `18 of 18` says the
-/// list is complete, where a bare `18` says so only to a reader who already
-/// knows that a missing total means finished. Completeness is information, and
-/// leaving it to be read off an absence is the same mistake the access badge
-/// made before it named the shared case.
+/// Kept once `loaded` has caught up rather than dropped, so that a caller can
+/// say a listing is complete instead of leaving it to be read off a number that
+/// has gone missing. Completeness is information, and the heading now spends
+/// words on it (`all 18 loaded`) for the same reason the access badge names the
+/// shared case rather than leaving it to an absence.
 ///
 /// `None` only when the service never said - a total of zero rows loaded is not
 /// a total of zero rows.
@@ -4634,8 +4637,8 @@ mod tests {
         assert_eq!(
             r.app.rows_available(),
             Some(4),
-            "and the heading still says how long the list is, so `4 of 4` tells \
-             the reader it is complete rather than leaving it to an absence"
+            "and the heading still says how long the list is, so it can read \
+             `all 4 loaded` rather than leaving completeness to an absence"
         );
     }
 
