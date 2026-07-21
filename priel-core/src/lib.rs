@@ -152,6 +152,15 @@ pub struct Track {
     /// the other way would condemn a whole listing the moment the service
     /// trimmed a field, which is worse than one play failing with its reason.
     pub streamable: bool,
+    /// The radio mix the service builds around this track, for
+    /// [`Client::mix_tracks`]. Empty when the row named none.
+    ///
+    /// Every listing row carries it, which is what lets a caller carry on
+    /// playing past the end of a queue without asking for anything first. Empty
+    /// is a real answer and not a failure: a track with no mix is a track
+    /// nothing can be continued from, and the caller has something to say about
+    /// that rather than something to retry.
+    pub mix_id: String,
 }
 
 /// Derive a short quality label from a track's mediaMetadata tags / audioQuality.
@@ -360,11 +369,26 @@ struct TrackBrief {
     allow_streaming: Option<bool>,
     #[serde(rename = "streamReady", default)]
     stream_ready: Option<bool>,
+    #[serde(default)]
+    mixes: MixIds,
 }
 #[derive(Deserialize, Default)]
 struct MediaMeta {
     #[serde(default)]
     tags: Vec<String>,
+}
+/// The mixes a track names, of which one can be played.
+///
+/// The object also carries the ids of screens built round the album and the
+/// artist, and those are left on the wire: they key pages this client has no
+/// view for, where `TRACK_MIX` keys the one listing [`Client::mix_tracks`] can
+/// already fetch. `Option` rather than `#[serde(default)]` for the same reason
+/// every string on [`TrackBrief`] is - an explicit `null` is how this service
+/// spells absence, and a defaulted `String` rejects it.
+#[derive(Deserialize, Default)]
+struct MixIds {
+    #[serde(rename = "TRACK_MIX", default)]
+    track_mix: Option<String>,
 }
 
 impl TrackBrief {
@@ -389,6 +413,7 @@ impl TrackBrief {
             copyright: self.copyright.unwrap_or_default(),
             // Both, and absent means yes. See the field's own note.
             streamable: self.allow_streaming.unwrap_or(true) && self.stream_ready.unwrap_or(true),
+            mix_id: self.mixes.track_mix.unwrap_or_default(),
         }
     }
 }
@@ -1856,6 +1881,39 @@ mod tests {
         let s = stub(vec![ok(SESSION), ok(r#"{"items":[{"item":{"id":9}}]}"#)]);
         let rows = connected(&s).favorite_tracks(0, 1).unwrap().items;
         assert!(rows[0].streamable);
+    }
+
+    #[test]
+    fn every_row_names_the_radio_mix_built_around_that_track() {
+        // Goal: the id under `mixes.TRACK_MIX` is on every listing row and was
+        // thrown away here, so nothing above this crate could continue a queue
+        // from the track that ended it. Only that one key is taken: the object
+        // also carries the ids of other screens, and a mix of a track is the
+        // only one anything here can play.
+        let body = r#"{"items":[{"item":{"id":1,
+            "mixes":{"TRACK_MIX":"0016d","MASTER_TRACK_MIX":"01699"}}}]}"#;
+        let s = stub(vec![ok(SESSION), ok(body)]);
+        let rows = connected(&s).favorite_tracks(0, 1).unwrap().items;
+        assert_eq!(rows[0].mix_id, "0016d");
+    }
+
+    #[test]
+    fn a_track_with_no_radio_mix_says_so_with_an_empty_id() {
+        // Goal: the negative space, and the one a mix's own rows may land in -
+        // they are a shorter shape than the other listings send. Absence has to
+        // be an ordinary answer rather than a failed page, because the caller
+        // has something to say about it and nothing to retry.
+        let cases = [
+            r#"{"id":9}"#,
+            r#"{"id":9,"mixes":{}}"#,
+            r#"{"id":9,"mixes":{"TRACK_MIX":null}}"#,
+        ];
+        for row in cases {
+            let body = format!(r#"{{"items":[{{"item":{row}}}]}}"#);
+            let s = stub(vec![ok(SESSION), ok(&body)]);
+            let rows = connected(&s).favorite_tracks(0, 1).unwrap().items;
+            assert_eq!(rows[0].mix_id, "", "for {row}");
+        }
     }
 
     #[test]
