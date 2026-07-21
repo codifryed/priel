@@ -189,11 +189,12 @@ pub enum Click {
     Seek(f64),
     /// A loaded list row, by index into the visible list.
     Row(usize),
-    /// A queue entry in the queue's own column, by index into the queue.
+    /// A queue entry in the queue's own column, by row of the play order.
     ///
-    /// An index into `queue` rather than into a visible list: the queue has no
-    /// filter of its own, and it is the one list on screen whose order is the
-    /// order it will be played in.
+    /// A row rather than an index into a visible list: the queue has no filter
+    /// of its own. It is a row of the *order* rather than of the queue, because
+    /// that is what the panel draws, and [`App::queue_at`] is the one place
+    /// that turns one into the other.
     QueueRow(usize),
     /// Bare surface, or a bar with nothing playing to seek within.
     Nothing,
@@ -656,10 +657,11 @@ pub struct App {
     /// Which list the keyboard was last asked for, which is not the same thing
     /// as which list has it: see [`App::focus`].
     focus_wanted: Focus,
-    /// The queue entry under the queue's own cursor.
+    /// The row of the play order under the queue's own cursor, which is a row
+    /// of the panel and not an index into `queue`: see [`App::queue_at`].
     pub queue_selected: usize,
-    /// The first queue entry on screen, maintained by the renderer exactly as
-    /// `list_offset` is.
+    /// The first row of the play order on screen, maintained by the renderer
+    /// exactly as `list_offset` is.
     pub queue_offset: usize,
 
     pub now_playing: Option<Track>,
