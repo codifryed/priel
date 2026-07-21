@@ -51,6 +51,7 @@
 //! along the bottom row, which is how bindings are discovered, so it is
 //! lightened on a dark theme and darkened on a light one until it clears.
 
+use clap::ValueEnum as _;
 use ratatui::style::{Color, Style};
 
 use crate::cli::ThemeName;
@@ -107,6 +108,36 @@ pub struct Theme {
     pub verdict_altered: Color,
     /// There is not yet anything to grade.
     pub verdict_unknown: Color,
+}
+
+/// The palettes on offer, in the order both the flag and the picker list them.
+///
+/// One list, so a palette the picker shows is always one `--theme` accepts.
+pub const OFFERED: &[ThemeName] = &[
+    ThemeName::Nord,
+    ThemeName::GruvboxDark,
+    ThemeName::GruvboxLight,
+    ThemeName::OneLight,
+    ThemeName::Terminal,
+];
+
+/// A palette's name, spelled the way `--theme` takes it.
+///
+/// Read back off the command definition rather than written out again here:
+/// a second spelling is a picker that can offer something the flag refuses.
+#[must_use]
+pub fn label(name: ThemeName) -> String {
+    name.to_possible_value()
+        .map_or_else(String::new, |v| v.get_name().to_string())
+}
+
+/// What the flag's own help says about a palette, so the picker and `--help`
+/// cannot describe the same theme two different ways.
+#[must_use]
+pub fn note(name: ThemeName) -> String {
+    name.to_possible_value()
+        .and_then(|v| v.get_help().map(ToString::to_string))
+        .unwrap_or_default()
 }
 
 impl Default for Theme {
@@ -345,10 +376,7 @@ mod tests {
 
     /// Every palette, with the name it is chosen by.
     fn all() -> Vec<(ThemeName, Theme)> {
-        ThemeName::value_variants()
-            .iter()
-            .map(|n| (*n, Theme::of(*n)))
-            .collect()
+        super::OFFERED.iter().map(|n| (*n, Theme::of(*n))).collect()
     }
 
     /// Goal: a role that cannot be read is a role that carries nothing, and the
@@ -461,6 +489,20 @@ mod tests {
                 !matches!(role, Color::Rgb(..) | Color::Indexed(_)),
                 "the terminal palette pins {role:?} instead of deferring"
             );
+        }
+    }
+
+    /// Goal: the picker walks `OFFERED` and the flag walks its own variants,
+    /// and a palette missing from either is one the two disagree about. Method:
+    /// compare the sets rather than trusting that both were edited.
+    #[test]
+    fn what_the_picker_offers_is_what_the_flag_accepts() {
+        let flagged = ThemeName::value_variants();
+        assert_eq!(super::OFFERED.len(), flagged.len());
+        for name in flagged {
+            assert!(super::OFFERED.contains(name), "the picker hides {name:?}");
+            assert!(!super::label(*name).is_empty(), "{name:?} has no name");
+            assert!(!super::note(*name).is_empty(), "{name:?} says nothing");
         }
     }
 

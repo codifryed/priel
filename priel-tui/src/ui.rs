@@ -27,7 +27,8 @@ use priel_player::graph::{SinkStage, SinkVolume};
 use priel_player::{Alteration, Fidelity, OutputAccess, StreamVolume, Verdict};
 
 use crate::app::{App, GraphRow, GraphRowKind, Hit, Mode, View};
-use crate::theme::Theme;
+use crate::cli::ThemeName;
+use crate::theme::{self, Theme};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([
@@ -62,6 +63,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     if app.mode == Mode::Devices {
         device_overlay(f, f.area(), app);
+    }
+    if app.mode == Mode::Themes {
+        theme_overlay(f, f.area(), app);
     }
     if app.mode == Mode::Credentials {
         let area = f.area();
@@ -494,6 +498,7 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
         "Session",
         &[
             row(&[("A", Some(Hit::SignIn))], "sign in again"),
+            row(&[("t", Some(Hit::Themes))], "colour theme"),
             row(&[("q", Some(Hit::Quit))], "quit priel"),
         ],
     ),
@@ -929,6 +934,153 @@ fn device_rows(f: &mut Frame, app: &mut App, body: Rect) {
     app.device_rows = rows;
 }
 
+/// How wide the name column is, in cells.
+///
+/// `gruvbox-light` is the longest name on offer and the descriptions read as a
+/// column only if they all start in the same place.
+const THEME_NAME_FIELD: usize = 15;
+
+/// The colour theme picker.
+///
+/// Modal like the output picker and scrolled with the same keys. Two things it
+/// must always say, for the same reason that one does: which palette is in use,
+/// and that a choice made here lasts for this session only - priel reads no
+/// configuration file, so `--theme` is the only way to keep one.
+///
+/// **Each row previews the palette it offers rather than the one in force.**
+/// The three fidelity grades are the reason a palette is a decision and not a
+/// preference, so every row carries `✓ ≈ ⚠` in that theme's own three colours,
+/// on that theme's own background. Painting them in the current theme would
+/// draw five identical rows and answer the one question the picker is for.
+fn theme_overlay(f: &mut Frame, area: Rect, app: &mut App) {
+    let t = app.theme();
+    let current = app.theme_name();
+    let selected = app.theme_selected();
+    let width = area.width.saturating_sub(4).min(72);
+    // Two for the border, two for the footer. Sized to the content, as the
+    // graph overlay is: a full-height box around five rows reads as a failure
+    // to load.
+    let wanted = u16::try_from(theme::OFFERED.len().saturating_add(4)).unwrap_or(u16::MAX);
+    let height = wanted.min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(t.surface())
+        .border_style(Style::default().fg(t.accent))
+        .title(" Colour theme ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    // Rebuilt every frame, exactly as the device picker's are - and cleared
+    // before the early return below, so a terminal too short to draw a row does
+    // not leave the last frame's hit box behind to be clicked.
+    app.theme_rows.clear();
+    if inner.height <= 2 {
+        return;
+    }
+
+    let body = Rect {
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    theme_rows(f, app, body, current, selected);
+
+    let footer = Style::default().fg(t.faint);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  this session only — --theme makes a choice permanent",
+            footer,
+        ))),
+        Rect {
+            y: inner.y + inner.height.saturating_sub(2),
+            height: 1,
+            ..inner
+        },
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  j k move · g G ends · Enter choose · click · t, Esc or q to close",
+            footer,
+        ))),
+        Rect {
+            y: inner.y + inner.height.saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+/// The theme rows, each registering its hit box in the walk that draws it.
+///
+/// No windowing: the list is five entries and cannot grow past what a usable
+/// terminal shows, so a row that does not fit is simply not drawn - and not
+/// registered either, since a control that was never painted must not answer to
+/// a click.
+fn theme_rows(f: &mut Frame, app: &mut App, body: Rect, current: ThemeName, selected: usize) {
+    let t = app.theme();
+    let mut rows = Vec::with_capacity(theme::OFFERED.len());
+    for (i, name) in theme::OFFERED.iter().enumerate() {
+        let Ok(offset) = u16::try_from(i) else { break };
+        if offset >= body.height {
+            break;
+        }
+        let line = Rect {
+            y: body.y.saturating_add(offset),
+            height: 1,
+            ..body
+        };
+        let mut bar = ControlBar::new(line);
+        let here = *name == current;
+        let label = format!(
+            "{}{:THEME_NAME_FIELD$}",
+            if here { "* " } else { "  " },
+            theme::label(*name)
+        );
+        bar.label(
+            label,
+            if i == selected {
+                t.selection()
+            } else if here {
+                Style::default().fg(t.active)
+            } else {
+                Style::default()
+            },
+        );
+        theme_swatch(&mut bar, *name);
+        bar.label(
+            format!("  {}", theme::note(*name)),
+            Style::default().fg(t.faint),
+        );
+        f.render_widget(Paragraph::new(Line::from(bar.spans)), line);
+        rows.push((line, *name));
+    }
+    app.theme_rows = rows;
+}
+
+/// The three grades as the palette on this row would paint them.
+///
+/// The glyphs are the ones the badge itself uses, so what is previewed here is
+/// literally what will be on the bottom row - including the fact that each mark
+/// says what it means with no colour at all.
+fn theme_swatch(bar: &mut ControlBar, name: ThemeName) {
+    let p = Theme::of(name);
+    let marks = [
+        ("✓", p.verdict_clean),
+        ("≈", p.verdict_near),
+        ("⚠", p.verdict_altered),
+    ];
+    for (glyph, colour) in marks {
+        bar.label(" ", Style::default());
+        bar.label(glyph, Style::default().fg(colour).bg(p.background));
+    }
+}
+
 /// One log line, coloured by how much it wants to be noticed.
 fn log_line<'a>(raw: &'a str, t: &Theme) -> Line<'a> {
     let text = raw.trim_end_matches('\n');
@@ -1120,6 +1272,11 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     // it two cells wide while unicode-width calls it one, moving every hit box
     // after it one cell off what was painted.
     bar.button(" ◎ ", Hit::Devices, t.control());
+    // Beside the output control because both are session settings rather than
+    // playback. A half-filled circle rather than any of the palette or paint
+    // codepoints: those all have emoji presentation, and an emoji font paints
+    // them two cells wide while unicode-width calls them one.
+    bar.button(" ◐ ", Hit::Themes, t.control());
     bar.label("  ", Style::default());
 
     if let Some(q) = queue {
@@ -3385,6 +3542,111 @@ mod tests {
             Mode::Devices,
             "and clicking it must open the same picker `d` opens"
         );
+    }
+
+    #[test]
+    fn the_theme_picker_is_opened_by_a_control_painted_in_the_header() {
+        // Goal: parity runs both ways - the picker answers to `t`, and it must
+        // also be reachable by pointing at something. The hit box has to be the
+        // cells the glyph was painted on, or the click lands elsewhere.
+        let mut sc = screen();
+        assert_eq!(
+            painted(&mut sc.app, 120, 12, Hit::Themes),
+            " ◐ ",
+            "the hit box must cover the glyph that was drawn"
+        );
+        click_hit(&mut sc.app, Hit::Themes);
+        assert_eq!(
+            sc.app.mode,
+            Mode::Themes,
+            "and clicking it must open the same picker `t` opens"
+        );
+    }
+
+    #[test]
+    fn the_theme_picker_names_every_palette_and_how_long_a_choice_lasts() {
+        // Goal: priel reads no configuration file, so the overlay owes the
+        // reader the same promise the output picker makes - this is for the
+        // session, and the flag is what keeps it.
+        let mut sc = screen();
+        sc.app.mode = Mode::Themes;
+        let out = text(&mut sc.app, 100, 20);
+        for name in crate::theme::OFFERED {
+            let label = crate::theme::label(*name);
+            assert!(out.contains(&label), "{label} is not offered: {out}");
+        }
+        assert!(out.contains("this session only"), "{out}");
+        assert!(out.contains("--theme"), "{out}");
+        assert!(out.contains("to close"), "an overlay must say the way out");
+    }
+
+    #[test]
+    fn every_theme_row_on_screen_is_clickable_where_it_was_drawn() {
+        // Goal: the rows are the control, so a hit box that drifted from what
+        // was painted would repaint priel in a palette the user did not point
+        // at.
+        let mut sc = screen();
+        sc.app.mode = Mode::Themes;
+        let lines = draw(&mut sc.app, 100, 20);
+        assert_eq!(
+            sc.app.theme_rows.len(),
+            crate::theme::OFFERED.len(),
+            "every palette on screen needs a hit box"
+        );
+        for (rect, name) in sc.app.theme_rows.clone() {
+            let painted = &lines[rect.y as usize];
+            assert!(
+                painted.contains(&crate::theme::label(name)),
+                "the hit box for {name:?} claims a line that does not show it: {painted}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_theme_row_shows_its_own_three_grades_rather_than_the_current_ones() {
+        // Goal: the grades are the reason a palette is a decision at all, so
+        // the picker previews them in the palette being offered - each mark in
+        // that theme's own colour, on that theme's own background. Reading the
+        // current theme's colours here would show five identical rows.
+        let mut sc = screen();
+        sc.app.mode = Mode::Themes;
+        let mut term = Terminal::new(TestBackend::new(100, 20)).expect("backend");
+        term.draw(|f| render(f, &mut sc.app)).expect("render");
+        let buf = term.backend().buffer().clone();
+        assert!(
+            !sc.app.theme_rows.is_empty(),
+            "no rows means nothing proved"
+        );
+
+        for (rect, name) in sc.app.theme_rows.clone() {
+            let t = Theme::of(name);
+            let mut seen = Vec::new();
+            for x in rect.x..rect.x.saturating_add(rect.width) {
+                let cell = &buf[(x, rect.y)];
+                if matches!(cell.symbol(), "✓" | "≈" | "⚠") {
+                    seen.push((cell.symbol().to_string(), cell.fg, cell.bg));
+                }
+            }
+            assert_eq!(seen.len(), 3, "{name:?} should preview all three grades");
+            let colours = [t.verdict_clean, t.verdict_near, t.verdict_altered];
+            for ((glyph, fg, bg), want) in seen.iter().zip(colours) {
+                assert_eq!(*fg, want, "{name:?}: {glyph} is not its own grade colour");
+                assert_eq!(*bg, t.background, "{name:?}: {glyph} is on the wrong base");
+            }
+        }
+    }
+
+    #[test]
+    fn the_reference_lists_the_key_that_changes_the_palette() {
+        // Goal: `t` is not on the bottom row - it is not an everyday action -
+        // so the `?` overlay is the only place it can be discovered, and the
+        // only place it can be clicked at a narrow width.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 100, 40);
+        assert!(out.contains("colour theme"), "{out}");
+        let has_control = sc.app.hits.iter().any(|(_, h)| *h == Hit::Themes);
+        assert!(has_control, "and the reference is where it is clicked");
     }
 
     #[test]
