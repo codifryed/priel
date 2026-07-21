@@ -4264,6 +4264,7 @@ mod tests {
             album: "Alb".into(),
             duration_secs: 100,
             quality: "HI-RES".into(),
+            ..Track::default()
         }
     }
 
@@ -4291,6 +4292,8 @@ mod tests {
             bit_depth: 24,
             codec: "flac".into(),
             quality: "HI_RES_LOSSLESS".into(),
+            replay_gain_db: 0.0,
+            peak: 0.0,
         }
     }
 

@@ -2403,6 +2403,7 @@ mod tests {
             album: "Album".into(),
             duration_secs: 245,
             quality: "HI-RES".into(),
+            ..Track::default()
         }
     }
 

@@ -107,16 +107,51 @@ impl Quality {
 }
 
 /// A track as it appears in library/favorites listings.
-#[derive(Clone, Debug)]
+///
+/// A listing row carries about thirty fields and this holds the twelve a
+/// terminal can act on. What the rest are, and why each was left where it was,
+/// is written down in `docs/track-fields.md` rather than guessed at again: the
+/// rows are **not** abbreviated by the listing endpoints, so anything missing
+/// here was discarded by this crate and can be had by asking for it.
+///
+/// `Default` is derived so a caller can build a partial row - a placeholder, a
+/// test fixture - without listing every field, and so that adding a twelfth does
+/// not break every construction site.
+#[derive(Clone, Debug, Default)]
 pub struct Track {
     pub id: u64,
     pub title: String,
+    /// The first credited artist, for the places with one line to spend.
     pub artist: String,
+    /// Everyone credited, in the order the service credits them. `artist` is
+    /// the first of these; a collaboration is the reason both exist.
+    pub artists: Vec<String>,
     pub album: String,
     pub duration_secs: u32,
     /// Short quality tier from the listing (HI-RES / LOSSLESS / HIGH / …).
     /// Per-track sample rate is only known after `resolve_stream`.
     pub quality: String,
+    /// What distinguishes this recording from the plain one: "Remastered",
+    /// "Live at Wembley", "Radio Edit". Empty when there is nothing to add.
+    ///
+    /// Worth its own field rather than folded into the title, because two rows
+    /// that are otherwise character-for-character identical differ only here.
+    pub version: String,
+    /// Whether the service marks the lyrics explicit.
+    pub explicit: bool,
+    /// The recording's global identifier, empty when the row omits it.
+    ///
+    /// Absent from a mix's rows, which are a shorter shape than the other
+    /// listings send. The empty string is that, not a track without one.
+    pub isrc: String,
+    /// The rights line, as the service words it. Empty when the row omits it.
+    pub copyright: String,
+    /// Whether the service says this track can be played at all.
+    ///
+    /// Two wire bits both have to hold. Absence is read as playable: defaulting
+    /// the other way would condemn a whole listing the moment the service
+    /// trimmed a field, which is worse than one play failing with its reason.
+    pub streamable: bool,
 }
 
 /// Derive a short quality label from a track's mediaMetadata tags / audioQuality.
@@ -197,6 +232,13 @@ pub struct ResolvedStream {
     pub bit_depth: u32,
     pub codec: String,
     pub quality: String,
+    /// The master's replay gain in decibels, or zero when the answer carried
+    /// none. Reported, never applied: scaling the samples is the one thing a
+    /// bit-perfect path may not do.
+    pub replay_gain_db: f32,
+    /// The master's peak amplitude as a fraction of full scale, or zero when the
+    /// answer carried none. A modern master reads a hair under 1.0.
+    pub peak: f32,
 }
 
 /// Authenticated session identity.
@@ -284,21 +326,40 @@ struct PlaylistState {
     /// The service's concurrency token for this playlist's contents.
     token: String,
 }
+/// One track as a listing sends it, in the service's own spelling.
+///
+/// Every string here is `Option<String>` rather than `#[serde(default)]`, and
+/// that is not tidiness. `#[serde(default)]` fills in a *missing* key and
+/// rejects an explicit `null` - and `null` is how this service spells "no
+/// version", on the majority of tracks in the catalogue. The distinction cost a
+/// whole listing per null before it was understood, so keep the `Option`s.
 #[derive(Deserialize)]
 struct TrackBrief {
     id: u64,
     #[serde(default)]
-    title: String,
+    title: Option<String>,
     #[serde(default)]
-    duration: u32,
+    duration: Option<u32>,
     #[serde(default)]
     artists: Vec<ArtistBrief>,
     #[serde(default)]
-    album: AlbumBrief,
+    album: Option<AlbumBrief>,
     #[serde(rename = "audioQuality", default)]
-    audio_quality: String,
+    audio_quality: Option<String>,
     #[serde(rename = "mediaMetadata", default)]
     media_metadata: MediaMeta,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    explicit: Option<bool>,
+    #[serde(default)]
+    isrc: Option<String>,
+    #[serde(default)]
+    copyright: Option<String>,
+    #[serde(rename = "allowStreaming", default)]
+    allow_streaming: Option<bool>,
+    #[serde(rename = "streamReady", default)]
+    stream_ready: Option<bool>,
 }
 #[derive(Deserialize, Default)]
 struct MediaMeta {
@@ -308,17 +369,26 @@ struct MediaMeta {
 
 impl TrackBrief {
     fn into_track(self) -> Track {
+        let artists: Vec<String> = self
+            .artists
+            .into_iter()
+            .filter_map(|a| a.name.filter(|n| !n.is_empty()))
+            .collect();
+        let audio_quality = self.audio_quality.unwrap_or_default();
         Track {
             id: self.id,
-            title: self.title,
-            artist: self
-                .artists
-                .first()
-                .map(|a| a.name.clone())
-                .unwrap_or_default(),
-            album: self.album.title,
-            duration_secs: self.duration,
-            quality: quality_label(&self.media_metadata.tags, &self.audio_quality),
+            title: self.title.unwrap_or_default(),
+            artist: artists.first().cloned().unwrap_or_default(),
+            artists,
+            album: self.album.unwrap_or_default().title.unwrap_or_default(),
+            duration_secs: self.duration.unwrap_or_default(),
+            quality: quality_label(&self.media_metadata.tags, &audio_quality),
+            version: self.version.unwrap_or_default(),
+            explicit: self.explicit.unwrap_or(false),
+            isrc: self.isrc.unwrap_or_default(),
+            copyright: self.copyright.unwrap_or_default(),
+            // Both, and absent means yes. See the field's own note.
+            streamable: self.allow_streaming.unwrap_or(true) && self.stream_ready.unwrap_or(true),
         }
     }
 }
@@ -431,12 +501,12 @@ impl<T> ScreenResp<T> {
 #[derive(Deserialize, Default)]
 struct ArtistBrief {
     #[serde(default)]
-    name: String,
+    name: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct AlbumBrief {
     #[serde(default)]
-    title: String,
+    title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -451,6 +521,10 @@ struct Stream {
     bit_depth: Option<u32>,
     #[serde(rename = "sampleRate", default)]
     sample_rate: Option<u32>,
+    #[serde(rename = "trackReplayGain", default)]
+    track_replay_gain: Option<f32>,
+    #[serde(rename = "trackPeakAmplitude", default)]
+    track_peak_amplitude: Option<f32>,
 }
 
 #[allow(non_snake_case)]
@@ -1426,6 +1500,8 @@ fn decode_manifest(s: &Stream) -> Result<ResolvedStream> {
         bit_depth: s.bit_depth.unwrap_or(0),
         codec,
         quality: s.audio_quality.clone(),
+        replay_gain_db: s.track_replay_gain.unwrap_or(0.0),
+        peak: s.track_peak_amplitude.unwrap_or(0.0),
     })
 }
 
@@ -1693,6 +1769,93 @@ mod tests {
         assert_eq!(rows[0].id, 9);
         assert_eq!(rows[0].artist, "");
         assert_eq!(rows[0].quality, "");
+    }
+
+    /// A listing row with every field the service was observed to send on one.
+    ///
+    /// Written from a captured answer rather than from documentation, because
+    /// the point of these tests is what actually arrives. See
+    /// `docs/track-fields.md` for where the capture came from and which of these
+    /// keys are read.
+    const FULL_ROW: &str = r#"{"id":1,"title":"Azizam","duration":162,
+        "version":"Live at Wembley","explicit":true,"isrc":"GBAHS2500081",
+        "copyright":"(P) 2025 A Label","allowStreaming":true,"streamReady":true,
+        "artists":[{"name":"A"},{"name":"B"}],"album":{"title":"Alb"},
+        "trackNumber":1,"volumeNumber":1,"popularity":80,"replayGain":-9.95,
+        "peak":0.988554,"audioQuality":"LOSSLESS",
+        "mediaMetadata":{"tags":["LOSSLESS"]}}"#;
+
+    #[test]
+    fn a_row_carries_more_about_a_track_than_a_row_can_show() {
+        // Goal: the wire has always sent a version, an explicit marker, an isrc
+        // and a copyright line on every listing row, and this crate dropped all
+        // four on the floor. A frontend cannot show what the library discarded.
+        let body = format!(r#"{{"items":[{{"item":{FULL_ROW}}}]}}"#);
+        let s = stub(vec![ok(SESSION), ok(&body)]);
+        let rows = connected(&s).favorite_tracks(0, 1).unwrap().items;
+        let t = &rows[0];
+        assert_eq!(t.version, "Live at Wembley");
+        assert!(t.explicit);
+        assert_eq!(t.isrc, "GBAHS2500081");
+        assert_eq!(t.copyright, "(P) 2025 A Label");
+    }
+
+    #[test]
+    fn every_credited_artist_is_kept_and_not_only_the_first() {
+        // Goal: a collaboration credits several artists and this crate kept one,
+        // so the rest were unrecoverable above it. `artist` stays the first, for
+        // the places that have one line to spend.
+        let body = format!(r#"{{"items":[{{"item":{FULL_ROW}}}]}}"#);
+        let s = stub(vec![ok(SESSION), ok(&body)]);
+        let rows = connected(&s).favorite_tracks(0, 1).unwrap().items;
+        assert_eq!(rows[0].artist, "A");
+        assert_eq!(rows[0].artists, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn a_null_where_a_string_was_expected_does_not_fail_the_page() {
+        // Goal: the service sends `"version": null` on the majority of tracks -
+        // it is how "no version" is spelled, not an omission. A plain `String`
+        // field with `#[serde(default)]` does not survive that: serde only
+        // defaults a *missing* key and rejects an explicit null, which would
+        // turn the commonest row on the service into a failed listing.
+        let body = r#"{"items":[{"item":{"id":9,"version":null,"isrc":null,
+            "copyright":null,"title":null,"audioQuality":null}}]}"#;
+        let s = stub(vec![ok(SESSION), ok(body)]);
+        let rows = connected(&s).favorite_tracks(0, 1).unwrap().items;
+        assert_eq!(rows[0].id, 9);
+        assert_eq!(rows[0].version, "");
+        assert_eq!(rows[0].isrc, "");
+        assert_eq!(rows[0].copyright, "");
+        assert_eq!(rows[0].title, "");
+    }
+
+    #[test]
+    fn a_track_the_service_will_not_stream_is_marked_as_such() {
+        // Goal: a row the service has already said it will not play should be
+        // knowable before the play fails. Two wire bits say it and both have to
+        // hold, since either one alone leaves a track that cannot start.
+        let cases = [
+            (r#""allowStreaming":false,"streamReady":true"#, false),
+            (r#""allowStreaming":true,"streamReady":false"#, false),
+            (r#""allowStreaming":true,"streamReady":true"#, true),
+        ];
+        for (fields, expected) in cases {
+            let body = format!(r#"{{"items":[{{"item":{{"id":1,{fields}}}}}]}}"#);
+            let s = stub(vec![ok(SESSION), ok(&body)]);
+            let rows = connected(&s).favorite_tracks(0, 1).unwrap().items;
+            assert_eq!(rows[0].streamable, expected, "for {fields}");
+        }
+    }
+
+    #[test]
+    fn a_row_that_says_nothing_about_streaming_is_assumed_playable() {
+        // Goal: absence is not a refusal. Defaulting the other way would grey
+        // out a whole listing the moment the service trimmed a field, which is
+        // a worse failure than letting one play fail with its own message.
+        let s = stub(vec![ok(SESSION), ok(r#"{"items":[{"item":{"id":9}}]}"#)]);
+        let rows = connected(&s).favorite_tracks(0, 1).unwrap().items;
+        assert!(rows[0].streamable);
     }
 
     #[test]
@@ -2306,6 +2469,46 @@ mod tests {
         let r = connected(&s).resolve_stream(1, Quality::Lossless).unwrap();
         assert_eq!(r.sample_rate, 48_000);
         assert_eq!(r.bit_depth, 0, "unknown depth reads as zero, not a guess");
+    }
+
+    #[test]
+    fn the_resolved_stream_carries_the_loudness_the_answer_reported() {
+        // Goal: the playback answer has always carried the track's replay gain
+        // and its peak, and only the manifest was read out of it. priel will not
+        // apply either - scaling the samples is the one thing a bit-perfect path
+        // may not do - but a listener can be told what the master measures.
+        let payload = STANDARD.encode(r#"{"codecs":"flac","urls":["https://cdn/a.flac"]}"#);
+        let body = format!(
+            r#"{{"manifestMimeType":"application/vnd.tidal.bts","manifest":"{payload}",
+                "trackReplayGain":-9.95,"trackPeakAmplitude":0.988554,
+                "albumReplayGain":-12.41,"albumPeakAmplitude":0.999969}}"#
+        );
+        let s = stub(vec![ok(SESSION), ok(&body)]);
+        let r = connected(&s).resolve_stream(1, Quality::Lossless).unwrap();
+        assert!(
+            (r.replay_gain_db - -9.95).abs() < 0.001,
+            "{}",
+            r.replay_gain_db
+        );
+        assert!((r.peak - 0.988_554).abs() < 0.001, "{}", r.peak);
+    }
+
+    #[test]
+    fn a_playback_answer_with_no_loudness_figures_reports_zero() {
+        // Goal: the figures are absent on the tiers that do not measure, and
+        // zero reads as "nothing to say" the way the bit depth beside it already
+        // does. A made-up gain is worse than none: it is indistinguishable from
+        // a real one.
+        let s = stub(vec![
+            ok(SESSION),
+            ok(&manifest(
+                "application/vnd.tidal.bts",
+                r#"{"codecs":"flac","urls":["https://cdn/a.flac"]}"#,
+            )),
+        ]);
+        let r = connected(&s).resolve_stream(1, Quality::HiRes).unwrap();
+        assert!((r.replay_gain_db).abs() < f32::EPSILON);
+        assert!((r.peak).abs() < f32::EPSILON);
     }
 
     #[test]
