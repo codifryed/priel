@@ -50,12 +50,12 @@ and web typography and does not transfer; I have not cited it where it does not.
 
 | # | Finding | Value | Disruption | Verdict | Status |
 |---|---------|-------|------------|---------|--------|
-| 1 | Track rows are a fixed 72-cell block | high | medium | guidance | propose |
-| 2 | The list title carries hints and is clipped | high | medium | guidance | propose |
+| 1 | Track rows are a fixed 72-cell block | high | medium | guidance | **done** |
+| 2 | The list title carries hints and is clipped | high | medium | guidance | **done** |
 | 3 | `HI_RES_LOSSLESS` shown raw in the list | medium | none | guidance | **done** |
 | 4 | The bottom row shifts one cell when output opens | medium | none | guidance | **done** |
-| 5 | Truncation counts characters, not cells | medium | low | guidance | propose |
-| 6 | No breadcrumb when a playlist or mix is open | medium | low | guidance | propose |
+| 5 | Truncation counts characters, not cells | medium | low | guidance | **done** |
+| 6 | No breadcrumb when a playlist or mix is open | medium | low | guidance | **done** |
 | 7 | Now-playing says "Artist — Title"; rows say the reverse | medium | low | taste | propose |
 | 8 | The elapsed time is centred and drifts | medium | medium | guidance | **done** |
 | 9 | Overlay body text hugs the border, footers do not | low | none | guidance | **done** |
@@ -70,7 +70,7 @@ as one person's opinion.
 
 ---
 
-## 1. Track rows are a fixed 72-cell block in a box of any width
+## 1. Track rows are a fixed 72-cell block in a box of any width — **done**
 
 **Guidance**, not taste: `content-priority` (show the important thing first, and
 do not let the layout decide silently) and `truncation-strategy` (truncate
@@ -135,7 +135,7 @@ quality and duration, and `Track::album` is fetched, stored and never drawn.
 That is worth a decision either way - draw it in the width finding 1 frees up,
 or drop the field.
 
-## 2. The list title carries key hints, and is clipped on an 80-column terminal
+## 2. The list title carries key hints, and is clipped on an 80-column terminal — **done**
 
 **Guidance**: the same rule as finding 1, and the repository's own statement
 that the bottom row is how bindings are discovered.
@@ -230,7 +230,7 @@ and the leading space put `DAC` one cell left of where `OUT —` sat. Fixed by
 making `device_readout` return no leading space in either case and letting
 `dac_badge` supply exactly one.
 
-## 5. Truncation counts characters, not cells
+## 5. Truncation counts characters, not cells — **done**
 
 **Guidance**: this repository's own rule, stated twice in `ui.rs` - widths come
 from `Span::width`, "the same unicode-width measurement ratatui uses to draw",
@@ -279,7 +279,7 @@ wider than the field it was asked to fit. Reachable from `device_rows`
 (`body.width / 2`) and `add_to_rows` (`body.width - 14`) on a very narrow
 overlay. That guard is **done**.
 
-## 6. There is no breadcrumb when a playlist or mix is open
+## 6. There is no breadcrumb when a playlist or mix is open — **done**
 
 **Guidance**: `nav-state-active` (the current location must be visually
 highlighted) and `breadcrumb` (use it at three or more levels). The issue names
@@ -491,8 +491,9 @@ question about where something lives, which issue #15 explicitly reserved.
 4. Finding 5 (cell-accurate truncation), which finding 1 makes more visible.
 5. Finding 8 (progress row), separately and carefully, because seeking.
 6. Findings 7, 10, 11, 12 as taste, in any order or not at all.
-</content>
-</invoke>
+
+That order was followed. Steps 1 to 5 are done; what is left of this audit is the
+last line, the four taste findings, and nothing else.
 
 ---
 
