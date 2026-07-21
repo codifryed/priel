@@ -1066,8 +1066,8 @@ fn handle_cmd(
         Cmd::Next => {
             command(mpv, "playlist-next", &["force"]);
         }
-        Cmd::TogglePause => {
-            command(mpv, "cycle", &["pause"]);
+        Cmd::SetPaused(paused) => {
+            set_prop(mpv, "pause", paused);
         }
         Cmd::Seek(t) => {
             let v = format!("{t}");
@@ -3139,7 +3139,7 @@ mod tests {
         assert!((mpv.get_property::<f64>("volume").unwrap() - 42.0).abs() < f64::EPSILON);
 
         for cmd in [
-            Cmd::TogglePause,
+            Cmd::SetPaused(true),
             Cmd::Seek(1.0),
             Cmd::SeekRelative(-1.0),
             Cmd::Next,
@@ -3159,6 +3159,36 @@ mod tests {
             handle_cmd(&mpv, &reg, &mut entries, &mut seq, &mut output, Cmd::Quit),
             "only Quit ends the loop"
         );
+    }
+
+    #[test]
+    fn the_pause_state_is_set_to_what_was_asked_for_rather_than_cycled() {
+        // Goal: a remote control says "pause", not "the other one". Answering an
+        // absolute with a cycle pauses a playing track when a panel applet's
+        // play button is pressed twice, which is the standard version of this
+        // bug. Method: ask for the same state twice and read the property back -
+        // a cycle would put it back where it started.
+        let mpv = silent_mpv();
+        let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let mut entries = Vec::new();
+        let mut seq = 0;
+        let mut output = no_output();
+        let mut set = |paused: bool| {
+            handle_cmd(
+                &mpv,
+                &reg,
+                &mut entries,
+                &mut seq,
+                &mut output,
+                Cmd::SetPaused(paused),
+            );
+            mpv.get_property::<bool>("pause")
+        };
+
+        assert_eq!(set(true).ok(), Some(true));
+        assert_eq!(set(true).ok(), Some(true), "asking twice is not a cycle");
+        assert_eq!(set(false).ok(), Some(false));
+        assert_eq!(set(false).ok(), Some(false));
     }
 
     #[test]

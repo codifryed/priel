@@ -112,7 +112,8 @@ synchronous C function invoked from mpv's own demuxer thread, and it must block 
 available - you cannot `.await` there. The buffer would stay `Mutex` + `Condvar` under any model, so
 async would buy nothing at the one boundary where it would have to earn its keep.
 
-- Four long-lived threads (UI, worker, player, log writer) plus one downloader per buffered track.
+- Four long-lived threads (UI, worker, player, log writer), a fifth for the session bus **only when
+  there is one**, plus one downloader per buffered track.
   Ownership is strict: only the worker touches `Client`, only the player thread touches `Mpv`. Cross-thread
   communication is `mpsc` plus the `Arc<Mutex<PlaybackStatus>>` snapshot. Keep it that way; a second
   path to the same state is how the queue desynchronises.

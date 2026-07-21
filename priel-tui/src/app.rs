@@ -42,6 +42,8 @@ use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig, Verdict};
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+use crate::bus::conn::Bus;
+use crate::bus::mpris::{self, BusCommand, Entry, Now, Snapshot};
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
 use crate::worker::{self, FromWorker, Task, ToWorker, Worker};
@@ -249,6 +251,30 @@ const SINK_VOLUME_INTERVAL: Duration = Duration::from_secs(5);
 /// without this the first frame of every open would claim there are no devices.
 const DEVICE_WAIT: Duration = Duration::from_secs(2);
 
+/// The most the desktop may ask for in one tick.
+///
+/// A consumer holding down a media key may not hold the render thread, and what
+/// is left waits a tenth of a second for the next tick.
+const MAX_BUS_COMMANDS_PER_TICK: usize = 32;
+
+/// Seconds as the microseconds every position in MPRIS is counted in.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a position in microseconds is nowhere near i64's range, and `as` saturates"
+)]
+fn micros(seconds: f64) -> i64 {
+    (seconds.max(0.0) * 1_000_000.0) as i64
+}
+
+/// And back, which is the unit the player seeks in.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a position in microseconds is far inside the integers f64 counts exactly"
+)]
+fn seconds(micros: i64) -> f64 {
+    micros as f64 / 1_000_000.0
+}
+
 /// State of a sign-in in progress.
 ///
 /// The verifier has to survive from building the authorize URL until the code
@@ -430,6 +456,24 @@ pub struct App {
     /// again, which the service accepts, and the heart then tells the truth.
     favorite_ids: HashSet<u64>,
 
+    /// priel's place on the session bus, or `None` on a machine that has none.
+    ///
+    /// `None` is the ordinary answer on a media-server box, and it costs
+    /// nothing at all: no thread, and no snapshot built on any tick.
+    bus: Option<Bus>,
+    /// What the desktop was last told. The next tick is announced by the
+    /// difference between this and what is true then.
+    published: Snapshot,
+    /// How many plays priel has started.
+    ///
+    /// Mints the object path a queue entry is known by on the bus. It counts
+    /// *plays* rather than tracks because a consumer resets its position when
+    /// the id changes: the same track twice in a queue needs two ids, and one
+    /// play of one entry must keep one throughout.
+    plays: u64,
+    /// The path the entry playing now is known by.
+    track_path: String,
+
     pub mode: Mode,
     pub filter: String,
     pub shuffle: bool,
@@ -545,11 +589,15 @@ struct RenderSig {
 }
 
 impl App {
+    /// `bus` is priel's place on the session bus, or `None` where there is
+    /// none. It is opened by `main` rather than here for the same reason the
+    /// migration is: it talks to the machine, and tests build an `App`.
     pub fn new(
         player: PlayerConfig,
         token_path: String,
         recent: crate::logging::Recent,
         theme: ThemeName,
+        bus: Option<Bus>,
     ) -> anyhow::Result<Self> {
         // Read before the config is handed over: the picker shows what was
         // asked for, and `--exclusive` is where a session starts from.
@@ -559,6 +607,7 @@ impl App {
         let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
         let worker = worker::spawn(token_path.clone(), creds_path.clone());
         let mut app = Self::with(player, worker);
+        app.bus = bus;
         app.set_theme(theme);
         app.exclusive = exclusive;
         app.recent = recent;
@@ -624,6 +673,10 @@ impl App {
             metas: HashMap::new(),
             advanced: false,
             favorite_ids: HashSet::new(),
+            bus: None,
+            published: Snapshot::default(),
+            plays: 0,
+            track_path: String::new(),
             mode: Mode::Normal,
             filter: String::new(),
             shuffle: false,
@@ -1778,16 +1831,140 @@ impl App {
         self.drain_fetch();
         self.drain_login();
         self.status = self.player.status();
+        // After the status and before the queue reacts to it: a `Seek` from the
+        // desktop is answered against what is playing now rather than against
+        // the tick before it.
+        self.drain_bus();
         self.refresh_from_status();
         self.page_in_more();
         self.refresh_devices();
+        self.publish();
     }
 
     /// The half of `refresh` that reacts to `self.status`, split out so tests can
     /// drive playback states the null player will never produce on its own.
     #[cfg(test)]
     fn refresh_for_test(&mut self) {
+        self.drain_bus();
         self.refresh_from_status();
+        self.publish();
+    }
+
+    // ---- the session bus ----
+
+    /// Run what the desktop asked for since the last tick.
+    ///
+    /// Bounded, like every other loop fed from outside: a consumer holding down
+    /// a media key may not hold the render thread, and what is left waits a
+    /// tenth of a second for the next tick.
+    fn drain_bus(&mut self) {
+        for _ in 0..MAX_BUS_COMMANDS_PER_TICK {
+            let Some(command) = self.bus.as_ref().and_then(Bus::next_command) else {
+                return;
+            };
+            self.apply(command);
+        }
+    }
+
+    /// Do what a consumer asked for.
+    ///
+    /// **Every arm calls the method a key already calls.** MPRIS is a third
+    /// caller of an action that exists - `Next` is what `n` and the header
+    /// control run - so there is one implementation of each and three ways in.
+    /// An arm that did its own thing here would be an action with no way to
+    /// reach it from the terminal.
+    fn apply(&mut self, command: BusCommand) {
+        match command {
+            BusCommand::Next => self.user_next(),
+            BusCommand::Previous => self.user_prev(),
+            // Absolute, where the space bar is a toggle. Answering `Play` with
+            // a toggle pauses a playing track when a panel applet's play button
+            // is pressed twice.
+            BusCommand::Play => self.player.set_paused(false),
+            BusCommand::Pause => self.player.set_paused(true),
+            BusCommand::PlayPause => self.player.toggle_pause(),
+            BusCommand::SeekTo(position_us) => self.player.seek(seconds(position_us)),
+            BusCommand::Shuffle(on) => self.set_shuffle(on),
+            BusCommand::Volume(unity) => self.player.set_volume(unity * 100.0),
+            BusCommand::Quit => self.should_quit = true,
+        }
+        self.dirty = true;
+    }
+
+    /// Tell the desktop what changed, and hand the bus thread what to answer
+    /// from.
+    ///
+    /// Nothing here runs without a bus, which is what keeps the media-server
+    /// box paying nothing for a desktop it does not have.
+    fn publish(&mut self) {
+        if self.bus.is_none() {
+            return;
+        }
+        let snapshot = self.bus_snapshot();
+        if let Some(bus) = self.bus.as_ref() {
+            // A jump is announced by `Seeked` and never by the position itself,
+            // which spec 2.2 forbids putting in a property change.
+            if let Some(position_us) = mpris::seeked(&self.published, &snapshot) {
+                bus.emit(mpris::seeked_signal(position_us));
+            }
+            // **One signal, not two.** A gapless transition changes the metadata
+            // while the playback status stays `Playing`, and two signals let a
+            // consumer render the old title against the new position.
+            let changed = mpris::changed(&self.published.now, &snapshot.now);
+            if !changed.is_empty() {
+                bus.emit(mpris::properties_changed(mpris::PLAYER_INTERFACE, changed));
+            }
+            bus.publish(snapshot.clone());
+        }
+        self.published = snapshot;
+    }
+
+    /// What the desktop is told, from what the app knows.
+    ///
+    /// The one place the queue's vocabulary becomes MPRIS's. Each capability is
+    /// the condition the method it enables actually acts on, so a button the
+    /// desktop offers is one that does something.
+    fn bus_snapshot(&self) -> Snapshot {
+        Snapshot {
+            now: Now {
+                track: self.now_playing.as_ref().map(|track| Entry {
+                    path: self.track_path.clone(),
+                    title: track.title.clone(),
+                    artist: track.artist.clone(),
+                    album: track.album.clone(),
+                    length_us: i64::from(track.duration_secs) * 1_000_000,
+                }),
+                paused: self.status.paused,
+                shuffle: self.shuffle,
+                // Rounded, so that a float wobbling in its last bits is not a
+                // property change announced ten times a second.
+                volume: (self.status.volume * 10.0).round() / 1000.0,
+                can_go_next: self.can_go_next(),
+                // `user_prev` always does something with a queue behind it: at
+                // the very least it starts the current track again.
+                can_go_previous: !self.queue.is_empty(),
+                // mpv reports no duration until a track is decoding, and a seek
+                // bar over an unknown length is a control that does nothing.
+                can_seek: self.status.duration > 0.0,
+            },
+            position_us: micros(self.status.position),
+        }
+    }
+
+    /// The three branches of `user_next` that come to something, as one answer.
+    fn can_go_next(&self) -> bool {
+        !self.queue.is_empty()
+            && (self.status.has_next || self.shuffle || self.queue_pos + 1 < self.queue.len())
+    }
+
+    /// Begin a new play of a queue entry, and mint the id it is known by.
+    ///
+    /// One play of one entry keeps one id throughout, and the same track twice
+    /// in a queue gets two - which is what a consumer reads to decide whether
+    /// to reset its position.
+    fn mint_play(&mut self) {
+        self.plays = self.plays.wrapping_add(1);
+        self.track_path = mpris::track_path(self.plays);
     }
 
     /// The state a status tick is allowed to look at.
@@ -1844,6 +2021,7 @@ impl App {
 
     /// Take up a track mpv moved to on its own.
     fn adopt(&mut self, id: u64) {
+        self.mint_play();
         self.expected_id = id;
         // We just advanced, so the end-of-track fallback must not also fire.
         self.advanced = true;
@@ -2044,6 +2222,7 @@ impl App {
         if pos >= self.queue.len() {
             return;
         }
+        self.mint_play();
         self.queue_pos = pos;
         self.next_intended = None;
         let t = self.queue[pos].clone();
@@ -2214,7 +2393,17 @@ impl App {
     }
 
     fn toggle_shuffle(&mut self) {
-        self.shuffle = !self.shuffle;
+        self.set_shuffle(!self.shuffle);
+    }
+
+    /// Turn shuffle on, or off.
+    ///
+    /// Absolute rather than a toggle because MPRIS's `Shuffle` is, and there is
+    /// one implementation with two callers rather than two implementations: the
+    /// `s` key asks for the opposite of what is in force, and the desktop asks
+    /// for what it wants.
+    fn set_shuffle(&mut self, on: bool) {
+        self.shuffle = on;
         self.notice = Some(
             if self.shuffle {
                 "Shuffle ON"
@@ -4652,6 +4841,330 @@ mod tests {
             favorite_requests(&requests(&r)),
             vec![(2, false)],
             "the one row the filter left on screen"
+        );
+    }
+
+    // ---- the session bus ----
+
+    /// A rig whose app is on a bus with both ends in the test's hands. No
+    /// socket is opened and no thread is started: `Bus::rigged` is the same
+    /// seam `App::rigged` is.
+    struct OnTheBus {
+        rig: Rig,
+        emitted: Receiver<crate::bus::wire::Message>,
+        consumer: Sender<BusCommand>,
+    }
+
+    impl OnTheBus {
+        fn new() -> Self {
+            let mut rig = rig();
+            let (bus, emitted, consumer) = Bus::rigged();
+            rig.app.bus = Some(bus);
+            Self {
+                rig,
+                emitted,
+                consumer,
+            }
+        }
+
+        /// Everything the app announced, as `(member, changed property names)`.
+        fn announced(&self) -> Vec<(String, Vec<String>)> {
+            std::iter::from_fn(|| self.emitted.try_recv().ok())
+                .map(|signal| {
+                    let member = signal.member().unwrap_or_default().to_owned();
+                    let names = signal
+                        .body
+                        .iter()
+                        .find_map(|arg| match arg {
+                            crate::bus::wire::Arg::Dict(fields) => {
+                                Some(fields.iter().map(|(name, _)| name.clone()).collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    (member, names)
+                })
+                .collect()
+        }
+
+        /// Queue three tracks and start the first, as pressing Enter does.
+        fn playing(&mut self) -> &mut Self {
+            self.rig.app.favorites = vec![
+                track(1, "One", "A"),
+                track(2, "Two", "B"),
+                track(3, "Three", "C"),
+            ];
+            self.rig.app.start_queue_at(0);
+            self.rig.app.status.playing = true;
+            self.rig.app.status.duration = 300.0;
+            self.rig.app.status.volume = 100.0;
+            self.rig.app.refresh_for_test();
+            let _ = self.announced();
+            self
+        }
+    }
+
+    /// Goal: **MPRIS is a third caller of an action, never a second
+    /// implementation of one.** Every transport method has to end up in the
+    /// same method the key binding calls, or the two drift and the desktop
+    /// button stops matching the key. Method: drive each command and check the
+    /// effect the key has.
+    #[test]
+    fn the_desktop_runs_the_very_methods_the_keys_do() {
+        let mut on = OnTheBus::new();
+        on.playing();
+        assert_eq!(on.rig.app.queue_pos, 0);
+
+        on.rig.app.apply(BusCommand::Next);
+        assert_eq!(on.rig.app.queue_pos, 1, "Next is what `n` does");
+        on.rig.app.apply(BusCommand::Previous);
+        assert_eq!(on.rig.app.queue_pos, 0, "Previous is what `p` does");
+
+        on.rig.app.apply(BusCommand::Shuffle(true));
+        assert!(on.rig.app.shuffle, "Shuffle is what `s` does");
+        on.rig.app.apply(BusCommand::Quit);
+        assert!(on.rig.app.should_quit, "Quit is what `q` does");
+    }
+
+    /// Goal: `Shuffle` is absolute where the key is a toggle, and there must be
+    /// one implementation with two callers. Asking for a state already in force
+    /// leaves it there, where a toggle would turn it off. Method: ask twice.
+    #[test]
+    fn a_shuffle_from_the_desktop_is_absolute_where_the_key_is_a_toggle() {
+        let mut r = rig();
+        r.app.apply(BusCommand::Shuffle(true));
+        r.app.apply(BusCommand::Shuffle(true));
+        assert!(r.app.shuffle, "asking twice is not a cycle");
+        r.app.on_key(key('s'));
+        assert!(!r.app.shuffle, "and the key still toggles");
+    }
+
+    /// Goal: commands arrive over a channel the app drains on its own tick, so
+    /// the bus thread never touches app state and the render thread never
+    /// blocks on the bus. Method: post a command as a consumer would and let
+    /// the ordinary refresh pick it up.
+    #[test]
+    fn what_a_consumer_asks_for_is_run_on_the_apps_own_tick() {
+        let mut on = OnTheBus::new();
+        on.playing();
+        on.consumer
+            .send(BusCommand::Next)
+            .expect("the app is listening");
+        assert_eq!(on.rig.app.queue_pos, 0, "not until the tick");
+        on.rig.app.refresh_for_test();
+        assert_eq!(on.rig.app.queue_pos, 1);
+    }
+
+    /// Goal: **a gapless change is one announcement.** The metadata changes
+    /// while the playback status stays `Playing`, and two signals let a
+    /// consumer render the old title against the new position. Method: move
+    /// mpv on to the next track the way a transition does, and count what went
+    /// out.
+    #[test]
+    fn a_gapless_change_is_announced_once_and_stays_playing() {
+        let mut on = OnTheBus::new();
+        on.playing();
+        // mpv moved on by itself, which is what a gapless transition looks like.
+        on.rig.app.status.current_id = 2;
+        on.rig.app.refresh_for_test();
+
+        let announced = on.announced();
+        assert_eq!(announced.len(), 1, "one signal, not two: {announced:?}");
+        assert_eq!(announced[0].0, "PropertiesChanged");
+        assert_eq!(
+            announced[0].1,
+            vec!["Metadata".to_owned()],
+            "the status did not change, so it is not announced"
+        );
+        assert_eq!(
+            on.rig
+                .app
+                .published
+                .now
+                .track
+                .as_ref()
+                .map(|t| t.title.as_str()),
+            Some("Two")
+        );
+    }
+
+    /// Goal: a quiet tick costs the bus nothing. priel refreshes ten times a
+    /// second for hours, and announcing an unchanged property set at that rate
+    /// is the traffic-hog bug the position rule exists to prevent. Method: tick
+    /// twice over with only the position moved.
+    #[test]
+    fn a_tick_where_only_the_position_moved_announces_nothing() {
+        let mut on = OnTheBus::new();
+        on.playing();
+        for tenth in 1..5 {
+            on.rig.app.status.position = f64::from(tenth) / 10.0;
+            on.rig.app.refresh_for_test();
+        }
+        assert!(on.announced().is_empty(), "{:?}", on.announced());
+        assert_eq!(
+            on.rig.app.published.position_us, 400_000,
+            "the position is published for a Get all the same"
+        );
+    }
+
+    /// Goal: a jump is announced by `Seeked`, which is what a consumer needs
+    /// because the position itself may never be put in a property change.
+    /// Method: move the position further than playing could account for.
+    #[test]
+    fn a_jump_within_one_track_is_announced_as_a_seek() {
+        let mut on = OnTheBus::new();
+        on.playing();
+        on.rig.app.status.position = 120.0;
+        on.rig.app.refresh_for_test();
+        let announced = on.announced();
+        assert_eq!(announced.len(), 1, "{announced:?}");
+        assert_eq!(announced[0].0, "Seeked");
+    }
+
+    /// Goal: **the same track twice in a queue must not collide**, because a
+    /// consumer resets its position when the id changes - and one play of one
+    /// entry must keep one id throughout. Method: play the same track twice
+    /// and compare the ids, then tick without changing anything.
+    #[test]
+    fn every_play_of_an_entry_gets_an_id_of_its_own() {
+        let mut on = OnTheBus::new();
+        on.playing();
+        let first = on.rig.app.track_path.clone();
+        assert!(!first.is_empty());
+
+        on.rig.app.refresh_for_test();
+        assert_eq!(on.rig.app.track_path, first, "one play, one id");
+
+        // A gapless transition is a new entry, so it is a new id too - the
+        // consumer resetting its position is the whole point of the change.
+        on.rig.app.status.current_id = 2;
+        on.rig.app.refresh_for_test();
+        let adopted = on.rig.app.track_path.clone();
+        assert_ne!(adopted, first, "mpv moved on, so the id moved with it");
+
+        // The same entry, played again.
+        on.rig.app.start_queue_at(0);
+        assert_ne!(
+            on.rig.app.track_path, adopted,
+            "a second play of the same track is a second id"
+        );
+    }
+
+    /// Wait for the player thread to catch up with a command. Only the real
+    /// backend has one to catch up: the stub applies nothing at all, which is
+    /// why this and its callers are behind the feature.
+    #[cfg(feature = "libmpv")]
+    fn settle(app: &App) {
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = app.player.status();
+    }
+
+    /// Goal: **`Play` and `Pause` are absolute where the space bar is a
+    /// toggle.** Answering `Play` with a toggle pauses a playing track when a
+    /// panel applet's play button is pressed twice, which is exactly the bug
+    /// this arrangement exists to prevent. Method: ask for the same state
+    /// twice each way, through the real player.
+    #[cfg(feature = "libmpv")]
+    #[test]
+    fn play_and_pause_from_the_desktop_are_absolute_and_play_pause_is_not() {
+        let mut r = rig();
+        r.app.apply(BusCommand::Pause);
+        settle(&r.app);
+        assert!(r.app.player.status().paused);
+        r.app.apply(BusCommand::Pause);
+        settle(&r.app);
+        assert!(r.app.player.status().paused, "asking twice is not a cycle");
+
+        r.app.apply(BusCommand::Play);
+        settle(&r.app);
+        assert!(!r.app.player.status().paused);
+        r.app.apply(BusCommand::Play);
+        settle(&r.app);
+        assert!(
+            !r.app.player.status().paused,
+            "Play on a playing track leaves it playing"
+        );
+
+        r.app.apply(BusCommand::PlayPause);
+        settle(&r.app);
+        assert!(
+            r.app.player.status().paused,
+            "and PlayPause is still the toggle the space bar is"
+        );
+    }
+
+    /// Goal: **no session bus means no bus, and it must cost nothing at all** -
+    /// that is the media-server box the whole design exists for. Method: the
+    /// ordinary rig, which has no bus, driven through everything that would
+    /// touch one.
+    #[test]
+    fn a_machine_with_no_session_bus_pays_nothing_for_one() {
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "One", "A")];
+        r.app.start_queue_at(0);
+        r.app.status.playing = true;
+        r.app.status.position = 42.0;
+        r.app.refresh_for_test();
+        r.app.refresh_for_test();
+        assert!(r.app.bus.is_none());
+        assert_eq!(
+            r.app.published,
+            Snapshot::default(),
+            "with no bus, no snapshot is even built"
+        );
+    }
+
+    /// Goal: the capability flags are read straight off the queue to enable the
+    /// skip buttons, so each has to be the condition the method it enables
+    /// actually acts on - a button that is offered and does nothing is worse
+    /// than one that is greyed out. Method: an empty queue, then a full one.
+    #[test]
+    fn the_skip_buttons_follow_what_the_queue_can_actually_do() {
+        let mut on = OnTheBus::new();
+        on.rig.app.refresh_for_test();
+        let bare = on.rig.app.bus_snapshot();
+        assert!(!bare.now.can_go_next, "nothing queued, nothing to skip to");
+        assert!(!bare.now.can_go_previous);
+        assert!(!bare.now.can_seek, "and no duration to seek within");
+
+        on.playing();
+        let full = on.rig.app.bus_snapshot();
+        assert!(full.now.can_go_next, "two tracks behind the first");
+        assert!(full.now.can_go_previous, "which at worst starts it again");
+        assert!(full.now.can_seek);
+
+        // The last track of a queue with nothing preloaded behind it.
+        on.rig.app.queue_pos = 2;
+        assert!(!on.rig.app.bus_snapshot().now.can_go_next);
+        on.rig.app.shuffle = true;
+        assert!(
+            on.rig.app.bus_snapshot().now.can_go_next,
+            "shuffle always has somewhere to go"
+        );
+    }
+
+    /// Goal: what the desktop reads is what priel is playing. The scales differ
+    /// on both sides (a percentage against unity, seconds against microseconds)
+    /// and getting either wrong is silent. Method: publish a track and read the
+    /// whole snapshot back off the bus's own end.
+    #[test]
+    fn the_bus_thread_is_handed_what_is_playing_in_the_units_it_publishes() {
+        let mut on = OnTheBus::new();
+        on.playing();
+        on.rig.app.status.position = 30.0;
+        on.rig.app.status.volume = 50.0;
+        on.rig.app.refresh_for_test();
+
+        let published = on.rig.app.bus.as_ref().expect("a bus").published();
+        let entry = published.now.track.expect("something is playing");
+        assert_eq!(entry.title, "One");
+        assert_eq!(entry.artist, "A");
+        assert_eq!(entry.length_us, 100_000_000, "the listing gives seconds");
+        assert_eq!(published.position_us, 30_000_000);
+        assert!(
+            (published.now.volume - 0.5).abs() < 1e-9,
+            "unity is 1.0 where priel counts to 100: {}",
+            published.now.volume
         );
     }
 
@@ -7476,6 +7989,9 @@ mod tests {
         // Goal: `new` is what main calls. A bad token path must still produce a
         // usable app - the failure arrives later as a notice. It is also the
         // one place `--theme` reaches the renderer, so assert the flag lands.
+        // The bus is `None` because this test builds a real app, and nothing a
+        // test constructs may reach the machine - which is exactly why `main`
+        // opens the bus rather than this constructor.
         let app = App::new(
             PlayerConfig {
                 audio_device: Some("null".into()),
@@ -7484,6 +8000,7 @@ mod tests {
             "/nonexistent/priel.json".into(),
             crate::logging::Recent::default(),
             ThemeName::OneLight,
+            None,
         )
         .expect("an app should be constructible without a valid token");
         assert_eq!(app.view, View::Favorites);

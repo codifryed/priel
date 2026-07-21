@@ -29,4 +29,5 @@
 //! decided above it.
 
 pub(crate) mod conn;
+pub(crate) mod mpris;
 pub(crate) mod wire;

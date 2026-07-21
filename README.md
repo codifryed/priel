@@ -75,6 +75,17 @@ water in and out of the flats twice a day, on the pull of the moon.*
   background, which is what makes `≈ near` and `⚠ resampled` as distinguishable
   on cream as they are on charcoal — and they carry a glyph each, so they still
   read with no colour at all.
+- **On your media keys and your lock screen, with no bus library.** priel
+  publishes MPRIS, so the desktop's own media controls, a panel applet and
+  `playerctl` all drive it, and the track shows up where the desktop shows
+  tracks. It speaks the D-Bus wire protocol itself rather than linking one:
+  every bus library either brings an async runtime or brings `libdbus`, and one
+  binary has to run on a media-server box with no desktop libraries on it. With
+  no session bus there is simply no bus — no fifth thread, no failure, and the
+  reason in the log. `TrackList` and `Playlists` are deliberately out of scope,
+  and there is no action on the bus that the keyboard and the mouse do not
+  already have. See
+  [`docs/adr/0003`](docs/adr/0003-the-session-bus-is-spoken-directly-or-not-at-all.md).
 - **A dependency list you can actually audit.** No async runtime anywhere in the
   tree — no tokio, no hyper. No OpenSSL: TLS is rustls. Under 40 crates for the
   API library and around 100 for the whole binary. **libmpv is the only non-Rust
@@ -281,7 +292,9 @@ negotiated, marking the node where the track's rate or width is first lost with 
 `⚠`, reporting the rates the sound server is permitted to clock at with the
 change to make when the track's rate is not one of them, and naming what has the
 output device open with what it would take to reserve it; a `d` picker for moving
-the output between devices, with an `x` toggle for taking a device exclusively; favoriting and unfavoriting the selected or playing track.
+the output between devices, with an `x` toggle for taking a device exclusively; favoriting and unfavoriting the selected or playing track; MPRIS, so the
+media keys, the desktop's own controls and `playerctl` drive the same actions
+the keyboard and the mouse do.
 
 Each section renders on its own evidence, so a directly held card — which has no
 graph by design — still gets its verdict, its device readout and its volume
@@ -332,7 +345,9 @@ Roadmap, roughly in order:
   cannot listen on, so the flow ends with a paste. A client registered with a
   loopback redirect would remove that step; the developer terms do not currently
   permit a native player, so it stands.
-- MPRIS, cover art (kitty/sixel).
+- Cover art (kitty/sixel). The listing carries none today, which is also why
+  MPRIS publishes no `mpris:artUrl`: an invented one is a broken image where an
+  absent one is a placeholder.
 
 **Not planned: a spectrum visualiser.** It was on this list for as long as the
 open question was whether it could coexist with bit-perfect output. It can:
