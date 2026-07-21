@@ -1272,15 +1272,24 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     // DAC badge, the shared activity slot (resolving / buffering / buffered),
     // then the keyboard reference. The clickable controls live in the header.
     let (act_text, act_color) = activity(app);
-    let (fid_text, fid_color) = fidelity_badge(app);
+    let (verdict_text, verdict_color) = verdict_badge(app);
     let (access_text, access_color) = access_badge(&app.status);
     let mut bar = ControlBar::new(l2);
     bar.label(dac_badge(&app.status), Style::default().fg(Color::Green));
     bar.label(access_text, Style::default().fg(access_color));
-    bar.label(
-        fid_text,
-        Style::default().fg(fid_color).add_modifier(Modifier::BOLD),
-    );
+    // The verdict says *whether*; clicking it says *why*, through the same
+    // method `[D]` runs. Registered in the walk that lays it out, like every
+    // other control, and only when there is a word to click on.
+    if !verdict_text.is_empty() {
+        bar.label("  ", Style::default());
+        bar.button(
+            verdict_text,
+            Hit::Graph,
+            Style::default()
+                .fg(verdict_color)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
     bar.label(act_text, Style::default().fg(act_color));
     bar.label("  ", Style::default());
     push_hints(&mut bar);
@@ -1508,58 +1517,44 @@ fn source_badge(app: &App) -> String {
     }
 }
 
-/// The bit-perfect indicator.
+/// The verdict: one word for what is reaching the device, and nothing else.
 ///
-/// Deliberately understated when it is good news and specific when it is not: a
-/// listener who sees a warning needs to know *which* link broke, because the fix
-/// differs (sink rate, sink format, or their own volume key).
+/// **Four words, no numbers, no stage named and no remedy.** The numbers are
+/// already on screen twice - the source badge carries the track and the device
+/// readout carries the output - so repeating them buys width and says nothing.
+/// What cannot be worked out at a glance is *which kind* of alteration, and that
+/// is what the word gives. Everything behind it is in the report under `[D]`,
+/// which this badge is also the button for.
 ///
-/// It reports what priel hands to the audio API. A `PipeWire` graph can still
-/// resample downstream, which mpv cannot see - hence "to device" rather than an
-/// unqualified claim.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "display-only: volume percent is clamped non-negative and shown whole"
-)]
-fn fidelity_badge(app: &App) -> (String, Color) {
-    match app.status.fidelity(app.now_meta.bit_depth) {
+/// The inline "0 for unity" that used to sit here is gone for a stronger reason
+/// than width: that remedy only clears priel's own volume, and now that the sink
+/// is a possible cause it would be actively wrong in exactly the cases this
+/// badge exists to catch.
+///
+/// `✓?` marks a tick reached without reading every stage. A glyph rather than a
+/// dimmed colour, so it survives a light theme, a dark theme, a monochrome
+/// terminal and the red/green deficiency the grades already lean on.
+fn verdict_badge(app: &App) -> (String, Color) {
+    let verdict = app.verdict();
+    let tick = if verdict.needs_qualifying() {
+        "✓?"
+    } else {
+        "✓"
+    };
+    match verdict.fidelity {
         Fidelity::Unknown => (String::new(), Color::DarkGray),
-        Fidelity::BitPerfect => ("  ✓ bit-perfect".to_string(), Color::Green),
-        Fidelity::NearBitPerfect(Alteration::VolumeScaled) => (
-            format!(
-                "  ≈ near bit-perfect · volume {}% · 0 for unity",
-                app.status.volume as u32
-            ),
-            Color::Yellow,
-        ),
-        Fidelity::NearBitPerfect(_) => (
-            "  ≈ near bit-perfect · system volume below unity".to_string(),
-            Color::Yellow,
-        ),
-        Fidelity::Altered(Alteration::Resampled) => (
-            // The destination is the *effective* output - the device rate when
-            // one was read. Printing `status.sample_rate` here showed the rate
-            // the audio server claimed, which in a resample is the source rate
-            // again: "resampled 44.1 to 44.1 kHz".
-            format!(
-                "  ⚠ resampled {}→{}",
-                fmt_khz(app.status.in_sample_rate),
-                fmt_khz(app.status.effective_output().0)
-            ),
-            Color::Red,
-        ),
-        Fidelity::Altered(Alteration::Truncated) => (
-            format!("  ⚠ truncated to {}", app.status.out_format.to_uppercase()),
-            Color::Red,
-        ),
-        Fidelity::Altered(Alteration::VolumeScaled) => (
-            format!("  ⚠ volume {}% · 0 for unity", app.status.volume as u32),
-            Color::Yellow,
-        ),
-        Fidelity::Altered(Alteration::ServerVolumeScaled | Alteration::SinkVolumeScaled) => {
-            ("  ⚠ system volume below unity".to_string(), Color::Yellow)
-        }
+        Fidelity::BitPerfect => (format!("{tick} bit-perfect"), Color::Green),
+        // Every level change reads the same, whichever stage made it. Naming
+        // the stage here would need the width the row does not have, and the
+        // report is where the three of them are laid out side by side.
+        Fidelity::NearBitPerfect(_)
+        | Fidelity::Altered(
+            Alteration::VolumeScaled
+            | Alteration::ServerVolumeScaled
+            | Alteration::SinkVolumeScaled,
+        ) => ("≈ near bit-perfect".to_string(), Color::Yellow),
+        Fidelity::Altered(Alteration::Resampled) => ("⚠ resampled".to_string(), Color::Red),
+        Fidelity::Altered(Alteration::Truncated) => ("⚠ truncated".to_string(), Color::Red),
     }
 }
 
@@ -1711,6 +1706,7 @@ mod tests {
     use priel_player::OutputAccess;
     use priel_player::graph::{
         AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, HeldDevice, NodeRole,
+        SinkLevels, SinkVolume,
     };
     use ratatui::layout::Rect;
     use ratatui::style::Style;
@@ -1721,7 +1717,6 @@ mod tests {
     /// disconnect the channels mid-test.
     struct Screen {
         app: App,
-        #[allow(dead_code, reason = "held to keep the worker channels alive")]
         to_app: Sender<FromWorker>,
         #[allow(dead_code, reason = "held to keep the worker channels alive")]
         from_app: Receiver<ToWorker>,
@@ -2777,6 +2772,24 @@ mod tests {
         sc.app.status.in_format = "s32".into();
         sc.app.status.sample_rate = out_rate;
         sc.app.status.out_format = out_fmt.into();
+        // Both stages mpv can see, read and at unity, so a test only has to
+        // move the one it is about - and so a clean chain reads as a clean
+        // tick rather than an unlooked-at one.
+        sc.app.status.ao_volume = Some(100.0);
+        // The third stage lives in the graph dump and arrives the same way the
+        // overlay's does. Without a reading the sink is a stage that exists and
+        // went unlooked-at, which is a mark on every one of these frames.
+        sc.to_app
+            .send(FromWorker::AudioGraph(Ok(AudioGraph {
+                volume: SinkVolume::Read(SinkLevels {
+                    set: vec![1.0, 1.0],
+                    software: vec![1.0, 1.0],
+                    silenced: false,
+                }),
+                ..AudioGraph::default()
+            })))
+            .expect("send");
+        sc.app.drain_worker();
     }
 
     #[test]
@@ -2824,18 +2837,108 @@ mod tests {
     }
 
     #[test]
-    fn lowering_the_volume_is_reported_as_the_listeners_own_doing() {
-        // Goal: distinguishable from the chain faults, because the fix is to
-        // press `+` rather than to reconfigure anything.
+    fn a_level_change_is_graded_apart_from_a_rebuilt_stream() {
+        // Goal: turning the volume down and resampling are different kinds of
+        // thing, and flattening them into one warning makes the indicator
+        // useless for the people who care most. The row says which kind; which
+        // stage did it is the report's job.
         let mut sc = screen();
         chain(&mut sc, 24, 96_000, 96_000, "s32");
         sc.app.status.volume = 70.0;
         let out = text(&mut sc.app, 140, 12);
-        assert!(out.contains("volume 70%"), "{out}");
+        assert!(out.contains("near bit-perfect"), "{out}");
+        assert!(!out.contains("resampled"), "{out}");
+    }
+
+    #[test]
+    fn the_row_carries_no_remedy_of_its_own() {
+        // Goal: `0 for unity` used to sit in this warning, and it only ever
+        // cleared priel's own volume. Now that the sink is a possible cause, an
+        // inline remedy would be actively wrong in exactly the cases this badge
+        // exists to catch - so the row says what, and the report says what to
+        // do.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        sc.app.status.ao_volume = Some(40.0);
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("near bit-perfect"), "{out}");
+        assert!(!out.contains("for unity"), "no remedy on the row: {out}");
+    }
+
+    #[test]
+    fn the_verdict_is_one_of_four_words_and_carries_no_numbers() {
+        // Goal: the row was over budget - at worst a hundred columns of badges
+        // before a single key hint, so on an eighty-column terminal every hint
+        // was already dropped. The numbers are on screen twice already, in the
+        // source badge and the device readout, so the verdict adds a word and
+        // nothing else.
+        let mut sc = screen();
+        chain(&mut sc, 24, 44_100, 44_100, "s16");
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("⚠ truncated"), "{out}");
         assert!(
-            out.contains("0 for unity"),
-            "the fix belongs in the warning: {out}"
+            !out.contains("truncated to"),
+            "the format it dropped to is in the device readout already: {out}"
         );
+    }
+
+    #[test]
+    fn a_tick_reached_without_reading_every_stage_says_so() {
+        // Goal: the overstatement this work removes. Today's tick already means
+        // "as far as I looked" and nobody can tell. A stage that exists and
+        // could not be read does not silently keep the tick - and does not void
+        // it either.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        assert!(
+            text(&mut sc.app, 140, 12).contains("✓ bit-perfect"),
+            "everything readable was read"
+        );
+
+        // The sound server is in the chain and its level for our stream could
+        // not be read, which is a stage that exists and went unlooked-at.
+        sc.app.status.ao_volume = None;
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains("✓? bit-perfect"), "{out}");
+    }
+
+    #[test]
+    fn the_mark_carries_its_meaning_with_no_colour_at_all() {
+        // Goal: a dimmed tick would say nothing on a monochrome terminal, in a
+        // light theme, or to the red/green deficiency these grades already lean
+        // on. The glyph costs one column and survives all of them.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        sc.app.status.ao_volume = None;
+        let out = text(&mut sc.app, 140, 12);
+        assert!(out.contains('?'), "the mark is in the text itself: {out}");
+    }
+
+    #[test]
+    fn clicking_the_verdict_opens_the_report_behind_it() {
+        // Goal: the row says whether; clicking it says why. It runs the same
+        // method `[D]` does, so the two cannot drift, and the hit box is
+        // registered in the walk that painted the span.
+        let mut sc = screen();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        // Wide enough for the bottom row to still be carrying `[D] graph`,
+        // which is the point: the badge is a second way in, never a
+        // replacement for the labelled key that makes it discoverable.
+        let _ = text(&mut sc.app, 220, 12);
+        let boxes: Vec<Rect> = sc
+            .app
+            .hits
+            .iter()
+            .filter(|(_, h)| *h == Hit::Graph)
+            .map(|(r, _)| *r)
+            .collect();
+        assert_eq!(
+            boxes.len(),
+            2,
+            "the verdict and the [D] hint both open it: {boxes:?}"
+        );
+        click_hit(&mut sc.app, Hit::Graph);
+        assert_eq!(sc.app.mode, Mode::Graph);
     }
 
     #[test]
@@ -3010,19 +3113,19 @@ mod tests {
         sc.app.status.volume = 65.0;
         let out = text(&mut sc.app, 140, 12);
         assert!(out.contains("65%"), "{out}");
-        assert!(out.contains("0 for unity"), "the fix must be stated: {out}");
     }
 
     #[test]
-    fn a_system_volume_below_unity_is_reported_separately() {
-        // Goal: the fix lives in the system mixer, not in priel, so it must not
-        // be confused with priel's own volume.
+    fn a_level_set_outside_priel_still_breaks_the_chain() {
+        // Goal: the audio server attenuates in software just as priel does, so
+        // priel sitting at unity does not make the chain clean. Which stage it
+        // was is the report's answer; that it happened is the row's.
         let mut sc = screen();
         chain(&mut sc, 24, 96_000, 96_000, "s32");
         sc.app.status.ao_volume = Some(40.0);
         let out = text(&mut sc.app, 160, 12);
         assert!(out.contains("near bit-perfect"), "{out}");
-        assert!(out.contains("system volume"), "{out}");
+        assert!(!out.contains("✓ bit-perfect"), "{out}");
     }
 
     #[test]
@@ -3091,11 +3194,12 @@ mod tests {
             channels: 2,
         });
         let out = text(&mut sc.app, 160, 12);
+        assert!(out.contains("⚠ resampled"), "{out}");
         assert!(
-            out.contains("resampled 44.1 kHz→48 kHz"),
-            "both ends of the conversion must be real: {out}"
+            out.contains("DAC S32_LE · 48 kHz"),
+            "the destination is the device's own rate, not the one the server \
+             accepted from us - reading it there produced 44.1 to 44.1: {out}"
         );
-        assert!(out.contains("DAC S32_LE · 48 kHz"), "{out}");
     }
 
     #[test]

@@ -34,9 +34,9 @@ use priel_core::{Fault, Playlist, Track};
 use priel_player::Alteration;
 use priel_player::graph::{
     Attribution, AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, NodeRole, RateAdvice,
-    SourceFormat,
+    SinkVolume, SourceFormat,
 };
-use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig};
+use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig, Verdict};
 
 #[cfg(test)]
 use std::sync::mpsc::Sender;
@@ -207,6 +207,13 @@ struct Plan {
     /// Playback stopped with nothing preloaded. Load the next from scratch.
     advance_fresh: bool,
 }
+
+/// How often the sink's own volume is re-read while something is playing.
+///
+/// Long, because reading it forks `pw-dump` and the tick that asks runs ten
+/// times a second, and short enough that a volume changed in the system mixer
+/// shows up in the verdict while the listener is still looking at it.
+const SINK_VOLUME_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long the picker says it is still looking before it says there is
 /// nothing to look at.
@@ -393,6 +400,20 @@ pub struct App {
     /// The last chain the worker read, or the reason it could not. `None` while
     /// a read is in flight, which is what the overlay says it is doing.
     audio_graph: Option<Result<AudioGraph, GraphError>>,
+    /// What the sink at the end of the chain is doing to the level.
+    ///
+    /// Kept apart from `audio_graph`, which the overlay clears every time it
+    /// opens so that no stale chain is ever shown as current. This one outlives
+    /// that: the bottom row is graded on it on every frame, and it is the last
+    /// thing that was read rather than the last thing that was asked for.
+    /// [`SinkVolume::Unread`] until something says otherwise, which is the
+    /// modest answer rather than the flattering one.
+    sink_volume: SinkVolume,
+    /// When the sink's volume was last asked for, or `None` for never.
+    ///
+    /// Reading it runs `pw-dump`, and the tick that would ask runs ten times a
+    /// second, so the request is spaced by [`SINK_VOLUME_INTERVAL`].
+    sink_volume_asked: Option<Instant>,
     /// How far down the audio-graph overlay is scrolled, from the top.
     graph_scroll: usize,
     /// The output devices the player last published. Kept only while the picker
@@ -553,6 +574,8 @@ impl App {
             recent: crate::logging::Recent::default(),
             log_scroll: 0,
             audio_graph: None,
+            sink_volume: SinkVolume::Unread,
+            sink_volume_asked: None,
             graph_scroll: 0,
             devices: Vec::new(),
             device_selected: 0,
@@ -1391,6 +1414,7 @@ impl App {
                 } => self.on_search_page(&query, offset, page),
                 FromWorker::Resolved(id, r) => self.on_resolved(id, &r),
                 FromWorker::AudioGraph(read) => {
+                    self.note_sink_volume(&read);
                     self.audio_graph = Some(read);
                     // The reply can be longer than the request that opened the
                     // overlay left room for, so the scroll starts again rather
@@ -1533,6 +1557,7 @@ impl App {
     fn refresh_from_status(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         self.report_device_error();
+        self.poll_sink_volume();
 
         let sig = self.render_sig();
         if sig != self.last_sig {
@@ -1889,6 +1914,56 @@ impl App {
         self.recent.lines().len().saturating_sub(1)
     }
 
+    /// The whole chain's verdict: what is happening to the samples, and what
+    /// that rests on.
+    ///
+    /// The one place the row and the report both read, so the word on the row
+    /// and the section headed `Verdict` cannot come to different conclusions.
+    #[must_use]
+    pub fn verdict(&self) -> Verdict {
+        self.status
+            .verdict(self.now_meta.bit_depth, &self.sink_volume)
+    }
+
+    /// Take the sink's volume out of a chain reading, whatever it turned out to
+    /// be.
+    ///
+    /// Each arm is a different statement and none may stand in for another. A
+    /// bypassed graph is a chain with no server sink on it at all, which counts
+    /// as fully evidenced; any other failure read nothing, which does not.
+    fn note_sink_volume(&mut self, read: &Result<AudioGraph, GraphError>) {
+        self.sink_volume = match read {
+            Ok(g) => g.volume.clone(),
+            Err(GraphError::Bypassed) => SinkVolume::Absent,
+            Err(_) => SinkVolume::Unread,
+        };
+    }
+
+    /// Keep the sink's volume current enough for the row to be graded on it.
+    ///
+    /// Reading it means running `pw-dump` and waiting for it, so the request
+    /// goes to the worker like every other one and is spaced out rather than
+    /// made on every tick. Nothing is asked for while nothing is playing, and
+    /// nothing is asked for on the direct path - there is no server sink there
+    /// to have a volume, which is a reading in itself.
+    fn poll_sink_volume(&mut self) {
+        if self.status.bypasses_sound_server() {
+            self.sink_volume = SinkVolume::Absent;
+            return;
+        }
+        if !self.status.loaded {
+            return;
+        }
+        if self
+            .sink_volume_asked
+            .is_some_and(|t| t.elapsed() < SINK_VOLUME_INTERVAL)
+        {
+            return;
+        }
+        self.sink_volume_asked = Some(Instant::now());
+        let _ = self.worker.tx.send(ToWorker::ReadAudioGraph);
+    }
+
     /// Open the audio-graph overlay and ask the worker to read the chain.
     ///
     /// Shared by the key press and the click so the two paths cannot drift.
@@ -1906,7 +1981,9 @@ impl App {
         // Asking anyway would answer "priel has no stream in the graph", which
         // reads as "nothing is playing yet" - the opposite of what is true.
         if self.status.bypasses_sound_server() {
-            self.audio_graph = Some(Err(GraphError::Bypassed));
+            let bypassed = Err(GraphError::Bypassed);
+            self.note_sink_volume(&bypassed);
+            self.audio_graph = Some(bypassed);
             return;
         }
         let _ = self.worker.tx.send(ToWorker::ReadAudioGraph);
@@ -2842,7 +2919,8 @@ fn row_matches(primary: &str, secondary: &str, filter_lower: &str) -> bool {
 mod tests {
     use super::*;
     use priel_core::{PlayableSource, ResolvedStream};
-    use priel_player::graph::HeldDevice;
+    use priel_player::Fidelity;
+    use priel_player::graph::{HeldDevice, SinkLevels};
     use priel_player::hw::HwParams;
 
     struct Rig {
@@ -4153,6 +4231,117 @@ mod tests {
             r.from_app.try_recv().is_err(),
             "and there is nothing to ask pw-dump, so it is not run"
         );
+    }
+
+    // ---- the sink's volume, which the row is graded on ----
+
+    /// A status playing through the sound server, with everything mpv can see
+    /// at unity, so a test only has to move the stage it is about.
+    fn through_server() -> PlaybackStatus {
+        PlaybackStatus {
+            loaded: true,
+            playing: true,
+            volume: 100.0,
+            ao_volume: Some(100.0),
+            sample_rate: 44_100,
+            out_format: "s32".into(),
+            in_sample_rate: 44_100,
+            in_format: "s32".into(),
+            audio_device: "pipewire/alsa_output.usb-x".into(),
+            ..PlaybackStatus::default()
+        }
+    }
+
+    #[test]
+    fn the_row_is_graded_on_the_sink_volume_the_worker_last_read() {
+        // Goal: the verdict on the bottom row has to include the stage nothing
+        // else can see. The reading arrives through the same reply the overlay
+        // is built from, so the two cannot disagree about one moment.
+        let mut r = rig();
+        r.app.status = through_server();
+        assert!(
+            r.app.verdict().needs_qualifying(),
+            "before any reading the sink is a stage that went unread"
+        );
+
+        let mut g = chain();
+        g.volume = SinkVolume::Read(SinkLevels {
+            set: vec![0.5, 0.5],
+            software: vec![0.5, 0.5],
+            silenced: false,
+        });
+        r.to_app.send(FromWorker::AudioGraph(Ok(g))).expect("send");
+        r.app.drain_worker();
+        assert_eq!(
+            r.app.verdict().fidelity,
+            Fidelity::NearBitPerfect(Alteration::SinkVolumeScaled),
+            "a sink attenuating in software is no longer reported as clean"
+        );
+    }
+
+    #[test]
+    fn the_direct_path_has_no_sink_stage_to_have_missed() {
+        // Goal: decision nine. priel holding the card itself is the cleanest
+        // chain there is, and a permanent question mark on it would teach the
+        // reader to ignore the mark everywhere it means something.
+        let mut r = rig();
+        r.app.status = PlaybackStatus {
+            audio_device: "alsa/hw:CARD=AUDIO,DEV=0".into(),
+            ao_volume: None,
+            ..through_server()
+        };
+        r.app.refresh_for_test();
+        let v = r.app.verdict();
+        assert_eq!(v.fidelity, Fidelity::BitPerfect);
+        assert!(!v.needs_qualifying(), "nothing here went unread");
+        assert!(
+            r.from_app.try_recv().is_err(),
+            "and there is no graph to ask pw-dump about"
+        );
+    }
+
+    #[test]
+    fn the_sink_volume_is_re_read_on_a_cadence_rather_than_every_tick() {
+        // Goal: reading it runs pw-dump, and the tick that would ask for it
+        // runs ten times a second. A request per tick would fork a subprocess
+        // per tick and hold the worker off the listener's own requests.
+        let mut r = rig();
+        r.app.status = through_server();
+        r.app.refresh_for_test();
+        assert!(
+            matches!(r.from_app.try_recv(), Ok(ToWorker::ReadAudioGraph)),
+            "the first tick with something playing asks"
+        );
+        r.app.refresh_for_test();
+        r.app.refresh_for_test();
+        assert!(
+            r.from_app.try_recv().is_err(),
+            "and the ones straight after it do not"
+        );
+    }
+
+    #[test]
+    fn nothing_is_asked_for_while_nothing_is_playing() {
+        // Goal: an idle priel has no chain to read and no verdict to reach, so
+        // it must not run a subprocess every few seconds for the whole session
+        // it is left open.
+        let mut r = rig();
+        r.app.refresh_for_test();
+        assert!(r.from_app.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_graph_that_could_not_be_read_leaves_the_sink_unread_rather_than_clean() {
+        // Goal: "say unknown rather than guess". pw-dump missing says nothing
+        // about the sink's volume, and treating a failed read as unity would
+        // hand out the flattering answer on every machine without the tools.
+        let mut r = rig();
+        r.app.status = through_server();
+        r.to_app
+            .send(FromWorker::AudioGraph(Err(GraphError::NotInstalled)))
+            .expect("send");
+        r.app.drain_worker();
+        assert!(r.app.verdict().needs_qualifying());
     }
 
     #[test]
