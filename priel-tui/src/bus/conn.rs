@@ -1436,12 +1436,15 @@ mod tests {
 
     /// Goal: what is not a method call is not answered. The bus sends
     /// `NameAcquired` unprompted the moment a name is taken, and a reply to a
-    /// signal is a protocol error. Method: a signal and a stray reply.
+    /// signal is a protocol error. Method: a signal and a stray reply, both
+    /// spelled *without* the no-reply flag - spec 0.43 makes that flag relevant
+    /// only to method calls, so what stops the answer has to be the message's
+    /// own kind and not a flag priel happens to find set.
     #[test]
     fn a_signal_and_a_stray_reply_are_not_answered() {
         let signal = Message {
             kind: MessageType::Signal,
-            flags: NO_REPLY_EXPECTED,
+            flags: 0,
             serial: 3,
             fields: vec![
                 Field::Path(BUS_PATH.to_owned()),
@@ -1452,7 +1455,14 @@ mod tests {
             body: Vec::new(),
         };
         let mut stream = marshal(&signal, Endian::NATIVE).expect("a signal the tests built");
-        stream.extend(bus_reply(4, 999, Vec::new()));
+        let stray = Message {
+            kind: MessageType::MethodReturn,
+            flags: 0,
+            serial: 4,
+            fields: vec![Field::ReplySerial(999), Field::Sender(BUS_NAME.to_owned())],
+            body: Vec::new(),
+        };
+        stream.extend(marshal(&stray, Endian::NATIVE).expect("a reply the tests built"));
         let mut duplex = after_handshake(vec![Turn::Bytes(stream)]);
         served(&mut duplex, None).expect("a session that ends cleanly");
         assert!(sent(&duplex).is_empty());
@@ -1482,6 +1492,56 @@ mod tests {
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].member(), Some("PropertiesChanged"));
         assert_eq!(written[0].serial, 1);
+    }
+
+    /// Goal: capping what one turn writes bounds how long the answering side
+    /// waits, and loses nothing - the rest go out on the turns that follow.
+    /// Method: queue more than one turn allows and count them all off the wire,
+    /// serials included, since a dropped signal is a desktop stuck on a stale
+    /// track.
+    #[test]
+    fn more_signals_than_one_turn_allows_all_still_go_out() {
+        let queued = MAX_OUTBOUND_PER_TURN + 6;
+        let mut duplex = after_handshake(vec![Turn::Idle, Turn::Idle, Turn::Idle]);
+        {
+            let (signals, outbox) = mpsc::channel();
+            let mut conn = Connection::new(&mut duplex, None);
+            conn.authenticate(Some(1000)).expect("the handshake");
+            for _ in 0..queued {
+                signals
+                    .send(Message::signal(
+                        0,
+                        "/org/mpris/MediaPlayer2",
+                        "org.freedesktop.DBus.Properties",
+                        "PropertiesChanged",
+                    ))
+                    .expect("a live channel");
+            }
+            conn.serve(&outbox).expect("a session that ends cleanly");
+        }
+        let written = sent(&duplex);
+        assert_eq!(written.len(), queued);
+        let serials: Vec<u32> = written.iter().map(|message| message.serial).collect();
+        let minted: Vec<u32> = (1..=u32::try_from(queued).unwrap_or(u32::MAX)).collect();
+        assert_eq!(serials, minted, "no two signals may share a serial");
+    }
+
+    /// Goal: every way a socket says "nothing arrived" is read as nothing
+    /// arrived. A read timeout on Linux surfaces as `WouldBlock`, but the
+    /// standard library documents `TimedOut` too, and either one taken for a
+    /// failure would take priel off the bus every hundred milliseconds.
+    /// Method: name all three, and one that really is a failure.
+    #[test]
+    fn every_way_a_socket_says_nothing_arrived_is_idle() {
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(is_idle(&io::Error::from(kind)), "{kind:?}");
+        }
+        assert!(!is_idle(&io::Error::from(ErrorKind::ConnectionReset)));
+        assert!(!is_idle(&io::Error::from(ErrorKind::BrokenPipe)));
     }
 
     /// Goal: the app dropping its end takes the connection down with it, which
@@ -1646,7 +1706,13 @@ mod tests {
     fn an_auth_line_that_never_ends_is_declined() {
         let mut duplex = Duplex::text(&b"O".repeat(MAX_AUTH_LINE * 4));
         let mut conn = Connection::new(&mut duplex, None);
-        assert!(conn.authenticate(Some(1000)).is_err());
+        let error = conn
+            .authenticate(Some(1000))
+            .expect_err("a line with no terminator");
+        assert!(
+            error.to_string().contains("longer than any"),
+            "the length is what has to end it, not the peer eventually hanging up: {error}"
+        );
     }
 
     /// Goal: a read timeout during the handshake is waited through, since the
