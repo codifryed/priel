@@ -55,7 +55,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         device_overlay(f, f.area(), app);
     }
     if app.mode == Mode::Credentials {
-        credentials_overlay(f, f.area(), app.credential_status());
+        let area = f.area();
+        credentials_overlay(f, app, area);
     }
     if app.mode == Mode::Login
         && let Some(flow) = app.login()
@@ -167,9 +168,16 @@ fn tail(s: &str, width: usize) -> String {
     s.chars().skip(count - width).collect()
 }
 
-/// Draw the consent screen. `status` is the line under the buttons: idle,
-/// in flight, or the reason a previous attempt failed.
-fn credentials_overlay(f: &mut Frame, area: Rect, status: Option<&str>) {
+/// Draw the consent screen.
+///
+/// Its three answers - download it, not now, quit - are controls, laid out and
+/// hit-boxed in the same walk the header's are. A stray click is still not
+/// consent: the app answers a click here only where it lands on one of these.
+fn credentials_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    let status = app.credential_status().map(ToString::to_string);
+    // Modal: whatever the header and the bottom row registered this frame is
+    // behind this screen and must not be reachable through it.
+    app.hits.clear();
     let rows = u16::try_from(CREDENTIALS_PROMPT.len()).unwrap_or(u16::MAX);
     let width = area.width.min(78);
     let height = rows.saturating_add(6).min(area.height);
@@ -188,7 +196,7 @@ fn credentials_overlay(f: &mut Frame, area: Rect, status: Option<&str>) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let mut lines: Vec<Line<'static>> = CREDENTIALS_PROMPT
+    let lines: Vec<Line<'static>> = CREDENTIALS_PROMPT
         .iter()
         .map(|l| {
             // The address and the destination path are the two facts a reader
@@ -202,22 +210,48 @@ fn credentials_overlay(f: &mut Frame, area: Rect, status: Option<&str>) {
             Line::from(Span::styled((*l).to_string(), style))
         })
         .collect();
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("    [f]", Style::default().fg(Color::Cyan)),
-        Span::styled(" download it   ", Style::default().fg(Color::Gray)),
-        Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
-        Span::styled(" not now   ", Style::default().fg(Color::Gray)),
-        Span::styled("[q]", Style::default().fg(Color::Cyan)),
-        Span::styled(" quit", Style::default().fg(Color::Gray)),
-    ]));
-    if let Some(status) = status {
-        lines.push(Line::from(Span::styled(
-            format!("    {status}"),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
     f.render_widget(Paragraph::new(lines), inner);
+
+    // A blank line after the prose, then the choices, then whatever the last
+    // attempt had to say. Placed by hand rather than pushed onto the paragraph
+    // because the controls need a rect of their own to register hit boxes in.
+    let dim = Style::default().fg(Color::Gray);
+    let key = Style::default().fg(Color::Cyan);
+    let choices = rows.saturating_add(1);
+    if choices >= inner.height {
+        return; // too short to draw them, so nothing to click either
+    }
+    let line = Rect {
+        y: inner.y.saturating_add(choices),
+        height: 1,
+        ..inner
+    };
+    let mut bar = ControlBar::new(line);
+    bar.label("    [", dim);
+    bar.button("f", Hit::FetchCredentials, key);
+    bar.label("] download it   [", dim);
+    bar.button("Esc", Hit::DeclineCredentials, key);
+    bar.label("] not now   [", dim);
+    bar.button("q", Hit::Quit, key);
+    bar.label("] quit", dim);
+    app.hits.extend(bar.hits.iter().copied());
+    f.render_widget(Paragraph::new(Line::from(bar.spans)), line);
+
+    if let Some(status) = status
+        && choices.saturating_add(1) < inner.height
+    {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("    {status}"),
+                Style::default().fg(Color::Yellow),
+            ))),
+            Rect {
+                y: line.y.saturating_add(1),
+                height: 1,
+                ..inner
+            },
+        );
+    }
 }
 
 /// The first-run consent screen for obtaining a client identity.
@@ -3022,6 +3056,46 @@ mod tests {
             "the manual alternative: {out}"
         );
         assert!(out.contains("[f]") && out.contains("[Esc]") && out.contains("[q]"));
+    }
+
+    #[test]
+    fn the_consent_screens_choices_are_painted_where_a_click_lands() {
+        // Goal: this screen appears before anything else priel does, and it had
+        // three actions and no way to point at any of them. Each key is a
+        // control on the cells it printed, and declining runs the same shared
+        // method `Esc` does.
+        let mut sc = screen();
+        sc.app.set_mode_for_test(Mode::Credentials);
+        for (hit, key) in [
+            (Hit::FetchCredentials, "f"),
+            (Hit::DeclineCredentials, "Esc"),
+            (Hit::Quit, "q"),
+        ] {
+            assert_eq!(painted(&mut sc.app, 100, 30, hit), key);
+        }
+        click_hit(&mut sc.app, Hit::DeclineCredentials);
+        assert_eq!(sc.app.mode, Mode::Normal, "declining continues without it");
+    }
+
+    #[test]
+    fn the_consent_screen_takes_the_hit_boxes_over_from_the_row_behind_it() {
+        // Goal: modal means a click cannot reach a control underneath. The header
+        // is drawn first, so its controls have to be replaced by this screen's.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 100, 30);
+        let header_row = sc
+            .app
+            .hits
+            .iter()
+            .map(|(r, _)| r.y)
+            .min()
+            .expect("the header should publish controls");
+        sc.app.set_mode_for_test(Mode::Credentials);
+        let _ = draw(&mut sc.app, 100, 30);
+        assert!(
+            !sc.app.hits.iter().any(|(r, _)| r.y == header_row),
+            "nothing behind the consent screen may still be clickable"
+        );
     }
 
     #[test]

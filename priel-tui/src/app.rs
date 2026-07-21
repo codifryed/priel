@@ -87,6 +87,10 @@ pub enum Hit {
     Graph,
     Devices,
     SignIn,
+    /// Download a client identity, from the first-run consent screen.
+    FetchCredentials,
+    /// Carry on without one, from the same screen.
+    DeclineCredentials,
     Quit,
 }
 
@@ -855,12 +859,20 @@ impl App {
         }
     }
 
+    /// Carry on without downloading a client identity.
+    ///
+    /// The one way out that is not quitting: `Esc`, `Enter` and the screen's own
+    /// "not now" control all come through here.
+    fn decline_credentials(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
     /// The consent screen is modal: nothing reaches the list behind it.
     fn on_key_credentials(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('f') => self.fetch_credentials(),
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
+            KeyCode::Esc | KeyCode::Enter => self.decline_credentials(),
             _ => {}
         }
     }
@@ -2272,7 +2284,18 @@ impl App {
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
         if matches!(self.mode, Mode::Credentials | Mode::Login) {
-            return; // these screens take no mouse input
+            // These two offer controls rather than a way out, and are the one
+            // place a click off a control means nothing at all: a stray click is
+            // not consent to download a credential, and not an abandoned
+            // sign-in. Both screens replace the frame's hit boxes with their
+            // own, so nothing behind them can be reached from here either.
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(h) = self.hit_at(m.column, m.row)
+            {
+                self.dispatch(h);
+                self.dirty = true;
+            }
+            return;
         }
         if self.mode == Mode::Log {
             match m.kind {
@@ -2384,6 +2407,8 @@ impl App {
             Hit::Graph => self.open_graph(),
             Hit::Devices => self.open_devices(),
             Hit::SignIn => self.start_login(),
+            Hit::FetchCredentials => self.fetch_credentials(),
+            Hit::DeclineCredentials => self.decline_credentials(),
             Hit::Quit => self.should_quit = true,
         }
     }
@@ -5877,9 +5902,24 @@ mod tests {
         fire(&mut r.app, Hit::EditSearch);
         assert_eq!(r.app.view, View::Search);
         assert_eq!(r.app.mode, Mode::Search);
-        // Nowhere to sign in to without a client identity, and a rigged app has
-        // none: what this asserts is that the control is wired to the attempt.
+        // Nowhere to sign in to and nowhere to download to without a client
+        // identity, and a rigged app has neither: what these assert is that the
+        // controls are wired to the attempt rather than to nothing.
         fire(&mut r.app, Hit::SignIn);
+        assert_eq!(r.app.mode, Mode::Normal);
+        fire(&mut r.app, Hit::FetchCredentials);
+        assert!(r.app.credential_status().is_none());
+        r.app.mode = Mode::Credentials;
+        r.app.hits = vec![(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+            Hit::DeclineCredentials,
+        )];
+        r.app.on_mouse(click(1, 0));
         assert_eq!(r.app.mode, Mode::Normal);
 
         r.app.view = View::Favorites;
@@ -6095,13 +6135,27 @@ mod tests {
     }
 
     #[test]
-    fn the_consent_screen_ignores_the_mouse() {
+    fn only_a_click_on_one_of_the_consent_screens_choices_answers_it() {
         // Goal: every other overlay is dismissed by a click. This one is not:
-        // a stray click must not be read as consent to download a credential.
+        // a stray click must not be read as consent to download a credential,
+        // nor as declining. Only a click that lands on one of its own controls
+        // answers, and it runs the same shared method the key does.
         let mut r = rig();
         r.app.set_mode_for_test(Mode::Credentials);
         r.app.on_mouse(click(1, 1));
         assert_eq!(r.app.mode, Mode::Credentials, "a click is not consent");
+
+        r.app.hits = vec![(
+            Rect {
+                x: 0,
+                y: 1,
+                width: 3,
+                height: 1,
+            },
+            Hit::DeclineCredentials,
+        )];
+        r.app.on_mouse(click(1, 1));
+        assert_eq!(r.app.mode, Mode::Normal, "but pointing at `not now` does");
     }
 
     #[test]
