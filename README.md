@@ -42,7 +42,8 @@ water in and out of the flats twice a day, on the pull of the moon.*
   fully evidenced rather than unread, so the cleanest chain on the machine gets a
   clean tick. It is a glyph rather than a colour, so it survives a light theme, a
   dark one, a monochrome terminal, and the red/green deficiency the grades
-  already lean on.
+  already lean on. The theme picker previews all three grades in the palette each
+  row offers, so the choice is made on the thing that matters.
 - **Unity gain is a first-class state.** Any software volume below 100%
   multiplies every sample. The header shows `100%` in green at unity and yellow
   otherwise, `0` restores it, and **all three stages are watched** — priel's own
@@ -64,6 +65,16 @@ water in and out of the flats twice a day, on the pull of the moon.*
   reference rather than making you read this file. Parity runs both ways: there
   is no control that only the mouse can reach, and none that only the keyboard
   can.
+- **Built-in themes, light and dark, that keep the indicator honest.** Four
+  published palettes — `nord` (the default), `gruvbox-dark`, `gruvbox-light` and
+  `one-light` — plus `terminal`, which paints with your terminal's own sixteen
+  colours and follows a palette you have already chosen rather than fighting it.
+  Every colour priel draws comes from one table of *roles*, so a theme is
+  complete by construction and a test refuses any bare colour written into the
+  renderer. The fidelity grades are held to a contrast floor on their own
+  background, which is what makes `≈ near` and `⚠ resampled` as distinguishable
+  on cream as they are on charcoal — and they carry a glyph each, so they still
+  read with no colour at all.
 - **A dependency list you can actually audit.** No async runtime anywhere in the
   tree — no tokio, no hyper. No OpenSSL: TLS is rustls. Under 40 crates for the
   API library and around 100 for the whole binary. **libmpv is the only non-Rust
@@ -121,6 +132,12 @@ and holding warnings and errors by default. `--log-level debug` (or
 file at all. mpv's own messages are recorded in the same file, in order, so a
 failed track shows both halves together — `[file] Cannot open file ...` next to
 priel's own account of what it was trying to play.
+
+`--theme` picks the palette: `nord` (the default), `gruvbox-dark`,
+`gruvbox-light`, `one-light`, or `terminal` to defer to your terminal's own
+colours. `t` opens the same list while priel is running, but **priel reads no
+configuration file**, so a choice made there lasts for that session only and the
+picker says so; the flag is how one is kept.
 
 Set `PRIEL_NO_BROWSER=1` to stop priel launching a browser; the sign-in screen
 always shows the URL as well, so a headless or remote session still works.
@@ -195,6 +212,7 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 | Output report | `D` | click the verdict, click `[D]`, or `[?]` then `D` |
 | Choose the output device | `d` | click `◎`, then a row in the picker |
 | Exclusive output on/off | `x` in the picker | click the toggle |
+| Choose a colour theme | `t` | click `◐`, then a row in the picker |
 | Sign in again | `A` | `[?]`, then `A` |
 | Switch view | `Tab` cycles, `1`/`2`/`3` | click a tab |
 | Move selection | `j`/`k`, `↑`/`↓` | scroll wheel |

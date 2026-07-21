@@ -42,6 +42,8 @@ use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig, Verdict};
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+use crate::cli::ThemeName;
+use crate::theme::{self, Theme};
 use crate::worker::{self, FromWorker, Task, ToWorker, Worker};
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -108,6 +110,8 @@ pub enum Hit {
     Log,
     Graph,
     Devices,
+    /// Open the colour theme picker.
+    Themes,
     SignIn,
     /// Download a client identity, from the first-run consent screen.
     FetchCredentials,
@@ -133,6 +137,7 @@ pub enum Mode {
     Log,         // the recent diagnostics are up; modal in the same way
     Graph,       // the chain to the output device is up; modal in the same way
     Devices,     // the output picker is up; modal in the same way
+    Themes,      // the colour theme picker is up; modal in the same way
     Credentials, // first run with no client identity; asking before fetching one
     Login,       // signing in: browser is open, waiting for the redirected URL
 }
@@ -408,6 +413,17 @@ pub struct App {
     pub filter: String,
     pub shuffle: bool,
 
+    /// Which palette is in force, and the colours it stands for. Held together
+    /// so the picker can mark the row that is current without mapping a palette
+    /// back to a name.
+    theme_name: ThemeName,
+    theme: Theme,
+    /// Which row of the theme picker is highlighted.
+    theme_selected: usize,
+    /// Clickable theme rows and the palette each stands for, rebuilt by the
+    /// renderer while the picker is up - exactly as `device_rows` is.
+    pub theme_rows: Vec<(Rect, ThemeName)>,
+
     pub notice: Option<String>,
     pub loading: bool,
     /// The worker thread has gone, and has been reported. Latched so the
@@ -512,6 +528,7 @@ impl App {
         player: PlayerConfig,
         token_path: String,
         recent: crate::logging::Recent,
+        theme: ThemeName,
     ) -> anyhow::Result<Self> {
         // Read before the config is handed over: the picker shows what was
         // asked for, and `--exclusive` is where a session starts from.
@@ -521,6 +538,7 @@ impl App {
         let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
         let worker = worker::spawn(token_path.clone(), creds_path.clone());
         let mut app = Self::with(player, worker);
+        app.set_theme(theme);
         app.exclusive = exclusive;
         app.recent = recent;
         let has_session = priel_core::auth::StoredToken::load(&token_path).is_ok();
@@ -583,6 +601,10 @@ impl App {
             mode: Mode::Normal,
             filter: String::new(),
             shuffle: false,
+            theme_name: ThemeName::default(),
+            theme: Theme::default(),
+            theme_selected: 0,
+            theme_rows: Vec::new(),
             notice: Some("Loading favorites…".into()),
             loading: true,
             frame: 0,
@@ -614,6 +636,106 @@ impl App {
             fetching: None,
             login: None,
         }
+    }
+
+    // ---- the colour theme ----
+
+    /// The palette the renderer paints with.
+    ///
+    /// [`Theme`] is `Copy` and the whole of it is twenty colours, so the
+    /// renderer takes a copy at the top of each function rather than holding a
+    /// borrow of `App` it would then have to give back before recording a hit
+    /// box.
+    #[must_use]
+    pub fn theme(&self) -> Theme {
+        self.theme
+    }
+
+    /// Paint with a different palette from here on.
+    ///
+    /// The one place that changes it, so `--theme`, the `t` key and a click on
+    /// a row of the picker cannot drift apart.
+    fn set_theme(&mut self, name: ThemeName) {
+        self.theme_name = name;
+        self.theme = Theme::of(name);
+        self.dirty = true;
+    }
+
+    /// Open the theme picker, on the palette already in force.
+    ///
+    /// The one way in: `t` and the header's `◐` control both come through here.
+    fn open_themes(&mut self) {
+        self.mode = Mode::Themes;
+        self.theme_selected = theme::OFFERED
+            .iter()
+            .position(|n| *n == self.theme_name)
+            .unwrap_or(0);
+    }
+
+    /// The picker: modal like the output one, and scrolled with the same keys.
+    fn on_key_themes(&mut self, key: KeyEvent) {
+        let last = theme::OFFERED.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('t' | 'q') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.theme_selected = (self.theme_selected + 1).min(last);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.theme_selected = self.theme_selected.saturating_sub(1);
+            }
+            KeyCode::Char('g') => self.theme_selected = 0,
+            KeyCode::Char('G') => self.theme_selected = last,
+            KeyCode::Enter => self.choose_theme(self.theme_selected),
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Repaint in the palette on this row, for this session.
+    ///
+    /// The one place a choice made in the picker lands: the Enter key and a
+    /// click on a row both arrive here. Nothing is written anywhere - priel
+    /// reads no configuration file, and `--theme` is what makes a choice
+    /// outlive the session, which is what the overlay says in words.
+    fn choose_theme(&mut self, index: usize) {
+        let Some(name) = theme::OFFERED.get(index).copied() else {
+            return;
+        };
+        self.set_theme(name);
+        self.notice = Some(format!("Theme: {} — this session only", theme::label(name)));
+        self.mode = Mode::Normal;
+    }
+
+    /// A click inside the picker. On a row it takes that palette, and anywhere
+    /// else it dismisses, as a click on the output picker does.
+    fn click_theme(&mut self, col: u16, row: u16) {
+        match self
+            .theme_rows
+            .iter()
+            .find(|(r, _)| hit(*r, col, row))
+            .map(|(_, n)| *n)
+        {
+            Some(name) => {
+                self.theme_selected = theme::OFFERED
+                    .iter()
+                    .position(|n| *n == name)
+                    .unwrap_or(self.theme_selected);
+                self.choose_theme(self.theme_selected);
+            }
+            None => self.mode = Mode::Normal,
+        }
+    }
+
+    /// Which row the picker is on.
+    #[must_use]
+    pub fn theme_selected(&self) -> usize {
+        self.theme_selected
+    }
+
+    /// Which palette is in force, so the picker can mark that row.
+    #[must_use]
+    pub fn theme_name(&self) -> ThemeName {
+        self.theme_name
     }
 
     /// Ask the user before downloading a client identity.
@@ -1977,6 +2099,7 @@ impl App {
             Mode::Log => self.on_key_log(key),
             Mode::Graph => self.on_key_graph(key),
             Mode::Devices => self.on_key_devices(key),
+            Mode::Themes => self.on_key_themes(key),
             Mode::Credentials => self.on_key_credentials(key),
             Mode::Login => self.on_key_login(key),
             Mode::Normal => self.on_key_normal(key),
@@ -2567,6 +2690,7 @@ impl App {
             KeyCode::Char('M') => self.open_log(),
             KeyCode::Char('D') => self.open_graph(),
             KeyCode::Char('d') => self.open_devices(),
+            KeyCode::Char('t') => self.open_themes(),
             KeyCode::Char('A') => self.start_login(),
             KeyCode::Enter => self.on_enter(),
             KeyCode::Char(' ') => self.player.toggle_pause(),
@@ -2647,6 +2771,21 @@ impl App {
             self.dirty = true;
             return;
         }
+        if self.mode == Mode::Themes {
+            let last = theme::OFFERED.len().saturating_sub(1);
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    self.theme_selected = (self.theme_selected + 1).min(last);
+                }
+                MouseEventKind::ScrollUp => {
+                    self.theme_selected = self.theme_selected.saturating_sub(1);
+                }
+                MouseEventKind::Down(MouseButton::Left) => self.click_theme(m.column, m.row),
+                _ => return,
+            }
+            self.dirty = true;
+            return;
+        }
         if self.mode == Mode::Help {
             // The reference is priel's menu: every key it lists is a control, so
             // a click that lands on one runs it and anything else just
@@ -2712,6 +2851,7 @@ impl App {
             Hit::Log => self.open_log(),
             Hit::Graph => self.open_graph(),
             Hit::Devices => self.open_devices(),
+            Hit::Themes => self.open_themes(),
             Hit::SignIn => self.start_login(),
             Hit::FetchCredentials => self.fetch_credentials(),
             Hit::DeclineCredentials => self.decline_credentials(),
@@ -5830,6 +5970,126 @@ mod tests {
         assert!(r.app.notice.is_none(), "nothing was chosen");
     }
 
+    // ---- the colour theme picker ----
+
+    /// The picker, open, with the default palette in force.
+    fn with_themes() -> Rig {
+        let mut r = rig();
+        r.app.on_key(key('t'));
+        r
+    }
+
+    #[test]
+    fn the_theme_picker_opens_on_its_key_and_closes_again() {
+        // Goal: `t` is the binding, and the three ways out of every other
+        // overlay have to work here too - a second idiom would be its own bug.
+        for out in ['t', 'q'] {
+            let mut r = with_themes();
+            assert_eq!(r.app.mode, Mode::Themes);
+            r.app.on_key(key(out));
+            assert_eq!(r.app.mode, Mode::Normal, "{out} should close it");
+        }
+        let mut r = with_themes();
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal, "Esc should close it");
+    }
+
+    #[test]
+    fn the_theme_picker_opens_on_the_palette_already_in_force() {
+        // Goal: a list opens on the row that was last touched, and the device
+        // picker already does exactly this.
+        let mut r = rig();
+        r.app.set_theme(ThemeName::OneLight);
+        r.app.on_key(key('t'));
+        assert_eq!(r.app.theme_selected(), 3, "one-light is the fourth offered");
+    }
+
+    #[test]
+    fn choosing_a_theme_repaints_and_says_it_is_for_this_session() {
+        // Goal: priel reads no configuration file, so a choice made here lasts
+        // for the session and the picker must say so - as the device picker
+        // does. The notice is the only place that promise is made in words.
+        let mut r = with_themes();
+        r.app.on_key(key('j'));
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.theme(), Theme::of(ThemeName::GruvboxDark));
+        assert_eq!(r.app.mode, Mode::Normal, "choosing closes the picker");
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("gruvbox-dark"), "{notice}");
+        assert!(notice.contains("this session only"), "{notice}");
+    }
+
+    #[test]
+    fn clicking_a_theme_row_does_what_the_enter_key_does() {
+        // Goal: the mouse is a first-class addition, never a second
+        // implementation. Both paths run `choose_theme` and nothing else.
+        let mut r = with_themes();
+        let row = Rect {
+            x: 2,
+            y: 5,
+            width: 60,
+            height: 1,
+        };
+        r.app.theme_rows = vec![(row, ThemeName::GruvboxLight)];
+        r.app.on_mouse(click(4, 5));
+        assert_eq!(r.app.theme(), Theme::of(ThemeName::GruvboxLight));
+        assert_eq!(r.app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_click_outside_the_theme_rows_dismisses_without_repainting() {
+        // Goal: missing a row must not change the palette, exactly as missing a
+        // device row must not move the output.
+        let mut r = with_themes();
+        r.app.notice = None;
+        r.app.theme_rows = vec![(
+            Rect {
+                x: 2,
+                y: 5,
+                width: 60,
+                height: 1,
+            },
+            ThemeName::Terminal,
+        )];
+        r.app.on_mouse(click(4, 9));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert_eq!(r.app.theme(), Theme::default(), "nothing was chosen");
+        assert!(r.app.notice.is_none());
+    }
+
+    #[test]
+    fn the_theme_picker_scrolls_with_the_same_keys_as_a_list() {
+        // Goal: j/k/g/G mean here what they mean everywhere else, and both ends
+        // are clamped rather than wrapping.
+        let mut r = with_themes();
+        let last = crate::theme::OFFERED.len() - 1;
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.theme_selected(), 1);
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.theme_selected(), 0);
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.theme_selected(), 0, "and stops at the first");
+        r.app.on_key(key('G'));
+        assert_eq!(r.app.theme_selected(), last, "G reaches the last");
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.theme_selected(), last, "and stops there");
+        r.app.on_key(key('g'));
+        assert_eq!(r.app.theme_selected(), 0);
+    }
+
+    #[test]
+    fn the_theme_picker_swallows_the_keys_behind_it() {
+        // Goal: modal in the same way every other overlay is. `s` would shuffle
+        // the list underneath, and must not reach it.
+        let mut r = with_themes();
+        r.app.on_key(key('s'));
+        assert!(
+            !r.app.shuffle,
+            "the list behind it must not have been touched"
+        );
+        assert_eq!(r.app.mode, Mode::Themes, "and it is still open");
+    }
+
     #[test]
     fn a_device_that_will_not_open_is_reported_once_rather_than_every_tick() {
         // Goal: the player carries the reason until the next change is
@@ -6716,6 +6976,8 @@ mod tests {
         assert_eq!(r.app.mode, Mode::Help);
         fire(&mut r.app, Hit::Devices);
         assert_eq!(r.app.mode, Mode::Devices);
+        fire(&mut r.app, Hit::Themes);
+        assert_eq!(r.app.mode, Mode::Themes);
         fire(&mut r.app, Hit::Graph);
         assert_eq!(r.app.mode, Mode::Graph);
         fire(&mut r.app, Hit::Log);
@@ -6855,7 +7117,8 @@ mod tests {
     #[test]
     fn the_real_constructor_wires_a_player_and_a_worker() {
         // Goal: `new` is what main calls. A bad token path must still produce a
-        // usable app - the failure arrives later as a notice.
+        // usable app - the failure arrives later as a notice. It is also the
+        // one place `--theme` reaches the renderer, so assert the flag lands.
         let app = App::new(
             PlayerConfig {
                 audio_device: Some("null".into()),
@@ -6863,10 +7126,16 @@ mod tests {
             },
             "/nonexistent/priel.json".into(),
             crate::logging::Recent::default(),
+            ThemeName::OneLight,
         )
         .expect("an app should be constructible without a valid token");
         assert_eq!(app.view, View::Favorites);
         assert!(app.loading, "it starts out loading");
+        assert_eq!(
+            app.theme(),
+            Theme::of(ThemeName::OneLight),
+            "--theme reaches the renderer"
+        );
     }
 
     #[test]
