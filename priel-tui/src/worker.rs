@@ -667,6 +667,10 @@ mod tests {
                             "totalNumberOfItems":2,
                             "items":[{{"type":"track","item":{{"id":{id}}}}}]}}}}]}}]}}"#
                     )
+                } else if line.contains("create-playlist") {
+                    // The newer API wraps what it made, and the uuid is the one
+                    // fact the interface cannot do without.
+                    r#"{"data":{"uuid":"new-1","title":"Late night"}}"#.to_string()
                 } else if line.contains("/v1/search") {
                     // Varied by offset for the same reason the favorites are.
                     let id = if line.contains("offset=0") { 1 } else { 2 };
@@ -1212,6 +1216,109 @@ mod tests {
                 assert!(detail.contains("not signed in"), "and say so: {detail}");
             }
             other => panic!("expected an error, got {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_created_playlist_comes_back_through_the_channel() {
+        // Goal: the whole chain for the one edit that answers with something -
+        // the app's request, the core's call, and the reply the interface needs
+        // because it cannot guess the uuid. Nothing here touches an account:
+        // the origin is a loopback stub.
+        let w = worker_on(origin());
+        w.tx.send(ToWorker::CreatePlaylist {
+            title: "Late night".into(),
+        })
+        .expect("the worker is listening");
+        match next(&w) {
+            FromWorker::PlaylistCreated(made) => {
+                assert_eq!(made.uuid, "new-1");
+                assert_eq!(made.title, "Late night");
+            }
+            other => panic!("expected the new playlist, got {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_delete_answers_and_a_rename_does_not() {
+        // Goal: the two halves of the silence rule, in one place because the
+        // difference between them is the point. A rename is already on screen,
+        // so success says nothing; a delete is not, so it must be reported or
+        // the row never leaves. The rename is proved silent by the reply that
+        // arrives being the *next* request's.
+        let w = worker_on(origin());
+        w.tx.send(ToWorker::RenamePlaylist {
+            uuid: "p1".into(),
+            title: "New".into(),
+            was: "Old".into(),
+        })
+        .expect("the worker is listening");
+        w.tx.send(ToWorker::DeletePlaylist {
+            uuid: "p1".into(),
+            title: "Old".into(),
+        })
+        .expect("the worker is listening");
+        match next(&w) {
+            FromWorker::PlaylistDeleted { uuid } => assert_eq!(uuid, "p1"),
+            other => panic!(
+                "the rename should have said nothing, but {} arrived",
+                variant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn a_track_added_to_a_playlist_is_reported_by_the_name_of_the_playlist() {
+        // Goal: the notice this becomes is the only confirmation the listener
+        // gets, so the title has to survive the round trip rather than being
+        // looked up again from a list that may not hold it.
+        let w = worker_on(origin());
+        w.tx.send(ToWorker::AddToPlaylist {
+            uuid: "p1".into(),
+            title: "Evening".into(),
+            track_id: 7,
+        })
+        .expect("the worker is listening");
+        match next(&w) {
+            FromWorker::PlaylistTrackAdded { title } => assert_eq!(title, "Evening"),
+            other => panic!("expected the add to be reported, got {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_refused_playlist_edit_names_the_action_the_user_took() {
+        // Goal: the notice line reads back what was asked for, not the endpoint
+        // that refused it. "deleting the playlist" is a sentence somebody can
+        // act on; "playlists -> HTTP 500" is not.
+        for (task, wanted) in [
+            (Task::CreatePlaylist, "creating the playlist"),
+            (
+                Task::DeletePlaylist { uuid: "p1".into() },
+                "deleting the playlist",
+            ),
+            (
+                Task::AddToPlaylist {
+                    uuid: "p1".into(),
+                    track_id: 7,
+                },
+                "adding to the playlist",
+            ),
+            (
+                Task::RemoveFromPlaylist {
+                    uuid: "p1".into(),
+                    track_id: 7,
+                },
+                "removing from the playlist",
+            ),
+            (
+                Task::RenamePlaylist {
+                    uuid: "p1".into(),
+                    was: "Old".into(),
+                },
+                "renaming the playlist",
+            ),
+        ] {
+            assert_eq!(task.to_string(), wanted);
         }
     }
 }
