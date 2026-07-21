@@ -43,9 +43,12 @@
 use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::Duration;
 
 use super::wire::{
-    Arg, Endian, Message, MessageType, Serials, Value, WireError, frame_len, marshal, parse,
+    Arg, Endian, Message, MessageType, NO_REPLY_EXPECTED, Serials, Value, WireError, frame_len,
+    marshal, parse,
 };
 
 /// The bus's own name, path and interface. Every call in this module is to
@@ -63,6 +66,33 @@ const NAME_FLAG_DO_NOT_QUEUE: u32 = 0x4;
 /// The most reads one reply may take. At the socket's read timeout this bounds
 /// a bus that accepted a call and then went quiet.
 const MAX_REPLY_READS: usize = 100;
+
+/// The environment variable that says where the session bus is. Its absence is
+/// the ordinary state of a machine with no desktop on it.
+const ADDRESS_VARIABLE: &str = "DBUS_SESSION_BUS_ADDRESS";
+
+/// The interface every peer on the bus answers, whatever else it implements.
+const PEER_INTERFACE: &str = "org.freedesktop.DBus.Peer";
+
+/// The errors priel sends. Both are spelled as `dbus-broker` spells them, which
+/// is what `busctl` and `gdbus` print when this is being debugged.
+const ERROR_UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
+const ERROR_FAILED: &str = "org.freedesktop.DBus.Error.Failed";
+
+/// The read timeout that lets one thread serve both directions.
+///
+/// A read finding nothing costs this long and then the outbound queue gets its
+/// turn, which is the whole reason there is no self-pipe and no sixth thread.
+/// It is the rate the player already ticks at.
+const READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// The most messages one turn of the loop will write before reading again. A
+/// burst of signals may not starve the side that answers calls.
+const MAX_OUTBOUND_PER_TURN: usize = 64;
+
+/// The most of a machine-id file priel will read. The file is 33 bytes; the
+/// bound is what stops a path that is not one from being read whole.
+const MACHINE_ID_MAX: u64 = 64;
 
 /// How much of one read is taken at a time. A message priel is sent is a few
 /// hundred bytes, so this is a ceiling rather than a size to tune.
@@ -254,7 +284,9 @@ impl<S: Read + Write> Connection<S> {
                 return Err(refused("the bus sent a handshake line longer than any"));
             }
             if self.fill()? == Fill::Closed {
-                return Err(refused("the bus closed the connection during the handshake"));
+                return Err(refused(
+                    "the bus closed the connection during the handshake",
+                ));
             }
         }
         Err(refused("the bus did not finish a line of the handshake"))
@@ -318,6 +350,84 @@ impl<S: Read + Write> Connection<S> {
             return Ok(Some(instance));
         }
         Ok(None)
+    }
+
+    /// Serve the bus until the connection or the caller ends.
+    ///
+    /// One thread does both directions, which the socket's read timeout is what
+    /// makes possible: a read that finds nothing costs [`READ_TIMEOUT`] and
+    /// then the outbound queue gets its turn. The inbox accumulates across
+    /// those timeouts and only whole frames are parsed, so a timeout landing
+    /// mid-message is not a special case.
+    ///
+    /// Ends when the peer hangs up or when `outbox`'s sender is dropped, which
+    /// is how the app takes the bus down with it on the way out.
+    pub(crate) fn serve(&mut self, outbox: &Receiver<Message>) -> Result<()> {
+        loop {
+            self.answer_inbox()?;
+            if !self.pump_outbox(outbox)? {
+                return Ok(());
+            }
+            if self.fill()? == Fill::Closed {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Answer every call the inbox already holds.
+    ///
+    /// Bounded by the inbox, which is bounded in [`Connection::fill`]: every
+    /// turn takes a whole frame out of it and no frame is shorter than a fixed
+    /// header, so the loop cannot fail to make progress.
+    fn answer_inbox(&mut self) -> Result<()> {
+        while let Some(message) = self.take_message()? {
+            if message.kind != MessageType::MethodCall {
+                // The bus sends `NameAcquired` unprompted the moment a name is
+                // taken, and replies to calls priel gave up waiting on can
+                // still land. Answering either is a protocol error.
+                continue;
+            }
+            if let Some(reply) = answer(&message, self.machine_id.as_deref()) {
+                self.send(reply)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the messages the app queued.
+    ///
+    /// Bounded per turn, so a burst of signals cannot starve the side that
+    /// answers calls. `false` means the app has dropped its end and the
+    /// connection goes with it.
+    fn pump_outbox(&mut self, outbox: &Receiver<Message>) -> Result<bool> {
+        for _ in 0..MAX_OUTBOUND_PER_TURN {
+            match outbox.try_recv() {
+                Ok(message) => self.send(message)?,
+                Err(TryRecvError::Empty) => return Ok(true),
+                Err(TryRecvError::Disconnected) => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Write one message, with the serial minted here.
+    ///
+    /// Fire-and-forget: nothing this sends has a reply to wait for. The serial
+    /// is minted here rather than by the caller because the counter belongs to
+    /// the connection, and two messages sharing a serial are two messages a
+    /// reply cannot be matched to.
+    pub(crate) fn send(&mut self, mut message: Message) -> Result<()> {
+        message.serial = self.serials.mint();
+        match marshal(&message, Endian::NATIVE) {
+            Ok(bytes) => self.write(&bytes),
+            // priel built this one, so this is priel's own bug rather than a
+            // peer's, and it costs the message it is in rather than the
+            // connection - the socket is still on a message boundary.
+            Err(error) => {
+                log::error!("priel dropped a message it could not marshal: {error}");
+                Ok(())
+            }
+        }
     }
 
     /// A call to the bus's own object, which is the only peer this module
@@ -428,6 +538,222 @@ fn is_idle(error: &io::Error) -> bool {
         error.kind(),
         ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
     )
+}
+
+/// priel's end of the session bus.
+///
+/// Fire-and-forget, the way `Player`'s command channel is: the app posts a
+/// signal and never waits for it. Dropping this ends the dispatch loop within
+/// one [`READ_TIMEOUT`], which is how the bus thread joins on the way out.
+pub(crate) struct Bus {
+    signals: mpsc::Sender<Message>,
+    name: String,
+    unique_name: String,
+}
+
+impl Bus {
+    /// The well-known name priel is published under. Either the one asked for
+    /// or its per-instance spelling.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The name the bus gave this connection, which is what a peer sees as the
+    /// sender of everything priel emits.
+    pub(crate) fn unique_name(&self) -> &str {
+        &self.unique_name
+    }
+
+    /// Queue a signal for the bus thread to write.
+    ///
+    /// Never blocks and never fails upwards: a closed channel means the bus
+    /// thread has gone, which costs the desktop a notification and the player
+    /// nothing at all.
+    pub(crate) fn emit(&self, signal: Message) {
+        if self.signals.send(signal).is_err() {
+            log::debug!("the session bus connection is gone, so a signal was dropped");
+        }
+    }
+}
+
+/// Put priel on the session bus under `well_known`, if there is a session bus.
+///
+/// `None` is the ordinary answer on a machine with no desktop, and the reason
+/// is in the diagnostic log either way. Nothing here can fail the program.
+#[cfg(unix)]
+pub(crate) fn start(well_known: &str) -> Option<Bus> {
+    let Ok(spec) = std::env::var(ADDRESS_VARIABLE) else {
+        log::info!("no {ADDRESS_VARIABLE} in the environment, so priel is not on the session bus");
+        return None;
+    };
+    let Some(address) = parse_address(&spec) else {
+        log::warn!("no address priel can speak in {ADDRESS_VARIABLE}: {spec}");
+        return None;
+    };
+    match connect(&address, well_known) {
+        Ok(bus) => {
+            log::info!(
+                "priel is on the session bus as {} ({})",
+                bus.name(),
+                bus.unique_name()
+            );
+            Some(bus)
+        }
+        Err(error) => {
+            log::warn!("priel is not on the session bus: {error}");
+            None
+        }
+    }
+}
+
+/// Open, authenticate, name, and hand the connection to its own thread.
+#[cfg(unix)]
+fn connect(address: &Address, well_known: &str) -> Result<Bus> {
+    let stream = open(address)?;
+    // The one thing that makes one thread enough for both directions.
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+
+    let mut connection = Connection::new(stream, machine_id());
+    connection.authenticate(current_uid())?;
+    connection.hello()?;
+    let unique_name = connection.unique_name().to_owned();
+    let Some(name) = connection.acquire_name(well_known)? else {
+        return Err(refused(format!(
+            "{well_known} and its per-instance spelling are both owned already"
+        )));
+    };
+
+    let (signals, outbox) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("bus".into())
+        .spawn(move || {
+            if let Err(error) = connection.serve(&outbox) {
+                log::warn!("the session bus connection ended: {error}");
+            }
+        })
+        .map_err(BusError::Io)?;
+    Ok(Bus {
+        signals,
+        name,
+        unique_name,
+    })
+}
+
+/// The one line that names a real socket.
+///
+/// Everything above it is written against `Read + Write`, which is what makes a
+/// whole session replayable in memory with no bus anywhere near the tests.
+#[cfg(unix)]
+fn open(address: &Address) -> Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::net::UnixStream;
+    match address {
+        Address::Path(path) => Ok(UnixStream::connect(path)?),
+        #[cfg(target_os = "linux")]
+        Address::Abstract(name) => {
+            use std::os::linux::net::SocketAddrExt as _;
+            let address = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+            Ok(UnixStream::connect_addr(&address)?)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Address::Abstract(_) => Err(refused(
+            "the bus is on an abstract socket, which only Linux has",
+        )),
+    }
+}
+
+/// This process's user id, which EXTERNAL proves possession of.
+///
+/// Read off `/proc/self` rather than through a C binding: one number is not a
+/// dependency's worth of reason, and `None` falls back to the identity-less
+/// form, which asks the bus to take the credentials it already has off the
+/// socket.
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata("/proc/self")
+        .ok()
+        .map(|metadata| metadata.uid())
+}
+
+/// This machine's id, which `org.freedesktop.DBus.Peer.GetMachineId` answers
+/// with.
+///
+/// The read is bounded because the path is not priel's to trust: the file is 33
+/// bytes and anything longer is not one.
+fn machine_id() -> Option<String> {
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let mut text = String::new();
+        if file.take(MACHINE_ID_MAX).read_to_string(&mut text).is_err() {
+            continue;
+        }
+        if let Some(id) = valid_machine_id(&text) {
+            return Some(id);
+        }
+    }
+    log::debug!("this machine has no readable id, so GetMachineId will answer with an error");
+    None
+}
+
+/// Spec 0.43: a machine id is 32 lowercase hex digits and nothing else.
+///
+/// Checked rather than trusted, because whatever is at that path is answered
+/// with verbatim and a consumer has no way to tell a bad one from a good one.
+fn valid_machine_id(text: &str) -> Option<String> {
+    let id = text.trim();
+    let shaped = id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    shaped.then(|| id.to_owned())
+}
+
+/// The answer to one method call, or `None` where the caller asked for none.
+///
+/// Pure, in the shape `App::decide` already established: the loop mints the
+/// serial and writes it. Every reply leaves here with serial 0, which
+/// [`marshal`] refuses, so a path that forgot to mint one fails loudly rather
+/// than sending a message no reply can be matched to.
+///
+/// priel answers only what the bus requires of every peer. Everything else gets
+/// the error a real service gives an unknown member - and that fallback is what
+/// the interfaces above will slot in ahead of.
+fn answer(call: &Message, machine_id: Option<&str>) -> Option<Message> {
+    if call.flags & NO_REPLY_EXPECTED != 0 {
+        return None;
+    }
+    let member = call.member().unwrap_or_default();
+    // The object path is deliberately not matched on: spec 0.43 puts `Peer` on
+    // every path a connection exposes, and a `Ping` answered only at one is a
+    // peer that looks hung to whatever probed it elsewhere.
+    let reply = match (call.interface(), member) {
+        (Some(PEER_INTERFACE), "Ping") => Message::method_return(0, call),
+        (Some(PEER_INTERFACE), "GetMachineId") => match machine_id {
+            Some(id) => Message::method_return(0, call)
+                .with_body(vec![Arg::Value(Value::Str(id.to_owned()))]),
+            // An invented id is worse than an error: a consumer would believe
+            // it, and two machines answering the same one is what the id exists
+            // to rule out.
+            None => Message::error(
+                0,
+                call,
+                ERROR_FAILED,
+                "priel could not read this machine's id",
+            ),
+        },
+        (interface, _) => Message::error(
+            0,
+            call,
+            ERROR_UNKNOWN_METHOD,
+            &format!(
+                "priel implements no member \"{member}\" in interface \"{}\"",
+                interface.unwrap_or("")
+            ),
+        ),
+    };
+    Some(reply)
 }
 
 /// An error reply, spelled for the log.
@@ -776,7 +1102,9 @@ mod tests {
         );
         assert_eq!(acquired, Some(expected.clone()));
         assert_eq!(
-            expected.strip_prefix("org.mpris.MediaPlayer2.").map(|tail| tail.split('.').next()),
+            expected
+                .strip_prefix("org.mpris.MediaPlayer2.")
+                .map(|tail| tail.split('.').next()),
             Some(Some("priel")),
             "playerctl splits on the first dot, so the suffix may not add one"
         );
@@ -798,7 +1126,10 @@ mod tests {
             Turn::Bytes(bus_reply(2, 2, vec![Arg::Value(Value::Uint32(3))])),
         ]);
         let mut conn = greeted(&mut duplex);
-        assert_eq!(conn.acquire_name("org.mpris.MediaPlayer2.priel").ok(), Some(None));
+        assert_eq!(
+            conn.acquire_name("org.mpris.MediaPlayer2.priel").ok(),
+            Some(None)
+        );
     }
 
     /// Goal: an error reply is reported with the name the bus put on it, since
@@ -815,7 +1146,9 @@ mod tests {
         let mut conn = greeted(&mut duplex);
         let error = conn.hello().expect_err("an error reply");
         assert!(
-            error.to_string().contains("org.freedesktop.DBus.Error.Failed"),
+            error
+                .to_string()
+                .contains("org.freedesktop.DBus.Error.Failed"),
             "the log has to carry the error name: {error}"
         );
     }
@@ -827,8 +1160,16 @@ mod tests {
     #[test]
     fn a_reply_is_matched_by_serial_and_not_by_order() {
         let mut duplex = after_handshake(vec![
-            Turn::Bytes(bus_reply(9, 77, vec![Arg::Value(Value::Str(":1.9".into()))])),
-            Turn::Bytes(bus_reply(1, 1, vec![Arg::Value(Value::Str(":1.4242".into()))])),
+            Turn::Bytes(bus_reply(
+                9,
+                77,
+                vec![Arg::Value(Value::Str(":1.9".into()))],
+            )),
+            Turn::Bytes(bus_reply(
+                1,
+                1,
+                vec![Arg::Value(Value::Str(":1.4242".into()))],
+            )),
         ]);
         let mut conn = greeted(&mut duplex);
         conn.hello().expect("the scripted Hello");
@@ -855,6 +1196,345 @@ mod tests {
         let mut duplex = after_handshake(vec![Turn::Idle; MAX_REPLY_READS * 2]);
         let mut conn = greeted(&mut duplex);
         assert!(conn.hello().is_err());
+    }
+
+    /// The bytes of a method call arriving from another peer.
+    fn incoming(serial: u32, interface: Option<&str>, member: &str, flags: u8) -> Vec<u8> {
+        let mut fields = vec![
+            Field::Path("/org/mpris/MediaPlayer2".to_owned()),
+            Field::Member(member.to_owned()),
+            Field::Sender(":1.99".to_owned()),
+            Field::Destination(":1.4242".to_owned()),
+        ];
+        if let Some(interface) = interface {
+            fields.push(Field::Interface(interface.to_owned()));
+        }
+        let call = Message {
+            kind: MessageType::MethodCall,
+            flags,
+            serial,
+            fields,
+            body: Vec::new(),
+        };
+        marshal(&call, Endian::NATIVE).expect("a call the tests built")
+    }
+
+    /// A `Ping` from another peer.
+    fn ping(serial: u32) -> Vec<u8> {
+        incoming(serial, Some(PEER_INTERFACE), "Ping", 0)
+    }
+
+    /// Run the dispatch loop over a scripted session with nothing to send.
+    fn served(duplex: &mut Duplex, machine_id: Option<String>) -> Result<()> {
+        // The sender is held for the whole loop, so the script is what ends it.
+        let (signals, outbox) = mpsc::channel();
+        let mut conn = Connection::new(duplex, machine_id);
+        conn.authenticate(Some(1000))
+            .expect("the scripted handshake");
+        let result = conn.serve(&outbox);
+        drop(signals);
+        result
+    }
+
+    /// Goal: a whole session works end to end - handshake, name, and a call
+    /// answered - because each piece passing on its own does not mean they
+    /// compose. Method: replay the lot and read back every message priel wrote.
+    #[test]
+    fn a_whole_session_runs_from_handshake_to_answered_call() {
+        let mut duplex = after_handshake(vec![
+            Turn::Bytes(bus_reply(
+                1,
+                1,
+                vec![Arg::Value(Value::Str(":1.4242".into()))],
+            )),
+            Turn::Bytes(bus_reply(2, 2, vec![Arg::Value(Value::Uint32(1))])),
+            Turn::Bytes(ping(7)),
+        ]);
+        let (name, unique) = {
+            let (signals, outbox) = mpsc::channel();
+            let mut conn = Connection::new(&mut duplex, None);
+            conn.authenticate(Some(1000)).expect("the handshake");
+            conn.hello().expect("Hello");
+            let name = conn
+                .acquire_name("org.mpris.MediaPlayer2.priel")
+                .expect("RequestName");
+            conn.serve(&outbox).expect("a session that ends cleanly");
+            drop(signals);
+            (name, conn.unique_name().to_owned())
+        };
+        assert_eq!(name.as_deref(), Some("org.mpris.MediaPlayer2.priel"));
+        assert_eq!(unique, ":1.4242");
+
+        let written = sent(&duplex);
+        assert_eq!(written.len(), 3);
+        assert_eq!(written[0].member(), Some("Hello"));
+        assert_eq!(written[1].member(), Some("RequestName"));
+        assert_eq!(written[2].kind, MessageType::MethodReturn);
+        assert_eq!(written[2].reply_serial(), Some(7));
+        assert_eq!(written[2].destination(), Some(":1.99"));
+        // Serial 3 follows the two calls, and no reply may reuse one.
+        assert_eq!(written[2].serial, 3);
+    }
+
+    /// Goal: a frame arriving in pieces is answered once it is whole, which is
+    /// what the inbox accumulating across reads buys. Method: one `Ping` cut
+    /// into three, with the cuts inside the fixed header and inside the fields.
+    #[test]
+    fn a_frame_split_across_three_reads_is_answered_once_it_is_whole() {
+        let frame = ping(7);
+        let mut duplex = after_handshake(vec![
+            Turn::Bytes(frame[..8].to_vec()),
+            Turn::Bytes(frame[8..20].to_vec()),
+            Turn::Bytes(frame[20..].to_vec()),
+        ]);
+        served(&mut duplex, None).expect("a session that ends cleanly");
+        let written = sent(&duplex);
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].reply_serial(), Some(7));
+    }
+
+    /// Goal: two frames sharing one read are both answered, since a read is not
+    /// a message boundary. Method: concatenate two calls into one turn.
+    #[test]
+    fn two_frames_in_one_read_are_both_answered() {
+        let mut both = ping(7);
+        both.extend(ping(8));
+        let mut duplex = after_handshake(vec![Turn::Bytes(both)]);
+        served(&mut duplex, None).expect("a session that ends cleanly");
+        let written = sent(&duplex);
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0].reply_serial(), Some(7));
+        assert_eq!(written[1].reply_serial(), Some(8));
+    }
+
+    /// Goal: a frame that cannot be measured costs the connection, because
+    /// nothing after it can be trusted to start on a message boundary. Method:
+    /// a fixed header whose byte-order marker is neither `l` nor `B`, with a
+    /// good call behind it that must never be answered.
+    #[test]
+    fn a_frame_that_cannot_be_measured_costs_the_connection() {
+        let mut stream = b"xxxxxxxxxxxxxxxx".to_vec();
+        stream.extend(ping(7));
+        let mut duplex = after_handshake(vec![Turn::Bytes(stream)]);
+        let error = served(&mut duplex, None).expect_err("a stream that cannot resynchronise");
+        assert!(
+            matches!(error, BusError::Wire(WireError::Framing(_))),
+            "framing is what costs the connection: {error}"
+        );
+        assert!(sent(&duplex).is_empty());
+    }
+
+    /// Goal: a frame that is malformed but measurable costs one message and not
+    /// the connection - that split is the whole reason `WireError` has two
+    /// variants. Method: patch a good call's serial to zero, which spec 0.43
+    /// forbids, and put a good call behind it that must still be answered.
+    #[test]
+    fn a_malformed_but_measurable_frame_costs_only_itself() {
+        let mut broken = ping(7);
+        // Bytes 8..12 are the serial, which leaves both declared lengths - and
+        // so the frame's own length - untouched.
+        broken[8..12].copy_from_slice(&0u32.to_ne_bytes());
+        broken.extend(ping(8));
+        let mut duplex = after_handshake(vec![Turn::Bytes(broken)]);
+        served(&mut duplex, None).expect("a connection that survives one bad message");
+        let written = sent(&duplex);
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].reply_serial(), Some(8));
+    }
+
+    /// Goal: a read timeout is not an event - the loop simply goes round, which
+    /// is what lets one thread serve both directions. Method: nothing but
+    /// timeouts before the call, and check it is still answered.
+    #[test]
+    fn a_read_that_finds_nothing_just_goes_round_again() {
+        let mut duplex = after_handshake(vec![
+            Turn::Idle,
+            Turn::Idle,
+            Turn::Idle,
+            Turn::Bytes(ping(7)),
+        ]);
+        served(&mut duplex, None).expect("a session that ends cleanly");
+        assert_eq!(sent(&duplex).len(), 1);
+    }
+
+    /// Goal: `Ping` is answered on whatever object path it arrives at, because
+    /// spec 0.43 puts `Peer` on every one. Method: a path priel publishes
+    /// nothing at.
+    #[test]
+    fn ping_is_answered_at_any_object_path() {
+        let reply = answer(&parsed(&ping(7)), None).expect("a reply to Ping");
+        assert_eq!(reply.kind, MessageType::MethodReturn);
+        assert_eq!(reply.reply_serial(), Some(7));
+        assert!(reply.body.is_empty());
+    }
+
+    /// Goal: `GetMachineId` answers with the id when there is one and errors
+    /// when there is not, rather than inventing one - a made-up id is worse
+    /// than an error, because a consumer would believe it. Method: both.
+    #[test]
+    fn get_machine_id_answers_with_the_id_or_says_it_has_none() {
+        let call = parsed(&incoming(7, Some(PEER_INTERFACE), "GetMachineId", 0));
+        let reply = answer(&call, Some("5aa16f5d981140ac87052e109dd35eaf")).expect("a reply");
+        assert_eq!(reply.kind, MessageType::MethodReturn);
+        assert_eq!(reply.signature(), "s");
+        assert_eq!(
+            reply.body,
+            vec![Arg::Value(Value::Str(
+                "5aa16f5d981140ac87052e109dd35eaf".into()
+            ))]
+        );
+
+        let reply = answer(&call, None).expect("a reply");
+        assert_eq!(reply.kind, MessageType::Error);
+        assert_eq!(reply.error_name(), Some(ERROR_FAILED));
+    }
+
+    /// Goal: a member priel does not implement gets the error a real service
+    /// gives, so a consumer sees a service that answered rather than one that
+    /// hung. Method: the interfaces that land next, plus a call carrying no
+    /// interface at all, which spec 0.43 permits.
+    #[test]
+    fn a_member_priel_does_not_implement_gets_a_well_formed_error() {
+        for interface in [
+            Some("org.mpris.MediaPlayer2.Player"),
+            Some(PEER_INTERFACE),
+            Some("org.freedesktop.DBus.Properties"),
+            None,
+        ] {
+            let call = parsed(&incoming(7, interface, "Wobble", 0));
+            let reply = answer(&call, None).expect("a reply to every call");
+            assert_eq!(reply.kind, MessageType::Error, "{interface:?}");
+            assert_eq!(reply.error_name(), Some(ERROR_UNKNOWN_METHOD));
+            assert_eq!(reply.reply_serial(), Some(7));
+            assert_eq!(reply.destination(), Some(":1.99"));
+            assert_eq!(reply.signature(), "s", "an error carries its own text");
+        }
+    }
+
+    /// Goal: a caller that said it wants no reply gets none, which spec 0.43
+    /// requires and which a `Ping` from a monitor relies on. Method: set the
+    /// flag on a call that would otherwise be answered.
+    #[test]
+    fn a_call_that_wants_no_reply_is_not_answered() {
+        let call = parsed(&incoming(
+            7,
+            Some(PEER_INTERFACE),
+            "Ping",
+            NO_REPLY_EXPECTED,
+        ));
+        assert!(answer(&call, None).is_none());
+
+        let mut duplex = after_handshake(vec![Turn::Bytes(incoming(
+            7,
+            Some(PEER_INTERFACE),
+            "Ping",
+            NO_REPLY_EXPECTED,
+        ))]);
+        served(&mut duplex, None).expect("a session that ends cleanly");
+        assert!(sent(&duplex).is_empty());
+    }
+
+    /// Goal: what is not a method call is not answered. The bus sends
+    /// `NameAcquired` unprompted the moment a name is taken, and a reply to a
+    /// signal is a protocol error. Method: a signal and a stray reply.
+    #[test]
+    fn a_signal_and_a_stray_reply_are_not_answered() {
+        let signal = Message {
+            kind: MessageType::Signal,
+            flags: NO_REPLY_EXPECTED,
+            serial: 3,
+            fields: vec![
+                Field::Path(BUS_PATH.to_owned()),
+                Field::Interface(BUS_NAME.to_owned()),
+                Field::Member("NameAcquired".to_owned()),
+                Field::Sender(BUS_NAME.to_owned()),
+            ],
+            body: Vec::new(),
+        };
+        let mut stream = marshal(&signal, Endian::NATIVE).expect("a signal the tests built");
+        stream.extend(bus_reply(4, 999, Vec::new()));
+        let mut duplex = after_handshake(vec![Turn::Bytes(stream)]);
+        served(&mut duplex, None).expect("a session that ends cleanly");
+        assert!(sent(&duplex).is_empty());
+    }
+
+    /// Goal: a signal the app queued goes out with a serial minted by the
+    /// connection, since the app has no counter and two messages sharing a
+    /// serial are two messages a reply cannot be matched to. Method: queue one
+    /// before the loop starts and read it back off the wire.
+    #[test]
+    fn a_queued_signal_goes_out_with_a_minted_serial() {
+        let mut duplex = after_handshake(vec![Turn::Idle]);
+        {
+            let (signals, outbox) = mpsc::channel();
+            let mut conn = Connection::new(&mut duplex, None);
+            conn.authenticate(Some(1000)).expect("the handshake");
+            let queued = Message::signal(
+                0,
+                "/org/mpris/MediaPlayer2",
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+            );
+            signals.send(queued).expect("a live channel");
+            conn.serve(&outbox).expect("a session that ends cleanly");
+        }
+        let written = sent(&duplex);
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].member(), Some("PropertiesChanged"));
+        assert_eq!(written[0].serial, 1);
+    }
+
+    /// Goal: the app dropping its end takes the connection down with it, which
+    /// is how the bus thread joins on the way out. Method: drop the sender
+    /// before the loop runs, and check it stopped rather than reading on - the
+    /// scripted call is never answered.
+    #[test]
+    fn the_app_dropping_its_end_ends_the_loop() {
+        let mut duplex = after_handshake(vec![Turn::Bytes(ping(7))]);
+        {
+            let (signals, outbox) = mpsc::channel::<Message>();
+            drop(signals);
+            let mut conn = Connection::new(&mut duplex, None);
+            conn.authenticate(Some(1000)).expect("the handshake");
+            conn.serve(&outbox).expect("a loop that stops cleanly");
+        }
+        assert!(sent(&duplex).is_empty());
+    }
+
+    /// Goal: a peer cannot make priel hold an unbounded buffer by declaring a
+    /// message larger than priel accepts. Method: more bytes than the cap, none
+    /// of which complete a frame.
+    #[test]
+    fn a_peer_cannot_grow_the_inbox_without_limit() {
+        let mut frame = ping(7);
+        // A declared body length far past what will ever arrive, so the inbox
+        // keeps accumulating and never holds a whole frame.
+        frame[4..8].copy_from_slice(&1_000_000u32.to_ne_bytes());
+        frame.extend(vec![0u8; MAX_INBOX * 2]);
+        let mut duplex = after_handshake(vec![Turn::Bytes(frame)]);
+        let error = served(&mut duplex, None).expect_err("a message priel will not hold");
+        assert!(matches!(error, BusError::Wire(WireError::Framing(_))));
+    }
+
+    /// Goal: whatever is at the machine-id path is checked rather than trusted,
+    /// because `GetMachineId` answers with it verbatim and a consumer cannot
+    /// tell a bad id from a good one. Method: the real id off this machine,
+    /// then the shapes something that is not a machine-id file has.
+    #[test]
+    fn a_machine_id_is_checked_before_it_is_answered_with() {
+        assert_eq!(
+            valid_machine_id("5aa16f5d981140ac87052e109dd35eaf\n").as_deref(),
+            Some("5aa16f5d981140ac87052e109dd35eaf")
+        );
+        assert_eq!(valid_machine_id(""), None);
+        assert_eq!(valid_machine_id("5aa16f5d981140ac87052e109dd35ea"), None);
+        assert_eq!(valid_machine_id("5aa16f5d981140ac87052e109dd35eaff"), None);
+        assert_eq!(valid_machine_id("5AA16F5D981140AC87052E109DD35EAF"), None);
+        assert_eq!(valid_machine_id("not a machine id at all, but 32"), None);
+    }
+
+    fn parsed(frame: &[u8]) -> Message {
+        parse(frame).expect("a frame the tests built")
     }
 
     /// Goal: an answer that is not the shape the specification names is
@@ -974,11 +1654,7 @@ mod tests {
     /// timeouts before the `OK`.
     #[test]
     fn a_timeout_during_the_handshake_is_waited_through() {
-        let mut duplex = Duplex::new(vec![
-            Turn::Idle,
-            Turn::Idle,
-            Turn::Bytes(OK_LINE.to_vec()),
-        ]);
+        let mut duplex = Duplex::new(vec![Turn::Idle, Turn::Idle, Turn::Bytes(OK_LINE.to_vec())]);
         let mut conn = Connection::new(&mut duplex, None);
         assert!(conn.authenticate(Some(1000)).is_ok());
     }
