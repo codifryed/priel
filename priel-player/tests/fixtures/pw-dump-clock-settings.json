@@ -1,0 +1,55 @@
+[
+  {
+    "id": 0,
+    "type": "PipeWire:Interface:Core",
+    "version": 4,
+    "permissions": [ "r", "x", "m" ],
+    "info": {
+      "cookie": 2977787975,
+      "user-name": "user",
+      "host-name": "host",
+      "version": "1.6.8",
+      "name": "pipewire-0",
+      "change-mask": [ "props" ],
+      "props": {
+        "application.name": "pipewire",
+        "config.name": "pipewire.conf",
+        "core.daemon": true,
+        "core.name": "pipewire-0",
+        "default.clock.allowed-rates": "[\n      \"44100\",\n      \"48000\",\n      \"88200\",\n      \"96000\",\n      \"176400\",\n      \"192000\",\n      \"352800\",\n      \"384000\",\n      \"705600\",\n      \"768000\"\n    ]",
+        "default.clock.max-quantum": 2048,
+        "default.clock.min-quantum": 32,
+        "default.clock.quantum": 1024,
+        "default.clock.rate": 48000,
+        "log.level": 2,
+        "object.id": 0,
+        "object.serial": 0
+      }
+    }
+  },
+  {
+    "id": 32,
+    "type": "PipeWire:Interface:Metadata",
+    "version": 3,
+    "permissions": [ "r", "w", "x", "m" ],
+    "props": {
+      "metadata.name": "settings",
+      "object.serial": 32
+    },
+    "metadata": [
+      { "subject": 0, "key": "log.level", "type": "", "value": 2 },
+      { "subject": 0, "key": "clock.rate", "type": "", "value": 48000 },
+      {
+        "subject": 0,
+        "key": "clock.allowed-rates",
+        "type": "",
+        "value": "[ 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000 ]"
+      },
+      { "subject": 0, "key": "clock.quantum", "type": "", "value": 1024 },
+      { "subject": 0, "key": "clock.min-quantum", "type": "", "value": 32 },
+      { "subject": 0, "key": "clock.max-quantum", "type": "", "value": 2048 },
+      { "subject": 0, "key": "clock.force-quantum", "type": "", "value": 0 },
+      { "subject": 0, "key": "clock.force-rate", "type": "", "value": 0 }
+    ]
+  }
+]
