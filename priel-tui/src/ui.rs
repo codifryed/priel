@@ -1915,6 +1915,53 @@ fn track_columns(width: usize) -> TrackColumns {
     }
 }
 
+/// One column of a track row, in the order the row lays them out.
+///
+/// Naming the columns is what lets anything else be laid out over them: which
+/// columns exist is decided once, in [`track_columns`], and walked once, in
+/// [`lay_out`], with the caller supplying only what goes in each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Column {
+    Title,
+    Artist,
+    Album,
+    Quality,
+    Duration,
+}
+
+/// Lay one line of the track list across `width` cells.
+///
+/// `lead` fills the [`LEAD`] cells before the title, and `cell` supplies the
+/// text for each column the width affords. Which columns those are, the order
+/// they come in, the two-cell gaps between them and the duration pinned to the
+/// right edge are all decided here and nowhere else, so the row and the header
+/// cannot come to disagree about where a column starts.
+fn lay_out(width: usize, lead: &str, mut cell: impl FnMut(Column) -> String) -> String {
+    let c = track_columns(width);
+    let mut line = String::with_capacity(width * 4);
+    line.push_str(lead);
+    line.push_str(&field(&cell(Column::Title), c.title));
+    for (col, wide) in [
+        (Column::Artist, c.artist),
+        (Column::Album, c.album),
+        (Column::Quality, c.quality),
+    ] {
+        if wide > 0 {
+            push_gap(&mut line);
+            line.push_str(&field(&cell(col), wide));
+        }
+    }
+    push_gap(&mut line);
+    // Padded from the left rather than to the right: the last column is pinned
+    // to the box's edge, because a column of times only reads as a column when
+    // the digits line up. Its header is pinned the same way, on the same edge,
+    // which is why it does not begin where the other headers do.
+    let tail = trunc(&cell(Column::Duration), DURATION_CELLS);
+    line.push_str(&" ".repeat(DURATION_CELLS.saturating_sub(cells(&tail))));
+    line.push_str(&tail);
+    line
+}
+
 /// Returns (rendered row text, `is_now_playing`).
 ///
 /// `visible` is passed in rather than recomputed: this runs once per rendered
@@ -1957,30 +2004,17 @@ fn row_text(app: &App, visible: &[usize], vi: usize, width: usize) -> (String, b
         // make a click mean two different things a cell apart. The keyboard row
         // carries the control, and it acts on whatever the click selected.
         let kept = heart(app.is_favorite(t.id));
-        let c = track_columns(width);
-        let mut row = String::with_capacity(width * 4);
-        row.push_str(mark);
-        row.push_str(kept);
-        row.push(' ');
-        row.push_str(&field(&t.title, c.title));
-        for (text, cells) in [
-            (&t.artist, c.artist),
-            (&t.album, c.album),
+        let row = lay_out(width, &format!("{mark}{kept} "), |col| match col {
+            Column::Title => t.title.clone(),
+            Column::Artist => t.artist.clone(),
+            Column::Album => t.album.clone(),
             // The same spelling the badge beside the playing track uses. The raw
             // wire token does not fit this column, so a row that printed it
             // named the track's quality one way while the row above the progress
             // bar named it another.
-            (&short_quality(&t.quality), c.quality),
-        ] {
-            if cells > 0 {
-                push_gap(&mut row);
-                row.push_str(&field(text, cells));
-            }
-        }
-        push_gap(&mut row);
-        let secs = fmt_dur(t.duration_secs);
-        row.push_str(&" ".repeat(DURATION_CELLS.saturating_sub(cells(&secs))));
-        row.push_str(&secs);
+            Column::Quality => short_quality(&t.quality),
+            Column::Duration => fmt_dur(t.duration_secs),
+        });
         (row, is_now)
     } else {
         (String::new(), false)
