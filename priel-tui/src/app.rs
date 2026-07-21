@@ -2487,8 +2487,18 @@ impl App {
     /// for a click alike.
     fn cycle_focus(&mut self) {
         if self.queue_inner.height == 0 {
-            self.notice =
-                Some("The queue shares the now-playing panel, which needs 120 columns.".into());
+            // Two reasons there is nothing to hand the keyboard to, and they
+            // want different things of the listener. Naming the width on a
+            // two-hundred-column terminal with an empty queue would be telling
+            // them to fix something that is not wrong.
+            self.notice = Some(
+                if self.queue.is_empty() {
+                    "Nothing is queued yet: press Enter on a track."
+                } else {
+                    "The queue needs the now-playing panel: 120 columns, and rows to spare."
+                }
+                .into(),
+            );
             return;
         }
         self.give_focus(match self.focus_wanted {
@@ -10471,6 +10481,7 @@ mod tests {
         // moving the keyboard somewhere invisible. Method: press it with no
         // region published and check both the focus and what the user is told.
         let mut r = rig();
+        queued(&mut r, 4);
         r.app.on_key(ctrl('w'));
         assert_eq!(r.app.focus(), Focus::List);
         let said = r.app.notice.clone().unwrap_or_default();
@@ -10734,5 +10745,25 @@ mod tests {
         r.app.on_mouse(wheel_down(3, 11));
         assert_eq!(r.app.selected, 1);
         assert_eq!(r.app.queue_selected, 1, "the queue stayed where it was");
+    }
+
+    #[test]
+    fn an_empty_queue_says_it_is_empty_rather_than_blaming_the_width() {
+        // Goal: there are two reasons there is no queue to focus - the terminal
+        // is too narrow for the panel, or nothing has been queued yet - and a
+        // key that named the width on a two-hundred-column terminal would be
+        // telling the listener to fix something that is not wrong. Method: ask
+        // for the queue with the panel up and nothing in it.
+        let mut r = rig();
+        r.app.on_key(ctrl('w'));
+        let said = r.app.notice.clone().unwrap_or_default();
+        assert!(
+            said.to_lowercase().contains("queue"),
+            "an empty queue is not named: {said:?}"
+        );
+        assert!(
+            !said.contains("120"),
+            "an empty queue was blamed on the width: {said:?}"
+        );
     }
 }
