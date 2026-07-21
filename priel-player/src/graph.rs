@@ -1067,10 +1067,18 @@ mod tests {
     /// the device. The captured dump has a clean chain, so there was nothing in
     /// it to attribute; this is what a machine with a virtual sink in the way
     /// looks like.
+    ///
+    /// Its sink names the card behind it but not the process that opened it,
+    /// which is the case that stops the holder's name being taken from whatever
+    /// client the dump happens to list first.
     const RESAMPLING: &str = include_str!("../tests/fixtures/pw-dump-resampling-loopback.json");
 
     /// **Synthetic**, not captured: the same shape with no loopback and the rate
     /// intact, so the only thing wrong is the width the sink settled on.
+    ///
+    /// It also carries a card object the sink does *not* point at, which is
+    /// what makes the unknown-holder case above a real test rather than a test
+    /// of an empty dump.
     const TRUNCATING: &str = include_str!("../tests/fixtures/pw-dump-truncating-sink.json");
 
     /// The pid the two hand-authored dumps are written for.
@@ -1950,14 +1958,35 @@ mod tests {
 
     #[test]
     fn a_chain_ending_on_a_sink_with_no_device_behind_it_says_unknown() {
-        // Goal: the honesty case. The chain reaches a sink and the dump says
-        // nothing about what device is behind it, so there is nothing to name -
-        // and the nearest card on the machine is a guess, not an answer.
+        // Goal: the honesty case, and the mutation it exists to kill. The sink
+        // in this dump names no device object, and there *is* a card in the
+        // same dump that carries the same ALSA index and the same id - so any
+        // code that reaches for the likeliest candidate rather than the one the
+        // sink points at will name it, and this test is what stops that being
+        // mistaken for an answer.
         assert_eq!(
             path_of(TRUNCATING, SYNTHETIC_PID).holder,
             DeviceHolder::Unknown {
                 sink: "Example DAC Analog Stereo".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn a_sink_the_dump_says_nothing_about_the_opener_of_names_nobody() {
+        // Goal: the second guess this could make. The card behind this sink is
+        // named, so the holder is known - but nothing in the dump says which
+        // process opened the node, and the only client in it is priel's own.
+        // Reaching for that one would put priel's name on a device the sound
+        // server is holding, which is the opposite of what the section says.
+        assert_eq!(
+            path_of(RESAMPLING, SYNTHETIC_PID).holder,
+            DeviceHolder::Server(HeldDevice {
+                sink: "Example DAC Analog Stereo".to_string(),
+                opened_by: None,
+                pcm: Some("hw:3,0".to_string()),
+                card_name: Some("alsa_card.usb-Example_DAC-00".to_string()),
+            })
         );
     }
 
