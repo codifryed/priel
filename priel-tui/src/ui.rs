@@ -71,14 +71,18 @@ pub fn render(f: &mut Frame, app: &mut App) {
 /// short as possible: the browser is already open, the box is already focused,
 /// and one paste plus Enter finishes the job.
 fn login_overlay(f: &mut Frame, app: &mut App, area: Rect) {
-    let Some(flow) = app.login() else {
+    // Read before the mutable borrow the hit boxes need, as the header does.
+    let flow = app
+        .login()
+        .map(|f| (f.is_busy(), f.pasted.clone(), f.status.clone()));
+    // Modal: whatever the header and the bottom row registered this frame is
+    // behind this screen and must not be reachable through it. Cleared before
+    // the guard below, so a mode with no flow to draw is not a mode in which the
+    // header underneath quietly answers to clicks.
+    app.hits.clear();
+    let Some((busy, pasted, status)) = flow else {
         return;
     };
-    // Read before the mutable borrow the hit boxes need, as the header does.
-    let (busy, pasted, status) = (flow.is_busy(), flow.pasted.clone(), flow.status.clone());
-    // Modal: whatever the header and the bottom row registered this frame is
-    // behind this screen and must not be reachable through it.
-    app.hits.clear();
     let width = area.width.min(76);
     let height = 16u16.min(area.height);
     let rect = Rect {
