@@ -83,7 +83,8 @@ pub struct Cli {
     /// Defaults to `nord`, a dark theme. `terminal` uses your terminal's own
     /// sixteen colours instead of priel's, which is the one to pick if you have
     /// already themed your terminal or if its background is light and you would
-    /// rather priel followed it.
+    /// rather priel followed it. It is also the one palette that draws no row
+    /// stripe: it cannot see the background it would be striping against.
     ///
     /// `t` opens the same list at runtime, but priel reads no configuration
     /// file, so a choice made there lasts for that session only. This flag is
@@ -139,7 +140,7 @@ pub enum ThemeName {
     TokyoNight,
     /// Light, indigo.
     TokyoNightDay,
-    /// Your terminal's own sixteen colours
+    /// Your terminal's own colours; no row stripe
     Terminal,
 }
 

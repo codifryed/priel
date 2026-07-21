@@ -78,6 +78,16 @@ water in and out of the flats twice a day, on the pull of the moon.*
   background, which is what makes `≈ near` and `⚠ resampled` as distinguishable
   on cream as they are on charcoal — and they carry a glyph each, so they still
   read with no colour at all.
+  Every other row of a list is backed by a **stripe** a whisper away from the
+  surface, so an eye that starts at a title and ends at a duration two hundred
+  cells later stays on the same track. Each palette picks its own, some a step
+  up and some a step down, and everything painted on it clears the same
+  contrast floor it clears on the surface. The tabs you are *not* on sit on
+  that same stripe and the one you are on is lifted off it, so the strip itself
+  says where you are rather than leaving it to the colour of four words.
+  `terminal` is the exception and says so in the picker: it cannot see the
+  background it is painting on, so it draws no stripe rather than guessing at
+  one.
 - **On your media keys and your lock screen, with no bus library.** priel
   publishes MPRIS, so the desktop's own media controls, a panel applet and
   `playerctl` all drive it, and the track shows up where the desktop shows
@@ -150,7 +160,9 @@ priel's own account of what it was trying to play.
 `--theme` picks the palette: `nord` (the default), `gruvbox-dark`,
 `gruvbox-light`, `one-light`, `dracula`, `one-dark`, `true-black`, `catppuccin`,
 `tokyo-night`, `tokyo-night-day`, or `terminal` to defer to your terminal's own
-colours. `t` opens the same list while priel is running, but **priel reads no
+colours — which is also the one palette that draws no row stripe, since it
+cannot see the background it would be striping against. `t` opens the same list
+while priel is running, but **priel reads no
 configuration file**, so a choice made there lasts for that session only and the
 picker says so; the flag is how one is kept.
 

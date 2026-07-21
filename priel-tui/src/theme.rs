@@ -55,6 +55,24 @@
 //! `muted` is lightened out of the same one rather than invented beside it.
 //! Not every palette needs it. Both gruvbox halves and `catppuccin` draw their
 //! comment grey above the floor to begin with, and ship here unmodified.
+//!
+//! ## The stripe is a second surface, and it is measured like one
+//!
+//! `stripe_bg` backs every other row of a list, so it is the only role here
+//! that is judged twice: it has to differ from the surface enough to be seen
+//! and little enough not to be read as a state, and *everything painted on it*
+//! has to clear the same floor it clears on the surface. Three foregrounds land
+//! on it - `text` on an ordinary row, `active` on the row in the speakers,
+//! `faint` on the tabs that are not the one you are on - and each is measured
+//! against the stripe rather than against the background, because that is the
+//! backing it is actually read on.
+//!
+//! Which direction a stripe goes is a palette's own answer, not a house rule.
+//! Most step up from the surface; `gruvbox-light`, `catppuccin` and
+//! `tokyo-night` step down, and each says why on its own constant - the step
+//! above may already be spoken for by the control chip, or the surface may be
+//! light enough that darkening it takes a foreground under its floor.
+//! `terminal` takes no stripe at all, for the reason recorded there.
 
 use clap::ValueEnum as _;
 use ratatui::style::{Color, Style};
@@ -85,6 +103,12 @@ pub struct Theme {
     pub selection_fg: Color,
     /// The highlighted row of a list or a picker.
     pub selection_bg: Color,
+    /// The backing of every other row in a list, and of the tabs that are not
+    /// the one you are on. A whisper away from [`Theme::background`]: enough to
+    /// carry the eye along a row two hundred cells wide, never enough to be
+    /// read as a state. Equal to the background means no stripe at all, which
+    /// is the only honest answer for a surface priel cannot see.
+    pub stripe_bg: Color,
     /// A control drawn as a glyph on a raised background.
     pub control_fg: Color,
     /// A control drawn as a glyph on a raised background.
@@ -198,6 +222,19 @@ impl Theme {
         Style::new().fg(self.selection_fg).bg(self.selection_bg)
     }
 
+    /// The backing a row sits on: the surface, or the stripe on every other
+    /// one. Foregroundless on purpose - a stripe changes what a row is drawn
+    /// on and never what it says, so the caller adds its own `fg` and the row
+    /// keeps whatever the surface gave it when it does not.
+    #[must_use]
+    pub const fn stripe(&self, striped: bool) -> Style {
+        if striped {
+            Style::new().bg(self.stripe_bg)
+        } else {
+            Style::new()
+        }
+    }
+
     /// A clickable glyph on a raised background.
     #[must_use]
     pub const fn control(&self) -> Style {
@@ -222,6 +259,18 @@ impl Theme {
 /// fighting a palette the user chose is its own bug. [`Color::Reset`] for the
 /// surface and for `text` means "whatever you set", so this follows a light
 /// terminal into light and a dark one into dark.
+///
+/// **The one palette with no stripe, and that is the decision rather than an
+/// omission.** Every other palette knows its own surface to the byte and can
+/// put a stripe a measured whisker away from it. This one does not know the
+/// surface at all - that is the whole point of it - so any stripe would be a
+/// guess at what the user's own background is, and a guess that lands wrong is
+/// a band of the wrong colour down every other row. There is no ANSI index for
+/// "the background, only slightly", and inventing one out of `black` or
+/// `dark gray` would pin exactly the colour this palette exists to defer to.
+/// So `stripe_bg` is `Reset`, the same as the surface, and the rows alternate
+/// with nothing. `--theme`'s own help says so, which is what puts it in the
+/// picker beside the palette rather than leaving it to be noticed as a bug.
 const TERMINAL: Theme = Theme {
     background: Color::Reset,
     text: Color::Reset,
@@ -230,6 +279,7 @@ const TERMINAL: Theme = Theme {
     accent: Color::Cyan,
     selection_fg: Color::Black,
     selection_bg: Color::Cyan,
+    stripe_bg: Color::Reset,
     control_fg: Color::Cyan,
     control_bg: Color::DarkGray,
     toggle_on_fg: Color::Black,
@@ -249,6 +299,13 @@ const TERMINAL: Theme = Theme {
 ///
 /// `faint` is nord3 lightened: nord3 itself sits at 2.4 against nord0, and the
 /// bottom row is not decoration.
+///
+/// The stripe is **half a step**, and the half is the considered part. Nord
+/// publishes nord1 as the elevated surface, but nord1 is 1.24:1 above nord0 -
+/// the loudest step any palette here offers - and at that distance `faint`
+/// falls to 2.82:1, under the floor a mark owes, on the very tabs the stripe
+/// would be backing. Halfway from nord0 to nord1 is 1.11:1, which is a stripe
+/// an eye follows and a `faint` at 3.15:1.
 const NORD: Theme = Theme {
     background: Color::Rgb(0x2e, 0x34, 0x40),
     text: Color::Rgb(0xec, 0xef, 0xf4),
@@ -257,6 +314,7 @@ const NORD: Theme = Theme {
     accent: Color::Rgb(0x88, 0xc0, 0xd0),
     selection_fg: Color::Rgb(0xec, 0xef, 0xf4),
     selection_bg: Color::Rgb(0x5e, 0x81, 0xac),
+    stripe_bg: Color::Rgb(0x34, 0x3b, 0x49),
     control_fg: Color::Rgb(0x88, 0xc0, 0xd0),
     control_bg: Color::Rgb(0x43, 0x4c, 0x5e),
     toggle_on_fg: Color::Rgb(0x2e, 0x34, 0x40),
@@ -275,6 +333,12 @@ const NORD: Theme = Theme {
 /// Gruvbox dark, by Pavel Pertsev. Warm, and half of a matched pair - switching
 /// to the light one changes the background without changing which hue means
 /// what.
+///
+/// The stripe is `bg0_s`, and it needed no adjusting at all. Gruvbox is the one
+/// palette here that publishes a background *between* its surface and its first
+/// raised step - `bg0_s`, the soft background, is exactly the half-step nord
+/// had to be blended into existence - and it lands at 1.12:1 with `faint` still
+/// at 3.58:1. `bg1` stays where it was, as the chip a control is drawn on.
 const GRUVBOX_DARK: Theme = Theme {
     background: Color::Rgb(0x28, 0x28, 0x28),
     text: Color::Rgb(0xeb, 0xdb, 0xb2),
@@ -283,6 +347,7 @@ const GRUVBOX_DARK: Theme = Theme {
     accent: Color::Rgb(0x83, 0xa5, 0x98),
     selection_fg: Color::Rgb(0x28, 0x28, 0x28),
     selection_bg: Color::Rgb(0x83, 0xa5, 0x98),
+    stripe_bg: Color::Rgb(0x32, 0x30, 0x2f),
     control_fg: Color::Rgb(0x83, 0xa5, 0x98),
     control_bg: Color::Rgb(0x3c, 0x38, 0x36),
     toggle_on_fg: Color::Rgb(0x28, 0x28, 0x28),
@@ -301,6 +366,13 @@ const GRUVBOX_DARK: Theme = Theme {
 /// Gruvbox light, the same palette's own light half. Its author redrew the
 /// accents for a cream background rather than reusing the dark ones, which is
 /// exactly why the near/altered distinction survives the switch.
+///
+/// The stripe is this half's own `bg0_s`, the same published soft background
+/// the dark half takes, at 1.11:1. It is the only light palette here whose
+/// stripe goes *down*: darkening a light surface costs every foreground on it
+/// some contrast, and this is the one light palette with enough in hand to pay.
+/// Its `active` olive drops from 4.29:1 to 3.87:1 and is still clear of the
+/// floor, where `one-light`'s green would go under.
 const GRUVBOX_LIGHT: Theme = Theme {
     background: Color::Rgb(0xfb, 0xf1, 0xc7),
     text: Color::Rgb(0x3c, 0x38, 0x36),
@@ -309,6 +381,7 @@ const GRUVBOX_LIGHT: Theme = Theme {
     accent: Color::Rgb(0x07, 0x66, 0x78),
     selection_fg: Color::Rgb(0xfb, 0xf1, 0xc7),
     selection_bg: Color::Rgb(0x07, 0x66, 0x78),
+    stripe_bg: Color::Rgb(0xf2, 0xe5, 0xbc),
     control_fg: Color::Rgb(0x07, 0x66, 0x78),
     control_bg: Color::Rgb(0xeb, 0xdb, 0xb2),
     toggle_on_fg: Color::Rgb(0xfb, 0xf1, 0xc7),
@@ -328,6 +401,17 @@ const GRUVBOX_LIGHT: Theme = Theme {
 /// one, so a light terminal has a choice rather than a single answer.
 ///
 /// `faint` is mono-3 darkened, for the reason the module docs give.
+///
+/// **The one stripe in the set that goes up rather than down, and the palette's
+/// own green is why.** One Light's `active` measures 3.07:1 on `#fafafa` -
+/// seven hundredths above the mark floor - so a stripe darkened out of the
+/// surface, the obvious move on a light theme, takes the row in the speakers
+/// under the floor before it is dark enough to see: `darken(bg, 4%)` reads
+/// 2.86:1. The surface is off-white rather than white, which leaves a step in
+/// the other direction, and a stripe of paper white *lifts* every foreground
+/// instead of charging it - `active` to 3.21:1, `faint` to 3.35:1. It is the
+/// quietest stripe here at 1.04:1, which is the price of the direction and is
+/// still the alternation a printed table uses.
 const ONE_LIGHT: Theme = Theme {
     background: Color::Rgb(0xfa, 0xfa, 0xfa),
     text: Color::Rgb(0x38, 0x3a, 0x42),
@@ -336,6 +420,7 @@ const ONE_LIGHT: Theme = Theme {
     accent: Color::Rgb(0x40, 0x78, 0xf2),
     selection_fg: Color::Rgb(0xfa, 0xfa, 0xfa),
     selection_bg: Color::Rgb(0x40, 0x78, 0xf2),
+    stripe_bg: Color::Rgb(0xff, 0xff, 0xff),
     control_fg: Color::Rgb(0x40, 0x78, 0xf2),
     control_bg: Color::Rgb(0xe5, 0xe5, 0xe6),
     toggle_on_fg: Color::Rgb(0xfa, 0xfa, 0xfa),
@@ -366,6 +451,14 @@ const ONE_LIGHT: Theme = Theme {
 /// chip a control is drawn on. `notice` is Orange rather than Yellow: Dracula's
 /// Yellow is a lime at hue 65 and would be read next to its Green at hue 135,
 /// which is the one distinction the fidelity grades cannot afford to lose.
+///
+/// The stripe is a quarter of the way from Background to Current Line, at
+/// 1.11:1. Dracula publishes one background and one line highlight and nothing
+/// between them - the same gap that made `muted` and `faint` a derivation here
+/// rather than a lookup - and Current Line itself is already the chip a control
+/// is drawn on. Taking a quarter of that one step is the smallest claim this
+/// palette allows: the whole step is 1.56:1, half again past the point an
+/// alternating background stops being a stripe and starts being a state.
 const DRACULA: Theme = Theme {
     background: Color::Rgb(0x28, 0x2a, 0x36),
     text: Color::Rgb(0xf8, 0xf8, 0xf2),
@@ -374,6 +467,7 @@ const DRACULA: Theme = Theme {
     accent: Color::Rgb(0xbd, 0x93, 0xf9),
     selection_fg: Color::Rgb(0x28, 0x2a, 0x36),
     selection_bg: Color::Rgb(0xbd, 0x93, 0xf9),
+    stripe_bg: Color::Rgb(0x2f, 0x31, 0x3f),
     control_fg: Color::Rgb(0xbd, 0x93, 0xf9),
     control_bg: Color::Rgb(0x44, 0x47, 0x5a),
     toggle_on_fg: Color::Rgb(0x28, 0x2a, 0x36),
@@ -403,6 +497,12 @@ const DRACULA: Theme = Theme {
 /// floor), and `notice` is hue-6-2 rather than the hue-6 `one-light` uses.
 /// `control_bg` is the theme's own raised surface - `lighten(@syntax-bg, 10%)`,
 /// what it paints a selected line with.
+///
+/// The stripe is the same construction one rung lower. One Dark builds its
+/// raised surface by lightening the background, so the stripe lightens it by a
+/// quarter as much and lands at 1.09:1, with `faint` at 3.28:1 and `text` at
+/// 6.02:1. The light sibling could not take the same move in the same
+/// direction, which is the one place the pair parts company.
 const ONE_DARK: Theme = Theme {
     background: Color::Rgb(0x28, 0x2c, 0x34),
     text: Color::Rgb(0xab, 0xb2, 0xbf),
@@ -411,6 +511,7 @@ const ONE_DARK: Theme = Theme {
     accent: Color::Rgb(0x61, 0xaf, 0xef),
     selection_fg: Color::Rgb(0x28, 0x2c, 0x34),
     selection_bg: Color::Rgb(0x61, 0xaf, 0xef),
+    stripe_bg: Color::Rgb(0x2e, 0x32, 0x3b),
     control_fg: Color::Rgb(0x61, 0xaf, 0xef),
     control_bg: Color::Rgb(0x3e, 0x44, 0x51),
     toggle_on_fg: Color::Rgb(0x28, 0x2c, 0x34),
@@ -457,6 +558,14 @@ const ONE_DARK: Theme = Theme {
 /// foreground, and the border is the step below it. The row backgrounds are its
 /// own too: `bg-region` is what it selects with, `bg-inactive` what it raises a
 /// surface with.
+///
+/// **The stripe costs light, which is the one thing this palette is spending
+/// carefully.** Half its rows stay at `#000000` and unlit; the other half sit
+/// at `#101010`, which is about as little light as a stripe can be made of and
+/// still be seen - 1.10:1. Modus publishes `bg-dim` at `#1e1e1e` and that would
+/// be the obvious lookup, but it is 1.26:1 and takes `border`, this palette's
+/// `faint`, to 2.82:1 on the tabs it backs. Half of `bg-dim` keeps `faint` at
+/// 3.22:1 and lights half as many pixels.
 const TRUE_BLACK: Theme = Theme {
     background: Color::Rgb(0x00, 0x00, 0x00),
     text: Color::Rgb(0xe6, 0xe6, 0xe6),
@@ -465,6 +574,7 @@ const TRUE_BLACK: Theme = Theme {
     accent: Color::Rgb(0x00, 0xbc, 0xff),
     selection_fg: Color::Rgb(0xe6, 0xe6, 0xe6),
     selection_bg: Color::Rgb(0x5a, 0x5a, 0x5a),
+    stripe_bg: Color::Rgb(0x10, 0x10, 0x10),
     control_fg: Color::Rgb(0x00, 0xbc, 0xff),
     control_bg: Color::Rgb(0x30, 0x30, 0x30),
     toggle_on_fg: Color::Rgb(0x00, 0x00, 0x00),
@@ -502,6 +612,13 @@ const TRUE_BLACK: Theme = Theme {
 /// measures 5.81:1 on Base. `faint` sits one tier below it at Overlay 1 and
 /// measures 4.44:1, the widest margin any `faint` here has, and still a
 /// published step rather than a value invented beside one.
+///
+/// **The stripe goes down, not up, and the palette chose that for priel.**
+/// Catppuccin publishes surfaces on both sides of Base - Mantle and Crust
+/// below, Surface 0 and 1 above - and Surface 0 is already the chip a control
+/// is drawn on here. So the stripe takes the step the palette still has spare:
+/// Mantle, at 1.07:1 below Base, which every foreground in the set gains
+/// contrast against rather than losing it. `faint` reads 4.75:1 on it.
 const CATPPUCCIN: Theme = Theme {
     background: Color::Rgb(0x1e, 0x1e, 0x2e),
     text: Color::Rgb(0xcd, 0xd6, 0xf4),
@@ -510,6 +627,7 @@ const CATPPUCCIN: Theme = Theme {
     accent: Color::Rgb(0xcb, 0xa6, 0xf7),
     selection_fg: Color::Rgb(0x1e, 0x1e, 0x2e),
     selection_bg: Color::Rgb(0xcb, 0xa6, 0xf7),
+    stripe_bg: Color::Rgb(0x18, 0x18, 0x25),
     control_fg: Color::Rgb(0xcb, 0xa6, 0xf7),
     control_bg: Color::Rgb(0x31, 0x32, 0x44),
     toggle_on_fg: Color::Rgb(0x1e, 0x1e, 0x2e),
@@ -540,6 +658,12 @@ const CATPPUCCIN: Theme = Theme {
 /// `dark5` - so `faint` is `dark5` at 4.10:1, a step the palette already
 /// drew. `bg_highlight` is what the theme raises a highlighted line with, and
 /// it carries the control chip here.
+///
+/// The stripe is `bg_dark`, the surface the theme paints its side panels with,
+/// and it goes down for the reason `catppuccin`'s does: the step above is
+/// `bg_highlight` and that is spoken for. At 1.05:1 it is the closest stripe in
+/// the set to its own surface - `bg_dark` is a small step, and the palette's
+/// own - and every foreground gains against it, `faint` reaching 4.31:1.
 const TOKYO_NIGHT: Theme = Theme {
     background: Color::Rgb(0x1a, 0x1b, 0x26),
     text: Color::Rgb(0xc0, 0xca, 0xf5),
@@ -548,6 +672,7 @@ const TOKYO_NIGHT: Theme = Theme {
     accent: Color::Rgb(0x7a, 0xa2, 0xf7),
     selection_fg: Color::Rgb(0x1a, 0x1b, 0x26),
     selection_bg: Color::Rgb(0x7a, 0xa2, 0xf7),
+    stripe_bg: Color::Rgb(0x16, 0x16, 0x1e),
     control_fg: Color::Rgb(0x7a, 0xa2, 0xf7),
     control_bg: Color::Rgb(0x29, 0x2e, 0x42),
     toggle_on_fg: Color::Rgb(0x1a, 0x1b, 0x26),
@@ -591,6 +716,13 @@ const TOKYO_NIGHT: Theme = Theme {
 /// and `red1` - `yellow` is literally what the theme names its warning colour -
 /// and the olive and the ochre sit about as far apart here as gruvbox-light's
 /// pair do, which is the closest any shipped palette puts them.
+///
+/// The stripe steps up, mirroring the night palette's step down - this is that
+/// palette inverted, so its second surface is above `bg` rather than below it -
+/// and up is also what the tightest palette in the set can afford. At 1.07:1
+/// nothing on it loses: `faint` goes from 3.71:1 to 3.96:1 and `active` from
+/// 4.04:1 to 4.31:1. A stripe darkened out of this surface would have taken
+/// both back towards a floor they were already sitting near.
 const TOKYO_NIGHT_DAY: Theme = Theme {
     background: Color::Rgb(0xe1, 0xe2, 0xe7),
     text: Color::Rgb(0x26, 0x43, 0x86),
@@ -599,6 +731,7 @@ const TOKYO_NIGHT_DAY: Theme = Theme {
     accent: Color::Rgb(0x25, 0x64, 0xba),
     selection_fg: Color::Rgb(0xe1, 0xe2, 0xe7),
     selection_bg: Color::Rgb(0x25, 0x64, 0xba),
+    stripe_bg: Color::Rgb(0xe9, 0xe9, 0xec),
     control_fg: Color::Rgb(0x25, 0x64, 0xba),
     control_bg: Color::Rgb(0xc4, 0xc8, 0xda),
     toggle_on_fg: Color::Rgb(0xe1, 0xe2, 0xe7),
@@ -699,28 +832,118 @@ mod tests {
         }
     }
 
-    /// Goal: the three pairs that carry their own background - the selected
-    /// row, a control, a toggle that is on - are read against that background
-    /// and not against the surface, so measuring them against the surface would
-    /// prove nothing.
+    /// Goal: the pairs that carry their own background - the selected row, a
+    /// control, a toggle that is on, and now the stripe - are read against that
+    /// background and not against the surface, so measuring them against the
+    /// surface would prove nothing.
+    ///
+    /// The stripe is three pairs rather than one because a striped backing is a
+    /// whole row: an ordinary track row wears `text`, the row in the speakers
+    /// wears `active`, and the tabs that are not the one you are on wear
+    /// `faint`. A stripe that only cleared against `text` would take the other
+    /// two under the floor on exactly the rows that say the most.
     #[test]
     fn every_pair_is_legible_against_its_own_backing() {
         for (name, t) in all() {
             let pairs = [
-                ("selection", t.selection_fg, t.selection_bg),
-                ("control", t.control_fg, t.control_bg),
-                ("toggle_on", t.toggle_on_fg, t.toggle_on_bg),
+                ("selection", t.selection_fg, t.selection_bg, MARK_FLOOR),
+                ("control", t.control_fg, t.control_bg, MARK_FLOOR),
+                ("toggle_on", t.toggle_on_fg, t.toggle_on_bg, MARK_FLOOR),
+                ("stripe/text", t.text, t.stripe_bg, PROSE_FLOOR),
+                ("stripe/active", t.active, t.stripe_bg, MARK_FLOOR),
+                ("stripe/faint", t.faint, t.stripe_bg, MARK_FLOOR),
             ];
-            for (role, fg, bg) in pairs {
+            for (role, fg, bg, floor) in pairs {
                 let Some(ratio) = contrast(fg, bg) else {
                     continue;
                 };
                 assert!(
-                    ratio >= MARK_FLOOR,
-                    "{name:?}: {role} is {ratio:.2}:1 against its own backing"
+                    ratio >= floor,
+                    "{name:?}: {role} is {ratio:.2}:1 against its own backing, under {floor}"
                 );
             }
         }
+    }
+
+    /// The least a stripe may differ from the surface and still be seen at all.
+    const STRIPE_MIN: f64 = 1.03;
+
+    /// The most it may differ before it stops being a stripe. Past this the
+    /// alternate rows read as two lists rather than one, and the row a stripe
+    /// is meant to help you follow is the one it starts to fight.
+    const STRIPE_MAX: f64 = 1.30;
+
+    /// The least a stripe may differ from the row the cursor is on. A striped
+    /// row that reads as a selected one is worse than no stripe at all.
+    const STRIPE_FROM_SELECTION: f64 = 1.5;
+
+    /// Goal: a zebra stripe is a whisper. It has to be visible enough to carry
+    /// the eye across a two-hundred-cell row and quiet enough that it is never
+    /// read as a second selection. Method: measure it against both of the
+    /// backings it sits between - the surface it alternates with, and the
+    /// selection it must not be confused for.
+    #[test]
+    fn the_stripe_is_a_whisper_and_never_a_second_selection() {
+        for (name, t) in all() {
+            let Some(ratio) = contrast(t.stripe_bg, t.background) else {
+                continue;
+            };
+            assert!(
+                ratio >= STRIPE_MIN,
+                "{name:?}: the stripe is {ratio:.3}:1 on the surface, too faint to see"
+            );
+            assert!(
+                ratio <= STRIPE_MAX,
+                "{name:?}: the stripe is {ratio:.3}:1 on the surface, loud enough to read \
+                 as a state of its own"
+            );
+            let Some(apart) = contrast(t.stripe_bg, t.selection_bg) else {
+                continue;
+            };
+            assert!(
+                apart >= STRIPE_FROM_SELECTION,
+                "{name:?}: the stripe is {apart:.2}:1 from the selected row's backing"
+            );
+        }
+    }
+
+    /// Goal: one palette declines the stripe, and that is a decision rather
+    /// than a gap. `terminal` paints in ANSI indices and [`Color::Reset`]
+    /// precisely so it inherits a palette priel cannot read; guessing a stripe
+    /// against an unknown background is the overstatement that theme exists to
+    /// avoid. Every other palette knows its own surface and owes a stripe.
+    ///
+    /// Method: assert the shape of the decision on both sides, so neither a
+    /// palette that quietly forgot its stripe nor a `terminal` that quietly
+    /// grew one can pass.
+    #[test]
+    fn only_the_terminal_palette_declines_a_stripe() {
+        for (name, t) in all() {
+            if name == ThemeName::Terminal {
+                assert_eq!(
+                    t.stripe_bg, t.background,
+                    "{name:?} cannot know the surface, so it must not stripe against it"
+                );
+            } else {
+                assert_ne!(
+                    t.stripe_bg, t.background,
+                    "{name:?} knows its own surface and owes it a stripe"
+                );
+            }
+        }
+    }
+
+    /// Goal: the palette that declines the stripe says so where a reader
+    /// chooses one, rather than leaving a missing stripe to be noticed as a
+    /// bug. The note is the flag's own help, so the picker, `--help`, the man
+    /// page and all three completions carry the same sentence.
+    #[test]
+    fn the_palette_that_declines_a_stripe_says_so_where_it_is_chosen() {
+        let note = super::note(ThemeName::Terminal);
+        assert!(
+            note.contains("stripe"),
+            "the palette with no stripe says nothing about it: {note:?}"
+        );
     }
 
     /// Goal: the three fidelity grades have to be told apart, and a palette
@@ -751,6 +974,7 @@ mod tests {
             t.accent,
             t.selection_fg,
             t.selection_bg,
+            t.stripe_bg,
             t.control_fg,
             t.control_bg,
             t.toggle_on_fg,
