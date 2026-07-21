@@ -1034,6 +1034,19 @@ impl App {
             flow.pasted.push_str(text.trim());
             self.dirty = true;
         }
+        // The other text box. A playlist name is as likely to be pasted as
+        // typed, and a box that took keystrokes but not a paste would be the
+        // one text field in priel that behaved differently. Bounded here as it
+        // is on the keystroke path, and by the same count.
+        if self.mode == Mode::Prompt {
+            for c in text.trim().chars() {
+                if self.prompt_text.chars().count() >= PLAYLIST_NAME_MAX {
+                    break;
+                }
+                self.prompt_text.push(c);
+            }
+            self.dirty = true;
+        }
     }
 
     /// Open the authorization page again.
@@ -8963,6 +8976,21 @@ mod tests {
         r.app.selected = 0;
         fire(&mut r.app, Mode::Normal, Hit::AddToPlaylist);
         assert_eq!(r.app.mode, Mode::AddTo);
+    }
+
+    #[test]
+    fn a_playlist_name_can_be_pasted_as_well_as_typed() {
+        // Goal: the name box is a text field, and the only other one that takes
+        // a paste is the sign-in box. A field that took keystrokes but not a
+        // paste would be an inconsistency nobody could guess at, and the bound
+        // has to hold on this path too.
+        let mut r = with_playlists();
+        r.app.on_key(key('N'));
+        r.app.on_paste("  Late night  ");
+        assert_eq!(r.app.prompt_text, "Late night");
+
+        r.app.on_paste(&"x".repeat(PLAYLIST_NAME_MAX * 2));
+        assert_eq!(r.app.prompt_text.chars().count(), PLAYLIST_NAME_MAX);
     }
 
     #[test]
