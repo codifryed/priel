@@ -98,6 +98,44 @@ pub enum ToWorker {
         track_id: u64,
         favorite: bool,
     },
+    /// Make a new, empty playlist.
+    ///
+    /// The only request here whose *success* the interface has to hear about:
+    /// the uuid is the service's to choose, so until the reply arrives there is
+    /// no row to show and nothing to open.
+    CreatePlaylist {
+        title: String,
+    },
+    /// Give a playlist a new title.
+    ///
+    /// The interface has already shown the new one, so `was` travels with it:
+    /// putting a refused rename back needs the exact title that was there, and
+    /// by the time the refusal arrives the interface no longer holds it.
+    RenamePlaylist {
+        uuid: String,
+        title: String,
+        was: String,
+    },
+    /// Delete a playlist. Carries the title so a refusal can name what survived.
+    DeletePlaylist {
+        uuid: String,
+        title: String,
+    },
+    /// Put a track at the end of a playlist.
+    ///
+    /// Carries the playlist's title because the notice that reports it is the
+    /// only sign the user gets: the playlist being added to is usually not the
+    /// one on screen, so nothing visible changes on its own.
+    AddToPlaylist {
+        uuid: String,
+        title: String,
+        track_id: u64,
+    },
+    /// Take a track out of a playlist.
+    RemoveFromPlaylist {
+        uuid: String,
+        track_id: u64,
+    },
     /// Read the chain to the output device. Runs `pw-dump` and waits for it,
     /// which is why it is here and not on the UI thread.
     ReadAudioGraph,
@@ -149,6 +187,26 @@ pub enum Task {
         track_id: u64,
         wanted: bool,
     },
+    /// A playlist edit that did not happen. Named by the playlist it was aimed
+    /// at, so a failure for one cannot stop a view showing another - and by the
+    /// track as well where there is one, since two edits to the same playlist
+    /// are two requests.
+    CreatePlaylist,
+    RenamePlaylist {
+        uuid: String,
+        was: String,
+    },
+    DeletePlaylist {
+        uuid: String,
+    },
+    AddToPlaylist {
+        uuid: String,
+        track_id: u64,
+    },
+    RemoveFromPlaylist {
+        uuid: String,
+        track_id: u64,
+    },
 }
 
 impl std::fmt::Display for Task {
@@ -167,6 +225,14 @@ impl std::fmt::Display for Task {
             // should read back the action they took.
             Self::SetFavorite { wanted: true, .. } => "adding to favorites",
             Self::SetFavorite { wanted: false, .. } => "removing from favorites",
+            // Named the same way: what the user asked for, not the endpoint.
+            // These are the sentences a refusal is read back with, and "the
+            // playlist was not deleted" is the one that has to be unmistakable.
+            Self::CreatePlaylist => "creating the playlist",
+            Self::RenamePlaylist { .. } => "renaming the playlist",
+            Self::DeletePlaylist { .. } => "deleting the playlist",
+            Self::AddToPlaylist { .. } => "adding to the playlist",
+            Self::RemoveFromPlaylist { .. } => "removing from the playlist",
         })
     }
 }
@@ -201,6 +267,31 @@ pub enum FromWorker {
         page: Page<Track>,
     },
     Resolved(u64, ResolvedStream),
+    /// A playlist now exists that did not before.
+    ///
+    /// The one success in this enum that is not a listing, and it is here
+    /// because the interface could not have guessed it: the uuid came from the
+    /// service, and without it the new row cannot be opened or edited.
+    PlaylistCreated(Playlist),
+    /// A playlist is gone. The interface waited for this rather than assuming
+    /// it - see `App::delete_playlist` for why a delete does not assume.
+    PlaylistDeleted {
+        uuid: String,
+    },
+    /// A track is out of a playlist, and the row may now be dropped.
+    PlaylistTrackRemoved {
+        uuid: String,
+        track_id: u64,
+    },
+    /// A track went into a playlist.
+    ///
+    /// Reported although nothing failed, which no other write here does. The
+    /// reason is that the playlist added to is usually not the one on screen,
+    /// so there is nothing the user can look at to see that it worked; the
+    /// notice is the only confirmation there is.
+    PlaylistTrackAdded {
+        title: String,
+    },
     /// The chain to the output device, or the reason there is none to show.
     ///
     /// The failure travels as `GraphError` rather than `Failed`: nothing about
@@ -275,6 +366,182 @@ pub fn spawn(token_path: String, credentials_path: String) -> Worker {
 /// The factory runs *on the worker thread* so a failure to authenticate becomes
 /// a `FromWorker::Error` on screen rather than a panic before the UI exists.
 /// Tests use this to point the worker at a stub origin with no token file.
+/// Make a playlist.
+///
+/// The one edit that answers with something. The uuid is the service's to
+/// choose, so until this comes back the interface has no row it could show.
+fn created(client: &mut Client, title: &str) -> FromWorker {
+    match client.create_playlist(title) {
+        Ok(made) => {
+            log::info!("created playlist {} ({})", made.title, made.uuid);
+            FromWorker::PlaylistCreated(made)
+        }
+        Err(e) => failed(Task::CreatePlaylist, &e),
+    }
+}
+
+/// Retitle a playlist.
+///
+/// Silence is success here, as it is for a favorite: the new title is already
+/// on screen, and the reply worth the channel is the one saying it should not
+/// be. `was` travels only so a refusal can put back the exact title.
+fn renamed(client: &mut Client, uuid: String, title: &str, was: String) -> Option<FromWorker> {
+    match client.rename_playlist(&uuid, title) {
+        Ok(()) => {
+            log::info!("renamed playlist {uuid} to {title}");
+            None
+        }
+        Err(e) => Some(failed(Task::RenamePlaylist { uuid, was }, &e)),
+    }
+}
+
+/// Delete a playlist.
+///
+/// **Not silence.** The interface still shows the row and is waiting to be told
+/// it may stop: this is the one edit that cannot be undone, so it is reported
+/// rather than assumed.
+fn deleted(client: &mut Client, uuid: String, title: &str) -> FromWorker {
+    match client.delete_playlist(&uuid) {
+        Ok(()) => {
+            log::info!("deleted playlist {title} ({uuid})");
+            FromWorker::PlaylistDeleted { uuid }
+        }
+        Err(e) => failed(Task::DeletePlaylist { uuid }, &e),
+    }
+}
+
+/// Put a track into a playlist.
+///
+/// Reported on success although nothing failed, which no other write does. The
+/// playlist added to is usually not the one on screen, so the notice this
+/// becomes is the only confirmation the listener gets.
+fn added(client: &mut Client, uuid: &str, title: String, track_id: u64) -> FromWorker {
+    match client.add_track_to_playlist(uuid, track_id) {
+        Ok(()) => {
+            log::info!("added track {track_id} to playlist {title} ({uuid})");
+            FromWorker::PlaylistTrackAdded { title }
+        }
+        Err(e) => failed(
+            Task::AddToPlaylist {
+                uuid: uuid.to_string(),
+                track_id,
+            },
+            &e,
+        ),
+    }
+}
+
+/// Take a track out of a playlist. Waits, for the reason a delete does.
+fn removed(client: &mut Client, uuid: String, track_id: u64) -> FromWorker {
+    match client.remove_track_from_playlist(&uuid, track_id) {
+        Ok(()) => {
+            log::info!("removed track {track_id} from playlist {uuid}");
+            FromWorker::PlaylistTrackRemoved { uuid, track_id }
+        }
+        Err(e) => failed(Task::RemoveFromPlaylist { uuid, track_id }, &e),
+    }
+}
+
+/// Carry out one request and say what to send back.
+///
+/// Split out of the loop so the thread's body stays readable as requests are
+/// added, and so the answer to "what does this request reply with" is one
+/// `match` rather than a hundred lines of thread setup around it. `None` is a
+/// success the interface does not need to hear about.
+fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
+    Some(match cmd {
+        ToWorker::LoadFavorites { offset, limit } => match client.favorite_tracks(offset, limit) {
+            Ok(page) => FromWorker::Favorites { offset, page },
+            Err(e) => failed(Task::Favorites { offset }, &e),
+        },
+        ToWorker::LoadPlaylists { offset, limit } => match client.user_playlists(offset, limit) {
+            Ok(page) => FromWorker::Playlists { offset, page },
+            Err(e) => failed(Task::Playlists { offset }, &e),
+        },
+        ToWorker::LoadPlaylistTracks {
+            uuid,
+            offset,
+            limit,
+        } => match client.playlist_tracks(&uuid, offset, limit) {
+            Ok(page) => FromWorker::PlaylistTracks { uuid, offset, page },
+            Err(e) => failed(Task::PlaylistTracks { uuid, offset }, &e),
+        },
+        ToWorker::LoadMixes { offset, limit } => match client.user_mixes(offset, limit) {
+            Ok(page) => FromWorker::Mixes { offset, page },
+            Err(e) => failed(Task::Mixes { offset }, &e),
+        },
+        ToWorker::LoadMixTracks {
+            mix_id,
+            offset,
+            limit,
+        } => match client.mix_tracks(&mix_id, offset, limit) {
+            Ok(page) => FromWorker::MixTracks {
+                mix_id,
+                offset,
+                page,
+            },
+            Err(e) => failed(Task::MixTracks { mix_id, offset }, &e),
+        },
+        ToWorker::Search {
+            query,
+            offset,
+            limit,
+        } => match client.search_tracks(&query, offset, limit) {
+            Ok(page) => FromWorker::SearchResults {
+                query,
+                offset,
+                page,
+            },
+            Err(e) => failed(Task::Search { query, offset }, &e),
+        },
+        ToWorker::Resolve(id) => match client.resolve_stream(id, Quality::HiRes) {
+            Ok(r) => FromWorker::Resolved(id, r),
+            Err(e) => failed(Task::Resolve, &e),
+        },
+        ToWorker::SetFavorite { track_id, favorite } => {
+            match client.set_favorite_track(track_id, favorite) {
+                // Silence is success, and it is the only reply in this
+                // loop that is. The interface changed the heart before
+                // this went out, so a confirmation would tell it only
+                // what it already believes; the reply worth the channel
+                // is the one that says it was wrong. Recorded in the log
+                // all the same, because a library that changed under the
+                // user is worth a line.
+                Ok(()) => {
+                    log::info!("favorite {track_id} -> {favorite}");
+                    return None;
+                }
+                Err(e) => failed(
+                    Task::SetFavorite {
+                        track_id,
+                        wanted: favorite,
+                    },
+                    &e,
+                ),
+            }
+        }
+        ToWorker::CreatePlaylist { title } => created(client, &title),
+        ToWorker::RenamePlaylist { uuid, title, was } => renamed(client, uuid, &title, was)?,
+        ToWorker::DeletePlaylist { uuid, title } => deleted(client, uuid, &title),
+        ToWorker::AddToPlaylist {
+            uuid,
+            title,
+            track_id,
+        } => added(client, &uuid, title, track_id),
+        ToWorker::RemoveFromPlaylist { uuid, track_id } => removed(client, uuid, track_id),
+        // The only request here that touches no network. It is still on
+        // this thread because it waits on a subprocess, and the render
+        // loop may not wait on anything.
+        ToWorker::ReadAudioGraph => {
+            let read = graph::probe();
+            if let Err(e) = &read {
+                log::info!("audio graph: {e}");
+            }
+            FromWorker::AudioGraph(read)
+        }
+    })
+}
+
 pub fn spawn_with<F>(build: F) -> Worker
 where
     F: FnOnce() -> anyhow::Result<Client> + Send + 'static,
@@ -296,91 +563,11 @@ where
         };
 
         for cmd in cmd_rx {
-            let msg = match cmd {
-                ToWorker::LoadFavorites { offset, limit } => {
-                    match client.favorite_tracks(offset, limit) {
-                        Ok(page) => FromWorker::Favorites { offset, page },
-                        Err(e) => failed(Task::Favorites { offset }, &e),
-                    }
-                }
-                ToWorker::LoadPlaylists { offset, limit } => {
-                    match client.user_playlists(offset, limit) {
-                        Ok(page) => FromWorker::Playlists { offset, page },
-                        Err(e) => failed(Task::Playlists { offset }, &e),
-                    }
-                }
-                ToWorker::LoadPlaylistTracks {
-                    uuid,
-                    offset,
-                    limit,
-                } => match client.playlist_tracks(&uuid, offset, limit) {
-                    Ok(page) => FromWorker::PlaylistTracks { uuid, offset, page },
-                    Err(e) => failed(Task::PlaylistTracks { uuid, offset }, &e),
-                },
-                ToWorker::LoadMixes { offset, limit } => match client.user_mixes(offset, limit) {
-                    Ok(page) => FromWorker::Mixes { offset, page },
-                    Err(e) => failed(Task::Mixes { offset }, &e),
-                },
-                ToWorker::LoadMixTracks {
-                    mix_id,
-                    offset,
-                    limit,
-                } => match client.mix_tracks(&mix_id, offset, limit) {
-                    Ok(page) => FromWorker::MixTracks {
-                        mix_id,
-                        offset,
-                        page,
-                    },
-                    Err(e) => failed(Task::MixTracks { mix_id, offset }, &e),
-                },
-                ToWorker::Search {
-                    query,
-                    offset,
-                    limit,
-                } => match client.search_tracks(&query, offset, limit) {
-                    Ok(page) => FromWorker::SearchResults {
-                        query,
-                        offset,
-                        page,
-                    },
-                    Err(e) => failed(Task::Search { query, offset }, &e),
-                },
-                ToWorker::Resolve(id) => match client.resolve_stream(id, Quality::HiRes) {
-                    Ok(r) => FromWorker::Resolved(id, r),
-                    Err(e) => failed(Task::Resolve, &e),
-                },
-                ToWorker::SetFavorite { track_id, favorite } => {
-                    match client.set_favorite_track(track_id, favorite) {
-                        // Silence is success, and it is the only reply in this
-                        // loop that is. The interface changed the heart before
-                        // this went out, so a confirmation would tell it only
-                        // what it already believes; the reply worth the channel
-                        // is the one that says it was wrong. Recorded in the log
-                        // all the same, because a library that changed under the
-                        // user is worth a line.
-                        Ok(()) => {
-                            log::info!("favorite {track_id} -> {favorite}");
-                            continue;
-                        }
-                        Err(e) => failed(
-                            Task::SetFavorite {
-                                track_id,
-                                wanted: favorite,
-                            },
-                            &e,
-                        ),
-                    }
-                }
-                // The only request here that touches no network. It is still on
-                // this thread because it waits on a subprocess, and the render
-                // loop may not wait on anything.
-                ToWorker::ReadAudioGraph => {
-                    let read = graph::probe();
-                    if let Err(e) = &read {
-                        log::info!("audio graph: {e}");
-                    }
-                    FromWorker::AudioGraph(read)
-                }
+            // A request that changed something and succeeded answers with
+            // nothing: the interface already shows what it asked for, so there
+            // is no reply worth the channel. Only `None` means that.
+            let Some(msg) = serve(&mut client, cmd) else {
+                continue;
             };
             // Recorded here rather than at each call site: one place covers
             // every request kind, and the app only ever sees the flattened
@@ -480,6 +667,10 @@ mod tests {
                             "totalNumberOfItems":2,
                             "items":[{{"type":"track","item":{{"id":{id}}}}}]}}}}]}}]}}"#
                     )
+                } else if line.contains("create-playlist") {
+                    // The newer API wraps what it made, and the uuid is the one
+                    // fact the interface cannot do without.
+                    r#"{"data":{"uuid":"new-1","title":"Late night"}}"#.to_string()
                 } else if line.contains("/v1/search") {
                     // Varied by offset for the same reason the favorites are.
                     let id = if line.contains("offset=0") { 1 } else { 2 };
@@ -887,6 +1078,10 @@ mod tests {
             FromWorker::SearchResults { .. } => "SearchResults",
             FromWorker::Resolved(..) => "Resolved",
             FromWorker::AudioGraph(_) => "AudioGraph",
+            FromWorker::PlaylistCreated(_) => "PlaylistCreated",
+            FromWorker::PlaylistDeleted { .. } => "PlaylistDeleted",
+            FromWorker::PlaylistTrackRemoved { .. } => "PlaylistTrackRemoved",
+            FromWorker::PlaylistTrackAdded { .. } => "PlaylistTrackAdded",
             FromWorker::Failed { .. } => "Failed",
         }
     }
@@ -1021,6 +1216,109 @@ mod tests {
                 assert!(detail.contains("not signed in"), "and say so: {detail}");
             }
             other => panic!("expected an error, got {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_created_playlist_comes_back_through_the_channel() {
+        // Goal: the whole chain for the one edit that answers with something -
+        // the app's request, the core's call, and the reply the interface needs
+        // because it cannot guess the uuid. Nothing here touches an account:
+        // the origin is a loopback stub.
+        let w = worker_on(origin());
+        w.tx.send(ToWorker::CreatePlaylist {
+            title: "Late night".into(),
+        })
+        .expect("the worker is listening");
+        match next(&w) {
+            FromWorker::PlaylistCreated(made) => {
+                assert_eq!(made.uuid, "new-1");
+                assert_eq!(made.title, "Late night");
+            }
+            other => panic!("expected the new playlist, got {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_delete_answers_and_a_rename_does_not() {
+        // Goal: the two halves of the silence rule, in one place because the
+        // difference between them is the point. A rename is already on screen,
+        // so success says nothing; a delete is not, so it must be reported or
+        // the row never leaves. The rename is proved silent by the reply that
+        // arrives being the *next* request's.
+        let w = worker_on(origin());
+        w.tx.send(ToWorker::RenamePlaylist {
+            uuid: "p1".into(),
+            title: "New".into(),
+            was: "Old".into(),
+        })
+        .expect("the worker is listening");
+        w.tx.send(ToWorker::DeletePlaylist {
+            uuid: "p1".into(),
+            title: "Old".into(),
+        })
+        .expect("the worker is listening");
+        match next(&w) {
+            FromWorker::PlaylistDeleted { uuid } => assert_eq!(uuid, "p1"),
+            other => panic!(
+                "the rename should have said nothing, but {} arrived",
+                variant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn a_track_added_to_a_playlist_is_reported_by_the_name_of_the_playlist() {
+        // Goal: the notice this becomes is the only confirmation the listener
+        // gets, so the title has to survive the round trip rather than being
+        // looked up again from a list that may not hold it.
+        let w = worker_on(origin());
+        w.tx.send(ToWorker::AddToPlaylist {
+            uuid: "p1".into(),
+            title: "Evening".into(),
+            track_id: 7,
+        })
+        .expect("the worker is listening");
+        match next(&w) {
+            FromWorker::PlaylistTrackAdded { title } => assert_eq!(title, "Evening"),
+            other => panic!("expected the add to be reported, got {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_refused_playlist_edit_names_the_action_the_user_took() {
+        // Goal: the notice line reads back what was asked for, not the endpoint
+        // that refused it. "deleting the playlist" is a sentence somebody can
+        // act on; "playlists -> HTTP 500" is not.
+        for (task, wanted) in [
+            (Task::CreatePlaylist, "creating the playlist"),
+            (
+                Task::DeletePlaylist { uuid: "p1".into() },
+                "deleting the playlist",
+            ),
+            (
+                Task::AddToPlaylist {
+                    uuid: "p1".into(),
+                    track_id: 7,
+                },
+                "adding to the playlist",
+            ),
+            (
+                Task::RemoveFromPlaylist {
+                    uuid: "p1".into(),
+                    track_id: 7,
+                },
+                "removing from the playlist",
+            ),
+            (
+                Task::RenamePlaylist {
+                    uuid: "p1".into(),
+                    was: "Old".into(),
+                },
+                "renaming the playlist",
+            ),
+        ] {
+            assert_eq!(task.to_string(), wanted);
         }
     }
 }

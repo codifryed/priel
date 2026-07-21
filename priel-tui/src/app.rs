@@ -143,7 +143,57 @@ pub enum Hit {
     ClearPaste,
     /// Abandon the sign-in.
     CancelLogin,
+    /// Make a new playlist. Opens the name prompt; it does not create anything
+    /// on its own, because a playlist with no name is not worth making.
+    NewPlaylist,
+    /// Rename the highlighted playlist. Opens the same prompt, primed.
+    RenamePlaylist,
+    /// Take away whatever is highlighted: the playlist itself in the playlist
+    /// list, the track in an open playlist.
+    ///
+    /// One control rather than two, for the reason [`Hit::Back`] is one: the
+    /// destination depends on where the listener is, and a control naming a
+    /// fixed one would delete something they were not looking at.
+    RemoveSelected,
+    /// Put the highlighted track into a playlist. Opens the target picker.
+    AddToPlaylist,
+    /// Accept what is typed in the name prompt.
+    SubmitPrompt,
+    /// Abandon the name prompt.
+    CancelPrompt,
+    /// Go through with the change the confirmation is asking about.
+    ///
+    /// The only control in priel that destroys something, which is why it is a
+    /// variant of its own rather than a reuse of [`Hit::Enter`]: nothing else
+    /// may dispatch to it by accident, and it exists on screen only while a
+    /// confirmation is up.
+    ConfirmYes,
+    /// Leave things as they are.
+    ConfirmNo,
     Quit,
+}
+
+/// The change a modal is collecting an answer for.
+///
+/// One value rather than a flag per action. The screen that asks and the code
+/// that acts read the same thing, so they cannot come to disagree about which
+/// playlist is being renamed or which track is about to go - and a modal with
+/// no pending change cannot act at all.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Pending {
+    /// Make a playlist with the name being typed.
+    NewPlaylist,
+    /// Retitle a playlist. `was` is what to put back if the service says no.
+    Rename { uuid: String, was: String },
+    /// Delete a playlist. The title is here for the question and the notice:
+    /// a confirmation that named a uuid would be a confirmation of nothing.
+    DeletePlaylist { uuid: String, title: String },
+    /// Take a track out of the playlist that is open.
+    RemoveTrack {
+        uuid: String,
+        track_id: u64,
+        title: String,
+    },
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -158,6 +208,9 @@ pub enum Mode {
     Themes,      // the colour theme picker is up; modal in the same way
     Credentials, // first run with no client identity; asking before fetching one
     Login,       // signing in: browser is open, waiting for the redirected URL
+    Prompt,      // typing a playlist name; modal
+    Confirm,     // asking before something that cannot be undone; modal
+    AddTo,       // choosing which playlist a track goes into; modal
 }
 
 /// What one line of the audio-graph overlay says.
@@ -274,6 +327,13 @@ fn micros(seconds: f64) -> i64 {
 fn seconds(micros: i64) -> f64 {
     micros as f64 / 1_000_000.0
 }
+
+/// How long a playlist name may be typed.
+///
+/// A bound because the box grows from keystrokes and nothing else would stop
+/// it, and this one rather than a larger one because the listing shows a title
+/// in a column: a name longer than this is a name nobody can read back.
+const PLAYLIST_NAME_MAX: usize = 100;
 
 /// State of a sign-in in progress.
 ///
@@ -489,6 +549,26 @@ pub struct App {
     /// renderer while the picker is up - exactly as `device_rows` is.
     pub theme_rows: Vec<(Rect, ThemeName)>,
 
+    /// What the modal on screen is asking about, and what to do with the answer.
+    ///
+    /// `None` in every mode that is not [`Mode::Prompt`] or [`Mode::Confirm`],
+    /// and the guard those modes act through: an answer with nothing pending
+    /// does nothing at all, which is what stops a stale confirmation from
+    /// deleting whatever happens to be selected now.
+    pending: Option<Pending>,
+    /// The name being typed in the prompt.
+    pub prompt_text: String,
+    /// The track the playlist picker is finding a home for. `None` unless
+    /// [`Mode::AddTo`] is up.
+    add_track: Option<u64>,
+    /// Which row of the playlist picker is highlighted.
+    add_selected: usize,
+    /// The first picker row on screen, maintained by the renderer as
+    /// `device_offset` is.
+    pub add_offset: usize,
+    /// Clickable picker rows and the index into `playlists` each stands for.
+    pub add_rows: Vec<(Rect, usize)>,
+
     pub notice: Option<String>,
     pub loading: bool,
     /// The worker thread has gone, and has been reported. Latched so the
@@ -499,6 +579,9 @@ pub struct App {
     /// How many lines back from the newest the log overlay is scrolled. Counted
     /// from the end because that is where the interesting line always is.
     log_scroll: usize,
+    /// How far down the reference is scrolled, from the top. Clamped by the
+    /// renderer, which is the only thing that knows how tall the box came out.
+    pub help_scroll: usize,
     /// The last chain the worker read, or the reason it could not. `None` while
     /// a read is in flight, which is what the overlay says it is doing.
     audio_graph: Option<Result<AudioGraph, GraphError>>,
@@ -684,6 +767,12 @@ impl App {
             theme: Theme::default(),
             theme_selected: 0,
             theme_rows: Vec::new(),
+            pending: None,
+            prompt_text: String::new(),
+            add_track: None,
+            add_selected: 0,
+            add_offset: 0,
+            add_rows: Vec::new(),
             notice: Some("Loading favorites…".into()),
             loading: true,
             frame: 0,
@@ -696,6 +785,7 @@ impl App {
             worker_lost: false,
             recent: crate::logging::Recent::default(),
             log_scroll: 0,
+            help_scroll: 0,
             audio_graph: None,
             sink_volume: SinkVolume::Unread,
             sink_volume_asked: None,
@@ -995,6 +1085,19 @@ impl App {
             && !flow.is_busy()
         {
             flow.pasted.push_str(text.trim());
+            self.dirty = true;
+        }
+        // The other text box. A playlist name is as likely to be pasted as
+        // typed, and a box that took keystrokes but not a paste would be the
+        // one text field in priel that behaved differently. Bounded here as it
+        // is on the keystroke path, and by the same count.
+        if self.mode == Mode::Prompt {
+            for c in text.trim().chars() {
+                if self.prompt_text.chars().count() >= PLAYLIST_NAME_MAX {
+                    break;
+                }
+                self.prompt_text.push(c);
+            }
             self.dirty = true;
         }
     }
@@ -1319,7 +1422,16 @@ impl App {
             }
             // A favorite belongs to no listing: it changes one row's state, not
             // how much of a list has been fetched.
-            Task::Startup | Task::Resolve | Task::SetFavorite { .. } => None,
+            // Neither does a playlist edit: it changes one row, or makes one,
+            // or takes one away. None of that is a page of a listing.
+            Task::Startup
+            | Task::Resolve
+            | Task::SetFavorite { .. }
+            | Task::CreatePlaylist
+            | Task::RenamePlaylist { .. }
+            | Task::DeletePlaylist { .. }
+            | Task::AddToPlaylist { .. }
+            | Task::RemoveFromPlaylist { .. } => None,
         }
     }
 
@@ -1716,6 +1828,13 @@ impl App {
         if let Task::SetFavorite { track_id, wanted } = task {
             self.remember_favorite(*track_id, !*wanted);
         }
+        // The other change shown before it was agreed to. Guarded by the uuid
+        // rather than unguarded: unlike a favorite this is not one bit, and a
+        // refusal arriving after a second rename would otherwise put back a
+        // title two edits old.
+        if let Task::RenamePlaylist { uuid, was } = task {
+            self.retitle_playlist(uuid, was.clone());
+        }
         if let Some((paging, offset)) = self.paging_for(task)
             && paging.wanted == Some(offset)
         {
@@ -1769,6 +1888,14 @@ impl App {
                     page,
                 } => self.on_search_page(&query, offset, page),
                 FromWorker::Resolved(id, r) => self.on_resolved(id, &r),
+                FromWorker::PlaylistCreated(made) => self.on_playlist_created(made),
+                FromWorker::PlaylistDeleted { uuid } => self.on_playlist_deleted(&uuid),
+                FromWorker::PlaylistTrackRemoved { uuid, track_id } => {
+                    self.on_playlist_track_removed(&uuid, track_id);
+                }
+                FromWorker::PlaylistTrackAdded { title } => {
+                    self.notice = Some(format!("Added to “{title}”."));
+                }
                 FromWorker::AudioGraph(read) => {
                     self.note_sink_volume(&read);
                     self.audio_graph = Some(read);
@@ -2358,6 +2485,369 @@ impl App {
         }
     }
 
+    // ---- editing playlists ----
+
+    /// The playlist under the cursor, if this view lists playlists.
+    ///
+    /// Through `visible()` for the reason [`Self::selected_track_id`] is: the
+    /// selection indexes the filtered rows, and reading the backing vec with it
+    /// would rename or delete a different playlist than the highlighted one
+    /// whenever a filter was on. That is a wrong *delete*, so it is not a
+    /// tidiness point.
+    fn selected_playlist(&self) -> Option<Playlist> {
+        let visible = self.visible();
+        let index = *visible.get(self.selected)?;
+        self.playlists.get(index).cloned()
+    }
+
+    /// Start making a playlist. **The one way in**, from `N` and from the
+    /// reference's control.
+    fn new_playlist(&mut self) {
+        self.open_prompt(Pending::NewPlaylist, String::new());
+    }
+
+    /// Start renaming the highlighted playlist. **The one way in.**
+    ///
+    /// The box opens holding the current title rather than empty: a rename is
+    /// usually an edit of what is there, and an empty box would make the
+    /// commonest case the most typing.
+    fn rename_selected_playlist(&mut self) {
+        if self.view != View::Playlists {
+            self.notice = Some("Renaming works on the playlists list.".into());
+            return;
+        }
+        let Some(playlist) = self.selected_playlist() else {
+            return;
+        };
+        let was = playlist.title.clone();
+        self.open_prompt(
+            Pending::Rename {
+                uuid: playlist.uuid,
+                was: was.clone(),
+            },
+            was,
+        );
+    }
+
+    /// Ask before taking away whatever is highlighted. **The one way in**, from
+    /// `X` and from the reference's control.
+    ///
+    /// Which thing that is depends on the view, and both answers are destructive
+    /// enough to be confirmed rather than done: in the playlist list it is the
+    /// playlist, and inside one it is the track. Anywhere else there is nothing
+    /// this could mean, and saying so beats doing nothing silently.
+    fn remove_selected(&mut self) {
+        match self.view {
+            View::Playlists => {
+                let Some(playlist) = self.selected_playlist() else {
+                    return;
+                };
+                self.open_confirm(Pending::DeletePlaylist {
+                    uuid: playlist.uuid,
+                    title: playlist.title,
+                });
+            }
+            View::PlaylistTracks => {
+                let Some((uuid, _)) = self.open_playlist.clone() else {
+                    return;
+                };
+                let Some(track_id) = self.selected_track_id() else {
+                    return;
+                };
+                let title = self
+                    .current_tracks()
+                    .iter()
+                    .find(|t| t.id == track_id)
+                    .map_or_else(String::new, |t| t.title.clone());
+                self.open_confirm(Pending::RemoveTrack {
+                    uuid,
+                    track_id,
+                    title,
+                });
+            }
+            _ => {
+                self.notice = Some("Nothing here can be removed - open a playlist first.".into());
+            }
+        }
+    }
+
+    /// Put the highlighted track into a playlist. **The one way in**, from `a`
+    /// and from the reference's control.
+    ///
+    /// Opens a picker rather than acting, because "which playlist" has no
+    /// answer the interface could guess: the one on screen is usually not the
+    /// one the listener means, since tracks are collected from favorites and
+    /// from search.
+    fn add_selected_to_playlist(&mut self) {
+        let Some(track_id) = self.selected_track_id() else {
+            self.notice = Some("Highlight a track first.".into());
+            return;
+        };
+        self.add_track = Some(track_id);
+        self.add_selected = 0;
+        self.add_offset = 0;
+        self.mode = Mode::AddTo;
+        // The picker lists what has been fetched. Somebody who has never opened
+        // the playlists tab has fetched nothing, so ask now rather than showing
+        // an empty picker that is not the truth.
+        if self.playlists.is_empty() {
+            self.load_playlists_from_the_top();
+        }
+    }
+
+    /// Put a modal on screen asking for a name.
+    fn open_prompt(&mut self, pending: Pending, text: String) {
+        self.pending = Some(pending);
+        self.prompt_text = text;
+        self.mode = Mode::Prompt;
+    }
+
+    /// Put a modal on screen asking whether to go through with something.
+    fn open_confirm(&mut self, pending: Pending) {
+        self.pending = Some(pending);
+        self.mode = Mode::Confirm;
+    }
+
+    /// Take the modal down without doing what it asked about.
+    ///
+    /// **`pending` is cleared here.** Leaving it set would let the next
+    /// confirmation answer for a change the user had already backed out of.
+    fn cancel_modal(&mut self) {
+        self.pending = None;
+        self.prompt_text.clear();
+        self.add_track = None;
+        self.mode = Mode::Normal;
+    }
+
+    /// What the name prompt is asking, for the renderer to put in its title.
+    #[must_use]
+    pub fn prompt_question(&self) -> Option<String> {
+        match self.pending.as_ref()? {
+            Pending::NewPlaylist => Some("Name the new playlist".into()),
+            Pending::Rename { was, .. } => Some(format!("Rename “{was}”")),
+            Pending::DeletePlaylist { .. } | Pending::RemoveTrack { .. } => None,
+        }
+    }
+
+    /// What the confirmation is asking, for the renderer to put on screen.
+    ///
+    /// The words name the thing, never a uuid or an index: a question the reader
+    /// cannot check is a question they will answer yes to out of habit. The
+    /// delete says it cannot be undone, because it cannot.
+    #[must_use]
+    pub fn confirm_question(&self) -> Option<Vec<String>> {
+        match self.pending.as_ref()? {
+            Pending::DeletePlaylist { title, .. } => Some(vec![
+                format!("Delete the playlist “{title}”?"),
+                "It goes from the account, not just from priel, and".into(),
+                "there is no way to bring it back.".into(),
+            ]),
+            Pending::RemoveTrack { title, .. } => {
+                let from = self
+                    .open_playlist
+                    .as_ref()
+                    .map_or_else(String::new, |(_, name)| name.clone());
+                Some(vec![
+                    format!("Take “{title}” out of “{from}”?"),
+                    "The track stays in the catalogue; only this".into(),
+                    "playlist changes.".into(),
+                ])
+            }
+            Pending::NewPlaylist | Pending::Rename { .. } => None,
+        }
+    }
+
+    /// What saying yes will do, in the words the control is labelled with.
+    ///
+    /// Named after the effect rather than "OK" or "yes": the label is the last
+    /// thing read before the click, and it is the only place the reader is told
+    /// which of the two buttons is the one that destroys something.
+    #[must_use]
+    pub fn confirm_verb(&self) -> Option<&'static str> {
+        match self.pending.as_ref()? {
+            Pending::DeletePlaylist { .. } => Some("delete it"),
+            Pending::RemoveTrack { .. } => Some("remove it"),
+            Pending::NewPlaylist | Pending::Rename { .. } => None,
+        }
+    }
+
+    /// Accept what is typed. **The one way in**, from `Enter` and from the
+    /// prompt's own control.
+    ///
+    /// A name of nothing but spaces is refused rather than sent: the service
+    /// accepts it and the listener ends up with a row they cannot tell from the
+    /// next one.
+    fn submit_prompt(&mut self) {
+        let title = self.prompt_text.trim().to_string();
+        if title.is_empty() {
+            self.notice = Some("A playlist needs a name.".into());
+            return;
+        }
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        self.prompt_text.clear();
+        self.mode = Mode::Normal;
+        match pending {
+            Pending::NewPlaylist => {
+                // Waits, and has to: the uuid is the service's to choose, so
+                // there is no row this could show early. The notice is what
+                // stands in for the row until the reply arrives.
+                self.notice = Some(format!("Creating “{title}”…"));
+                self.ask(ToWorker::CreatePlaylist { title });
+            }
+            Pending::Rename { uuid, was } => {
+                // Optimistic, like a favorite and for the same reasons: one
+                // field, visible immediately, and put back exactly by
+                // `on_failed` if the service refuses.
+                self.retitle_playlist(&uuid, title.clone());
+                self.ask(ToWorker::RenamePlaylist { uuid, title, was });
+            }
+            Pending::DeletePlaylist { .. } | Pending::RemoveTrack { .. } => {}
+        }
+    }
+
+    /// Go through with the change the confirmation was asking about. **The one
+    /// way in**, from `y` and from the confirmation's own control.
+    ///
+    /// **Neither of these is optimistic, and that is the deliberate difference
+    /// from a favorite.** Both wait for the service to say it happened before
+    /// the row leaves the screen. A favorite is one bit and the same keystroke
+    /// puts it back; a deleted playlist is gone, and a row that vanished and
+    /// then quietly reappeared would be read as a glitch rather than as the
+    /// refusal it was.
+    fn confirm_yes(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        self.mode = Mode::Normal;
+        match pending {
+            Pending::DeletePlaylist { uuid, title } => {
+                self.notice = Some(format!("Deleting “{title}”…"));
+                self.ask(ToWorker::DeletePlaylist { uuid, title });
+            }
+            Pending::RemoveTrack { uuid, track_id, .. } => {
+                self.ask(ToWorker::RemoveFromPlaylist { uuid, track_id });
+            }
+            Pending::NewPlaylist | Pending::Rename { .. } => {}
+        }
+    }
+
+    /// Give the row for `uuid` a new title, asking nothing.
+    ///
+    /// Shared by the optimistic rename and by the revert, so the two cannot
+    /// come to write to different places.
+    fn retitle_playlist(&mut self, uuid: &str, title: String) {
+        if let Some(row) = self.playlists.iter_mut().find(|p| p.uuid == uuid) {
+            row.title = title;
+        }
+    }
+
+    /// Send the highlighted track to the chosen playlist. **The one way in**,
+    /// from `Enter` in the picker and from a click on a row.
+    fn choose_add_target(&mut self, index: usize) {
+        let Some(track_id) = self.add_track else {
+            return;
+        };
+        let Some(playlist) = self.playlists.get(index) else {
+            return;
+        };
+        let (uuid, title) = (playlist.uuid.clone(), playlist.title.clone());
+        self.add_track = None;
+        self.mode = Mode::Normal;
+        self.ask(ToWorker::AddToPlaylist {
+            uuid,
+            title,
+            track_id,
+        });
+    }
+
+    fn add_down(&mut self, by: usize) {
+        let last = self.playlists.len().saturating_sub(1);
+        self.add_selected = self.add_selected.saturating_add(by).min(last);
+    }
+
+    fn add_up(&mut self, by: usize) {
+        self.add_selected = self.add_selected.saturating_sub(by);
+    }
+
+    /// Which picker row is highlighted, for the renderer.
+    #[must_use]
+    pub fn add_selected_row(&self) -> usize {
+        self.add_selected
+    }
+
+    /// Resolve a click in the playlist picker.
+    ///
+    /// A click that lands on no row closes the picker, the way the output and
+    /// theme pickers do. Safe here for the same reason it is safe there: the
+    /// picker adds, it does not remove, and closing it does nothing.
+    fn click_add_target(&mut self, col: u16, row: u16) {
+        match self
+            .add_rows
+            .iter()
+            .find(|(r, _)| hit(*r, col, row))
+            .map(|(_, i)| *i)
+        {
+            Some(index) => {
+                self.add_selected = index;
+                self.choose_add_target(index);
+            }
+            None => self.cancel_modal(),
+        }
+    }
+
+    /// A playlist now exists that did not before.
+    ///
+    /// Put at the top of the list rather than left for a reload to find. The
+    /// listing is ordered newest first, so that is where the service would put
+    /// it too, and a reload would throw away a filter the listener had typed
+    /// and their place in a list they had scrolled.
+    fn on_playlist_created(&mut self, made: Playlist) {
+        self.notice = Some(format!("Created “{}”.", made.title));
+        self.playlists.insert(0, made);
+        // The listing is one longer than the service said it was when the page
+        // arrived. Left alone, paging would ask for the last row twice.
+        self.playlists_paging.total = self.playlists_paging.total.saturating_add(1);
+        if self.view == View::Playlists {
+            self.clamp_selection();
+        }
+    }
+
+    /// A playlist is gone, and the service has said so.
+    ///
+    /// Only now does the row leave the screen. If the listener is inside the
+    /// playlist that was deleted they are taken back out of it, because the
+    /// view they are in no longer stands for anything.
+    fn on_playlist_deleted(&mut self, uuid: &str) {
+        self.playlists.retain(|p| p.uuid != uuid);
+        self.playlists_paging.total = self.playlists_paging.total.saturating_sub(1);
+        if self.open_playlist.as_ref().is_some_and(|(u, _)| u == uuid) {
+            self.open_playlist = None;
+            self.playlist_tracks.clear();
+            if self.view == View::PlaylistTracks {
+                self.switch_view(View::Playlists);
+            }
+        }
+        self.notice = Some("Deleted.".into());
+        self.clamp_selection();
+    }
+
+    /// A track is out of a playlist, and the service has said so.
+    ///
+    /// Guarded on the playlist still being the open one: a removal that lands
+    /// after the listener has moved to another playlist must not take a row out
+    /// of *that* one.
+    fn on_playlist_track_removed(&mut self, uuid: &str, track_id: u64) {
+        if self.open_playlist.as_ref().is_none_or(|(u, _)| u != uuid) {
+            return;
+        }
+        self.playlist_tracks.retain(|t| t.id != track_id);
+        self.playlist_tracks_paging.total = self.playlist_tracks_paging.total.saturating_sub(1);
+        self.notice = Some("Removed from the playlist.".into());
+        self.clamp_selection();
+    }
+
     fn play_selected(&mut self) {
         self.start_queue_at(self.selected);
     }
@@ -2458,19 +2948,47 @@ impl App {
             Mode::Themes => self.on_key_themes(key),
             Mode::Credentials => self.on_key_credentials(key),
             Mode::Login => self.on_key_login(key),
+            Mode::Prompt => self.on_key_prompt(key),
+            Mode::Confirm => self.on_key_confirm(key),
+            Mode::AddTo => self.on_key_add_to(key),
             Mode::Normal => self.on_key_normal(key),
         }
     }
 
     /// The help overlay is modal: anything that reads as "done" dismisses it, and
     /// nothing else leaks through to the list underneath.
+    /// Show the reference, from the top. **The one way in.**
+    fn open_help(&mut self) {
+        self.mode = Mode::Help;
+        self.help_scroll = 0;
+    }
+
+    /// Keys while the reference is up.
+    ///
+    /// It scrolls, with the same j/k and g/G the log overlay uses. That is not
+    /// decoration: the reference is how bindings are discovered, and it now
+    /// holds more rows than a 24-row terminal can show. Clipping it would
+    /// silently delete the keys at the bottom, which is the bug that once lost
+    /// `[q]` off the end of the bottom row.
     fn on_key_help(&mut self, key: KeyEvent) {
-        if matches!(
-            key.code,
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q' | ' ')
-        ) {
-            self.mode = Mode::Normal;
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q' | ' ') => {
+                self.mode = Mode::Normal;
+                self.help_scroll = 0;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('g') => self.help_scroll = 0,
+            // The renderer knows how far down the content actually goes and
+            // clamps this on the next frame, the way it clamps `device_offset`.
+            KeyCode::Char('G') => self.help_scroll = usize::MAX,
+            _ => {}
         }
+        self.dirty = true;
     }
 
     /// Open the recent diagnostics.
@@ -3039,7 +3557,7 @@ impl App {
             KeyCode::Char('K') => self.move_up(self.full_page()),
             KeyCode::Char('g') => self.goto_top(),
             KeyCode::Char('G') => self.goto_bottom(),
-            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('?') => self.open_help(),
             KeyCode::Char('M') => self.open_log(),
             KeyCode::Char('D') => self.open_graph(),
             KeyCode::Char('d') => self.open_devices(),
@@ -3059,12 +3577,107 @@ impl App {
             KeyCode::Char('f') => self.favorite_selected(),
             KeyCode::Char('F') => self.favorite_now_playing(),
             KeyCode::Char('r') => self.reload_view(),
+            KeyCode::Char('a') => self.add_selected_to_playlist(),
+            KeyCode::Char('N') => self.new_playlist(),
+            KeyCode::Char('R') => self.rename_selected_playlist(),
+            KeyCode::Char('X') => self.remove_selected(),
             _ => {}
         }
     }
 
-    pub fn on_mouse(&mut self, m: MouseEvent) {
-        if matches!(self.mode, Mode::Credentials | Mode::Login) {
+    /// Keys while a playlist name is being typed.
+    ///
+    /// The same shape as the filter and the search box, so there is one idiom
+    /// for a line of text rather than three. `Ctrl-U` clears it, as it does in
+    /// the paste box.
+    fn on_key_prompt(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if key.code == KeyCode::Char('u') {
+                self.prompt_text.clear();
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.cancel_modal(),
+            KeyCode::Enter => self.submit_prompt(),
+            KeyCode::Backspace => {
+                self.prompt_text.pop();
+            }
+            // Bounded, like everything else built from what arrives from
+            // outside. A held key would otherwise grow this without end.
+            KeyCode::Char(c) if self.prompt_text.chars().count() < PLAYLIST_NAME_MAX => {
+                self.prompt_text.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys while a confirmation is up.
+    ///
+    /// **`Enter` is not yes.** Every other modal in priel accepts on `Enter`,
+    /// and that is exactly why this one must not: a listener who has just
+    /// pressed `Enter` to open a playlist and pressed it again out of rhythm
+    /// would delete it. Going through with it takes the one key that means
+    /// nothing else here, and everything unrecognised is ignored rather than
+    /// treated as either answer.
+    fn on_key_confirm(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') => self.confirm_yes(),
+            KeyCode::Char('n' | 'q') | KeyCode::Esc => self.cancel_modal(),
+            _ => {}
+        }
+    }
+
+    /// Keys while a playlist is being chosen for a track.
+    ///
+    /// The picker idiom, unchanged from the output and theme pickers: `j`/`k`
+    /// and `g`/`G` move, `Enter` chooses, `Esc` backs out. A second idiom for
+    /// the same gesture would be its own bug.
+    fn on_key_add_to(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.cancel_modal(),
+            KeyCode::Char('j') | KeyCode::Down => self.add_down(1),
+            KeyCode::Char('k') | KeyCode::Up => self.add_up(1),
+            KeyCode::Char('J') => self.add_down(self.full_page()),
+            KeyCode::Char('K') => self.add_up(self.full_page()),
+            KeyCode::Char('g') => self.add_selected = 0,
+            KeyCode::Char('G') => self.add_selected = self.playlists.len().saturating_sub(1),
+            KeyCode::Enter => self.choose_add_target(self.add_selected),
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Answer a click while a modal overlay is up. `true` if it was handled.
+    ///
+    /// Each overlay owns the pointer while it is on screen: nothing behind one
+    /// may be reached through it, and the two that ask a question answer only
+    /// where their own controls were painted.
+    fn on_mouse_overlay(&mut self, m: MouseEvent) -> bool {
+        // The picker answers like the other two: a row chooses, anything else
+        // closes it. Adding a track to a playlist takes nothing away, so a
+        // click that misses can safely mean "never mind".
+        if self.mode == Mode::AddTo {
+            match m.kind {
+                MouseEventKind::ScrollDown => self.add_down(1),
+                MouseEventKind::ScrollUp => self.add_up(1),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.click_add_target(m.column, m.row);
+                }
+                _ => {}
+            }
+            self.dirty = true;
+            return true;
+        }
+        // The prompt and the confirmation answer only where their own controls
+        // are, which is the consent screen's rule and is here for a stronger
+        // reason: one of these controls deletes a playlist, and a click that
+        // landed anywhere near it must not be read as an answer. Scrolling and
+        // dragging are swallowed too - neither means yes.
+        if matches!(
+            self.mode,
+            Mode::Credentials | Mode::Login | Mode::Prompt | Mode::Confirm
+        ) {
             // These two offer controls rather than a way out, and are the one
             // place a click off a control means nothing at all: a stray click is
             // not consent to download a credential, and not an abandoned
@@ -3076,7 +3689,7 @@ impl App {
                 self.dispatch(h);
                 self.dirty = true;
             }
-            return;
+            return true;
         }
         if self.mode == Mode::Log {
             match m.kind {
@@ -3094,7 +3707,7 @@ impl App {
                 }
                 _ => {}
             }
-            return;
+            return true;
         }
         if self.mode == Mode::Graph {
             match m.kind {
@@ -3112,17 +3725,17 @@ impl App {
                 }
                 _ => {}
             }
-            return;
+            return true;
         }
         if self.mode == Mode::Devices {
             match m.kind {
                 MouseEventKind::ScrollDown => self.device_down(1),
                 MouseEventKind::ScrollUp => self.device_up(1),
                 MouseEventKind::Down(MouseButton::Left) => self.click_device(m.column, m.row),
-                _ => return,
+                _ => return true,
             }
             self.dirty = true;
-            return;
+            return true;
         }
         if self.mode == Mode::Themes {
             let last = theme::OFFERED.len().saturating_sub(1);
@@ -3134,10 +3747,10 @@ impl App {
                     self.theme_selected = self.theme_selected.saturating_sub(1);
                 }
                 MouseEventKind::Down(MouseButton::Left) => self.click_theme(m.column, m.row),
-                _ => return,
+                _ => return true,
             }
             self.dirty = true;
-            return;
+            return true;
         }
         if self.mode == Mode::Help {
             // The reference is priel's menu: every key it lists is a control, so
@@ -3156,6 +3769,18 @@ impl App {
                 }
                 self.dirty = true;
             }
+            return true;
+        }
+        false
+    }
+
+    /// A mouse event, routed by what is on screen.
+    ///
+    /// Split in two because it had grown past being readable in one piece: an
+    /// overlay that is up owns the pointer entirely, so that half answers first
+    /// and says whether it did.
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.on_mouse_overlay(m) {
             return;
         }
         match m.kind {
@@ -3201,7 +3826,7 @@ impl App {
             Hit::EditSearch => self.edit_search(),
             Hit::Reload => self.reload_view(),
             Hit::CycleView => self.cycle_view(),
-            Hit::Help => self.mode = Mode::Help,
+            Hit::Help => self.open_help(),
             Hit::Log => self.open_log(),
             Hit::Graph => self.open_graph(),
             Hit::Devices => self.open_devices(),
@@ -3213,6 +3838,13 @@ impl App {
             Hit::ReopenBrowser => self.reopen_browser(),
             Hit::ClearPaste => self.clear_paste(),
             Hit::CancelLogin => self.cancel_login(),
+            Hit::NewPlaylist => self.new_playlist(),
+            Hit::RenamePlaylist => self.rename_selected_playlist(),
+            Hit::RemoveSelected => self.remove_selected(),
+            Hit::AddToPlaylist => self.add_selected_to_playlist(),
+            Hit::SubmitPrompt => self.submit_prompt(),
+            Hit::CancelPrompt | Hit::ConfirmNo => self.cancel_modal(),
+            Hit::ConfirmYes => self.confirm_yes(),
             Hit::Quit => self.should_quit = true,
         }
     }
@@ -8331,5 +8963,561 @@ mod tests {
             !super::should_open_browser(),
             "the suite must never reach the user's browser"
         );
+    }
+
+    // ---- editing playlists ----
+
+    /// An app sitting on the playlists list with two of them loaded.
+    fn with_playlists() -> Rig {
+        let mut r = rig();
+        r.app.playlists = vec![playlist("a1", "Morning"), playlist("b2", "Evening")];
+        r.app.playlists_paging.total = 2;
+        r.app.view = View::Playlists;
+        let _ = requests(&r);
+        r
+    }
+
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(c));
+        }
+    }
+
+    #[test]
+    fn a_new_playlist_is_named_before_anything_is_asked_for() {
+        // Goal: `N` must not create anything on its own. A playlist is made once
+        // and cannot be un-made, so the request goes out only after a name has
+        // been typed and accepted.
+        let mut r = with_playlists();
+        r.app.on_key(key('N'));
+        assert_eq!(r.app.mode, Mode::Prompt);
+        type_in(&mut r.app, "  Late night  ");
+        assert!(
+            requests(&r).is_empty(),
+            "nothing may go out while it is being typed"
+        );
+
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.mode, Mode::Normal);
+        let sent = requests(&r);
+        assert_eq!(sent.len(), 1);
+        assert!(
+            matches!(&sent[0], ToWorker::CreatePlaylist { title } if title == "Late night"),
+            "the name is trimmed before it is sent"
+        );
+    }
+
+    #[test]
+    fn a_playlist_with_no_name_is_not_created() {
+        // Goal: the service accepts an empty title and the listener ends up with
+        // a row they cannot tell from any other. The prompt stays up so the name
+        // can be typed rather than the attempt being lost.
+        let mut r = with_playlists();
+        r.app.on_key(key('N'));
+        type_in(&mut r.app, "   ");
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.mode, Mode::Prompt, "still asking");
+        assert!(requests(&r).is_empty());
+    }
+
+    #[test]
+    fn a_created_playlist_appears_without_reloading_the_list() {
+        // Goal: the uuid is the service's to choose, so this reply is the only
+        // moment the new row can exist. Reloading instead would throw away a
+        // filter the listener had typed and their place in the list.
+        let mut r = with_playlists();
+        r.to_app
+            .send(FromWorker::PlaylistCreated(playlist("c3", "Late night")))
+            .expect("the rigged channel is open");
+        r.app.drain_worker();
+        assert_eq!(
+            r.app.playlists[0].uuid, "c3",
+            "newest first, as the listing is"
+        );
+        assert_eq!(r.app.playlists.len(), 3);
+        assert_eq!(
+            r.app.playlists_paging.total, 3,
+            "the listing is one longer, or paging asks for the last row twice"
+        );
+    }
+
+    #[test]
+    fn renaming_shows_the_new_title_at_once_and_puts_the_old_one_back_if_refused() {
+        // Goal: a rename is one field and cheap to undo, so it is optimistic
+        // like a favorite. That is only safe if the refusal really does restore
+        // the exact title that was there - hence the round trip both ways.
+        let mut r = with_playlists();
+        r.app.selected = 1;
+        r.app.on_key(key('R'));
+        assert_eq!(r.app.prompt_text, "Evening", "primed with what is there");
+        type_in(&mut r.app, "!");
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(
+            r.app.playlists[1].title, "Evening!",
+            "shown before it is agreed"
+        );
+
+        let sent = requests(&r);
+        assert!(matches!(
+            &sent[0],
+            ToWorker::RenamePlaylist { uuid, title, was }
+                if uuid == "b2" && title == "Evening!" && was == "Evening"
+        ));
+
+        r.to_app
+            .send(FromWorker::Failed {
+                task: Task::RenamePlaylist {
+                    uuid: "b2".into(),
+                    was: "Evening".into(),
+                },
+                fault: Fault::Refused,
+                detail: "no".into(),
+            })
+            .expect("the rigged channel is open");
+        r.app.drain_worker();
+        assert_eq!(r.app.playlists[1].title, "Evening", "put back exactly");
+    }
+
+    #[test]
+    fn a_rename_acts_on_the_highlighted_playlist_not_the_row_beneath_it() {
+        // Goal: selection indexes the *filtered* rows. Reading the backing vec
+        // with it renames whichever playlist happens to sit at that position in
+        // the unfiltered list, which is a different playlist entirely.
+        let mut r = with_playlists();
+        r.app.filter = "even".into();
+        r.app.selected = 0;
+        r.app.on_key(key('R'));
+        assert_eq!(
+            r.app.prompt_text, "Evening",
+            "the one row the filter left, not the first of the two"
+        );
+    }
+
+    #[test]
+    fn deleting_a_playlist_asks_first_and_sends_nothing_until_it_is_answered() {
+        // Goal: the one action in priel that cannot be undone. `X` must open a
+        // question naming the playlist, and the question must be answerable
+        // only on purpose.
+        let mut r = with_playlists();
+        r.app.selected = 0;
+        r.app.on_key(key('X'));
+        assert_eq!(r.app.mode, Mode::Confirm);
+        let asked = r.app.confirm_question().expect("a question");
+        assert!(
+            asked[0].contains("Morning"),
+            "it names the playlist: {asked:?}"
+        );
+        assert!(
+            asked.iter().any(|l| l.contains("no way to bring it back")),
+            "and says what it means: {asked:?}"
+        );
+        assert!(requests(&r).is_empty(), "asking is not doing");
+
+        r.app.on_key(key('y'));
+        let sent = requests(&r);
+        assert!(matches!(
+            &sent[0],
+            ToWorker::DeletePlaylist { uuid, .. } if uuid == "a1"
+        ));
+    }
+
+    #[test]
+    fn enter_does_not_answer_a_confirmation() {
+        // Goal: every other modal here accepts on Enter, and that is exactly the
+        // danger. Enter opens a playlist; pressing it twice out of rhythm must
+        // not be the difference between reading a question and deleting.
+        let mut r = with_playlists();
+        r.app.on_key(key('X'));
+        for k in [KeyCode::Enter, KeyCode::Char(' '), KeyCode::Char('d')] {
+            r.app.on_key(code(k));
+            assert_eq!(r.app.mode, Mode::Confirm, "{k:?} must not answer it");
+        }
+        assert!(requests(&r).is_empty());
+    }
+
+    #[test]
+    fn a_click_that_misses_the_confirmations_controls_does_nothing_at_all() {
+        // Goal: a stray click is not consent, and it is not anything else
+        // either. The list is still underneath - the renderer clears the header
+        // and hint hit boxes but `list_inner` is a rect, not a hit box - so
+        // without the modal guard a click on a row would move the selection and
+        // a double-click would start playing, all while a delete is being asked
+        // about. Scrolling is swallowed for the same reason.
+        let mut r = with_playlists();
+        r.app.list_inner = Rect {
+            x: 0,
+            y: 4,
+            width: 40,
+            height: 10,
+        };
+        r.app.on_key(key('X'));
+        r.app.hits = vec![(
+            Rect {
+                x: 10,
+                y: 20,
+                width: 3,
+                height: 1,
+            },
+            Hit::ConfirmYes,
+        )];
+
+        r.app.on_mouse(click(5, 5));
+        r.app.on_mouse(click(5, 5));
+        r.app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(r.app.mode, Mode::Confirm, "still asking");
+        assert_eq!(r.app.selected, 0, "the list behind is out of reach");
+        assert!(r.app.now_playing.is_none(), "and cannot be played through");
+        assert!(requests(&r).is_empty(), "nothing was deleted");
+
+        r.app.on_mouse(click(11, 20));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert_eq!(requests(&r).len(), 1, "the control itself does answer");
+    }
+
+    #[test]
+    fn backing_out_of_a_confirmation_forgets_what_it_was_asking_about() {
+        // Goal: a question left pending would be answered by the *next* one, so
+        // a `y` meant for a harmless prompt could delete whatever `X` had been
+        // pointed at minutes earlier.
+        let mut r = with_playlists();
+        r.app.on_key(key('X'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(r.app.confirm_question().is_none(), "nothing is pending");
+
+        r.app.set_mode_for_test(Mode::Confirm);
+        r.app.on_key(key('y'));
+        assert!(requests(&r).is_empty(), "a stale yes deletes nothing");
+    }
+
+    #[test]
+    fn the_row_stays_until_the_service_says_the_playlist_is_gone() {
+        // Goal: the deliberate difference from a favorite. A favorite is one bit
+        // and the same key puts it back; a deleted playlist is not, so the row
+        // must not vanish on hope and quietly reappear when the answer is no.
+        let mut r = with_playlists();
+        r.app.on_key(key('X'));
+        r.app.on_key(key('y'));
+        assert_eq!(
+            r.app.playlists.len(),
+            2,
+            "still there while it is in flight"
+        );
+
+        r.to_app
+            .send(FromWorker::PlaylistDeleted { uuid: "a1".into() })
+            .expect("the rigged channel is open");
+        r.app.drain_worker();
+        assert_eq!(r.app.playlists.len(), 1);
+        assert_eq!(r.app.playlists[0].uuid, "b2");
+        assert_eq!(r.app.playlists_paging.total, 1);
+    }
+
+    #[test]
+    fn a_refused_delete_leaves_the_playlist_where_it_was() {
+        // Goal: the other half of waiting. Nothing to put back, and the reason
+        // has to reach the notice line rather than being swallowed.
+        let mut r = with_playlists();
+        r.app.on_key(key('X'));
+        r.app.on_key(key('y'));
+        r.to_app
+            .send(FromWorker::Failed {
+                task: Task::DeletePlaylist { uuid: "a1".into() },
+                fault: Fault::Refused,
+                detail: "deleting the playlist: not yours".into(),
+            })
+            .expect("the rigged channel is open");
+        r.app.drain_worker();
+        assert_eq!(r.app.playlists.len(), 2, "nothing was taken away");
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("not yours"), "{notice}");
+    }
+
+    #[test]
+    fn deleting_the_playlist_that_is_open_takes_the_listener_back_out_of_it() {
+        // Goal: the view would otherwise go on showing the tracks of a playlist
+        // that no longer exists, and reloading it would 404.
+        let mut r = with_playlists();
+        r.app.open_playlist = Some(("a1".into(), "Morning".into()));
+        r.app.playlist_tracks = vec![track(1, "T", "A")];
+        r.app.view = View::PlaylistTracks;
+        r.to_app
+            .send(FromWorker::PlaylistDeleted { uuid: "a1".into() })
+            .expect("the rigged channel is open");
+        r.app.drain_worker();
+        assert_eq!(r.app.view, View::Playlists);
+        assert!(r.app.open_playlist.is_none());
+        assert!(r.app.playlist_tracks.is_empty());
+    }
+
+    #[test]
+    fn removing_a_track_asks_first_and_waits_before_the_row_goes() {
+        // Goal: `X` means "take away what is highlighted", and inside a playlist
+        // that is the track. It is confirmed for the same reason the delete is,
+        // and it waits for the same reason: the row leaving is the only report
+        // the listener gets that it worked.
+        let mut r = with_playlists();
+        r.app.open_playlist = Some(("a1".into(), "Morning".into()));
+        r.app.playlist_tracks = vec![track(7, "So What", "Miles"), track(8, "Blue", "Miles")];
+        r.app.playlist_tracks_paging.total = 2;
+        r.app.view = View::PlaylistTracks;
+        r.app.selected = 0;
+
+        r.app.on_key(key('X'));
+        let asked = r.app.confirm_question().expect("a question");
+        assert!(
+            asked[0].contains("So What"),
+            "it names the track: {asked:?}"
+        );
+        assert!(asked[0].contains("Morning"), "and the playlist: {asked:?}");
+
+        r.app.on_key(key('y'));
+        assert_eq!(
+            r.app.playlist_tracks.len(),
+            2,
+            "still there while in flight"
+        );
+        let sent = requests(&r);
+        assert!(matches!(
+            &sent[0],
+            ToWorker::RemoveFromPlaylist { uuid, track_id } if uuid == "a1" && *track_id == 7
+        ));
+
+        r.to_app
+            .send(FromWorker::PlaylistTrackRemoved {
+                uuid: "a1".into(),
+                track_id: 7,
+            })
+            .expect("the rigged channel is open");
+        r.app.drain_worker();
+        assert_eq!(r.app.playlist_tracks.len(), 1);
+        assert_eq!(r.app.playlist_tracks[0].id, 8);
+        assert_eq!(r.app.playlist_tracks_paging.total, 1);
+    }
+
+    #[test]
+    fn a_removal_that_lands_after_the_listener_has_moved_on_changes_nothing() {
+        // Goal: the reply names the playlist it belongs to. Without that guard a
+        // removal answered late would take a row out of whichever playlist is
+        // open now, which is a track the listener never asked to lose.
+        let mut r = with_playlists();
+        r.app.open_playlist = Some(("b2".into(), "Evening".into()));
+        r.app.playlist_tracks = vec![track(7, "So What", "Miles")];
+        r.to_app
+            .send(FromWorker::PlaylistTrackRemoved {
+                uuid: "a1".into(),
+                track_id: 7,
+            })
+            .expect("the rigged channel is open");
+        r.app.drain_worker();
+        assert_eq!(
+            r.app.playlist_tracks.len(),
+            1,
+            "a different playlist is open"
+        );
+    }
+
+    #[test]
+    fn there_is_nothing_to_remove_outside_a_playlist() {
+        // Goal: `X` in the favorites has no honest meaning - taking a track off
+        // the favorites is what `f` does - so it says so rather than guessing.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "T", "A")];
+        r.app.view = View::Favorites;
+        let _ = requests(&r);
+        r.app.on_key(key('X'));
+        assert_eq!(r.app.mode, Mode::Normal, "no question was opened");
+        assert!(requests(&r).is_empty());
+        assert!(r.app.notice.clone().unwrap_or_default().contains("removed"));
+    }
+
+    #[test]
+    fn adding_a_track_asks_which_playlist_and_sends_the_one_chosen() {
+        // Goal: the playlist being added to is usually not the one on screen, so
+        // there is no target the interface could guess. The picker is the whole
+        // point, and the track it carries is the highlighted one.
+        let mut r = with_playlists();
+        r.app.view = View::Favorites;
+        r.app.favorites = vec![track(1, "One", "A"), track(2, "Two", "A")];
+        r.app.selected = 1;
+
+        r.app.on_key(key('a'));
+        assert_eq!(r.app.mode, Mode::AddTo);
+        assert!(requests(&r).is_empty(), "opening it asks for nothing");
+
+        r.app.on_key(key('j'));
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.mode, Mode::Normal);
+        let sent = requests(&r);
+        assert!(
+            matches!(
+                &sent[0],
+                ToWorker::AddToPlaylist { uuid, title, track_id }
+                    if uuid == "b2" && title == "Evening" && *track_id == 2
+            ),
+            "the second playlist and the highlighted track"
+        );
+    }
+
+    #[test]
+    fn the_picker_adds_to_the_playlist_that_was_clicked() {
+        // Goal: a key press and a click run the same method, so the row under
+        // the pointer is the row that is chosen.
+        let mut r = with_playlists();
+        r.app.view = View::Favorites;
+        r.app.favorites = vec![track(1, "One", "A")];
+        r.app.on_key(key('a'));
+        r.app.add_rows = vec![(
+            Rect {
+                x: 0,
+                y: 3,
+                width: 20,
+                height: 1,
+            },
+            1,
+        )];
+        r.app.on_mouse(click(4, 3));
+        let sent = requests(&r);
+        assert!(matches!(
+            &sent[0],
+            ToWorker::AddToPlaylist { uuid, .. } if uuid == "b2"
+        ));
+    }
+
+    #[test]
+    fn backing_out_of_the_picker_adds_nothing() {
+        // Goal: Esc cancels, as it does in the other two pickers, and the track
+        // it was holding is let go so a later Enter cannot send it.
+        let mut r = with_playlists();
+        r.app.view = View::Favorites;
+        r.app.favorites = vec![track(1, "One", "A")];
+        r.app.on_key(key('a'));
+        r.app.on_key(code(KeyCode::Esc));
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(requests(&r).is_empty());
+
+        r.app.set_mode_for_test(Mode::AddTo);
+        r.app.on_key(code(KeyCode::Enter));
+        assert!(requests(&r).is_empty(), "there is no track pending");
+    }
+
+    #[test]
+    fn the_picker_fetches_the_playlists_if_it_has_none_to_show() {
+        // Goal: somebody who has never opened the playlists tab has none loaded.
+        // An empty picker would say they have no playlists, which is not true.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "One", "A")];
+        r.app.view = View::Favorites;
+        let _ = requests(&r);
+        r.app.on_key(key('a'));
+        assert!(
+            requests(&r)
+                .iter()
+                .any(|q| matches!(q, ToWorker::LoadPlaylists { offset: 0, .. })),
+            "it asks rather than showing an empty list as the truth"
+        );
+    }
+
+    #[test]
+    fn adding_a_track_is_reported_because_nothing_on_screen_would_show_it() {
+        // Goal: the one success that is announced. A favorite fills a heart the
+        // listener is looking at; this changes a playlist they are not, so the
+        // notice is the only confirmation there is.
+        let mut r = with_playlists();
+        r.to_app
+            .send(FromWorker::PlaylistTrackAdded {
+                title: "Evening".into(),
+            })
+            .expect("the rigged channel is open");
+        r.app.drain_worker();
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("Evening"), "{notice}");
+    }
+
+    #[test]
+    fn every_playlist_control_is_wired_to_the_same_method_its_key_runs() {
+        // Goal: `Hit` is the contract between the renderer and the input layer,
+        // and a variant wired to nothing compiles into a dead button. Each of
+        // these is reached from the reference overlay, which is the only place
+        // the mouse can get at them.
+        let mut r = with_playlists();
+        let fire = |app: &mut App, mode: Mode, h: Hit| {
+            app.set_mode_for_test(mode);
+            app.hits = vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                },
+                h,
+            )];
+            app.on_mouse(click(1, 0));
+        };
+
+        fire(&mut r.app, Mode::Normal, Hit::NewPlaylist);
+        assert_eq!(r.app.mode, Mode::Prompt);
+        fire(&mut r.app, Mode::Prompt, Hit::CancelPrompt);
+        assert_eq!(r.app.mode, Mode::Normal);
+
+        fire(&mut r.app, Mode::Normal, Hit::RenamePlaylist);
+        assert_eq!(r.app.mode, Mode::Prompt);
+        assert_eq!(r.app.prompt_text, "Morning");
+        fire(&mut r.app, Mode::Prompt, Hit::SubmitPrompt);
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(requests(&r).iter().any(|q| matches!(
+            q,
+            ToWorker::RenamePlaylist { uuid, .. } if uuid == "a1"
+        )));
+
+        fire(&mut r.app, Mode::Normal, Hit::RemoveSelected);
+        assert_eq!(r.app.mode, Mode::Confirm);
+        fire(&mut r.app, Mode::Confirm, Hit::ConfirmNo);
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(requests(&r).is_empty(), "no is no");
+
+        fire(&mut r.app, Mode::Normal, Hit::RemoveSelected);
+        fire(&mut r.app, Mode::Confirm, Hit::ConfirmYes);
+        assert!(requests(&r).iter().any(|q| matches!(
+            q,
+            ToWorker::DeletePlaylist { uuid, .. } if uuid == "a1"
+        )));
+
+        r.app.view = View::Favorites;
+        r.app.favorites = vec![track(1, "One", "A")];
+        r.app.selected = 0;
+        fire(&mut r.app, Mode::Normal, Hit::AddToPlaylist);
+        assert_eq!(r.app.mode, Mode::AddTo);
+    }
+
+    #[test]
+    fn a_playlist_name_can_be_pasted_as_well_as_typed() {
+        // Goal: the name box is a text field, and the only other one that takes
+        // a paste is the sign-in box. A field that took keystrokes but not a
+        // paste would be an inconsistency nobody could guess at, and the bound
+        // has to hold on this path too.
+        let mut r = with_playlists();
+        r.app.on_key(key('N'));
+        r.app.on_paste("  Late night  ");
+        assert_eq!(r.app.prompt_text, "Late night");
+
+        r.app.on_paste(&"x".repeat(PLAYLIST_NAME_MAX * 2));
+        assert_eq!(r.app.prompt_text.chars().count(), PLAYLIST_NAME_MAX);
+    }
+
+    #[test]
+    fn a_typed_name_stops_growing_at_the_bound() {
+        // Goal: the box grows from keystrokes and nothing else would stop it.
+        let mut r = with_playlists();
+        r.app.on_key(key('N'));
+        for _ in 0..(PLAYLIST_NAME_MAX + 50) {
+            r.app.on_key(key('x'));
+        }
+        assert_eq!(r.app.prompt_text.chars().count(), PLAYLIST_NAME_MAX);
     }
 }

@@ -34,6 +34,57 @@ pub mod mpd;
 const API: &str = "https://api.tidal.com";
 const UA: &str = concat!("priel/", env!("CARGO_PKG_VERSION"));
 
+/// Rows one scan of a playlist's items asks for, looking for a track's position.
+const PLAYLIST_ITEMS_PAGE: u32 = 500;
+
+/// How many such scans one removal makes before giving up.
+///
+/// A bound rather than "until the end" because the listing is external input
+/// and a service that kept answering would keep this loop running. Twenty pages
+/// reaches ten thousand tracks, which is past the longest playlist the vendor
+/// will store.
+const PLAYLIST_SCANS_MAX: u32 = 20;
+
+/// The digits a percent-escape is written with.
+const HEX: [char; 16] = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
+];
+
+/// Percent-encode a set of pairs as an HTML form body.
+///
+/// Written here rather than taken from a crate because it is fifteen lines and
+/// the only caller is the two playlist writes: a title is user-written text and
+/// may hold a space, an ampersand or an accent, any of which would otherwise
+/// arrive as a different title or as two fields.
+fn form_encode(pairs: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (key, value) in pairs {
+        if !out.is_empty() {
+            out.push('&');
+        }
+        out.push_str(key);
+        out.push('=');
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(char::from(byte));
+                }
+                b' ' => out.push('+'),
+                _ => {
+                    // Two hex digits, upper case, written straight in: the
+                    // encoding is defined on bytes, and formatting through a
+                    // temporary String to append two characters is waste on a
+                    // path a title with an accent takes for every one of them.
+                    out.push('%');
+                    out.push(HEX[usize::from(byte >> 4)]);
+                    out.push(HEX[usize::from(byte & 0x0f)]);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Requested audio quality tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quality {
@@ -206,6 +257,32 @@ struct FavTracksResp {
 #[derive(Deserialize)]
 struct ItemRow {
     item: TrackBrief,
+}
+/// One row of a playlist's *items* listing, read only for its position.
+///
+/// Deliberately not [`ItemRow`]: this one is asked what number a row is, not
+/// what is on it, so every field is optional. A playlist whose contents cannot
+/// be parsed is a playlist a track cannot be removed from, and a sparse row is
+/// not a good enough reason to refuse that.
+#[derive(Deserialize)]
+struct PlaylistItemRow {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    item: PlaylistItemId,
+}
+#[derive(Deserialize, Default)]
+struct PlaylistItemId {
+    #[serde(default)]
+    id: u64,
+}
+
+/// What a caller must hold before it may change a playlist.
+struct PlaylistState {
+    /// The description as it stands, which a rename has to send back unchanged.
+    description: String,
+    /// The service's concurrency token for this playlist's contents.
+    token: String,
 }
 #[derive(Deserialize)]
 struct TrackBrief {
@@ -652,6 +729,68 @@ impl Client {
         })
     }
 
+    /// A PUT that renews the session the way a GET does.
+    ///
+    /// Everything this verb is used for here carries its arguments in the query
+    /// string, so there is no body parameter to go with it.
+    fn put_authed(&mut self, url: &str, query: &[(&str, &str)]) -> Result<Response<Body>> {
+        self.send_authed(|http, token| {
+            let mut req = http
+                .put(url)
+                .header("Authorization", format!("Bearer {token}"));
+            for (k, v) in query {
+                req = req.query(*k, *v);
+            }
+            Ok(req.send_empty()?)
+        })
+    }
+
+    /// A change of a playlist's contents, sent under a concurrency token.
+    ///
+    /// The token is the whole reason this is not `post_form_authed`. The
+    /// service will only apply a change to a playlist whose contents still look
+    /// the way they did when the caller last read them, and it spells that
+    /// condition `If-None-Match` - the header's usual meaning inverted, which
+    /// is why the name says what it is *for* rather than what it sends.
+    fn post_form_guarded(
+        &mut self,
+        url: &str,
+        query: &[(&str, &str)],
+        form: &str,
+        token: &str,
+    ) -> Result<Response<Body>> {
+        self.send_authed(|http, bearer| {
+            let mut req = http
+                .post(url)
+                .header("Authorization", format!("Bearer {bearer}"))
+                .header("If-None-Match", token)
+                .content_type("application/x-www-form-urlencoded");
+            for (k, v) in query {
+                req = req.query(*k, *v);
+            }
+            Ok(req.send(form)?)
+        })
+    }
+
+    /// A DELETE sent under a concurrency token. See [`Self::post_form_guarded`].
+    fn delete_guarded(
+        &mut self,
+        url: &str,
+        query: &[(&str, &str)],
+        token: &str,
+    ) -> Result<Response<Body>> {
+        self.send_authed(|http, bearer| {
+            let mut req = http
+                .delete(url)
+                .header("Authorization", format!("Bearer {bearer}"))
+                .header("If-None-Match", token);
+            for (k, v) in query {
+                req = req.query(*k, *v);
+            }
+            Ok(req.call()?)
+        })
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
     }
@@ -991,6 +1130,244 @@ impl Client {
         Ok(())
     }
 
+    /// Make a new, empty playlist and hand it back.
+    ///
+    /// Unlike every other write here this one answers with something, because
+    /// the caller cannot name what it just made: the uuid is the service's to
+    /// choose, and without it the new playlist cannot be opened, renamed or
+    /// added to. The listing the caller is showing is stale either way, so the
+    /// row comes back rather than the caller being told to reload to find it.
+    ///
+    /// A playlist is created at the top level. The service files playlists into
+    /// folders and takes a folder here; priel shows no folders, so it always
+    /// says the root one rather than exposing a concept it does not display.
+    ///
+    /// # Errors
+    /// If [`Self::connect`] has not run, on a transport failure, on a
+    /// non-success status, or if the answer carries no playlist.
+    pub fn create_playlist(&mut self, title: &str) -> Result<Playlist> {
+        // The one call in this crate on the newer API. The older one still
+        // creates a playlist, but only the newer one files it, and a playlist
+        // that is in no folder is one the vendor's own clients do not list.
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(default)]
+            data: Option<PlaylistBrief>,
+        }
+
+        let sess = self.session()?.clone();
+        let url = self.url("/v2/my-collection/playlists/folders/create-playlist");
+        let mut resp = self.put_authed(
+            &url,
+            &[
+                ("countryCode", sess.country_code.as_str()),
+                ("folderId", "root"),
+                ("name", title),
+                ("description", ""),
+            ],
+        )?;
+        Self::accepted("create playlist", &mut resp)?;
+        let r: R = resp.body_mut().read_json()?;
+        let brief = r
+            .data
+            .ok_or_else(|| anyhow!("create playlist: the service made no playlist"))?;
+        Ok(brief.into_playlist())
+    }
+
+    /// Give a playlist a new title.
+    ///
+    /// **The service has no rename.** It has an edit that replaces every field
+    /// it is sent, so a request carrying only a title erases whatever
+    /// description the playlist had. This reads the current one back and sends
+    /// it again, which is why a rename costs two round trips. That belongs here
+    /// rather than in every caller: a frontend asked the user for a title, and
+    /// nothing about the title it was given says a description exists.
+    ///
+    /// # Errors
+    /// If [`Self::connect`] has not run, on a transport failure, or on a
+    /// non-success status from either request.
+    pub fn rename_playlist(&mut self, uuid: &str, title: &str) -> Result<()> {
+        let country = self.session()?.country_code.clone();
+        let held = self.playlist_state(uuid)?;
+        let url = self.url(&format!("/v1/playlists/{uuid}"));
+        let form = form_encode(&[("title", title), ("description", &held.description)]);
+        let mut resp = self.post_form_authed(&url, &[("countryCode", country.as_str())], &form)?;
+        Self::accepted("rename playlist", &mut resp)
+    }
+
+    /// Delete a playlist.
+    ///
+    /// **This cannot be undone from here, and the service offers no way back.**
+    /// A caller that shows the result before the reply arrives is showing
+    /// something it cannot put back if the answer is no; unlike a favorite,
+    /// this one is worth waiting for.
+    ///
+    /// # Errors
+    /// If [`Self::connect`] has not run, on a transport failure, or on a
+    /// non-success status.
+    pub fn delete_playlist(&mut self, uuid: &str) -> Result<()> {
+        let country = self.session()?.country_code.clone();
+        let url = self.url(&format!("/v1/playlists/{uuid}"));
+        let mut resp = self.delete_authed(&url, &[("countryCode", country.as_str())])?;
+        Self::accepted("delete playlist", &mut resp)
+    }
+
+    /// Put a track at the end of a playlist.
+    ///
+    /// One track, though the endpoint takes a list and this sends a list of
+    /// one - the same shape [`Self::set_favorite_track`] has, and for the same
+    /// reason: no caller here has more than one, and a list would make every
+    /// one of them build a vector to say so.
+    ///
+    /// A track already in the playlist is left alone rather than added twice.
+    ///
+    /// # Errors
+    /// If [`Self::connect`] has not run, on a transport failure, or on a
+    /// non-success status from either request. A playlist edited elsewhere
+    /// since it was read is refused rather than overwritten.
+    pub fn add_track_to_playlist(&mut self, uuid: &str, track_id: u64) -> Result<()> {
+        let country = self.session()?.country_code.clone();
+        let held = self.playlist_state(uuid)?;
+        let url = self.url(&format!("/v1/playlists/{uuid}/items"));
+        let form = form_encode(&[
+            ("trackIds", &track_id.to_string()),
+            // A track the catalogue has withdrawn is skipped rather than failing
+            // the request, and a track already there is not doubled.
+            ("onArtifactNotFound", "SKIP"),
+            ("onDupes", "SKIP"),
+        ]);
+        let mut resp = self.post_form_guarded(
+            &url,
+            &[("countryCode", country.as_str())],
+            &form,
+            &held.token,
+        )?;
+        Self::accepted("add to playlist", &mut resp)
+    }
+
+    /// Take a track out of a playlist.
+    ///
+    /// **The service removes by position, not by track.** The position is
+    /// looked up here rather than taken from the caller, and that is the whole
+    /// point of this method: a frontend holds a filtered, partly-loaded view of
+    /// a playlist, so any index it could offer is an index into something other
+    /// than the playlist. Passing one in is how the wrong track gets deleted.
+    ///
+    /// A playlist holding the same track twice loses the first copy.
+    ///
+    /// # Errors
+    /// If [`Self::connect`] has not run, on a transport failure, on a
+    /// non-success status, or if the playlist does not hold that track - which
+    /// is an error rather than a silent success, because the caller believed it
+    /// did and is about to say so on screen.
+    pub fn remove_track_from_playlist(&mut self, uuid: &str, track_id: u64) -> Result<()> {
+        let country = self.session()?.country_code.clone();
+        let held = self.playlist_state(uuid)?;
+        let position = self
+            .playlist_position(uuid, track_id)?
+            .ok_or_else(|| anyhow!("track {track_id} is not in this playlist"))?;
+        let url = self.url(&format!("/v1/playlists/{uuid}/items/{position}"));
+        let mut resp =
+            self.delete_guarded(&url, &[("countryCode", country.as_str())], &held.token)?;
+        Self::accepted("remove from playlist", &mut resp)
+    }
+
+    /// Read back what a caller has to know before it may change a playlist.
+    ///
+    /// Both facts come from the one request because both have the same shelf
+    /// life: the description is what a rename must not erase, and the token is
+    /// what the service checks before applying a change of contents.
+    fn playlist_state(&mut self, uuid: &str) -> Result<PlaylistState> {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(default)]
+            description: String,
+        }
+
+        let country = self.session()?.country_code.clone();
+        let url = self.url(&format!("/v1/playlists/{uuid}"));
+        let mut resp = self.get_authed(&url, &[("countryCode", country.as_str())])?;
+        Self::accepted("read playlist", &mut resp)?;
+        let token = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let r: R = resp.body_mut().read_json()?;
+        Ok(PlaylistState {
+            description: r.description,
+            token,
+        })
+    }
+
+    /// Where a track sits in a playlist, counting from zero, if it is there.
+    ///
+    /// Counted over the *items* listing rather than the tracks one, because the
+    /// positions the service deletes by count everything a playlist can hold. A
+    /// playlist with a video in it renumbers every track after that video, and
+    /// counting only the tracks would delete the wrong row from exactly the
+    /// playlists whose owner would least expect it.
+    fn playlist_position(&mut self, uuid: &str, track_id: u64) -> Result<Option<u32>> {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(default)]
+            items: Vec<PlaylistItemRow>,
+            #[serde(rename = "totalNumberOfItems", default)]
+            total_number_of_items: u32,
+        }
+
+        let country = self.session()?.country_code.clone();
+        let url = self.url(&format!("/v1/playlists/{uuid}/items"));
+        let mut offset = 0u32;
+        for _ in 0..PLAYLIST_SCANS_MAX {
+            let (off, lim) = (offset.to_string(), PLAYLIST_ITEMS_PAGE.to_string());
+            let mut resp = self.get_authed(
+                &url,
+                &[
+                    ("countryCode", country.as_str()),
+                    ("limit", lim.as_str()),
+                    ("offset", off.as_str()),
+                ],
+            )?;
+            Self::accepted("read playlist items", &mut resp)?;
+            let r: R = resp.body_mut().read_json()?;
+            if r.items.is_empty() {
+                return Ok(None);
+            }
+            for (nth, row) in r.items.iter().enumerate() {
+                // The kind is checked as well as the id: a video and a track can
+                // wear the same number, and they are different rows.
+                if row.item.id == track_id && !row.kind.eq_ignore_ascii_case("video") {
+                    let seen = u32::try_from(nth).unwrap_or(u32::MAX);
+                    return Ok(Some(offset.saturating_add(seen)));
+                }
+            }
+            offset = offset.saturating_add(PLAYLIST_ITEMS_PAGE);
+            if offset >= r.total_number_of_items {
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Turn a non-success answer into an error carrying the reason.
+    ///
+    /// Shared by the writes because the reason is always in the body: "not
+    /// yours", "no longer exists", and the refusal that means the playlist has
+    /// changed since it was read. Reporting only the status would throw away
+    /// the one sentence the user could act on.
+    fn accepted(what: &str, resp: &mut Response<Body>) -> Result<()> {
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let status = resp.status();
+        bail!(
+            "{what} -> HTTP {status}: {}",
+            resp.body_mut().read_to_string().unwrap_or_default()
+        )
+    }
+
     /// Resolve a track to a playable source at the requested quality.
     ///
     /// # Errors
@@ -1068,24 +1445,38 @@ mod tests {
         seen: Receiver<Req>,
     }
 
-    /// One request the stub saw: the request line, and the body that followed.
+    /// One request the stub saw: the request line, the body that followed, and
+    /// the concurrency token it carried.
     ///
     /// The body is read rather than skipped for two reasons. A write is only
     /// verifiable if what it carried can be asserted - the id of the track being
     /// favorited travels in the body, not the URL - and closing a socket that
     /// still has unread bytes in it resets the connection, which can lose the
     /// answer the client is in the middle of reading.
+    ///
+    /// `if_none_match` is here for the same reason the body is. A playlist's
+    /// contents may only be changed under the token from a fresh read of it, so
+    /// a test that asserted only the verb, the path and the body would pass a
+    /// write that had dropped the token - and dropping it is how one client
+    /// silently overwrites another's edit.
     struct Req {
         line: String,
         body: String,
+        if_none_match: Option<String>,
     }
 
+    /// Serve canned responses in order, tagging each with an `ETag` of its own.
+    ///
+    /// The tag names the *answer*, not the stub, so a test can say which read a
+    /// token came from. A single fixed tag would be satisfied by a client that
+    /// had hard-coded one, which is the bug worth catching: the token has to be
+    /// the one the service just handed back.
     fn stub(responses: Vec<(u16, String)>) -> Stub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         let (tx, seen) = mpsc::channel();
         thread::spawn(move || {
-            for (code, body) in responses {
+            for (nth, (code, body)) in responses.into_iter().enumerate() {
                 let Ok((mut sock, _)) = listener.accept() else {
                     return;
                 };
@@ -1093,6 +1484,7 @@ mod tests {
                 let mut line = String::new();
                 let _ = reader.read_line(&mut line);
                 let mut length = 0usize;
+                let mut if_none_match = None;
                 loop {
                     let mut header = String::new();
                     match reader.read_line(&mut header) {
@@ -1102,6 +1494,13 @@ mod tests {
                             let lower = header.to_ascii_lowercase();
                             if let Some(v) = lower.strip_prefix("content-length:") {
                                 length = v.trim().parse().unwrap_or(0);
+                            }
+                            // Matched on the lowercased name but taken from the
+                            // line as sent, since the token's own case matters.
+                            if lower.starts_with("if-none-match:")
+                                && let Some((_, v)) = header.split_once(':')
+                            {
+                                if_none_match = Some(v.trim().to_string());
                             }
                         }
                     }
@@ -1113,10 +1512,12 @@ mod tests {
                 let _ = tx.send(Req {
                     line: line.trim().to_string(),
                     body: String::from_utf8_lossy(&sent).to_string(),
+                    if_none_match,
                 });
                 let resp = format!(
                     "HTTP/1.1 {code} S\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                     ETag: \"{}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    etag_of(nth),
                     body.len()
                 );
                 let _ = sock.write_all(resp.as_bytes());
@@ -1124,6 +1525,11 @@ mod tests {
             }
         });
         Stub { base, seen }
+    }
+
+    /// The `ETag` the stub sends with its `nth` answer, counting from zero.
+    fn etag_of(nth: usize) -> String {
+        format!("answer-{nth}")
     }
 
     fn client(s: &Stub) -> Client {
@@ -1585,6 +1991,256 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("connect"), "{err}");
+    }
+
+    // ---- playlist writes ----
+
+    #[test]
+    fn creating_a_playlist_names_it_and_hands_back_what_was_made() {
+        // Goal: the caller has to be able to open what it just made, so the
+        // uuid the service chose has to come back out. The name travels in the
+        // query string on this one, not in a body, and it is the whole request -
+        // a test that checked only the path would pass an empty playlist.
+        let s = stub(vec![
+            ok(SESSION),
+            ok(r#"{"data":{"uuid":"new-1","title":"Evening","numberOfTracks":0}}"#),
+        ]);
+        let made = connected(&s)
+            .create_playlist("Evening")
+            .expect("the playlist should be created");
+        assert_eq!(made.uuid, "new-1", "the caller has to be able to open it");
+        assert_eq!(made.title, "Evening");
+
+        let _ = s.seen.recv().expect("session");
+        let req = s.seen.recv().expect("create");
+        assert!(
+            req.line
+                .starts_with("PUT /v2/my-collection/playlists/folders/create-playlist"),
+            "{}",
+            req.line
+        );
+        assert!(req.line.contains("name=Evening"), "{}", req.line);
+        assert!(
+            req.line.contains("folderId=root"),
+            "a new playlist belongs at the top level: {}",
+            req.line
+        );
+    }
+
+    #[test]
+    fn renaming_a_playlist_keeps_the_description_it_already_had() {
+        // Goal: the service has no rename. It has an edit that replaces every
+        // field it is sent, so a rename that sent only the title would silently
+        // erase a description the user had written. The current one has to be
+        // read back and sent again, and nothing above this may need to know.
+        let s = stub(vec![
+            ok(SESSION),
+            ok(r#"{"uuid":"abc","title":"Old","description":"songs for the drive"}"#),
+            ok("{}"),
+        ]);
+        connected(&s)
+            .rename_playlist("abc", "New")
+            .expect("the rename should succeed");
+
+        let _ = s.seen.recv().expect("session");
+        let read = s.seen.recv().expect("read");
+        assert!(
+            read.line.starts_with("GET /v1/playlists/abc"),
+            "{}",
+            read.line
+        );
+        let write = s.seen.recv().expect("write");
+        assert!(
+            write.line.starts_with("POST /v1/playlists/abc"),
+            "{}",
+            write.line
+        );
+        assert!(write.body.contains("title=New"), "{}", write.body);
+        assert!(
+            write.body.contains("songs+for+the+drive")
+                || write.body.contains("songs%20for%20the%20drive"),
+            "the description has to survive a rename: {:?}",
+            write.body
+        );
+    }
+
+    #[test]
+    fn deleting_a_playlist_asks_for_that_one_playlist() {
+        // Goal: the one call here that cannot be taken back. It must name the
+        // playlist in the path and must not be confusable with the call that
+        // empties one - so the assertion pins the whole line, not a prefix of it.
+        let s = stub(vec![ok(SESSION), (204, String::new())]);
+        connected(&s)
+            .delete_playlist("abc")
+            .expect("the delete should succeed");
+
+        let _ = s.seen.recv().expect("session");
+        let req = s.seen.recv().expect("delete");
+        assert!(
+            req.line.starts_with("DELETE /v1/playlists/abc"),
+            "{}",
+            req.line
+        );
+        assert!(
+            !req.line.contains("/items"),
+            "deleting the playlist is not emptying it: {}",
+            req.line
+        );
+    }
+
+    #[test]
+    fn adding_a_track_carries_the_token_from_the_read_that_preceded_it() {
+        // Goal: a playlist's contents may only be changed under the token from a
+        // fresh read of that playlist. The write has to carry the tag the read
+        // just answered with - the stub tags each answer differently, so a
+        // hard-coded or stale token fails here - and the track travels in the
+        // body, which is the same trap the favorites write had.
+        let s = stub(vec![ok(SESSION), ok(r#"{"uuid":"abc"}"#), ok("{}")]);
+        connected(&s)
+            .add_track_to_playlist("abc", 42)
+            .expect("the add should succeed");
+
+        let _ = s.seen.recv().expect("session");
+        let read = s.seen.recv().expect("read");
+        assert!(
+            read.line.starts_with("GET /v1/playlists/abc"),
+            "{}",
+            read.line
+        );
+        let write = s.seen.recv().expect("write");
+        assert!(
+            write.line.starts_with("POST /v1/playlists/abc/items"),
+            "{}",
+            write.line
+        );
+        assert_eq!(
+            write.if_none_match.as_deref(),
+            Some(format!("\"{}\"", etag_of(1)).as_str()),
+            "the write has to carry the token the read answered with"
+        );
+        assert!(
+            write.body.contains("trackIds=42"),
+            "the track has to be in the body: {:?}",
+            write.body
+        );
+    }
+
+    #[test]
+    fn removing_a_track_finds_where_it_sits_before_deleting_anything() {
+        // Goal: the service removes by *position*, not by track id, so the
+        // position has to be looked up first. Getting this wrong deletes a
+        // different track than the one asked for, which is the worst failure in
+        // this crate - hence a listing where the wanted track is neither first
+        // nor last, so an off-by-one cannot pass.
+        let items = r#"{"totalNumberOfItems":3,"items":[
+            {"type":"track","item":{"id":11}},
+            {"type":"track","item":{"id":42}},
+            {"type":"track","item":{"id":13}}]}"#;
+        let s = stub(vec![
+            ok(SESSION),
+            ok(r#"{"uuid":"abc"}"#),
+            ok(items),
+            ok("{}"),
+        ]);
+        connected(&s)
+            .remove_track_from_playlist("abc", 42)
+            .expect("the removal should succeed");
+
+        let _ = s.seen.recv().expect("session");
+        let _ = s.seen.recv().expect("read");
+        let scan = s.seen.recv().expect("scan");
+        assert!(
+            scan.line.starts_with("GET /v1/playlists/abc/items"),
+            "positions come from the items listing, which counts videos too: {}",
+            scan.line
+        );
+        let write = s.seen.recv().expect("write");
+        assert!(
+            write.line.starts_with("DELETE /v1/playlists/abc/items/1 ")
+                || write.line.starts_with("DELETE /v1/playlists/abc/items/1?"),
+            "the track sits at position 1, not 0 and not 42: {}",
+            write.line
+        );
+        assert_eq!(
+            write.if_none_match.as_deref(),
+            Some(format!("\"{}\"", etag_of(1)).as_str()),
+            "a removal is a change of contents and needs the token too"
+        );
+    }
+
+    #[test]
+    fn removing_a_track_the_playlist_does_not_hold_deletes_nothing() {
+        // Goal: the negative space, and it is the dangerous one. Position 0 is
+        // what a "not found" would collapse to if the lookup returned a number
+        // rather than an absence, and that would delete the wrong track every
+        // time. Nothing may go out at all.
+        let items = r#"{"totalNumberOfItems":1,"items":[{"type":"track","item":{"id":11}}]}"#;
+        let s = stub(vec![ok(SESSION), ok(r#"{"uuid":"abc"}"#), ok(items)]);
+        let err = connected(&s)
+            .remove_track_from_playlist("abc", 42)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not in"), "say what was wrong: {err}");
+
+        let _ = s.seen.recv().expect("session");
+        let _ = s.seen.recv().expect("read");
+        let _ = s.seen.recv().expect("scan");
+        assert!(
+            s.seen.try_recv().is_err(),
+            "nothing may be deleted when the track was never there"
+        );
+    }
+
+    #[test]
+    fn a_refused_playlist_change_comes_back_as_an_error() {
+        // Goal: every one of these is shown to the user as having happened
+        // before the reply arrives, so a refusal that read as success would
+        // leave the interface believing an edit the account never took.
+        let s = stub(vec![ok(SESSION), (403, "not yours".into())]);
+        let err = connected(&s).delete_playlist("abc").unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+        assert!(err.to_string().contains("not yours"), "{err}");
+        assert_eq!(Fault::of(&err), Fault::Refused);
+    }
+
+    #[test]
+    fn a_playlist_edit_refuses_to_run_before_connect() {
+        // Goal: every one of these interpolates the country code, and creating
+        // one interpolates the user's own listing. Without a session they would
+        // go out malformed and come back as a puzzling 404.
+        let s = stub(vec![]);
+        for err in [
+            client(&s).create_playlist("x").unwrap_err().to_string(),
+            client(&s)
+                .rename_playlist("abc", "x")
+                .unwrap_err()
+                .to_string(),
+            client(&s).delete_playlist("abc").unwrap_err().to_string(),
+            client(&s)
+                .add_track_to_playlist("abc", 1)
+                .unwrap_err()
+                .to_string(),
+            client(&s)
+                .remove_track_from_playlist("abc", 1)
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(err.contains("connect"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_title_is_encoded_so_it_cannot_become_a_second_field() {
+        // Goal: a playlist title is text the user typed, and it goes into a form
+        // body where `&` separates fields and `=` separates a name from a value.
+        // Sent raw, a title holding either one arrives as a different title or
+        // as an extra field - "Rock & Roll" would set `description` to " Roll"
+        // and quietly erase the real one.
+        let encoded = form_encode(&[("title", "Rock & Roll = 100%"), ("description", "café")]);
+        assert_eq!(
+            encoded, "title=Rock+%26+Roll+%3D+100%25&description=caf%C3%A9",
+            "separators must not survive, and non-ASCII goes out as UTF-8 bytes"
+        );
     }
 
     // ---- stream resolution ----

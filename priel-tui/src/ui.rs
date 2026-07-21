@@ -75,6 +75,257 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let area = f.area();
         login_overlay(f, app, area);
     }
+    if app.mode == Mode::AddTo {
+        add_to_overlay(f, f.area(), app);
+    }
+    if app.mode == Mode::Prompt {
+        let area = f.area();
+        prompt_overlay(f, app, area);
+    }
+    if app.mode == Mode::Confirm {
+        let area = f.area();
+        confirm_overlay(f, app, area);
+    }
+}
+
+/// The box a playlist name is typed into.
+///
+/// Modal like the consent screen, and for a milder version of the same reason:
+/// the keys being pressed are text, so anything behind this that answered to a
+/// letter would answer to the name being typed.
+fn prompt_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme();
+    let Some(question) = app.prompt_question() else {
+        return;
+    };
+    // Whatever the header and the bottom row registered this frame is behind
+    // this box; clearing before anything else means a terminal too short to
+    // draw the controls leaves nothing clickable rather than last frame's.
+    app.hits.clear();
+    let width = area.width.saturating_sub(4).min(64);
+    let height = 5u16.min(area.height);
+    let rect = centred(area, width, height);
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(t.surface())
+        .border_style(Style::default().fg(t.accent))
+        .title(format!(" {question} "));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+
+    // The tail rather than the head, and the same cursor glyph the paste box
+    // uses: a name longer than the box should show what is still being typed.
+    let room = usize::from(inner.width).saturating_sub(3);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ".to_string(), Style::default()),
+            Span::styled(tail(&app.prompt_text, room), Style::default().fg(t.text)),
+            Span::styled("▏".to_string(), Style::default().fg(t.accent)),
+        ])),
+        Rect { height: 1, ..inner },
+    );
+
+    if inner.height < 3 {
+        return;
+    }
+    let line = Rect {
+        y: inner.y.saturating_add(2),
+        height: 1,
+        ..inner
+    };
+    let dim = Style::default().fg(t.faint);
+    let key = Style::default().fg(t.accent);
+    let mut bar = ControlBar::new(line);
+    bar.label(" [", dim);
+    bar.button("Enter", Hit::SubmitPrompt, key);
+    bar.label("] save   [", dim);
+    bar.button("Esc", Hit::CancelPrompt, key);
+    bar.label("] cancel", dim);
+    app.hits.extend(bar.hits.iter().copied());
+    f.render_widget(Paragraph::new(Line::from(bar.spans)), line);
+}
+
+/// The question asked before something that cannot be taken back.
+///
+/// **Nothing outside the two controls answers it.** `App::on_mouse` swallows
+/// every other click while this is up, and the hit boxes are the only way in -
+/// so a click that lands on the prose, on the border, or on the list behind
+/// does nothing at all. The one control that destroys something is drawn in the
+/// error colour and says what it will destroy, rather than reading "OK".
+fn confirm_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme();
+    let Some(lines) = app.confirm_question() else {
+        return;
+    };
+    let verb = app.confirm_verb().unwrap_or("do it");
+    app.hits.clear();
+    let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let width = area.width.saturating_sub(4).min(64);
+    let height = rows.saturating_add(4).min(area.height);
+    let rect = centred(area, width, height);
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(t.surface())
+        // The error colour, not the accent: this box is the one place in priel
+        // where saying yes cannot be walked back.
+        .border_style(Style::default().fg(t.error))
+        .title(" Are you sure? ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+
+    let body: Vec<Line<'static>> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            // The first line names the thing; the rest say what it means.
+            let style = if i == 0 {
+                Style::default().fg(t.text)
+            } else {
+                Style::default().fg(t.muted)
+            };
+            Line::from(Span::styled(format!(" {text}"), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(body), inner);
+
+    let choices = rows.saturating_add(1);
+    if choices >= inner.height {
+        return; // too short to draw them, so there is nothing to click either
+    }
+    let line = Rect {
+        y: inner.y.saturating_add(choices),
+        height: 1,
+        ..inner
+    };
+    let dim = Style::default().fg(t.faint);
+    let mut bar = ControlBar::new(line);
+    bar.label(" [", dim);
+    bar.button("y", Hit::ConfirmYes, Style::default().fg(t.error));
+    bar.label(format!("] {verb}   ["), dim);
+    // Backing out is the easy one to reach, and the one every other key here
+    // already means.
+    bar.button("n", Hit::ConfirmNo, Style::default().fg(t.accent));
+    bar.label("] keep it   (Esc)", dim);
+    app.hits.extend(bar.hits.iter().copied());
+    f.render_widget(Paragraph::new(Line::from(bar.spans)), line);
+}
+
+/// The picker that chooses which playlist a track goes into.
+///
+/// The output picker's shape, windowed the same way and hit-boxed in the same
+/// left-to-right walk, so the gesture a listener already knows works here.
+fn add_to_overlay(f: &mut Frame, area: Rect, app: &mut App) {
+    let t = app.theme();
+    let width = area.width.saturating_sub(4).min(80);
+    let height = area.height.saturating_sub(2);
+    let rect = centred(area, width, height);
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(t.surface())
+        .border_style(Style::default().fg(t.accent))
+        .title(" Add to playlist ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    // Cleared before the early return, so a terminal too short to draw a row
+    // cannot leave the last frame's boxes behind to be clicked.
+    app.add_rows.clear();
+    if inner.height <= 1 {
+        return;
+    }
+
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    if app.playlists.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  Fetching your playlists…",
+                Style::default().fg(t.faint),
+            ))),
+            body,
+        );
+    } else {
+        add_to_rows(f, app, body);
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  j k move · g G ends · Enter add · click · Esc or q to close",
+            Style::default().fg(t.faint),
+        ))),
+        Rect {
+            y: inner.y + inner.height.saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+/// The picker's rows, windowed onto the selection.
+fn add_to_rows(f: &mut Frame, app: &mut App, body: Rect) {
+    let t = app.theme();
+    let total = app.playlists.len();
+    let h = body.height as usize;
+    let selected = app.add_selected_row();
+    if selected < app.add_offset {
+        app.add_offset = selected;
+    } else if selected >= app.add_offset + h {
+        app.add_offset = selected + 1 - h;
+    }
+    if app.add_offset >= total {
+        app.add_offset = 0;
+    }
+
+    let name_width = usize::from(body.width).saturating_sub(14);
+    let mut rows = Vec::new();
+    for (i, index) in (app.add_offset..(app.add_offset + h).min(total)).enumerate() {
+        let p = &app.playlists[index];
+        let text = format!(
+            "  {:name_width$}  {:>5} tracks",
+            trunc(&p.title, name_width),
+            p.num_tracks
+        );
+        let style = if index == selected {
+            t.selection()
+        } else {
+            Style::default()
+        };
+        let rect = Rect {
+            x: body.x,
+            y: body.y + u16::try_from(i).unwrap_or(u16::MAX),
+            width: body.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(text).style(style), rect);
+        rows.push((rect, index));
+    }
+    app.add_rows = rows;
+}
+
+/// A box of the given size in the middle of `area`.
+///
+/// Extracted because five overlays did the same arithmetic, and one of them
+/// getting it subtly wrong is a box that hangs off the edge of the terminal.
+fn centred(area: Rect, width: u16, height: u16) -> Rect {
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
 }
 
 /// The sign-in screen.
@@ -485,6 +736,24 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
         ],
     ),
     (
+        // Every one of these is reachable only from here with the mouse: none
+        // of them is common enough to earn width on the bottom row, and the
+        // reference is where an action that is not constantly used belongs.
+        "Playlists",
+        &[
+            row(&[("N", Some(Hit::NewPlaylist))], "new playlist"),
+            row(&[("R", Some(Hit::RenamePlaylist))], "rename this playlist"),
+            row(&[("a", Some(Hit::AddToPlaylist))], "add track to playlist"),
+            row(
+                &[("X", Some(Hit::RemoveSelected))],
+                "delete playlist / track",
+            ),
+            // The vocabulary again: `X` asks first, and this says so where the
+            // key is read rather than only where it is pressed.
+            row(&[("y", None), ("n", None)], "answer that question"),
+        ],
+    ),
+    (
         "Find",
         &[
             row(&[("/", Some(Hit::Filter))], "filter this list"),
@@ -542,39 +811,46 @@ fn help_column(
     sections: &[(&str, &[HelpRow])],
     hits: &mut Vec<(Rect, Hit)>,
     t: &Theme,
+    skip: usize,
 ) {
     let dim = Style::default().fg(t.faint);
-    let end = area.y.saturating_add(area.height);
-    let mut y = area.y;
+    // Laid out in content lines, drawn in screen rows. Every line is counted
+    // whether or not it is drawn - a header scrolled off the top still moves
+    // its own rows down - and a line outside the window registers no hit box,
+    // so a control that is not on screen does not answer to a click where it
+    // used to be.
+    let mut line = 0usize;
+    let place = |line: &mut usize| {
+        let at = *line;
+        *line = line.saturating_add(1);
+        let offset = at.checked_sub(skip)?;
+        let y = area
+            .y
+            .checked_add(u16::try_from(offset).unwrap_or(u16::MAX))?;
+        (y < area.y.saturating_add(area.height)).then_some(Rect {
+            y,
+            height: 1,
+            ..area
+        })
+    };
     for (i, (title, rows)) in sections.iter().enumerate() {
         if i > 0 {
-            y = y.saturating_add(1); // a blank line between sections
+            let _ = place(&mut line); // a blank line between sections
         }
-        if y >= end {
-            return;
+        if let Some(head) = place(&mut line) {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    (*title).to_string(),
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                ))),
+                head,
+            );
         }
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                (*title).to_string(),
-                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-            ))),
-            Rect {
-                y,
-                height: 1,
-                ..area
-            },
-        );
-        y = y.saturating_add(1);
         for r in *rows {
-            if y >= end {
-                return;
-            }
-            let line = Rect {
-                y,
-                height: 1,
-                ..area
+            let Some(row) = place(&mut line) else {
+                continue;
             };
-            let mut bar = ControlBar::new(line);
+            let mut bar = ControlBar::new(row);
             bar.label("  ", Style::default());
             for (n, (key, hit)) in r.keys.iter().enumerate() {
                 if n > 0 {
@@ -593,8 +869,7 @@ fn help_column(
             bar.label(" ".repeat(pad), Style::default());
             bar.label(r.what, dim);
             hits.extend(bar.hits.iter().copied());
-            f.render_widget(Paragraph::new(Line::from(bar.spans)), line);
-            y = y.saturating_add(1);
+            f.render_widget(Paragraph::new(Line::from(bar.spans)), row);
         }
     }
 }
@@ -1141,17 +1416,38 @@ fn help_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         height: inner.height.saturating_sub(1),
         ..inner
     };
+    // Clamped here because only the renderer knows how tall the box came out.
+    // `G` sets the scroll to its maximum and lets this decide what that is,
+    // which is the same trick `device_offset` uses.
+    let shown = usize::from(body.height);
+    let content = if stacked {
+        left + right + 1
+    } else {
+        left.max(right)
+    };
+    let furthest = content.saturating_sub(shown);
+    app.help_scroll = app.help_scroll.min(furthest);
+    let skip = app.help_scroll;
+
     let cols =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(body);
     let mut found = Vec::new();
-    help_column(f, cols[0], HELP_LEFT, &mut found, &t);
-    help_column(f, cols[1], HELP_RIGHT, &mut found, &t);
+    help_column(f, cols[0], HELP_LEFT, &mut found, &t, skip);
+    help_column(f, cols[1], HELP_RIGHT, &mut found, &t, skip);
     app.hits = found;
 
     if inner.height > 0 {
+        // The way out is always shown, and so is the way down when there is
+        // more below: a reference that silently ended would be a reference that
+        // silently lost bindings.
+        let footer = if furthest > 0 {
+            "  j k scroll · g G ends · press ?, Esc or q to close"
+        } else {
+            "  press ?, Esc or q to close"
+        };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  press ?, Esc or q to close",
+                footer,
                 Style::default().fg(t.faint),
             ))),
             Rect {
@@ -2635,10 +2931,6 @@ mod tests {
         assert!(out.contains("Keyboard and mouse"), "{out}");
         assert!(out.contains("to close"), "{out}");
         assert!(
-            out.contains("Mouse"),
-            "the mouse gestures are documented: {out}"
-        );
-        assert!(
             out.contains("choose the device"),
             "a binding that is not in here cannot be discovered: {out}"
         );
@@ -2646,6 +2938,50 @@ mod tests {
             !out.contains("Hidden Title"),
             "the list should be covered: {out}"
         );
+    }
+
+    #[test]
+    fn every_section_of_the_reference_is_reachable_on_a_short_terminal() {
+        // Goal: the reference holds more rows than a short terminal can show,
+        // and it is the only place several bindings are named. Clipping it would
+        // delete those bindings silently - the same failure that once lost `[q]`
+        // off the end of the bottom row - so it scrolls, and the last section
+        // has to be reachable by scrolling rather than merely below the fold.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let first = text(&mut sc.app, 100, 26);
+        assert!(first.contains("Views"), "the top is shown first: {first}");
+        assert!(
+            first.contains("j k scroll"),
+            "a reference with more below has to say so: {first}"
+        );
+
+        press(&mut sc.app, 'G');
+        let last = text(&mut sc.app, 100, 26);
+        assert!(
+            last.contains("Mouse"),
+            "the last section has to be reachable: {last}"
+        );
+        assert!(
+            last.contains("to close"),
+            "and the way out never scrolls away: {last}"
+        );
+
+        press(&mut sc.app, 'g');
+        let back = text(&mut sc.app, 100, 26);
+        assert_eq!(back, first, "g returns to exactly the top");
+    }
+
+    #[test]
+    fn a_terminal_tall_enough_for_the_whole_reference_is_not_told_to_scroll() {
+        // Goal: the negative space. The scroll hint costs width on the one line
+        // that must always carry the way out, so it appears only when there is
+        // something below to scroll to.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 100, 60);
+        assert!(out.contains("Mouse"), "it all fits at this height: {out}");
+        assert!(!out.contains("j k scroll"), "{out}");
     }
 
     #[test]
@@ -4060,5 +4396,150 @@ mod tests {
             per_frame * 10.0 * 100.0,
             per_frame * 30.0 * 100.0
         );
+    }
+
+    // ---- editing playlists ----
+
+    fn with_two_playlists(sc: &mut Screen) {
+        sc.app.playlists = vec![
+            priel_core::Playlist {
+                uuid: "a1".into(),
+                title: "Morning".into(),
+                num_tracks: 12,
+                duration_secs: 900,
+            },
+            priel_core::Playlist {
+                uuid: "b2".into(),
+                title: "Evening".into(),
+                num_tracks: 3,
+                duration_secs: 400,
+            },
+        ];
+        sc.app.view = View::Playlists;
+    }
+
+    #[test]
+    fn the_confirmation_names_what_it_will_destroy_and_says_it_is_final() {
+        // Goal: this is the one screen where saying yes cannot be walked back,
+        // so the question has to be checkable by the person answering it. A
+        // uuid, an index, or a bare "are you sure" would all be answered out of
+        // habit.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        press(&mut sc.app, 'X');
+        let out = text(&mut sc.app, 90, 26);
+        assert!(out.contains("Morning"), "it names the playlist: {out}");
+        assert!(
+            out.contains("no way to bring it back"),
+            "and says it is final: {out}"
+        );
+        assert!(
+            out.contains("delete it"),
+            "the control says what it does, not OK: {out}"
+        );
+        assert!(out.contains("keep it"), "and so does the other one: {out}");
+    }
+
+    #[test]
+    fn the_confirmations_controls_are_clickable_exactly_where_they_were_painted() {
+        // Goal: the hit box and the painted cells are built in one walk, so a
+        // click cannot land on "delete it" while the pointer is over "keep it".
+        // On this screen that difference is a playlist.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        press(&mut sc.app, 'X');
+        assert_eq!(painted(&mut sc.app, 90, 26, Hit::ConfirmYes), "y");
+        assert_eq!(painted(&mut sc.app, 90, 26, Hit::ConfirmNo), "n");
+    }
+
+    #[test]
+    fn a_confirmation_too_short_to_draw_its_controls_registers_none() {
+        // Goal: a control clipped off the box must not still answer to a click
+        // at the place it would have been - which on this screen would be a
+        // delete nobody could see they were agreeing to.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        press(&mut sc.app, 'X');
+        let _ = text(&mut sc.app, 90, 5);
+        assert!(
+            !sc.app.hits.iter().any(|(_, h)| *h == Hit::ConfirmYes),
+            "nothing was painted, so nothing may be clicked"
+        );
+    }
+
+    #[test]
+    fn the_name_prompt_shows_what_has_been_typed() {
+        // Goal: it is a text box, and a text box that does not echo is one
+        // nobody can check before pressing Enter.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        press(&mut sc.app, 'N');
+        for c in "Late night".chars() {
+            press(&mut sc.app, c);
+        }
+        let out = text(&mut sc.app, 90, 26);
+        assert!(out.contains("Name the new playlist"), "{out}");
+        assert!(out.contains("Late night"), "{out}");
+        assert_eq!(painted(&mut sc.app, 90, 26, Hit::SubmitPrompt), "Enter");
+    }
+
+    #[test]
+    fn the_picker_lists_the_playlists_a_track_can_go_into() {
+        // Goal: the choice has to be readable before it is made, and a row's hit
+        // box has to be the row that was drawn - adding a track to the wrong
+        // playlist is a mess somebody has to clean up by hand.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        sc.app.view = View::Favorites;
+        sc.app.favorites = vec![track(1, "One")];
+        press(&mut sc.app, 'a');
+        let out = text(&mut sc.app, 90, 26);
+        assert!(out.contains("Add to playlist"), "{out}");
+        assert!(out.contains("Morning"), "{out}");
+        assert!(out.contains("Evening"), "{out}");
+        assert!(
+            out.contains("Enter add"),
+            "it says what choosing does: {out}"
+        );
+
+        let rows = sc.app.add_rows.clone();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1].1, 1,
+            "the second box stands for the second playlist"
+        );
+    }
+
+    #[test]
+    fn the_picker_says_it_is_still_fetching_rather_than_showing_an_empty_list() {
+        // Goal: somebody who has never opened the playlists tab has none loaded,
+        // and an empty picker would read as "you have no playlists".
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "One")];
+        press(&mut sc.app, 'a');
+        let out = text(&mut sc.app, 90, 26);
+        assert!(out.contains("Fetching your playlists"), "{out}");
+        assert!(sc.app.add_rows.is_empty(), "and nothing to click yet");
+    }
+
+    #[test]
+    fn a_modal_of_this_feature_covers_the_list_behind_it() {
+        // Goal: all three are modal. What is behind must not show through, and
+        // - more to the point - the header's controls registered earlier in the
+        // frame must not still be reachable.
+        let mut sc = screen();
+        with_two_playlists(&mut sc);
+        sc.app.favorites = vec![track(1, "Hidden Title")];
+        for (open, name) in [('N', "prompt"), ('X', "confirmation")] {
+            sc.app.view = View::Playlists;
+            sc.app.mode = Mode::Normal;
+            press(&mut sc.app, open);
+            let out = text(&mut sc.app, 90, 26);
+            assert!(!out.contains("Hidden Title"), "the {name} covers it: {out}");
+            assert!(
+                !sc.app.hits.iter().any(|(_, h)| *h == Hit::Quit),
+                "and nothing behind the {name} is clickable"
+            );
+        }
     }
 }
