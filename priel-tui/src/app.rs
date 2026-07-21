@@ -337,6 +337,11 @@ pub enum Hit {
     /// rule `x` follows in the output picker: a control that would do nothing
     /// where it was clicked is not a control.
     QueueColumn,
+    /// Hide the album cover, or ask for it back. Drawn only where the cover can
+    /// appear - a tall enough terminal - for the reason [`Hit::QueueColumn`] is
+    /// drawn only at [`crate::ui::WIDE_COLS`]: below that it would do nothing
+    /// where it was clicked.
+    CoverArt,
     Quit,
 }
 
@@ -874,6 +879,21 @@ pub struct App {
     /// the file holds what a flag can set, and this is a gesture rather than a
     /// setting.
     pub queue_shown: bool,
+    /// Whether the album cover is wanted in the now-playing box.
+    ///
+    /// An *intent*, exactly like [`App::queue_shown`], and for the same reason:
+    /// the renderer still asks whether the terminal has the rows to spare, so
+    /// this can be true on a short terminal and draw nothing. A gesture rather
+    /// than a setting, so it is kept for the session and never written to the
+    /// settings file.
+    pub cover_shown: bool,
+    /// The cover for the track that is playing, once it has arrived.
+    ///
+    /// Decoded off the render thread and held as pixels, keyed by the track it
+    /// belongs to: replies are correlated by id and never by request order, so a
+    /// cover that arrives after the track changed is dropped rather than drawn
+    /// over the one now playing.
+    pub cover: Option<(u64, crate::art::Image)>,
     pub progress_rect: Rect,
     /// Clickable regions, rebuilt by the renderer every frame.
     pub hits: Vec<(Rect, Hit)>,
@@ -1041,6 +1061,8 @@ impl App {
             list_inner: Rect::default(),
             queue_inner: Rect::default(),
             queue_shown: true,
+            cover_shown: true,
+            cover: None,
             progress_rect: Rect::default(),
             hits: Vec::new(),
             last_click: None,
@@ -2676,6 +2698,30 @@ impl App {
     /// in step with that one.
     fn toggle_queue_column(&mut self) {
         self.queue_shown = !self.queue_shown;
+    }
+
+    /// Hide the album cover, or ask for it back. **The one way in**, from the
+    /// key and from the header control alike.
+    ///
+    /// An intent and nothing else, like [`App::toggle_queue_column`]: a terminal
+    /// without the rows to spare draws no cover whatever this says, and that
+    /// decision stays with the renderer so there is only one place it is made.
+    fn toggle_cover(&mut self) {
+        self.cover_shown = !self.cover_shown;
+    }
+
+    /// The cover to draw right now, if the one held belongs to the track that is
+    /// playing.
+    ///
+    /// Asked rather than stored so that a track change needs no invalidation
+    /// step: the moment `now_playing` moves on, the held cover stops answering,
+    /// and whatever arrives for the new track replaces it.
+    #[must_use]
+    pub fn cover_for_now_playing(&self) -> Option<&crate::art::Image> {
+        let playing = self.now_playing.as_ref()?.id;
+        self.cover
+            .as_ref()
+            .and_then(|(id, image)| (*id == playing).then_some(image))
     }
 
     /// Point the keyboard at a region, clamping the cursor it finds there.
@@ -4411,6 +4457,7 @@ impl App {
             // away, so the pair names the same thing rather than spending a
             // second idiom on it.
             KeyCode::Char('W') => self.toggle_queue_column(),
+            KeyCode::Char('C') => self.toggle_cover(),
             _ => {}
         }
     }
@@ -4711,6 +4758,7 @@ impl App {
             Hit::CycleView => self.cycle_view(),
             Hit::CycleFocus => self.cycle_focus(),
             Hit::QueueColumn => self.toggle_queue_column(),
+            Hit::CoverArt => self.toggle_cover(),
             Hit::Help => self.open_help(),
             Hit::Log => self.open_log(),
             Hit::Graph => self.open_graph(),

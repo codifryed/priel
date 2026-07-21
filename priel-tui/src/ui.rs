@@ -60,6 +60,47 @@ const WIDE_COLS: u16 = 120;
 /// more.
 const QUEUE_COLS: u16 = 36;
 
+/// The album cover, when it is drawn, is this many rows tall and twice that wide.
+///
+/// A cell is one pixel wide and two tall, so `COVER_ROWS` rows is `2*COVER_ROWS`
+/// pixels, and a square cover wants a column `2*COVER_ROWS` wide - see
+/// [`crate::art`]. Eight rows is where a cover stops being a colour smear and
+/// starts being recognisably itself.
+const COVER_ROWS: u16 = 8;
+
+/// The terminal must be at least this tall before the cover is drawn.
+///
+/// The row breakpoint, the same shape [`WIDE_COLS`] is one axis over: below it
+/// the box stays three rows and the list keeps every row it has, so a listener
+/// on a short terminal never pays for the art. Above it the extra height buys
+/// the cover rather than more list.
+const COVER_MIN_HEIGHT: u16 = 30;
+
+/// How tall the now-playing box is on this frame: three rows plus its border, or
+/// taller when the cover is drawn.
+///
+/// The one place the height is decided, because two callers need to agree on
+/// it: [`render`] splits the screen by it, and [`now_playing`] fills what it is
+/// given. Drawn only when all three of the cover's conditions hold - it is
+/// wanted, the terminal has the rows, and there is a cover for the track that is
+/// playing - which mirrors the three ways the queue column can be absent.
+fn now_playing_rows(area: Rect, app: &App) -> u16 {
+    if cover_wanted(area, app) {
+        COVER_ROWS.saturating_add(2)
+    } else {
+        5
+    }
+}
+
+/// Whether the cover is drawn this frame: wanted, room for it, and one to draw.
+///
+/// Shown only when there is something to show, like the queue column: a track
+/// with no cover, or a cover still on its way, reserves no rows. That is what
+/// keeps the box from standing half-empty while the download runs.
+fn cover_wanted(area: Rect, app: &App) -> bool {
+    app.cover_shown && area.height >= COVER_MIN_HEIGHT && app.cover_for_now_playing().is_some()
+}
+
 /// The three widths every overlay is one of, and the margin all of them keep.
 ///
 /// There were eight caps and two margin rules before: two overlays shared a cap
@@ -125,9 +166,9 @@ fn overlay_width(area: Rect, cap: u16) -> u16 {
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([
-        Constraint::Length(1), // header / tabs
-        Constraint::Min(1),    // the list, and the queue beside it
-        Constraint::Length(5), // the now-playing box, at every width
+        Constraint::Length(1),                               // header / tabs
+        Constraint::Min(1),                                  // the list, and the queue beside it
+        Constraint::Length(now_playing_rows(f.area(), app)), // the now-playing box
         Constraint::Length(1), // the keyboard reference, outside the box
     ])
     .split(f.area());
@@ -814,6 +855,7 @@ const HELP_LEFT: &[(&str, &[HelpRow])] = &[
             // ordinary width: the bottom row gives the focus hint up first and
             // never had room for this one.
             row(&[("W", Some(Hit::QueueColumn))], "show / hide the queue"),
+            row(&[("C", Some(Hit::CoverArt))], "show / hide the cover"),
         ],
     ),
     (
@@ -1815,6 +1857,11 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     // will never reach is a control telling the listener a lie.
     let carrying_on = app.radio_follows();
     let queue_column = app.queue_shown;
+    let cover = app.cover_shown;
+    // Only where the cover can appear, so the control is not offered where it
+    // would do nothing. The same reason the queue toggle is width-gated - and
+    // the height is the *frame's*, because this bar's own rect is one row tall.
+    let cover_possible = f.area().height >= COVER_MIN_HEIGHT;
     let queue = app.queue_indicator();
     let from_radio = app.playing_from_radio();
     let filtering = app.mode == Mode::Filter;
@@ -1895,6 +1942,12 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     // calls them one, and every hit box after it would move.
     if area.width >= WIDE_COLS {
         bar.button(" ▤ ", Hit::QueueColumn, t.toggle(queue_column));
+    }
+    // The cover toggle, on a tall enough terminal. A framed-picture glyph, and
+    // one that is not emoji: an emoji font would paint it two cells wide while
+    // unicode-width calls it one, moving every hit box after it.
+    if cover_possible {
+        bar.button(" ▣ ", Hit::CoverArt, t.toggle(cover));
     }
     bar.label("  ", Style::default());
 
@@ -2398,16 +2451,26 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Split rather than offset from `inner.y`: on a terminal too short for three
-    // rows, hand-computed offsets address cells outside the buffer and ratatui
-    // panics. A layout clamps to what exists, yielding empty rects instead.
+    // The cover takes a column on the left when the box is tall enough to hold
+    // it; the three facts sit in what is left, bottom-aligned, so they keep the
+    // rows off the bottom they have at every other size. `cover_column` draws
+    // the art and hands back the rect the text gets - the whole inner box when
+    // there is no cover.
+    let text_area = cover_column(f, app, inner);
+
+    // Split rather than offset from `text_area.y`: on a terminal too short for
+    // three rows, hand-computed offsets address cells outside the buffer and
+    // ratatui panics. A layout clamps to what exists, yielding empty rects
+    // instead. `Min(0)` eats the slack above, which is what bottom-aligns the
+    // three fixed rows within a box that may be taller than they are.
     let rows = Layout::vertical([
+        Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .split(inner);
-    let (l0, l1, l2) = (rows[0], rows[1], rows[2]);
+    .split(text_area);
+    let (l0, l1, l2) = (rows[1], rows[2], rows[3]);
 
     let title = match &app.now_playing {
         // Title first, the same way round as a track row. One pair of facts in
@@ -2480,6 +2543,47 @@ fn key_row(f: &mut Frame, app: &mut App, area: Rect) {
     push_hints(&mut bar, &t, two_regions(app));
     app.hits.extend(bar.hits);
     f.render_widget(Paragraph::new(Line::from(bar.spans)), area);
+}
+
+/// Draw the album cover down the left of the box, and return the rect the text
+/// gets - the whole box when there is no cover to draw.
+///
+/// The cover is a square block `inner.height` rows tall and twice that wide, so
+/// it reaches from the top border to the bottom one. The text keeps the rest,
+/// with one blank column between so the artwork does not touch the words.
+///
+/// Whether to draw at all is [`cover_wanted`], the same question [`render`]
+/// asked to size the box - so the two cannot disagree about whether there is a
+/// cover this frame, and a box sized for one that then drew none would strand
+/// the text in empty rows.
+fn cover_column(f: &mut Frame, app: &App, inner: Rect) -> Rect {
+    if !cover_wanted(f.area(), app) {
+        return inner;
+    }
+    let Some(image) = app.cover_for_now_playing() else {
+        return inner;
+    };
+    let rows = inner.height;
+    // Twice as wide as tall for a square picture, but never wider than half the
+    // box - a narrow terminal keeps the words legible ahead of the art.
+    let cols = rows
+        .saturating_mul(2)
+        .min(inner.width.saturating_sub(inner.width / 2));
+    let art = crate::art::draw(image, rows, cols);
+    f.render_widget(
+        Paragraph::new(art),
+        Rect {
+            width: cols,
+            ..inner
+        },
+    );
+    // One blank column between the art and the text.
+    let taken = cols.saturating_add(1);
+    Rect {
+        x: inner.x.saturating_add(taken),
+        width: inner.width.saturating_sub(taken),
+        ..inner
+    }
 }
 
 /// Playing, paused, or neither, as one glyph. Shared by both layouts so they
@@ -5288,6 +5392,175 @@ mod tests {
                 height: h,
             },
         )
+    }
+
+    /// A flat-red cover for the track that is playing.
+    fn with_cover(sc: &mut Screen, id: u64) {
+        let side = 16;
+        let mut rgb = Vec::new();
+        for _ in 0..side * side {
+            rgb.extend_from_slice(&[200, 30, 30]);
+        }
+        sc.app.cover = Some((
+            id,
+            crate::art::Image {
+                width: side,
+                height: side,
+                rgb,
+            },
+        ));
+    }
+
+    #[test]
+    fn the_cover_draws_beside_the_text_and_the_text_stays_put() {
+        // Goal: issue #29. The cover takes a column on the left of the box and
+        // the three facts stay bottom-aligned beside it, so what a listener
+        // glances at without looking for it does not move when the art arrives -
+        // which is settled decision 10, applied to a taller box. Method: render
+        // the same track with and without the cover on a terminal tall enough
+        // for it, and check the three rows landed on the same rows off the
+        // bottom either way, with half blocks to their left only when the cover
+        // is there.
+        let mut with = screen();
+        with.app.now_playing = Some(track(1, "Reckoner"));
+        with.app.status.position = 61.0;
+        with_cover(&mut with, 1);
+        let framed = draw(&mut with.app, 100, 40);
+
+        let mut without = screen();
+        without.app.now_playing = Some(track(1, "Reckoner"));
+        without.app.status.position = 61.0;
+        without.app.cover_shown = false;
+        let bare = draw(&mut without.app, 100, 40);
+
+        // Each fact is the same number of rows off the bottom either way. Found
+        // by its own words rather than by the whole row, because with the cover
+        // those rows also carry half blocks to the left.
+        let row_off = |frame: &[String], needle: &str| {
+            let i = frame
+                .iter()
+                .rposition(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is nowhere: {frame:?}"));
+            frame.len() - i
+        };
+        for needle in ["Reckoner", "1:01", "OUT \u{2014}"] {
+            assert_eq!(
+                row_off(&framed, needle),
+                row_off(&bare, needle),
+                "{needle:?} moved off the bottom when the cover arrived"
+            );
+        }
+        assert!(
+            framed.iter().any(|l| l.contains('\u{2580}')),
+            "no cover was drawn: {framed:?}"
+        );
+        assert!(
+            !bare.iter().any(|l| l.contains('\u{2580}')),
+            "a cover was drawn with the column folded: {bare:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_terminal_gets_no_cover_and_keeps_its_list() {
+        // Goal: the height breakpoint, the same shape the queue column has one
+        // axis over. A listener on a short terminal never pays rows for the art.
+        // Method: the same cover on a short terminal and a tall one, comparing
+        // the rows the list was given.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "Reckoner"));
+        with_cover(&mut sc, 1);
+
+        let _ = draw(&mut sc.app, 100, 24);
+        let short = sc.app.list_inner.height;
+        let short_frame = draw(&mut sc.app, 100, 24);
+        assert!(
+            !short_frame.iter().any(|l| l.contains('\u{2580}')),
+            "a short terminal drew the cover anyway: {short_frame:?}"
+        );
+
+        let _ = draw(&mut sc.app, 100, 40);
+        let tall = sc.app.list_inner.height;
+        assert!(
+            draw(&mut sc.app, 100, 40)
+                .iter()
+                .any(|l| l.contains('\u{2580}')),
+            "a tall terminal did not draw the cover"
+        );
+        assert!(
+            tall < short + 40 - 24,
+            "the tall terminal spent none of its extra height on the cover"
+        );
+    }
+
+    #[test]
+    fn the_cover_folds_away_by_key_and_by_control() {
+        // Goal: the cover has a fold, the same way the queue column does - a
+        // listener who wants the rows for the list has to be able to say so, at
+        // any size. Method: on a terminal tall enough for the art, press the key
+        // and click the control, and read whether the half blocks are there.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "Reckoner"));
+        with_cover(&mut sc, 1);
+
+        let has_art = |sc: &mut Screen| {
+            draw(&mut sc.app, 120, 40)
+                .iter()
+                .any(|l| l.contains('\u{2580}'))
+        };
+
+        assert!(has_art(&mut sc), "the cover is shown by default");
+        press(&mut sc.app, 'C');
+        assert!(!has_art(&mut sc), "the key did not fold it away");
+        press(&mut sc.app, 'C');
+        assert!(has_art(&mut sc), "the key did not bring it back");
+
+        // And the header control runs the same toggle.
+        let _ = draw(&mut sc.app, 120, 40);
+        click_hit(&mut sc.app, Hit::CoverArt);
+        assert!(!has_art(&mut sc), "the control did not fold it away");
+    }
+
+    #[test]
+    fn the_cover_control_is_only_offered_where_the_cover_can_appear() {
+        // Goal: a control that did nothing where it was clicked is the defect
+        // `x` and the queue toggle both avoid. Below the height breakpoint the
+        // cover cannot be drawn, so its control is not there to click. Method:
+        // read the header's hit boxes at a short and a tall terminal.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "Reckoner"));
+        with_cover(&mut sc, 1);
+
+        let _ = draw(&mut sc.app, 120, 24);
+        assert!(
+            !sc.app.hits.iter().any(|(_, h)| *h == Hit::CoverArt),
+            "a short terminal offered a control that would do nothing"
+        );
+
+        let _ = draw(&mut sc.app, 120, 40);
+        assert!(
+            sc.app.hits.iter().any(|(_, h)| *h == Hit::CoverArt),
+            "a tall terminal did not offer the control"
+        );
+    }
+
+    #[test]
+    fn no_cover_no_taller_box() {
+        // Goal: the queue column's precedent - shown only when there is
+        // something to show. A track with no cover, or a cover still arriving,
+        // must not reserve empty rows the list could use. Method: a tall
+        // terminal with a playing track and no cover.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "Reckoner"));
+        let _ = draw(&mut sc.app, 100, 40);
+        let bare = sc.app.list_inner.height;
+
+        with_cover(&mut sc, 1);
+        let _ = draw(&mut sc.app, 100, 40);
+        let covered = sc.app.list_inner.height;
+        assert!(
+            covered < bare,
+            "the box did not grow for a cover that arrived: {covered} vs {bare}"
+        );
     }
 
     #[test]

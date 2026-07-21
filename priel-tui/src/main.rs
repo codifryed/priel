@@ -32,6 +32,7 @@
 //! the file wins over the default.
 
 mod app;
+mod art;
 mod bus;
 mod cli;
 mod logging;
