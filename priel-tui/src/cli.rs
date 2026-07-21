@@ -78,6 +78,19 @@ pub struct Cli {
     #[arg(long)]
     pub list_devices: bool,
 
+    /// Colour theme
+    ///
+    /// Defaults to `nord`, a dark theme. `terminal` uses your terminal's own
+    /// sixteen colours instead of priel's, which is the one to pick if you have
+    /// already themed your terminal or if its background is light and you would
+    /// rather priel followed it.
+    ///
+    /// `t` opens the same list at runtime, but priel reads no configuration
+    /// file, so a choice made there lasts for that session only. This flag is
+    /// how one is kept.
+    #[arg(long, value_name = "THEME")]
+    pub theme: Option<ThemeName>,
+
     /// Detail recorded in the diagnostic log
     ///
     /// Defaults to `warn`. `$PRIEL_LOG` sets it too, for launching from a
@@ -91,6 +104,31 @@ pub struct Cli {
     /// `~/.local/state` when `XDG_STATE_HOME` is unset. Truncated at startup.
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<String>,
+}
+
+/// Which built-in palette priel paints with.
+///
+/// Lives here rather than beside the palettes themselves for the same reason
+/// [`LogLevel`] does: deriving the enum on the command definition is what puts
+/// the choices into `--help`, into the man page and into all three completions,
+/// and the asset generator compiles this module alone. `priel_tui::theme` maps
+/// a name onto the colours.
+///
+/// The order is the order the runtime picker lists them in, so the flag and the
+/// picker cannot disagree about what is on offer.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThemeName {
+    /// Dark. The default.
+    #[default]
+    Nord,
+    /// Dark, warm.
+    GruvboxDark,
+    /// Light, warm.
+    GruvboxLight,
+    /// Light, cool.
+    OneLight,
+    /// Your terminal's own sixteen colours, whatever you have set them to.
+    Terminal,
 }
 
 /// How much detail the diagnostic log carries.

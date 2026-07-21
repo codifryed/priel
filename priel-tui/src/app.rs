@@ -42,6 +42,8 @@ use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig, Verdict};
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+use crate::cli::ThemeName;
+use crate::theme::Theme;
 use crate::worker::{self, FromWorker, Task, ToWorker, Worker};
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -408,6 +410,12 @@ pub struct App {
     pub filter: String,
     pub shuffle: bool,
 
+    /// Which palette is in force, and the colours it stands for. Held together
+    /// so the picker can mark the row that is current without mapping a palette
+    /// back to a name.
+    theme_name: ThemeName,
+    theme: Theme,
+
     pub notice: Option<String>,
     pub loading: bool,
     /// The worker thread has gone, and has been reported. Latched so the
@@ -512,6 +520,7 @@ impl App {
         player: PlayerConfig,
         token_path: String,
         recent: crate::logging::Recent,
+        theme: ThemeName,
     ) -> anyhow::Result<Self> {
         // Read before the config is handed over: the picker shows what was
         // asked for, and `--exclusive` is where a session starts from.
@@ -521,6 +530,7 @@ impl App {
         let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
         let worker = worker::spawn(token_path.clone(), creds_path.clone());
         let mut app = Self::with(player, worker);
+        app.set_theme(theme);
         app.exclusive = exclusive;
         app.recent = recent;
         let has_session = priel_core::auth::StoredToken::load(&token_path).is_ok();
@@ -583,6 +593,8 @@ impl App {
             mode: Mode::Normal,
             filter: String::new(),
             shuffle: false,
+            theme_name: ThemeName::default(),
+            theme: Theme::default(),
             notice: Some("Loading favorites…".into()),
             loading: true,
             frame: 0,
@@ -614,6 +626,29 @@ impl App {
             fetching: None,
             login: None,
         }
+    }
+
+    // ---- the colour theme ----
+
+    /// The palette the renderer paints with.
+    ///
+    /// [`Theme`] is `Copy` and the whole of it is twenty colours, so the
+    /// renderer takes a copy at the top of each function rather than holding a
+    /// borrow of `App` it would then have to give back before recording a hit
+    /// box.
+    #[must_use]
+    pub fn theme(&self) -> Theme {
+        self.theme
+    }
+
+    /// Paint with a different palette from here on.
+    ///
+    /// The one place that changes it, so `--theme`, the `t` key and a click on
+    /// a row of the picker cannot drift apart.
+    fn set_theme(&mut self, name: ThemeName) {
+        self.theme_name = name;
+        self.theme = Theme::of(name);
+        self.dirty = true;
     }
 
     /// Ask the user before downloading a client identity.
@@ -6855,7 +6890,8 @@ mod tests {
     #[test]
     fn the_real_constructor_wires_a_player_and_a_worker() {
         // Goal: `new` is what main calls. A bad token path must still produce a
-        // usable app - the failure arrives later as a notice.
+        // usable app - the failure arrives later as a notice. It is also the
+        // one place `--theme` reaches the renderer, so assert the flag lands.
         let app = App::new(
             PlayerConfig {
                 audio_device: Some("null".into()),
@@ -6863,10 +6899,16 @@ mod tests {
             },
             "/nonexistent/priel.json".into(),
             crate::logging::Recent::default(),
+            ThemeName::OneLight,
         )
         .expect("an app should be constructible without a valid token");
         assert_eq!(app.view, View::Favorites);
         assert!(app.loading, "it starts out loading");
+        assert_eq!(
+            app.theme(),
+            Theme::of(ThemeName::OneLight),
+            "--theme reaches the renderer"
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //!   --device <mpv-device>   e.g. pipewire/alsa_output.usb-SMSL...pro-output-0
 //!   --exclusive             take that device for priel alone (never automatic)
 //!   --list-devices          print the output devices and exit
+//!   --theme <theme>         colour palette (default: nord; `terminal` defers)
 //!   --log-level <level>     diagnostics detail (default: warn; `$PRIEL_LOG` too)
 //!   --log-file <path>       default: `~/.local/state/priel/priel.log`
 
@@ -29,6 +30,7 @@ mod app;
 mod bus;
 mod cli;
 mod logging;
+mod theme;
 mod ui;
 mod worker;
 
@@ -148,13 +150,19 @@ fn session(args: cli::Cli, recent: logging::Recent) -> Result<()> {
     priel_core::auth::migrate_from_config("token.json");
     priel_core::auth::migrate_from_config("credentials.json");
     let mut terminal = setup().context("preparing the terminal")?;
+    let theme = args.theme.unwrap_or_default();
     let player = priel_player::PlayerConfig {
         mpv_log_level: args.mpv_log_level(),
         audio_device: args.device,
         exclusive: args.exclusive,
     };
-    let res = App::new(player, priel_core::Client::default_token_path(), recent)
-        .and_then(|mut app| run(&mut terminal, &mut app, &mut TerminalEvents));
+    let res = App::new(
+        player,
+        priel_core::Client::default_token_path(),
+        recent,
+        theme,
+    )
+    .and_then(|mut app| run(&mut terminal, &mut app, &mut TerminalEvents));
     restore(&mut terminal)?;
     // Reported rather than returned: the terminal is back, and printing the
     // error beats anyhow's own rendering of it after an interactive session.
