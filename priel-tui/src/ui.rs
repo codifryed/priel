@@ -59,6 +59,30 @@ const WIDE_COLS: u16 = 120;
 /// more.
 const QUEUE_COLS: u16 = 36;
 
+/// The three widths every overlay is one of, and the margin all of them keep.
+///
+/// There were eight caps and two margin rules before: two overlays shared a cap
+/// of 76 and still came out different widths because one subtracted a margin and
+/// the other did not, and three ran to the edges of the screen while the other
+/// seven floated. No evidence says any particular number is better than any
+/// other - which is why this is three buckets rather than ten tuned figures.
+///
+/// `OVERLAY_MEDIUM` is 84 and not 80 because that is the width the keyboard
+/// reference's rows were laid out for. Anything narrower starts wrapping the one
+/// overlay whose whole job is to be read.
+const OVERLAY_WIDE: u16 = 120;
+const OVERLAY_MEDIUM: u16 = 84;
+const OVERLAY_NARROW: u16 = 64;
+/// Cells kept clear each side, so an overlay never touches the screen edge.
+const OVERLAY_MARGIN: u16 = 2;
+
+/// How wide an overlay is on this terminal: its bucket, or the room there is.
+fn overlay_width(area: Rect, cap: u16) -> u16 {
+    area.width
+        .saturating_sub(OVERLAY_MARGIN.saturating_mul(2))
+        .min(cap)
+}
+
 pub fn render(f: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([
         Constraint::Length(1), // header / tabs
@@ -149,7 +173,7 @@ fn prompt_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     // this box; clearing before anything else means a terminal too short to
     // draw the controls leaves nothing clickable rather than last frame's.
     app.hits.clear();
-    let width = area.width.saturating_sub(4).min(64);
+    let width = overlay_width(area, OVERLAY_NARROW);
     let height = 5u16.min(area.height);
     let rect = centred(area, width, height);
 
@@ -212,7 +236,7 @@ fn confirm_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     let verb = app.confirm_verb().unwrap_or("do it");
     app.hits.clear();
     let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let width = area.width.saturating_sub(4).min(64);
+    let width = overlay_width(area, OVERLAY_NARROW);
     let height = rows.saturating_add(4).min(area.height);
     let rect = centred(area, width, height);
 
@@ -273,7 +297,7 @@ fn confirm_overlay(f: &mut Frame, app: &mut App, area: Rect) {
 /// left-to-right walk, so the gesture a listener already knows works here.
 fn add_to_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme();
-    let width = area.width.saturating_sub(4).min(80);
+    let width = overlay_width(area, OVERLAY_WIDE);
     let height = area.height.saturating_sub(2);
     let rect = centred(area, width, height);
 
@@ -410,7 +434,7 @@ fn login_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     let Some((busy, pasted, status)) = flow else {
         return;
     };
-    let width = area.width.min(76);
+    let width = overlay_width(area, OVERLAY_MEDIUM);
     let height = 16u16.min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -551,7 +575,7 @@ fn credentials_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     // behind this screen and must not be reachable through it.
     app.hits.clear();
     let rows = u16::try_from(CREDENTIALS_PROMPT.len()).unwrap_or(u16::MAX);
-    let width = area.width.min(78);
+    let width = overlay_width(area, OVERLAY_MEDIUM);
     let height = rows.saturating_add(6).min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -970,7 +994,7 @@ fn help_column(
 /// lines that are in the log file, without going to look for it.
 fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
     let t = app.theme();
-    let width = area.width.saturating_sub(4).min(120);
+    let width = overlay_width(area, OVERLAY_WIDE);
     let height = area.height.saturating_sub(2);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -1048,7 +1072,7 @@ fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
 fn graph_overlay(f: &mut Frame, area: Rect, app: &App) {
     let t = app.theme();
     let rows = app.graph_rows();
-    let width = area.width.saturating_sub(4).min(76);
+    let width = overlay_width(area, OVERLAY_MEDIUM);
     // Two for the border, one for the way out. Sized to the content rather than
     // to the screen: this is a short list and a full-height box around three
     // lines reads as something failing to load.
@@ -1156,7 +1180,7 @@ const DEVICE_NAME_SHARE: u16 = 2;
 /// both directions.
 fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme();
-    let width = area.width.saturating_sub(4).min(110);
+    let width = overlay_width(area, OVERLAY_WIDE);
     let height = area.height.saturating_sub(2);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -1329,7 +1353,7 @@ fn theme_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme();
     let current = app.theme_name();
     let selected = app.theme_selected();
-    let width = area.width.saturating_sub(4).min(72);
+    let width = overlay_width(area, OVERLAY_MEDIUM);
     // Two for the border, two for the footer. Sized to the content, as the
     // graph overlay is: a full-height box around a handful of rows reads as a failure
     // to load.
@@ -1477,7 +1501,7 @@ fn help_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
     let left = help_height(HELP_LEFT);
     let right = help_height(HELP_RIGHT);
-    let width = area.width.min(84);
+    let width = overlay_width(area, OVERLAY_MEDIUM);
     // Two columns need a 14-cell key field plus a description, twice over.
     // Below that, stacking beats clipping every description in half.
     let stacked = width.saturating_sub(2) < 76;
@@ -3207,8 +3231,9 @@ fn fmt_hms(secs: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlBar, FOCUS_HINT, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, QUEUE_COLS,
-        WIDE_COLS, hint_width, push_hints, render,
+        ControlBar, FOCUS_HINT, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, OVERLAY_MARGIN,
+        OVERLAY_MEDIUM, OVERLAY_NARROW, OVERLAY_WIDE, QUEUE_COLS, WIDE_COLS, hint_width,
+        push_hints, render,
     };
     use crate::app::{App, Click, Focus, Hit, Mode, View};
     use crate::cli::ThemeName;
@@ -5182,6 +5207,124 @@ mod tests {
             "the row {row:?} and the now-playing line {now:?} disagree"
         );
         assert!(order(&now), "and both lead with the title");
+    }
+
+    /// A box that goes over the screen: what to call it, how wide it should come
+    /// out, and how a listener opens it.
+    type Overlay = (&'static str, u16, fn(&mut Screen));
+
+    /// Every box that goes over the screen, opened the way a listener opens it,
+    /// paired with the bucket it belongs to.
+    ///
+    /// Opened through the real path rather than by assigning `app.mode`, because
+    /// four of them draw nothing without the state that path sets up - and a
+    /// test that silently measured an empty frame would pass for ever.
+    ///
+    /// `Mode::Login` is not here: it wants a credentials file on disk and a
+    /// browser, and nothing a test builds may touch a real home directory. Its
+    /// width comes from the same helper, and that helper is measured on the
+    /// nine below.
+    fn each_overlay() -> Vec<Overlay> {
+        vec![
+            (
+                "Log",
+                OVERLAY_WIDE,
+                (|sc| sc.app.mode = Mode::Log) as fn(&mut Screen),
+            ),
+            ("Devices", OVERLAY_WIDE, |sc| sc.app.mode = Mode::Devices),
+            ("AddTo", OVERLAY_WIDE, |sc| {
+                with_two_playlists(sc);
+                sc.app.mode = Mode::AddTo;
+            }),
+            ("Graph", OVERLAY_MEDIUM, |sc| sc.app.mode = Mode::Graph),
+            ("Help", OVERLAY_MEDIUM, |sc| sc.app.mode = Mode::Help),
+            ("Credentials", OVERLAY_MEDIUM, |sc| {
+                sc.app.mode = Mode::Credentials;
+            }),
+            ("Themes", OVERLAY_MEDIUM, |sc| sc.app.mode = Mode::Themes),
+            ("Prompt", OVERLAY_NARROW, |sc| {
+                with_two_playlists(sc);
+                press(&mut sc.app, 'N');
+            }),
+            ("Confirm", OVERLAY_NARROW, |sc| {
+                with_two_playlists(sc);
+                sc.app.view = View::Playlists;
+                press(&mut sc.app, 'X');
+            }),
+        ]
+    }
+
+    /// The columns the overlay's top border runs between, as painted.
+    ///
+    /// An overlay is drawn over the list, and one of them is exactly as tall as
+    /// the list's box - so both top borders land on the same row and the row
+    /// carries two corners. The overlay is the *rightmost* `\u{250c}`, because it
+    /// is drawn over a list box that always starts at column zero. Callers fold
+    /// the queue away so there is no third box to be rightmost.
+    fn overlay_edges(app: &mut App, w: u16, h: u16, name: &str) -> (usize, usize, String) {
+        for line in draw(app, w, h) {
+            let cells: Vec<char> = line.chars().collect();
+            let Some(left) = cells.iter().rposition(|c| *c == '\u{250c}') else {
+                continue;
+            };
+            if left == 0 {
+                continue; // the list's own box, with nothing over it
+            }
+            let right = cells
+                .iter()
+                .skip(left)
+                .position(|c| *c == '\u{2510}')
+                .map_or_else(|| panic!("{name}: an unclosed box: {line:?}"), |i| left + i);
+            return (left, right, line);
+        }
+        panic!("{name} drew no overlay at {w}x{h}")
+    }
+
+    #[test]
+    fn every_overlay_is_one_of_three_widths() {
+        // Goal: audit finding 10. Ten overlays had eight different width caps
+        // between them, tuned one at a time, with no evidence that any
+        // particular number was better than any other. Method: open each in
+        // turn on a terminal wider than the widest bucket, and measure the box
+        // that was painted rather than reading the constants back.
+        for (name, want, open) in each_overlay() {
+            let mut sc = screen();
+            open(&mut sc);
+            // Folded, so the only two boxes on screen are the list's and the
+            // overlay's and the corner test below cannot pick the wrong one.
+            sc.app.queue_shown = false;
+            let (left, right, top) = overlay_edges(&mut sc.app, 200, 40, name);
+            assert_eq!(
+                right - left + 1,
+                usize::from(want),
+                "{name} is not one of the three widths: {top:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_overlay_touches_the_edge_of_a_narrow_terminal() {
+        // Goal: the other half of finding 10, and the half a listener can
+        // actually see. Three overlays ran flush to the screen edges while the
+        // other seven kept two cells clear - two of them shared a width cap of
+        // 76 and still came out different widths, because one subtracted a
+        // margin and the other did not. Method: a terminal narrower than every
+        // bucket, so the cap cannot be what decides the width.
+        for (name, _, open) in each_overlay() {
+            let mut sc = screen();
+            open(&mut sc);
+            let (left, right, top) = overlay_edges(&mut sc.app, 60, 24, name);
+            assert_eq!(
+                left,
+                usize::from(OVERLAY_MARGIN),
+                "{name} does not keep the margin: {top:?}"
+            );
+            assert_eq!(
+                60 - right - 1,
+                usize::from(OVERLAY_MARGIN),
+                "{name} keeps it on one side only: {top:?}"
+            );
+        }
     }
 
     #[test]

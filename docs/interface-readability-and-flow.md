@@ -59,7 +59,7 @@ and web typography and does not transfer; I have not cited it where it does not.
 | 7 | Now-playing says "Artist — Title"; rows say the reverse | medium | low | taste | **done** |
 | 8 | The elapsed time is centred and drifts | medium | medium | guidance | **done** |
 | 9 | Overlay body text hugs the border, footers do not | low | none | guidance | **done** |
-| 10 | Overlay widths are an arbitrary ladder | low | low | taste | propose |
+| 10 | Overlay widths are an arbitrary ladder | low | low | taste | **done** |
 | 11 | The report and the device picker are both "Output" | low | low | taste | **done** |
 | 12 | Overlay footers are dead text | low | medium | taste | propose |
 | 13 | Small wording and spacing inconsistencies | low | none | mixed | **done** |
@@ -409,7 +409,7 @@ a heading at column 0 and its rows at 2, and the output report puts a heading at
 wrong; they are simply not the same step. Worth one decision if the overlays are
 ever unified per finding 10.
 
-## 10. The overlay widths are an arbitrary ladder
+## 10. The overlay widths are an arbitrary ladder — **done**
 
 **Taste**, though `navigation-consistency` gestures at it.
 
@@ -434,6 +434,35 @@ long: log, devices, add-to), medium (a fixed body: report, help, sign in,
 identity, themes), narrow (a question: prompt, confirm) - one margin rule, and
 content-height wherever the content is bounded. I have no evidence any specific
 number is better than any other, which is why this is taste.
+
+**Settled: three buckets and one margin**, as proposed, with one number changed.
+Medium is **84 and not 80**, because 84 is the width the keyboard reference's
+rows were laid out for and anything narrower starts wrapping the one overlay
+whose whole job is to be read. The five overlays below it simply get wider,
+which costs nothing.
+
+```
+wide    120  log, output device, add to playlist
+medium   84  output report, keyboard reference, sign in,
+             client identity, colour theme
+narrow   64  prompt, confirm
+margin    2  every overlay, no exceptions
+```
+
+Two tests, because there are two properties and they fail independently: one
+opens every overlay on a terminal wider than the widest bucket and measures the
+painted box, the other opens each on a terminal narrower than every bucket -
+where the cap cannot be what decides the width - and checks both margins.
+Verified by mutation: restoring one overlay's hand-tuned width fails the first
+and not the second; removing one overlay's margin fails the second and not the
+first.
+
+Each is opened **the way a listener opens it** rather than by assigning
+`app.mode`, because four of them draw nothing without the state that path sets
+up, and a test that measured an empty frame would have passed for ever.
+`Mode::Login` is the one exclusion, stated in the test: it wants a credentials
+file on disk and a browser, and nothing a test builds may touch a real home
+directory.
 
 ## 11. The report and the device picker are both called "Output" — **done**
 
