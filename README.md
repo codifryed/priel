@@ -175,7 +175,7 @@ row of the interface is also clickable.
 | Full key reference | `?` | click `[?]` |
 | Recent log messages | `M` | scroll to page back |
 | Audio graph to the device | `D` | click `[D]` |
-| Choose the output device | `d` | click a row in the picker |
+| Choose the output device | `d` | click `◎`, then a row in the picker |
 | Exclusive output on/off | `x` in the picker | click the toggle |
 | Sign in again | `A` | — |
 | Switch view | `Tab` cycles, `1`/`2`/`3` | click a tab |

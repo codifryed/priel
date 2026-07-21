@@ -841,6 +841,13 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     };
     bar.button(vol_text, Hit::VolUnity, vol_style);
     bar.button(" + ", Hit::VolUp, button_style());
+    bar.label(" ", Style::default());
+    // Last in the output cluster, because that is what it belongs to: it opens
+    // the picker that decides where these samples go. A bullseye rather than a
+    // speaker: every speaker codepoint is emoji, and an emoji font would paint
+    // it two cells wide while unicode-width calls it one, moving every hit box
+    // after it one cell off what was painted.
+    bar.button(" ◎ ", Hit::Devices, button_style());
     bar.label("  ", Style::default());
 
     if let Some(q) = queue {
@@ -1540,6 +1547,40 @@ mod tests {
             width,
             height: 1,
         }
+    }
+
+    /// Render a frame and return the cells the control's hit box covers.
+    ///
+    /// The one assertion every clickable control owes: what was painted and what
+    /// is clickable are the same cells. Comparing the two by eye in a frame dump
+    /// is exactly the check that has been missed before.
+    fn painted(app: &mut App, w: u16, h: u16, wanted: Hit) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let rect = app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == wanted)
+            .map_or_else(|| panic!("{wanted:?} has no hit box"), |(r, _)| *r);
+        let buf = term.backend().buffer().clone();
+        (rect.x..rect.x.saturating_add(rect.width))
+            .map(|x| buf[(x, rect.y)].symbol().to_string())
+            .collect()
+    }
+
+    /// Press a control the way a user would: on its own hit box.
+    fn click_hit(app: &mut App, wanted: Hit) {
+        let rect = app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == wanted)
+            .map_or_else(|| panic!("{wanted:?} has no hit box"), |(r, _)| *r);
+        app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
     }
 
     #[test]
@@ -2561,6 +2602,25 @@ mod tests {
             sc.app.device_exclusive_rect,
             Rect::default(),
             "nothing was painted, so there is nothing to click"
+        );
+    }
+
+    #[test]
+    fn the_output_picker_is_opened_by_a_control_painted_in_the_header() {
+        // Goal: the picker answered to `d` and to nothing at all on screen, which
+        // is the asymmetry the parity rule exists to catch. The control has to be
+        // painted, and its hit box has to be the cells it was painted on.
+        let mut sc = screen();
+        assert_eq!(
+            painted(&mut sc.app, 120, 12, Hit::Devices),
+            " ◎ ",
+            "the hit box must cover the glyph that was drawn"
+        );
+        click_hit(&mut sc.app, Hit::Devices);
+        assert_eq!(
+            sc.app.mode,
+            Mode::Devices,
+            "and clicking it must open the same picker `d` opens"
         );
     }
 

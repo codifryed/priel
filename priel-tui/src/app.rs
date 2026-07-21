@@ -52,8 +52,10 @@ pub enum View {
     Search,
 }
 
-/// A clickable region recorded by the renderer. Mouse support is a headline
-/// feature, so every control that has a key binding also has a hit box: the
+/// A clickable region recorded by the renderer.
+///
+/// Parity runs both ways: every action has a VIM-style key binding *and* a hit
+/// box, so this enum is the list of everything priel can be asked to do. The
 /// renderer knows the geometry, and only the renderer should have to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
@@ -76,6 +78,7 @@ pub enum Hit {
     CycleView,
     Help,
     Graph,
+    Devices,
     Quit,
 }
 
@@ -1912,8 +1915,8 @@ impl App {
 
     /// Open the output picker, asking for a fresh list as it opens.
     ///
-    /// The one way in: the key and the hint click both come through here, so the
-    /// two cannot drift apart.
+    /// The one way in: `d` and the header's `◎` control both come through here,
+    /// so the two cannot drift apart.
     fn open_devices(&mut self) {
         self.mode = Mode::Devices;
         self.device_offset = 0;
@@ -2333,6 +2336,7 @@ impl App {
             Hit::CycleView => self.cycle_view(),
             Hit::Help => self.mode = Mode::Help,
             Hit::Graph => self.open_graph(),
+            Hit::Devices => self.open_devices(),
             Hit::Quit => self.should_quit = true,
         }
     }
@@ -5787,6 +5791,10 @@ mod tests {
         assert_eq!(r.app.mode, Mode::Filter);
         fire(&mut r.app, Hit::Help);
         assert_eq!(r.app.mode, Mode::Help);
+        fire(&mut r.app, Hit::Devices);
+        assert_eq!(r.app.mode, Mode::Devices);
+        fire(&mut r.app, Hit::Graph);
+        assert_eq!(r.app.mode, Mode::Graph);
 
         // These reach the player rather than app state; with a silent player the
         // observable part is that they are accepted without panicking.
