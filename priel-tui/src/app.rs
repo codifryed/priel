@@ -1576,7 +1576,13 @@ impl App {
         self.loading = false;
         let loaded = self.favorites.len();
         self.notice = Some(match rows_missing(loaded, self.favorites_paging.total) {
-            Some(total) => format!("{loaded} of {total} favorites"),
+            // Worded like the heading: the two figures are named, not
+            // juxtaposed. `42 of 417` leaves the reader to work out which is
+            // which, which is the whole of #23.
+            Some(total) if usize::try_from(total).is_ok_and(|t| t == loaded) => {
+                format!("all {total} favorites loaded")
+            }
+            Some(total) => format!("{loaded} loaded of {total} favorites"),
             None => format!("{loaded} favorites"),
         });
         if self.view == View::Favorites {
@@ -1684,7 +1690,11 @@ impl App {
         self.loading = false;
         let loaded = self.search_tracks.len();
         self.notice = Some(match rows_missing(loaded, self.search_paging.total) {
-            Some(total) => format!("{loaded} of {total} results"),
+            // Named rather than juxtaposed; see the favorites notice.
+            Some(total) if usize::try_from(total).is_ok_and(|t| t == loaded) => {
+                format!("all {total} results loaded")
+            }
+            Some(total) => format!("{loaded} loaded of {total} results"),
             None => format!("{loaded} results"),
         });
         if self.view == View::Search {
