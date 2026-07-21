@@ -258,7 +258,16 @@ Roadmap, roughly in order:
   loopback redirect would remove that step; the developer terms do not currently
   permit a native player, so it stands.
 - MPRIS, cover art (kitty/sixel).
-- **Spectrum visualiser**, if it can coexist with bit-perfect output.
+
+**Not planned: a spectrum visualiser.** It was on this list for as long as the
+open question was whether it could coexist with bit-perfect output. It can:
+splitting the decoded stream and analysing one copy leaves the other byte for
+byte what the device would have received, and the fidelity badge reads exactly
+the same with it running. What stops it is elsewhere. The filter graph that
+performs the split is rebuilt for every track and takes the audio output with
+it, so every transition costs the gap that gapless playback exists to remove -
+whatever `gapless-audio` is set to. The measurements and the alternatives are in
+[`docs/adr/0002`](docs/adr/0002-a-display-of-the-audio-costs-the-gapless-transition.md).
 
 ## Workspace
 
