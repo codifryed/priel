@@ -225,6 +225,12 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 | Previous / next track | `H`/`L`, or `p`/`n` | click `|◁` / `▷|` |
 | Filter the current list | `/`, type, `Enter`/`Esc` | click `[/]` |
 | Reload the current list | `r` | click `↻` |
+| New playlist | `N`, type, `Enter` | `[?]`, then `N` |
+| Rename this playlist | `R`, edit, `Enter` | `[?]`, then `R` |
+| Add track to a playlist | `a`, then a row | `[?]` then `a`; then click a row |
+| Delete playlist / remove track | `X`, then `y` | `[?]` then `X`; then click `[y]` |
+| Answer a confirmation | `y` do it, `n` or `Esc` don't | click `[y]` / `[n]` |
+| Scroll the `?` reference | `j`/`k`, `g`/`G` | `[?]`, then the same keys |
 | Search the catalogue | `3`, type, `Enter`; `i` to re-edit | click the `3` tab; `[?]` then `i` |
 | Shuffle the current view | `s` | click `⇄` |
 | Favorite the selected track | `f` | click `[f]` |
@@ -250,9 +256,33 @@ track you take off the favorites keeps its row in the list until the list is
 reloaded with `r`: removing the row would move every row below it out from under
 the cursor, including the one you just acted on.
 
-`Esc` cancels: it leaves a filter or search box, and steps back out of an opened
-playlist or mix — to the list it was opened from, whichever that was. It never
-quits.
+`Esc` cancels: it leaves a filter or search box, backs out of a picker or a
+confirmation, and steps back out of an opened playlist or mix — to the list it
+was opened from, whichever that was. It never quits.
+
+`N` makes a playlist, `R` renames the highlighted one and `a` puts the
+highlighted track into one you pick from a list. `X` takes away whatever is
+highlighted: the playlist itself in the `2` tab, the track in an opened
+playlist.
+
+**The two that take something away ask first, and `Enter` is not the answer.**
+The question names what it is about to remove and, for a playlist, says that it
+goes from the account rather than only from priel and cannot be brought back.
+Only `y` — or a click on the `[y]` control itself — goes through with it; `n`,
+`Esc` and every other key leave things alone, and a click anywhere but on those
+two controls does nothing at all. `Enter` is deliberately not a yes: it is what
+opens a playlist, and pressing it twice out of rhythm should not be the
+difference between reading a question and answering it.
+
+A rename shows up straight away and is put back with a message if the service
+refuses it, the way a heart is. The two removals do not: the row stays where it
+is until the service confirms it is gone, because a row that vanished on hope
+and quietly reappeared would read as a glitch rather than as the refusal it was.
+Creating a playlist waits too — the service chooses its identifier, so there is
+nothing to show until it answers — and the new playlist then appears at the top
+of the list without the list being reloaded. Adding a track to a playlist is the
+one change that reports its own success, since the playlist you added to is
+usually not the one you are looking at.
 
 The `4` tab holds the mixes the service builds for you, kept apart from the
 playlists you wrote rather than mingled with them: nobody can edit a mix, and it
@@ -265,7 +295,8 @@ neither for a mix; its length is only knowable once you open it.
 
 ## Status
 
-Working: favorites, playlists, the service's own mixes and catalogue search,
+Working: favorites, playlists — including making, renaming and deleting them and
+changing what is in them — the service's own mixes and catalogue search,
 each paged in as the selection nears the end of the loaded rows and reloadable
 with `r`; local
 filtering; hi-res resolution and playback (24/192 via progressive segment
