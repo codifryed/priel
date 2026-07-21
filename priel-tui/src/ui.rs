@@ -1462,9 +1462,9 @@ fn help_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         // more below: a reference that silently ended would be a reference that
         // silently lost bindings.
         let footer = if furthest > 0 {
-            "  j k scroll · g G ends · press ?, Esc or q to close"
+            "  j k scroll · g G ends · ?, Esc or q to close"
         } else {
-            "  press ?, Esc or q to close"
+            "  ?, Esc or q to close"
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -2088,7 +2088,10 @@ fn source_badge(app: &App) -> String {
     if parts.is_empty() {
         String::new()
     } else {
-        format!("   ·  {}", parts.join(" · "))
+        // Two cells either side of the separator that joins the title to the
+        // badge, against one either side of the separators inside it: enough of
+        // a gap to read as a group, and even, which three-then-two was not.
+        format!("  ·  {}", parts.join(" · "))
     }
 }
 
@@ -4627,6 +4630,28 @@ mod tests {
     }
 
     #[test]
+    fn the_source_badge_is_joined_on_with_an_even_separator() {
+        // Goal: the separator between the title and the badge carried three
+        // spaces on its left and two on its right, where every separator inside
+        // the badge carries one of each. An uneven gap around one glyph reads
+        // as a misalignment rather than as a grouping.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "So What"));
+        sc.app.now_meta = crate::app::StreamMeta {
+            bit_depth: 24,
+            sample_rate: 192_000,
+            codec: "flac".into(),
+            quality: "HI_RES_LOSSLESS".into(),
+        };
+        let out = text(&mut sc.app, 130, 12);
+        assert!(out.contains("  ·  24-bit · 192 kHz"), "{out}");
+        assert!(
+            !out.contains("   ·  24-bit"),
+            "and no third space on the left: {out}"
+        );
+    }
+
+    #[test]
     fn a_field_with_no_room_truncates_to_nothing_rather_than_overflowing() {
         // Goal: `trunc(s, 0)` returned a lone ellipsis, one cell wider than the
         // field it was asked to fit. Reachable from the device picker
@@ -4686,6 +4711,28 @@ mod tests {
                 inside(&footer, border),
                 "{name}\nbody:   {body}\nfooter: {footer}"
             );
+        }
+    }
+
+    #[test]
+    fn every_overlay_says_the_way_out_the_same_way() {
+        // Goal: five overlays print one closing instruction and one of them
+        // used to say `press ?, Esc or q to close` where the rest said
+        // `M, Esc or q to close`. A single stray verb is the kind of drift the
+        // reader reads as a difference in meaning.
+        for mode in [
+            Mode::Help,
+            Mode::Log,
+            Mode::Graph,
+            Mode::Devices,
+            Mode::Themes,
+        ] {
+            let name = format!("{mode:?}");
+            let mut sc = screen();
+            sc.app.set_mode_for_test(mode);
+            let out = text(&mut sc.app, 100, 40);
+            assert!(out.contains(", Esc or q to close"), "{name}: {out}");
+            assert!(!out.contains("press "), "{name} says it its own way: {out}");
         }
     }
 }
