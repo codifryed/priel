@@ -67,18 +67,26 @@ pub enum Hit {
     SeekFwd,
     MoveUp,
     MoveDown,
+    HalfPageUp,
+    HalfPageDown,
+    PageUp,
+    PageDown,
     Top,
     Bottom,
+    Enter,
     Shuffle,
     VolUp,
     VolDown,
     VolUnity,
     Filter,
+    EditSearch,
     Reload,
     CycleView,
     Help,
+    Log,
     Graph,
     Devices,
+    SignIn,
     Quit,
 }
 
@@ -1525,6 +1533,21 @@ impl App {
         }
     }
 
+    /// Put the cursor in the search box, going to that view first if need be.
+    ///
+    /// The one way in: `i` and the `i` control in the reference overlay both
+    /// come through here. Not guarded by the current view, because a control the
+    /// mouse could reach only from one screen would be an action the keyboard
+    /// had a shorter route to than the mouse - the asymmetry, backwards. Already
+    /// on the search view it only reopens the box, leaving the results and the
+    /// selection where they were.
+    fn edit_search(&mut self) {
+        if self.view != View::Search {
+            self.switch_view(View::Search);
+        }
+        self.mode = Mode::Search;
+    }
+
     fn cycle_view(&mut self) {
         let next = match self.view {
             View::Favorites => View::Playlists,
@@ -1775,6 +1798,17 @@ impl App {
         ) {
             self.mode = Mode::Normal;
         }
+    }
+
+    /// Open the recent diagnostics.
+    ///
+    /// The one way in: `M` and the `M` control in the reference overlay both
+    /// come through here, so the two cannot drift apart. Always opens on the
+    /// newest line - the reason for opening this is almost always something that
+    /// just happened.
+    fn open_log(&mut self) {
+        self.mode = Mode::Log;
+        self.log_scroll = 0;
     }
 
     /// The log overlay: modal like the help one, and scrolled like every list.
@@ -2208,8 +2242,7 @@ impl App {
             KeyCode::Char('1') => self.switch_view(View::Favorites),
             KeyCode::Char('2') => self.switch_view(View::Playlists),
             KeyCode::Char('3') => self.switch_view(View::Search),
-            // Re-edit the search query while in the Search view.
-            KeyCode::Char('i') if self.view == View::Search => self.mode = Mode::Search,
+            KeyCode::Char('i') => self.edit_search(),
             KeyCode::Char('j') | KeyCode::Down => self.move_down(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(1),
             KeyCode::Char('J') => self.move_down(self.full_page()),
@@ -2217,12 +2250,7 @@ impl App {
             KeyCode::Char('g') => self.goto_top(),
             KeyCode::Char('G') => self.goto_bottom(),
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('M') => {
-                self.mode = Mode::Log;
-                // Always open on the newest line: the reason for opening this is
-                // almost always something that just happened.
-                self.log_scroll = 0;
-            }
+            KeyCode::Char('M') => self.open_log(),
             KeyCode::Char('D') => self.open_graph(),
             KeyCode::Char('d') => self.open_devices(),
             KeyCode::Char('A') => self.start_login(),
@@ -2293,9 +2321,20 @@ impl App {
             return;
         }
         if self.mode == Mode::Help {
-            // Any click dismisses; scrolling the list behind it would be odd.
+            // The reference is priel's menu: every key it lists is a control, so
+            // a click that lands on one runs it and anything else just
+            // dismisses. Either way the overlay closes, and the mode is put back
+            // *before* dispatching so an action that opens another overlay is
+            // not closed again by its own click. The renderer replaces the hit
+            // boxes with the overlay's own while it is up, so nothing behind it
+            // can be reached from here. Scrolling the list behind it would be
+            // odd, so only a click is answered.
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let landed = self.hit_at(m.column, m.row);
                 self.mode = Mode::Normal;
+                if let Some(h) = landed {
+                    self.dispatch(h);
+                }
                 self.dirty = true;
             }
             return;
@@ -2325,29 +2364,41 @@ impl App {
             Hit::SeekFwd => self.player.seek_relative(5.0),
             Hit::MoveUp => self.move_up(1),
             Hit::MoveDown => self.move_down(1),
+            Hit::HalfPageUp => self.move_up(self.half_page()),
+            Hit::HalfPageDown => self.move_down(self.half_page()),
+            Hit::PageUp => self.move_up(self.full_page()),
+            Hit::PageDown => self.move_down(self.full_page()),
             Hit::Top => self.goto_top(),
             Hit::Bottom => self.goto_bottom(),
+            Hit::Enter => self.on_enter(),
             Hit::Shuffle => self.toggle_shuffle(),
             Hit::VolUp => self.volume_step(5.0),
             Hit::VolDown => self.volume_step(-5.0),
             Hit::VolUnity => self.volume_unity(),
             Hit::Filter => self.start_filter(),
+            Hit::EditSearch => self.edit_search(),
             Hit::Reload => self.reload_view(),
             Hit::CycleView => self.cycle_view(),
             Hit::Help => self.mode = Mode::Help,
+            Hit::Log => self.open_log(),
             Hit::Graph => self.open_graph(),
             Hit::Devices => self.open_devices(),
+            Hit::SignIn => self.start_login(),
             Hit::Quit => self.should_quit = true,
         }
     }
 
-    fn on_click(&mut self, col: u16, row: u16) {
-        if let Some(h) = self
-            .hits
+    /// The control under the pointer, if any. The renderer rebuilds `hits` every
+    /// frame, so this only ever answers with something currently on screen.
+    fn hit_at(&self, col: u16, row: u16) -> Option<Hit> {
+        self.hits
             .iter()
             .find(|(r, _)| hit(*r, col, row))
             .map(|(_, h)| *h)
-        {
+    }
+
+    fn on_click(&mut self, col: u16, row: u16) {
+        if let Some(h) = self.hit_at(col, row) {
             self.dispatch(h);
             return;
         }
@@ -5660,9 +5711,13 @@ mod tests {
     }
 
     #[test]
-    fn a_click_dismisses_the_reference_without_activating_anything() {
-        // Goal: clicking to dismiss must not also press whatever control sits
-        // under the pointer.
+    fn a_click_on_the_reference_runs_the_key_it_landed_on_and_closes() {
+        // Goal: the reference is priel's menu, so a click on one of its keys must
+        // run that key rather than merely dismiss - that is the mouse's route to
+        // everything the bottom row has no width for. A click on nothing still
+        // just dismisses. That the keys under the pointer belong to the overlay
+        // and never to the header behind it is the renderer's half of this, and
+        // is asserted in `ui`.
         let mut r = rig();
         r.app.hits = vec![(
             Rect {
@@ -5675,8 +5730,13 @@ mod tests {
         )];
         r.app.on_key(key('?'));
         r.app.on_mouse(click(1, 0));
+        assert_eq!(r.app.mode, Mode::Normal, "the overlay closes either way");
+        assert!(r.app.shuffle, "and the key it landed on ran");
+
+        r.app.on_key(key('?'));
+        r.app.on_mouse(click(40, 20));
         assert_eq!(r.app.mode, Mode::Normal);
-        assert!(!r.app.shuffle, "the click was consumed by the overlay");
+        assert!(r.app.shuffle, "a click on nothing changes nothing else");
     }
 
     // ---- redraw gating ----
@@ -5772,6 +5832,14 @@ mod tests {
             app.on_mouse(click(1, 0));
         };
 
+        // A page is measured from the list rect the renderer published.
+        r.app.list_inner = Rect {
+            x: 0,
+            y: 1,
+            width: 40,
+            height: 2,
+        };
+
         fire(&mut r.app, Hit::MoveDown);
         assert_eq!(r.app.selected, 1);
         fire(&mut r.app, Hit::Bottom);
@@ -5779,6 +5847,15 @@ mod tests {
         fire(&mut r.app, Hit::MoveUp);
         assert_eq!(r.app.selected, 3);
         fire(&mut r.app, Hit::Top);
+        assert_eq!(r.app.selected, 0);
+
+        fire(&mut r.app, Hit::PageDown);
+        assert_eq!(r.app.selected, 2, "a full page is the list's height");
+        fire(&mut r.app, Hit::HalfPageDown);
+        assert_eq!(r.app.selected, 3, "and half of it is rounded up to one");
+        fire(&mut r.app, Hit::HalfPageUp);
+        assert_eq!(r.app.selected, 2);
+        fire(&mut r.app, Hit::PageUp);
         assert_eq!(r.app.selected, 0);
 
         fire(&mut r.app, Hit::Shuffle);
@@ -5795,6 +5872,24 @@ mod tests {
         assert_eq!(r.app.mode, Mode::Devices);
         fire(&mut r.app, Hit::Graph);
         assert_eq!(r.app.mode, Mode::Graph);
+        fire(&mut r.app, Hit::Log);
+        assert_eq!(r.app.mode, Mode::Log);
+        fire(&mut r.app, Hit::EditSearch);
+        assert_eq!(r.app.view, View::Search);
+        assert_eq!(r.app.mode, Mode::Search);
+        // Nowhere to sign in to without a client identity, and a rigged app has
+        // none: what this asserts is that the control is wired to the attempt.
+        fire(&mut r.app, Hit::SignIn);
+        assert_eq!(r.app.mode, Mode::Normal);
+
+        r.app.view = View::Favorites;
+        r.app.selected = 2;
+        fire(&mut r.app, Hit::Enter);
+        assert_eq!(
+            r.app.now_playing.as_ref().map(|t| t.id),
+            Some(3),
+            "Enter plays the row the selection is on"
+        );
 
         // These reach the player rather than app state; with a silent player the
         // observable part is that they are accepted without panicking.
