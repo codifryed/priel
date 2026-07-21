@@ -1671,10 +1671,10 @@ impl App {
         }
     }
 
-    /// How long the current listing is, while some of it is still missing.
+    /// How long the current listing is, whenever the service has said.
     ///
-    /// `None` once everything is loaded, so the heading mentions a total only
-    /// while it still tells the user something.
+    /// Kept once everything is loaded, so a complete list says it is complete
+    /// rather than leaving that to be inferred from a missing number.
     #[must_use]
     pub fn rows_available(&self) -> Option<u32> {
         rows_missing(self.loaded_rows(), self.paging().total)
@@ -4217,13 +4217,19 @@ fn negotiated(node: &GraphNode) -> String {
 /// by the caller, which is what keeps this off the per-row allocation path.
 /// An empty filter matches everything; `secondary` may be empty for item kinds
 /// that only have one searchable field.
-/// The length of a listing, while some of it is still missing.
+/// How long a listing is, whenever the service has said.
 ///
-/// `None` once `loaded` has caught up, so nothing on screen offers a total that
-/// only repeats the row count beside it.
+/// Kept once `loaded` has caught up rather than dropped: `18 of 18` says the
+/// list is complete, where a bare `18` says so only to a reader who already
+/// knows that a missing total means finished. Completeness is information, and
+/// leaving it to be read off an absence is the same mistake the access badge
+/// made before it named the shared case.
+///
+/// `None` only when the service never said - a total of zero rows loaded is not
+/// a total of zero rows.
 fn rows_missing(loaded: usize, total: u32) -> Option<u32> {
     let known = usize::try_from(total).ok()?;
-    (loaded < known).then_some(total)
+    (known > 0 || loaded == 0).then_some(total)
 }
 
 fn row_matches(primary: &str, secondary: &str, filter_lower: &str) -> bool {
@@ -4580,8 +4586,9 @@ mod tests {
         assert!(requests(&r).is_empty(), "everything is already loaded");
         assert_eq!(
             r.app.rows_available(),
-            None,
-            "and the heading should stop mentioning a total"
+            Some(4),
+            "and the heading still says how long the list is, so `4 of 4` tells \
+             the reader it is complete rather than leaving it to an absence"
         );
     }
 

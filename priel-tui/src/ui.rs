@@ -2919,8 +2919,11 @@ mod tests {
     #[test]
     fn the_favorites_heading_separates_rows_loaded_from_rows_there_are() {
         // Goal: a list that has paged in its first hundred must not read as the
-        // whole library, or the user has no reason to keep scrolling. Once
-        // everything is loaded the second number says nothing, so it goes.
+        // whole library, or the user has no reason to keep scrolling. The total
+        // stays once everything is loaded: `2 of 2` says the list is complete,
+        // where a bare `2 tracks` only says so to a reader who knows that a
+        // missing total means finished. The same reason the access badge names
+        // the shared case rather than leaving it to be read off an absence.
         let mut sc = screen();
         sc.app.favorites = vec![track(1, "One"), track(2, "Two")];
         sc.app.favorites_paging.total = 417;
@@ -2929,8 +2932,10 @@ mod tests {
 
         sc.app.favorites_paging.total = 2;
         let out = text(&mut sc.app, 120, 12);
-        assert!(out.contains("2 tracks"), "{out}");
-        assert!(!out.contains(" of "), "nothing left to page in: {out}");
+        assert!(
+            out.contains("2 of 2 tracks"),
+            "a complete list says so rather than leaving it to an absence: {out}"
+        );
     }
 
     #[test]
