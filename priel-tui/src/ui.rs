@@ -27,7 +27,7 @@ use std::fmt::Write as _;
 use priel_player::graph::{SinkStage, SinkVolume};
 use priel_player::{Alteration, Fidelity, OutputAccess, StreamVolume, Verdict};
 
-use crate::app::{App, Focus, GraphRow, GraphRowKind, Hit, Mode, View};
+use crate::app::{App, Focus, GraphRow, GraphRowKind, Hit, Mode, Repeat, View};
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
 
@@ -779,7 +779,14 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
                 "next / previous track",
             ),
             row(&[("s", Some(Hit::Shuffle))], "shuffle this view"),
+            row(&[("e", Some(Hit::Repeat))], "repeat: off / all / one"),
             row(&[("c", Some(Hit::Continue))], "keep playing at the end"),
+            // The vocabulary, not an action: the three marks the one control
+            // wears, so which of three it is in is readable here as well as on
+            // screen - and the one interaction between the two keys above it,
+            // which is why the `∞` goes dark under a repeat.
+            row(&[("⟳- ⟳A ⟳1", None)], "none / queue / track"),
+            row(&[("repeat", None)], "outranks the radio"),
             // The vocabulary, not an action: this is the word the queue counter
             // wears once the music stopped being something anybody picked.
             row(&[("radio", None)], "suggested, not chosen"),
@@ -1615,7 +1622,10 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     let playing = app.status.playing;
     let shuffle = app.shuffle;
     let volume = app.status.volume as u32;
-    let carrying_on = app.continue_radio;
+    let repeat = app.repeat;
+    // Not `continue_radio`: a control lit up for something a repeating queue
+    // will never reach is a control telling the listener a lie.
+    let carrying_on = app.radio_follows();
     let queue = app.queue_indicator();
     let from_radio = app.playing_from_radio();
     let filtering = app.mode == Mode::Filter;
@@ -1644,6 +1654,12 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     bar.button(" ▷| ", Hit::Next, t.control());
     bar.label(" ", Style::default());
     bar.button(" ⇄ ", Hit::Shuffle, t.toggle(shuffle));
+    // The three are answers to "and then?" and sit in the order they are
+    // consulted: the shuffle picks, the repeat says whether there is an end, and
+    // the radio answers only where there is one. The backing says on or off and
+    // the mark says which kind of on - three states have no colour-free
+    // shorthand, so [`Repeat::glyph`] carries it.
+    bar.button(repeat.glyph(), Hit::Repeat, t.toggle(repeat != Repeat::Off));
     // Beside the shuffle because both answer "and then?", and drawn the same
     // way so the pair reads as a pair. A lemniscate rather than any of the
     // broadcast or repeat codepoints: those are emoji, and an emoji font paints
@@ -2590,6 +2606,10 @@ const HINTS: &[Hint] = &[
     Hint {
         keys: &[("s", Hit::Shuffle)],
         label: "shuffle",
+    },
+    Hint {
+        keys: &[("e", Hit::Repeat)],
+        label: "repeat",
     },
     Hint {
         keys: &[("c", Hit::Continue)],
@@ -4045,6 +4065,60 @@ mod tests {
         let out = text(&mut sc.app, 130, 30);
         assert!(out.contains("keep playing at the end"), "{out}");
         assert!(out.contains("suggested, not chosen"), "the word too: {out}");
+    }
+
+    #[test]
+    fn the_repeat_control_says_which_of_three_states_it_is_in_without_colour() {
+        // Goal: a toggle has a backing to say on or off, and three states have
+        // no such shorthand - the difference between repeating the queue and
+        // repeating one track has to be legible in the glyphs themselves, the
+        // rule the verdict badges follow. Method: paint all three and check the
+        // cells the hit box covers are three different things.
+        let mut sc = screen();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(painted(&mut sc.app, 140, 12, Hit::Repeat));
+            click_hit(&mut sc.app, Hit::Repeat);
+        }
+        assert_eq!(seen.len(), 3);
+        for (i, one) in seen.iter().enumerate() {
+            for other in &seen[i + 1..] {
+                assert_ne!(one, other, "two states painted the same: {seen:?}");
+            }
+        }
+        assert_eq!(seen[0], " ⟳- ", "off is where it starts: {seen:?}");
+
+        assert!(
+            text(&mut sc.app, 200, 12).contains("] repeat"),
+            "on the row"
+        );
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 140, 30);
+        assert!(out.contains("repeat: off / all / one"), "{out}");
+        assert!(out.contains("outranks the radio"), "the interaction: {out}");
+    }
+
+    #[test]
+    fn the_radio_control_stops_claiming_while_the_repeat_is_on() {
+        // Goal: a repeating queue has no end, so there is nothing for the radio
+        // to continue from. The two toggles stay independent - neither writes to
+        // the other - but a control lit up for something that will not happen is
+        // a control telling the listener a lie. Method: read the backing off the
+        // three cases; the flag itself is untouched throughout.
+        let mut sc = screen();
+        let off = painted_backing(&mut sc.app, 140, 12, Hit::Continue);
+
+        click_hit(&mut sc.app, Hit::Continue);
+        let claiming = painted_backing(&mut sc.app, 140, 12, Hit::Continue);
+        assert_ne!(claiming, off, "on, with an end to carry on from");
+
+        click_hit(&mut sc.app, Hit::Repeat);
+        assert_eq!(
+            painted_backing(&mut sc.app, 140, 12, Hit::Continue),
+            off,
+            "a repeating queue never reaches it"
+        );
+        assert!(sc.app.continue_radio, "and the flag was not reached into");
     }
 
     // ---- favorites ----

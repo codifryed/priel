@@ -80,6 +80,98 @@ pub enum Focus {
     Queue,
 }
 
+/// What the queue does when it reaches the end of a track, or the end of itself.
+///
+/// Three states rather than two flags, because they are exclusive: a queue
+/// cannot both start again and play one track for ever, and two booleans would
+/// have a fourth combination that means nothing. Spec 2.2's `LoopStatus` has the
+/// same three, which is why one type serves the key, the control and the bus.
+///
+/// **Session state rather than a setting**, in the sense
+/// `docs/adr/0004-a-settings-file-that-is-edited-never-rewritten.md` means it:
+/// its membership test is "can a flag already set it", no flag can, and its
+/// exclusion list names the shuffle flag - the toggle beside this one - as the
+/// kind of thing that stays out. `settings.rs` has the test.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Repeat {
+    /// The queue ends where it ends. The radio is then the only thing that can
+    /// follow it, and only if it was asked for.
+    #[default]
+    Off,
+    /// The queue starts again at its top.
+    All,
+    /// The track playing now plays again.
+    One,
+}
+
+impl Repeat {
+    /// The state after this one, which is what the key and the control both ask
+    /// for. Off, then the whole queue, then one track: widest scope first, so
+    /// the cycle reads as narrowing rather than as an arbitrary order.
+    #[must_use]
+    const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+
+    /// What a *deliberate* skip honours.
+    ///
+    /// Repeat-one reads as off here, and nothing else changes: the natural end
+    /// of a track repeats it, but pressing next says otherwise. A repeat-one
+    /// that could not be skipped out of would be a trap with no key to leave it.
+    #[must_use]
+    const fn skipped(self) -> Self {
+        match self {
+            Self::One => Self::Off,
+            other => other,
+        }
+    }
+
+    /// The MPRIS spelling. Spec 2.2 allows exactly these three words, and they
+    /// map onto the three states one for one - which is what made publishing
+    /// `LoopStatus` a translation rather than a design.
+    #[must_use]
+    pub(crate) const fn loop_status(self) -> &'static str {
+        match self {
+            Self::Off => "None",
+            Self::All => "All",
+            Self::One => "Track",
+        }
+    }
+
+    /// And back, or `None` for a word the specification does not name - which
+    /// the consumer is told about rather than being guessed at.
+    #[must_use]
+    pub(crate) fn from_loop_status(word: &str) -> Option<Self> {
+        match word {
+            "None" => Some(Self::Off),
+            "All" => Some(Self::All),
+            "Track" => Some(Self::One),
+            _ => None,
+        }
+    }
+
+    /// The glyph and mark a control paints, which says which of three it is in
+    /// **without any colour at all** - the rule the verdict badges follow. The
+    /// backing says on or off; only these say which kind of on.
+    ///
+    /// A gapped circle arrow rather than any of the repeat codepoints: those
+    /// have emoji presentation, and an emoji font paints them two cells wide
+    /// while unicode-width calls them one, moving every hit box after them off
+    /// what was painted.
+    #[must_use]
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Off => " ⟳- ",
+            Self::All => " ⟳A ",
+            Self::One => " ⟳1 ",
+        }
+    }
+}
+
 /// What a left click at one cell means, read off the geometry the renderer
 /// published for this frame.
 ///
@@ -153,6 +245,15 @@ pub enum Hit {
     /// been.
     Back,
     Shuffle,
+    /// Cycle no repeat, repeat all and repeat one.
+    ///
+    /// One control for three states rather than three controls: they are
+    /// exclusive, so a strip of them would offer two clicks that undo each
+    /// other. Between [`Hit::Shuffle`] and [`Hit::Continue`] because the three
+    /// are answers to "and then?" in the order they are consulted - the shuffle
+    /// picks, the repeat decides whether there is an end, and the radio answers
+    /// only where there is one.
+    Repeat,
     /// Carry on with the service's radio when the queue runs out, or stop
     /// there. Beside [`Hit::Shuffle`] because both are answers to "and then?".
     Continue,
@@ -581,6 +682,12 @@ pub struct App {
     /// list names the shuffle flag - the toggle beside this one - as the kind of
     /// thing that stays out.
     pub continue_radio: bool,
+    /// Whether the queue, or the track, starts again rather than ending.
+    ///
+    /// Independent of [`Self::continue_radio`] and never written by it: a
+    /// repeating queue simply has no end for the radio to be asked at, so the
+    /// two interact through the queue rather than through each other.
+    pub repeat: Repeat,
     /// The track whose radio has already been asked about, whatever the answer.
     ///
     /// The preload decision fires on every tick for as long as nothing is queued
@@ -868,6 +975,7 @@ impl App {
             metas: HashMap::new(),
             advanced: false,
             continue_radio: false,
+            repeat: Repeat::Off,
             radio_asked: None,
             radio_from: None,
             favorite_ids: HashSet::new(),
@@ -2156,6 +2264,7 @@ impl App {
             BusCommand::PlayPause => self.player.toggle_pause(),
             BusCommand::SeekTo(position_us) => self.player.seek(seconds(position_us)),
             BusCommand::Shuffle(on) => self.set_shuffle(on),
+            BusCommand::Loop(repeat) => self.set_repeat(repeat),
             BusCommand::Volume(unity) => self.player.set_volume(unity * 100.0),
             BusCommand::Quit => self.should_quit = true,
         }
@@ -2207,6 +2316,7 @@ impl App {
                 }),
                 paused: self.status.paused,
                 shuffle: self.shuffle,
+                repeat: self.repeat,
                 // Rounded, so that a float wobbling in its last bits is not a
                 // property change announced ten times a second.
                 volume: (self.status.volume * 10.0).round() / 1000.0,
@@ -2222,10 +2332,15 @@ impl App {
         }
     }
 
-    /// The three branches of `user_next` that come to something, as one answer.
+    /// The two branches of `user_next` that come to something, as one answer.
+    ///
+    /// It mirrors that method rather than describing it, down to the repeat that
+    /// is skipped past, so a button the desktop offers is a button that does
+    /// something.
     fn can_go_next(&self) -> bool {
         !self.queue.is_empty()
-            && (self.status.has_next || self.shuffle || self.queue_pos + 1 < self.queue.len())
+            && ((self.status.has_next && self.repeat != Repeat::One)
+                || self.next_pos(self.repeat.skipped()).is_some())
     }
 
     /// Begin a new play of a queue entry, and mint the id it is known by.
@@ -2628,21 +2743,18 @@ impl App {
             self.next_intended = None;
             return;
         }
-        let next = if self.shuffle {
-            Some(self.rand_other())
-        } else if self.queue_pos + 1 < self.queue.len() {
-            Some(self.queue_pos + 1)
-        } else {
-            None
-        };
-        if let Some(p) = next {
+        if let Some(p) = self.next_pos(self.repeat) {
+            // Repeat-one lands on the track already playing, and that is a
+            // preload like any other: mpv's playlist takes a second entry for
+            // it, so the repeat is gapless exactly as a change of track is.
             let id = self.queue[p].id;
             self.next_intended = Some(id);
             self.ask(ToWorker::Resolve(id));
         } else {
-            // Nothing follows this track. Shuffle never reaches here - it always
-            // has somewhere to go - so this is the ordered end of a queue, and
-            // the one moment the radio has anything to answer.
+            // Nothing follows this track. Neither the shuffle nor a repeat ever
+            // reaches here - both always have somewhere to go - so this is the
+            // ordered end of a queue that is not repeating, and the one moment
+            // the radio has anything to answer.
             self.next_intended = None;
             self.extend_with_radio();
         }
@@ -2774,12 +2886,55 @@ impl App {
     }
 
     fn advance_fresh(&mut self) {
-        if self.shuffle {
-            let p = self.rand_other();
+        if let Some(p) = self.next_pos(self.repeat) {
             self.load_fresh(p);
-        } else if self.queue_pos + 1 < self.queue.len() {
-            self.load_fresh(self.queue_pos + 1);
         }
+    }
+
+    /// Where the queue goes after the entry playing now, or `None` where it
+    /// ends there.
+    ///
+    /// **One rule with three callers** - the gapless preload, the end-of-track
+    /// fallback and a deliberate skip - so they cannot come to disagree about
+    /// what a repeat means, which would show up only at the moment something
+    /// else had already gone wrong. `repeat` is an argument rather than read
+    /// from `self` because a skip asks a different question: see
+    /// [`Repeat::skipped`].
+    ///
+    /// **The shuffle says what the play order is; the repeat says whether that
+    /// order ends.** The two are answers to different questions, which is what
+    /// keeps this readable as the shuffle changes shape underneath it.
+    fn next_pos(&self, repeat: Repeat) -> Option<usize> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        // Repeat-one is about *this* track, so it outranks the shuffle under
+        // either shape: there is no next track to pick when the answer is "this
+        // one again".
+        if repeat == Repeat::One {
+            return Some(self.queue_pos);
+        }
+        // The shuffle's own answer to "what next?".
+        //
+        // Today it is a fresh pick on every advance rather than an order, so it
+        // never runs out and there is no end for repeat-all to start again from:
+        // with the shuffle on, repeat-all changes nothing, and that is the
+        // consequence of the shuffle having no order rather than a rule of its
+        // own. When the shuffle gains a real order, an exhausted order returns
+        // `None` from here and falls through to the same repeat question the
+        // ordered end below asks. Nothing about repeat-all changes then - only
+        // whether that branch is ever reached.
+        if self.shuffle {
+            return Some(self.rand_other());
+        }
+        if self.queue_pos + 1 < self.queue.len() {
+            return Some(self.queue_pos + 1);
+        }
+        // The end of the order. Repeat-all starts it again - and in a queue of
+        // one that lands on the track already playing, which is what makes
+        // repeat-all and repeat-one the same thing there on purpose rather than
+        // by accident.
+        (repeat == Repeat::All).then_some(0)
     }
 
     fn rand_other(&self) -> usize {
@@ -3253,13 +3408,13 @@ impl App {
         if self.queue.is_empty() {
             return;
         }
-        if self.status.has_next {
+        // The entry mpv already has is the right answer unless it is this same
+        // track again: a skip out of repeat-one has to move on, so the preloaded
+        // repeat is passed over and the next track is loaded outright.
+        if self.status.has_next && self.repeat != Repeat::One {
             self.player.skip_next();
-        } else if self.shuffle {
-            let p = self.rand_other();
+        } else if let Some(p) = self.next_pos(self.repeat.skipped()) {
             self.load_fresh(p);
-        } else if self.queue_pos + 1 < self.queue.len() {
-            self.load_fresh(self.queue_pos + 1);
         }
     }
 
@@ -3283,6 +3438,19 @@ impl App {
         self.set_shuffle(!self.shuffle);
     }
 
+    /// Will the radio actually follow this queue?
+    ///
+    /// [`Self::continue_radio`] says the listener asked for it; this says
+    /// whether it can happen at all. A repeating queue reaches no end, so it
+    /// cannot - and the control then paints itself off rather than claiming
+    /// something that will not happen. One place that reads both flags, so the
+    /// control and the notice cannot come to different answers, and it writes
+    /// neither: the toggles stay independent.
+    #[must_use]
+    pub fn radio_follows(&self) -> bool {
+        self.continue_radio && self.repeat == Repeat::Off
+    }
+
     /// Turn carrying on past the end of the queue on, or off.
     ///
     /// The one implementation behind the `c` key and the header control, so the
@@ -3296,10 +3464,54 @@ impl App {
         // what was already asked goes with it.
         self.radio_asked = None;
         self.notice = Some(
-            if self.continue_radio {
-                "Radio ON: the queue carries on with the service's suggestions."
-            } else {
-                "Radio OFF: the queue ends where it ends."
+            match (self.continue_radio, self.repeat) {
+                // A read of the other toggle, never a write to it: turning this
+                // on under a repeat is the one moment the listener would
+                // otherwise be told something that will not happen.
+                (true, Repeat::All | Repeat::One) => {
+                    "Radio ON, but the repeat comes first: this queue has no end."
+                }
+                (true, Repeat::Off) => {
+                    "Radio ON: the queue carries on with the service's suggestions."
+                }
+                (false, _) => "Radio OFF: the queue ends where it ends.",
+            }
+            .into(),
+        );
+    }
+
+    /// Move on to the next of the three repeat states.
+    ///
+    /// The one implementation behind the `e` key and the header control, which
+    /// is what stops the two drifting. It cycles where the desktop sets, in
+    /// exactly the way `toggle_shuffle` cycles where `set_shuffle` sets.
+    fn cycle_repeat(&mut self) {
+        self.set_repeat(self.repeat.next());
+    }
+
+    /// Say how the queue repeats.
+    ///
+    /// Absolute rather than a cycle because MPRIS's `LoopStatus` is: one
+    /// implementation with three callers rather than three implementations - the
+    /// key and the control ask for the state after this one, and the desktop
+    /// asks for the state it wants.
+    ///
+    /// **It does not reach into what mpv already has.** The next entry is in
+    /// mpv's playlist by the time this is pressed, and a second path into that
+    /// playlist is the one thing the gapless pipeline must not grow - the same
+    /// reasoning [`Self::toggle_continue`] records. A change is answered by the
+    /// next preload decision, which is the only path there is.
+    ///
+    /// It writes nothing but its own state, and `continue_radio` least of all:
+    /// a repeating queue reaches no end, so the radio is never asked, and that
+    /// falls out of the queue rather than out of one toggle editing another.
+    fn set_repeat(&mut self, repeat: Repeat) {
+        self.repeat = repeat;
+        self.notice = Some(
+            match repeat {
+                Repeat::Off => "Repeat OFF: the queue ends where it ends.",
+                Repeat::All => "Repeat ALL: the queue starts again at the top.",
+                Repeat::One => "Repeat ONE: this track plays again.",
             }
             .into(),
         );
@@ -4004,6 +4216,7 @@ impl App {
             KeyCode::Char(' ') => self.player.toggle_pause(),
             KeyCode::Char('s') => self.toggle_shuffle(),
             KeyCode::Char('c') => self.toggle_continue(),
+            KeyCode::Char('e') => self.cycle_repeat(),
             KeyCode::Char('n' | 'L') => self.user_next(),
             KeyCode::Char('p' | 'H') => self.user_prev(),
             KeyCode::Char('h') | KeyCode::Left => self.player.seek_relative(-5.0),
@@ -4274,6 +4487,7 @@ impl App {
             Hit::Enter => self.on_enter(),
             Hit::Back => self.go_back(),
             Hit::Shuffle => self.toggle_shuffle(),
+            Hit::Repeat => self.cycle_repeat(),
             Hit::Continue => self.toggle_continue(),
             Hit::VolUp => self.volume_step(5.0),
             Hit::VolDown => self.volume_step(-5.0),
@@ -6099,6 +6313,12 @@ mod tests {
 
         on.rig.app.apply(BusCommand::Shuffle(true));
         assert!(on.rig.app.shuffle, "Shuffle is what `s` does");
+        on.rig.app.apply(BusCommand::Loop(Repeat::One));
+        assert_eq!(
+            on.rig.app.repeat,
+            Repeat::One,
+            "LoopStatus is what `e` does"
+        );
         on.rig.app.apply(BusCommand::Quit);
         assert!(on.rig.app.should_quit, "Quit is what `q` does");
     }
@@ -6114,6 +6334,22 @@ mod tests {
         assert!(r.app.shuffle, "asking twice is not a cycle");
         r.app.on_key(key('s'));
         assert!(!r.app.shuffle, "and the key still toggles");
+    }
+
+    /// Goal: `LoopStatus` is absolute where the key cycles, in the way `Shuffle`
+    /// already is: three states make the difference plainer than two, because a
+    /// cycle asked for twice lands somewhere the consumer never named. Method:
+    /// ask twice, then check the key still cycles from where the desktop left
+    /// it, and that the state reaches the desktop's own snapshot.
+    #[test]
+    fn a_repeat_from_the_desktop_is_absolute_where_the_key_cycles() {
+        let mut r = rig();
+        r.app.apply(BusCommand::Loop(Repeat::All));
+        r.app.apply(BusCommand::Loop(Repeat::All));
+        assert_eq!(r.app.repeat, Repeat::All, "asking twice is not a cycle");
+        assert_eq!(r.app.bus_snapshot().now.repeat, Repeat::All);
+        r.app.on_key(key('e'));
+        assert_eq!(r.app.repeat, Repeat::One, "and the key carries on from it");
     }
 
     /// Goal: commands arrive over a channel the app drains on its own tick, so
@@ -9047,6 +9283,178 @@ mod tests {
             "each says which way it went: {:?}",
             r.app.notice
         );
+    }
+
+    // ---- repeating: no repeat, repeat all, repeat one ----
+
+    /// What the queue asked to have resolved this tick, having settled first.
+    fn preloaded(r: &Rig) -> Vec<u64> {
+        resolved_ids(&requests(r))
+    }
+
+    #[test]
+    fn the_three_repeat_states_cycle_from_a_key_and_from_the_control() {
+        // Goal: one action with two ways in. Three states cannot be a boolean,
+        // so the key cycles rather than toggling, and the control has to cycle
+        // through the very same method or the two drift apart.
+        let mut r = rig();
+        assert_eq!(r.app.repeat, Repeat::Off, "off until it is asked for");
+        r.app.on_key(key('e'));
+        assert_eq!(r.app.repeat, Repeat::All);
+        r.app.dispatch(Hit::Repeat);
+        assert_eq!(r.app.repeat, Repeat::One, "the control carries on cycling");
+        r.app.on_key(key('e'));
+        assert_eq!(r.app.repeat, Repeat::Off, "and round to the start");
+        assert!(
+            r.app.notice.clone().unwrap_or_default().contains("epeat"),
+            "each step says where it landed: {:?}",
+            r.app.notice
+        );
+    }
+
+    #[test]
+    fn repeat_all_starts_the_queue_again_at_its_top() {
+        // Goal: the end of a repeating queue is its own beginning, and it has to
+        // arrive through the ordinary gapless preload rather than a second
+        // mechanism - the preload is what makes the wrap seamless.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track(1, "A", "X"), track(2, "B", "Y")]);
+        r.app.set_repeat(Repeat::All);
+        r.app.refresh_for_test();
+        assert_eq!(preloaded(&r), vec![1], "the top of the queue follows it");
+    }
+
+    #[test]
+    fn repeat_one_preloads_the_track_that_is_playing_again() {
+        // Goal: preloading the same track is not preloading the next one, and it
+        // still has to be a preload: mpv's playlist gets a second entry for it,
+        // so the repeat is gapless like any other transition.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track(1, "A", "X"), track(2, "B", "Y")]);
+        r.app.queue_pos = 0;
+        r.app.set_repeat(Repeat::One);
+        r.app.refresh_for_test();
+        assert_eq!(preloaded(&r), vec![1], "itself, not the track after it");
+    }
+
+    #[test]
+    fn a_queue_of_one_repeats_the_same_way_under_both_states() {
+        // Goal: with one track, "start the queue again" and "play this again"
+        // are the same instruction. That has to be true on purpose rather than
+        // by accident, because it is the case a wrap-around gets wrong.
+        for repeat in [Repeat::All, Repeat::One] {
+            let mut r = rig();
+            on_the_last_track(&mut r, vec![track(1, "Alone", "X")]);
+            r.app.set_repeat(repeat);
+            r.app.refresh_for_test();
+            assert_eq!(preloaded(&r), vec![1], "{repeat:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeating_queue_never_reaches_the_radio() {
+        // Goal: a queue set to repeat has no end, so there is nothing for the
+        // radio to continue from. The two toggles stay independent - neither
+        // writes to the other - and this falls out of the repeat always having
+        // somewhere to go, which is the only place the radio is ever asked.
+        for repeat in [Repeat::All, Repeat::One] {
+            let mut r = rig();
+            on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+            r.app.continue_radio = true;
+            r.app.set_repeat(repeat);
+            r.app.refresh_for_test();
+            assert!(radios_asked(&r).is_empty(), "{repeat:?}");
+            assert!(r.app.continue_radio, "and the radio was not turned off");
+        }
+
+        // The guard under test, removed: the same queue with no repeat does ask.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.continue_radio = true;
+        r.app.refresh_for_test();
+        assert_eq!(radios_asked(&r), vec!["0016d".to_string()]);
+    }
+
+    #[test]
+    fn repeat_one_outranks_the_shuffle_and_repeat_all_defers_to_it() {
+        // Goal: the two interactions worth writing down. The shuffle says what
+        // the play order is and the repeat says whether it ends, so repeat-one
+        // outranks the shuffle - there is no next track to pick when the answer
+        // is this one again - and repeat-all defers to it, because a shuffle
+        // that picks afresh on every advance has no end to start again from.
+        // That second half is a consequence of today's shuffle having no order
+        // at all, not a rule of its own: give the shuffle a real order and its
+        // exhausted case falls through to the same repeat question the ordered
+        // end asks. This test asserts the shape that holds either way.
+        let mut r = rig();
+        r.app.queue = (1..=4).map(|i| track(i, "T", "A")).collect();
+        r.app.queue_pos = 2;
+        r.app.shuffle = true;
+
+        r.app.set_repeat(Repeat::One);
+        for _ in 0..25 {
+            assert_eq!(r.app.next_pos(Repeat::One), Some(2), "this one again");
+        }
+
+        r.app.set_repeat(Repeat::All);
+        for _ in 0..25 {
+            let p = r.app.next_pos(Repeat::All).expect("somewhere to go");
+            assert_ne!(p, 2, "the shuffle still moves somewhere else");
+        }
+    }
+
+    #[test]
+    fn the_end_of_track_fallback_honours_the_repeat_too() {
+        // Goal: the fallback is what carries a track whose preload never
+        // arrived, and it has to answer the same question the preload does - one
+        // rule with two callers, or the two disagree about where the queue goes
+        // exactly when something has already gone wrong.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track(1, "A", "X"), track(2, "B", "Y")]);
+        r.app.set_repeat(Repeat::All);
+        r.app.status.ended = true;
+        r.app.status.playing = false;
+        r.app.refresh_for_test();
+        assert_eq!(r.app.queue_pos, 0, "back to the top from scratch");
+    }
+
+    #[test]
+    fn a_deliberate_skip_leaves_a_track_that_is_repeating() {
+        // Goal: repeat-one that could not be skipped out of is a trap with no
+        // key to leave it. The natural end of the track repeats it; pressing
+        // `L` says otherwise, so it moves on - and the entry mpv already has
+        // preloaded is this same track, so the preloaded one must not be taken.
+        let mut r = rig();
+        r.app.queue = vec![track(1, "A", "X"), track(2, "B", "Y")];
+        r.app.queue_pos = 0;
+        r.app.now_playing = Some(track(1, "A", "X"));
+        r.app.expected_id = 1;
+        r.app.status.has_next = true;
+        r.app.set_repeat(Repeat::One);
+        let _ = requests(&r);
+
+        r.app.on_key(key('L'));
+        assert_eq!(r.app.queue_pos, 1, "the skip goes to the next track");
+        assert_eq!(
+            preloaded(&r),
+            vec![2],
+            "loaded from scratch, not skipped to"
+        );
+    }
+
+    #[test]
+    fn the_repeat_does_not_reach_into_what_mpv_already_has() {
+        // Goal: the next entry is in mpv's playlist by the time this is pressed,
+        // and a second path into that playlist is the one thing the gapless
+        // pipeline must not grow - the same reasoning `toggle_continue` records.
+        // So a change of repeat is answered by the next preload decision, and
+        // asks for nothing on the tick it happens.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track(1, "A", "X"), track(2, "B", "Y")]);
+        r.app.status.has_next = true;
+        r.app.set_repeat(Repeat::One);
+        r.app.refresh_for_test();
+        assert!(preloaded(&r).is_empty(), "mpv has one ready already");
     }
 
     #[test]

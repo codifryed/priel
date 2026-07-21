@@ -186,6 +186,27 @@ playerctl. It is minted per *queue entry*, because Plasma treats a change of
 trackid as the signal to reset its position: the same track twice in the queue
 needs two ids, and one play of one entry must keep one id throughout.
 
+**What priel leaves out, and the one thing that no longer belongs on that
+list.** The subset is decided by one rule, stated above: the bus may only expose
+actions that already have a key binding and a click target. So there is no
+`Stop`, no `OpenUri`, no `Raise`, no `Fullscreen` and no `CanSetFullscreen` -
+priel has none of those actions, and inventing one here would make the bus the
+back door the rule exists to close.
+
+`LoopStatus` was on that list for that reason and **is not any more.** priel now
+cycles no repeat, repeat all and repeat one from the `e` key and from a header
+control, so the objection is spent: the three states map one for one onto
+`None`, `All` and `Track`, a `Set` drives the same `App::set_repeat` the key
+does, and the property is a plain string, so the marshaller's closed set of
+signatures did not have to grow to carry it. **An omission list that is not
+corrected when the reason for an omission goes is how a wrong invariant
+survives**, which is why this paragraph is edited here rather than contradicted
+in a later one.
+
+`TrackList` and `Playlists` remain permanently out of scope, and the reason is a
+different one: not that the actions are missing but that the containers are, as
+the closing paragraph below says.
+
 **`priel_core::Track` carries no cover art**, so `mpris:artUrl` is either omitted
 - which costs a placeholder in the applet - or a field is added to the library and
 populated from the listing. That is a `priel-core` change and therefore a separate

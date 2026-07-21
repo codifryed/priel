@@ -30,6 +30,11 @@
 //! Specifications: MPRIS D-Bus Interface Specification 2.2, D-Bus 0.43.
 
 use super::wire::{Arg, Message, Value, Variant};
+// The three repeat states, not a second spelling of them. `LoopStatus` is the
+// same question the `e` key answers, and the bus is a third caller of that
+// action rather than the owner of a vocabulary of its own - a second enum here
+// would be two tables to keep in step for no gain.
+use crate::app::Repeat;
 
 /// The well-known name priel asks the session bus for.
 ///
@@ -145,6 +150,7 @@ const INTROSPECTION: &str = r#"<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS 
   </method>
   <signal name="Seeked"><arg name="Position" type="x"/></signal>
   <property name="PlaybackStatus" type="s" access="read"/>
+  <property name="LoopStatus" type="s" access="readwrite"/>
   <property name="Metadata" type="a{sv}" access="read"/>
   <property name="Position" type="x" access="read"/>
   <property name="Rate" type="d" access="read"/>
@@ -193,6 +199,9 @@ pub(crate) struct Now {
     pub(crate) track: Option<Entry>,
     pub(crate) paused: bool,
     pub(crate) shuffle: bool,
+    /// Whether the queue, or the track, starts again rather than ending. Spec
+    /// 2.2 spells it `None`, `All` or `Track`; see [`Repeat::loop_status`].
+    pub(crate) repeat: Repeat,
     /// The software volume as a fraction of unity, which is the scale MPRIS
     /// carries. priel's own is a percentage.
     pub(crate) volume: f64,
@@ -272,6 +281,10 @@ fn announced(now: &Now) -> Vec<(String, Variant)> {
         double("MaximumRate", 1.0),
         double("Volume", now.volume),
         boolean("Shuffle", now.shuffle),
+        // A plain string, so it needs no new signature in a marshaller built
+        // for a closed set - which is what made publishing it a small change
+        // once there was an action behind it to publish.
+        text("LoopStatus", now.repeat.loop_status()),
         // Read directly to enable the skip buttons, and a missing property reads
         // as false.
         boolean("CanGoNext", now.can_go_next),
@@ -410,6 +423,8 @@ pub(crate) enum BusCommand {
     /// not symmetric.
     SeekTo(i64),
     Shuffle(bool),
+    /// How the queue repeats, which spec 2.2 calls `LoopStatus`.
+    Loop(Repeat),
     /// The volume as a fraction of unity, which is the scale MPRIS carries.
     Volume(f64),
     Quit,
@@ -525,10 +540,10 @@ fn get_all(call: &Message, snapshot: &Snapshot) -> Answer {
     )
 }
 
-/// The two properties a consumer may write.
+/// The properties a consumer may write.
 ///
-/// Both are absolute where priel has a toggle, which is the whole reason
-/// `Player::set_paused` and `App::set_shuffle` exist. The change is announced by
+/// Each is absolute where priel has a toggle or a cycle, which is the whole
+/// reason `Player::set_paused`, `App::set_shuffle` and `App::set_repeat` exist. The change is announced by
 /// the next tick's diff, so there is no second path that emits one.
 fn set(call: &Message) -> Answer {
     let (Some(interface), Some(property)) = (text_at(&call.body, 0), text_at(&call.body, 1)) else {
@@ -546,7 +561,16 @@ fn set(call: &Message) -> Answer {
             BusCommand::Volume(volume.max(0.0))
         }
         (PLAYER_INTERFACE, "Shuffle", Value::Bool(on)) => BusCommand::Shuffle(*on),
-        (PLAYER_INTERFACE, "Volume" | "Shuffle", _) => {
+        (PLAYER_INTERFACE, "LoopStatus", Value::Str(word)) => {
+            let Some(repeat) = Repeat::from_loop_status(word) else {
+                // Spec 2.2 names exactly three words. A fourth is refused
+                // rather than guessed at: there is no state to fall back to
+                // that is not one of the three a consumer might have meant.
+                return Answer::said(invalid(call, "LoopStatus is None, All or Track"));
+            };
+            BusCommand::Loop(repeat)
+        }
+        (PLAYER_INTERFACE, "Volume" | "Shuffle" | "LoopStatus", _) => {
             return Answer::said(invalid(call, "that property is not of that type"));
         }
         _ => {
@@ -756,6 +780,7 @@ mod tests {
                 track: Some(entry(1, "A Title")),
                 paused: false,
                 shuffle: false,
+                repeat: Repeat::Off,
                 volume: 1.0,
                 can_go_next: true,
                 can_go_previous: true,
@@ -1269,13 +1294,13 @@ mod tests {
 
     /// Goal: a property priel does not publish is an error rather than a
     /// silence, so a consumer sees a service that answered. Method: a property
-    /// priel deliberately leaves out.
+    /// priel deliberately leaves out - there is no full screen to be in.
     #[test]
     fn a_property_priel_does_not_publish_says_so() {
         let call = call(
             PROPERTIES_INTERFACE,
             "Get",
-            vec![string(PLAYER_INTERFACE), string("LoopStatus")],
+            vec![string(PLAYER_INTERFACE), string("Fullscreen")],
         );
         let reply = answer(&call, &playing())
             .and_then(|answered| answered.reply)
@@ -1451,12 +1476,12 @@ mod tests {
         );
     }
 
-    /// Goal: the two writable properties are the two priel has an absolute for,
+    /// Goal: the writable properties are the ones priel has an absolute for,
     /// and a write is acknowledged with an empty reply. The change itself is
     /// announced by the next tick's diff, so there is no second path that emits
-    /// one. Method: both, plus the refusals.
+    /// one. Method: each, plus the refusals.
     #[test]
-    fn the_volume_and_the_shuffle_are_the_two_a_consumer_may_write() {
+    fn the_properties_a_consumer_may_write_are_the_ones_with_an_absolute() {
         let snapshot = playing();
         let set = |property: &str, value: Value| {
             call(
@@ -1494,13 +1519,76 @@ mod tests {
             "a property priel publishes but will not be told"
         );
         assert_eq!(
-            refused(&set("LoopStatus", Value::Str("Track".into()))).as_deref(),
+            refused(&set("Fullscreen", Value::Bool(true))).as_deref(),
             Some(ERROR_UNKNOWN_PROPERTY)
         );
         assert_eq!(
             refused(&set("Shuffle", Value::Str("yes".into()))).as_deref(),
             Some(ERROR_INVALID_ARGS),
             "the right property of the wrong type"
+        );
+    }
+
+    /// Goal: **`LoopStatus` is published and settable, and a `Set` drives the
+    /// very method the key does** - #9 left it out for one reason, that priel
+    /// had no such action and the bus must not be the back door through which
+    /// one arrives, and that reason is gone now `e` cycles the three. Spec 2.2
+    /// names exactly three words, so a fourth is an error rather than a guess at
+    /// which of three was meant. Method: read each state back, write each word,
+    /// and the two refusals.
+    #[test]
+    fn the_loop_status_is_published_and_the_desktop_may_set_it() {
+        let mut snapshot = playing();
+        for (repeat, word) in [
+            (Repeat::Off, "None"),
+            (Repeat::All, "All"),
+            (Repeat::One, "Track"),
+        ] {
+            snapshot.now.repeat = repeat;
+            assert_eq!(
+                get(&player_properties(&snapshot), "LoopStatus"),
+                Some(&Variant::Value(Value::Str(word.into()))),
+                "{repeat:?}"
+            );
+        }
+
+        let set = |value: Value| {
+            call(
+                PROPERTIES_INTERFACE,
+                "Set",
+                vec![
+                    string(PLAYER_INTERFACE),
+                    string("LoopStatus"),
+                    Arg::Variant(Variant::Value(value)),
+                ],
+            )
+        };
+        for (word, repeat) in [
+            ("None", Repeat::Off),
+            ("All", Repeat::All),
+            ("Track", Repeat::One),
+        ] {
+            assert_eq!(
+                ran(&set(Value::Str(word.into())), &snapshot),
+                Some(BusCommand::Loop(repeat)),
+                "{word}"
+            );
+        }
+
+        let refused = |call: &Message| {
+            answer(call, &snapshot)
+                .and_then(|answered| answered.reply)
+                .and_then(|reply| reply.error_name().map(str::to_owned))
+        };
+        assert_eq!(
+            refused(&set(Value::Str("Playlist".into()))).as_deref(),
+            Some(ERROR_INVALID_ARGS),
+            "a fourth word is refused rather than guessed at"
+        );
+        assert_eq!(
+            refused(&set(Value::Bool(true))).as_deref(),
+            Some(ERROR_INVALID_ARGS),
+            "and it is a string, not a boolean"
         );
     }
 
@@ -1561,6 +1649,7 @@ mod tests {
             "\"SetPosition\"",
             "\"Position\"",
             "\"CanPlay\"",
+            "\"LoopStatus\"",
         ] {
             assert!(
                 xml.contains(named),
@@ -1573,7 +1662,6 @@ mod tests {
             "\"Stop\"",
             "\"OpenUri\"",
             "\"Raise\"",
-            "LoopStatus",
         ] {
             assert!(
                 !xml.contains(absent),

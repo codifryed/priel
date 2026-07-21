@@ -284,6 +284,7 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 | Scroll the `?` reference | `j`/`k`, `g`/`G` | `[?]`, then the same keys |
 | Search the catalogue | `3`, type, `Enter`; `i` to re-edit | click the `3` tab; `[?]` then `i` |
 | Shuffle the current view | `s` | click `⇄` |
+| Repeat: off / all / one | `e` cycles | click `⟳-` / `⟳A` / `⟳1` |
 | Keep playing when the queue ends | `c` | click `∞` |
 | Favorite the selected track | `f` | click `[f]` |
 | Favorite the playing track | `F` | click the `♥` beside the title |
@@ -332,6 +333,25 @@ navigation rather than a picture of it.
 
 `F` still favorites the playing track and the `♥` beside the title is still
 clickable, whichever box has the keyboard.
+
+**A repeating queue has no end, so the radio never fires while `e` is on**, and
+the `∞` control goes dark to say so rather than claiming something that will not
+happen. Neither toggle changes the other: turn the repeat off and the radio is
+exactly as you left it.
+
+**The shuffle says what the play order is; the repeat says whether that order
+ends.** Repeat-one outranks the shuffle, because there is no next track to pick
+when the answer is this one again. Repeat-all defers to it: today the shuffle
+picks afresh on every advance rather than laying out an order, so it never runs
+out and there is no end for repeat-all to start again from — with the shuffle on,
+repeat-all changes nothing. That is a consequence of the shuffle having no order
+yet, not a rule of its own. Once it has one, the end of that order is exactly
+where repeat-all starts it again instead of stopping, and nothing about the
+repeat has to change to mean that. In a queue of one track the two
+repeat states are the same thing, deliberately. A repeat is answered at the next
+preload, so pressing `e` while a track plays takes effect at the end of it: the
+entry after this one is already in mpv's playlist, and a second path into that
+playlist is the one thing the gapless pipeline must not grow.
 
 Entries the radio added when the queue ran out are marked `~`, and the heading
 above the queue says so — `Queue 4/9  ~ radio` — for as long as there is a mark
@@ -410,7 +430,10 @@ each paged in as the selection nears the end of the loaded rows and reloadable
 with `r`; local
 filtering; hi-res resolution and playback (24/192 via progressive segment
 streaming); a gapless
-play queue with a preloaded next track; shuffle with auto-advance; an optional
+play queue with a preloaded next track; shuffle with auto-advance; an `e` control
+that cycles no repeat, repeat all and repeat one — the queue starting again at
+its top, or the one track playing again, both through the same preload that makes
+every other transition gapless; an optional
 `c` toggle that carries the queue on with the service's radio for the track that
 ended it, off unless it is asked for and saying `radio` in place of `queue` for
 as long as what is playing is a suggestion rather than a choice; play, pause,
@@ -426,7 +449,9 @@ change to make when the track's rate is not one of them, and naming what has the
 output device open with what it would take to reserve it; a `d` picker for moving
 the output between devices, with an `x` toggle for taking a device exclusively; favoriting and unfavoriting the selected or playing track; MPRIS, so the
 media keys, the desktop's own controls and `playerctl` drive the same actions
-the keyboard and the mouse do.
+the keyboard and the mouse do — including the shuffle and the repeat, which are
+readable and settable from the desktop and end up in the very methods `s` and `e`
+run.
 
 Each section renders on its own evidence, so a directly held card — which has no
 graph by design — still gets its verdict, its device readout and its volume
