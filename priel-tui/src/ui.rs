@@ -1935,6 +1935,7 @@ mod tests {
                     current_hz: Some(48_000),
                     forced_hz: None,
                 },
+                ..AudioGraph::default()
             },
         );
         sc.app.mode = Mode::Graph;

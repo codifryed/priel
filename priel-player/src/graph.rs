@@ -49,11 +49,15 @@
 //! opening another application's, and the server publishes what it is actually
 //! running on rather than what a file asked for.
 //!
-//! What is here is still deliberately shaped to be built on: [`GraphNode::id`]
-//! is kept so a later pass can go back to the dump for a node's other
-//! properties, and [`NodeRole`] separates the hops that sit between the stream
-//! and the device - which is where a second application holding the device would
-//! show up.
+//! The third fact the same dump carries is who has the device at the end of the
+//! chain open. A server that passes samples through untouched still owns the
+//! device and can be reshaped by the next application that starts, so
+//! [`DeviceHolder`] names the holder whether or not the chain is clean, and
+//! [`DeviceHolder::lines`] gives the change that would free the card - all of it
+//! read through [`GraphNode::id`], which was kept for exactly this.
+//!
+//! [`NodeRole`] separates the hops that sit between the stream and the device,
+//! which is where a second application holding the device would show up.
 //!
 //! Linux-only by nature, like the rest of the audio plumbing. Everywhere else
 //! `pw-dump` is simply not installed, which is one of the answers.
@@ -113,6 +117,9 @@ pub struct AudioGraph {
     /// What the server is permitted to clock this chain at, read from the same
     /// dump so the chain and the setting cannot come from two moments.
     pub clock: ClockRates,
+    /// What has the device at the end of the chain open, from the same dump for
+    /// the same reason.
+    pub holder: DeviceHolder,
 }
 
 /// The rates the sound server is permitted to clock its graph at.
@@ -293,6 +300,119 @@ fn spaced(rates_hz: &[u32]) -> String {
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// What has the output device open.
+///
+/// The sound server passing samples through untouched is still a mixer: it owns
+/// the device, and the graph can be reshaped the moment another application
+/// starts. Anyone who wants the DAC out of the graph has to know that it is
+/// claimed before anything else, so this is reported whether or not the chain is
+/// clean.
+///
+/// The three answers that are not [`Server`](Self::Server) are all silence, and
+/// deliberately so. [`Unknown`](Self::Unknown) is an admission and never the
+/// nearest card on the machine - a rule matching a name priel guessed at would
+/// disable something that was working. [`NoDevice`](Self::NoDevice) is a
+/// different admission: nothing is at the end of the chain to have a holder.
+/// And [`Direct`](Self::Direct) is the destination rather than a problem, so it
+/// gets no advice at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DeviceHolder {
+    /// The chain reaches no output device: priel's stream ends before one.
+    ///
+    /// Also what an empty graph reports, which is the same statement about a
+    /// path with nothing on it.
+    #[default]
+    NoDevice,
+    /// The chain ends at `sink` and the dump does not say what device is behind
+    /// it, so there is nothing to name.
+    Unknown { sink: String },
+    /// The sound server has an output device open and mixes into it.
+    Server(HeldDevice),
+    /// priel has the device itself, with nothing between it and the DAC.
+    ///
+    /// Never read from a dump: a direct card device puts priel outside the
+    /// sound server, so there is no graph for it to appear in. The player knows
+    /// which device it opened and says so, exactly as it does for
+    /// [`GraphError::Bypassed`].
+    Direct { device: String },
+}
+
+/// The device the sound server is holding, as the dump describes it.
+///
+/// Everything but the sink is optional, and each `None` is a separate thing the
+/// dump did not say. `card_name` especially: the holder being known and the card
+/// being nameable are two facts, and only the second one can produce a rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldDevice {
+    /// The sink the samples end at, by description.
+    pub sink: String,
+    /// What opened it: `application.process.binary` of the client that created
+    /// the node, which on a normal desktop is the session manager rather than
+    /// the server itself.
+    pub opened_by: Option<String>,
+    /// `api.alsa.path` of the sink, e.g. `hw:2,0` - the PCM the card admits one
+    /// opener on.
+    pub pcm: Option<String>,
+    /// `device.name` of the card object, e.g. `alsa_card.usb-...`.
+    ///
+    /// Only ever filled in for an ALSA card, because the rule below can reserve
+    /// nothing else. A Bluetooth or network device leaves this `None` and takes
+    /// the advice with it.
+    pub card_name: Option<String>,
+}
+
+impl DeviceHolder {
+    /// What it would take to hand the device over, one line per row.
+    ///
+    /// Empty wherever there is nothing to hand over or nothing to name. The
+    /// advice is about freeing the card *from the server*, which is a change to
+    /// the server's own configuration; asking priel to take a free card is a
+    /// separate thing that already has a flag and a toggle, and repeating it
+    /// here would teach the reader that this section restates what they know.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        let Self::Server(held) = self else {
+            return Vec::new();
+        };
+        let mut out = vec![
+            "The sound server has this device open and mixes everything on".to_string(),
+            "the machine into it.".to_string(),
+        ];
+        let Some(card_name) = held.card_name.as_deref() else {
+            out.push("The graph does not name the card behind it, so there is no".to_string());
+            out.push("rule to reserve here.".to_string());
+            return out;
+        };
+        out.push("To reserve the card, stop the server from claiming it. Put".to_string());
+        out.push("this in ~/.config/wireplumber/wireplumber.conf.d/51-reserve.conf:".to_string());
+        out.extend(reserve_lines(card_name));
+        out.push("Restart the sound server for it to take effect.".to_string());
+        out.push("Nothing else on this machine will be able to play through this".to_string());
+        out.push("device while that rule is in place.".to_string());
+        out
+    }
+}
+
+/// The rule that stops the sound server claiming one card.
+///
+/// Spread over lines rather than written as the one-liner it could be: the card
+/// name is the longest thing in the overlay and the renderer clips instead of
+/// wrapping, so the compact spelling would lose its tail on exactly the cards
+/// with the longest names. This layout leaves the name over forty columns, which
+/// is more than the bus-derived names ALSA builds have ever needed.
+fn reserve_lines(card_name: &str) -> Vec<String> {
+    vec![
+        "  monitor.alsa.rules = [".to_string(),
+        "    {".to_string(),
+        "      matches = [".to_string(),
+        format!("        {{ device.name = \"{card_name}\" }}"),
+        "      ]".to_string(),
+        "      actions = { update-props = { device.disabled = true } }".to_string(),
+        "    }".to_string(),
+        "  ]".to_string(),
+    ]
 }
 
 /// The track as the decoder produced it, which every node is compared against.
@@ -725,9 +845,61 @@ pub fn parse(dump: &str, pid: u32) -> Result<AudioGraph, GraphError> {
         return Err(GraphError::NoStream);
     }
     Ok(AudioGraph {
+        holder: holder_of(&objects, &path),
         path,
         clock: clock_of(&objects),
     })
+}
+
+/// What has the device at the end of the path open.
+///
+/// A per-concern extractor over the already-parsed object list, like
+/// [`clock_of`]: pure, so the whole of it is a table of tests over recorded
+/// dumps rather than something only a live sound server can show.
+///
+/// Every step can fail to answer and each failure stops here rather than
+/// falling through to a likelier-looking one. A sink with no device behind it in
+/// this dump is [`DeviceHolder::Unknown`], not the card that happens to match
+/// its name: the reader acts on this by disabling something, and disabling the
+/// wrong thing is worse than being told priel could not tell.
+fn holder_of(objects: &[Value], path: &[GraphNode]) -> DeviceHolder {
+    let Some(sink) = path.last().filter(|n| n.role == NodeRole::Device) else {
+        return DeviceHolder::NoDevice;
+    };
+    let unknown = || DeviceHolder::Unknown {
+        sink: sink.description.clone(),
+    };
+    let Some(node) = object_at(objects, "PipeWire:Interface:Node", sink.id) else {
+        return unknown();
+    };
+    let Some(card) = prop_u32(node, "device.id")
+        .and_then(|id| object_at(objects, "PipeWire:Interface:Device", id))
+    else {
+        return unknown();
+    };
+    DeviceHolder::Server(HeldDevice {
+        sink: sink.description.clone(),
+        opened_by: prop_u32(node, "client.id")
+            .and_then(|id| object_at(objects, "PipeWire:Interface:Client", id))
+            .and_then(|c| prop_str(c, "application.process.binary"))
+            .map(ToString::to_string),
+        pcm: prop_str(node, "api.alsa.path").map(ToString::to_string),
+        // Filled in only for an ALSA card, because `monitor.alsa.rules` can
+        // reserve nothing else and a name in a rule that matches nothing is
+        // advice that silently does nothing.
+        card_name: (prop_str(card, "device.api") == Some("alsa"))
+            .then(|| prop_str(card, "device.name"))
+            .flatten()
+            .map(ToString::to_string),
+    })
+}
+
+/// One object of a given interface, by id.
+fn object_at<'a>(objects: &'a [Value], interface: &str, id: u32) -> Option<&'a Value> {
+    objects
+        .iter()
+        .filter(|o| is_type(o, interface))
+        .find(|o| id_of(o) == Some(id))
 }
 
 /// Where a hop sits, from its position rather than from its `media.class`.
@@ -798,10 +970,7 @@ fn downstream(objects: &[Value], from: u32) -> Option<u32> {
 
 /// Build the reportable node for an id, or nothing if the dump has no such node.
 fn node_at(objects: &[Value], id: u32, role: NodeRole) -> Option<GraphNode> {
-    let o = objects
-        .iter()
-        .filter(|o| is_type(o, "PipeWire:Interface:Node"))
-        .find(|o| id_of(o) == Some(id))?;
+    let o = object_at(objects, "PipeWire:Interface:Node", id)?;
     let name = prop_str(o, "node.name").unwrap_or_default().to_string();
     let description = prop_str(o, "node.description")
         .filter(|d| !d.is_empty())
@@ -868,8 +1037,8 @@ fn as_u32(v: &Value) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attribution, AudioGraph, ClockRates, GraphError, NodeRole, RateAdvice, SourceFormat, parse,
-        parse_clock, parse_sinks,
+        Attribution, AudioGraph, ClockRates, DeviceHolder, GraphError, HeldDevice, NodeRole,
+        RateAdvice, SourceFormat, parse, parse_clock, parse_sinks,
     };
     use crate::Alteration;
 
@@ -1745,6 +1914,158 @@ mod tests {
         assert!(
             text.contains("default.clock.allowed-rates = ["),
             "still the same setting, just spread over lines: {text}"
+        );
+    }
+
+    // ---- what has the output device open ----
+
+    /// **Synthetic**, not captured: priel's stream with no link leaving it, so
+    /// the chain reaches no device at all. A capture of that would be a capture
+    /// of a moment too short to catch by hand.
+    const UNLINKED: &str = include_str!("../tests/fixtures/pw-dump-unlinked-stream.json");
+
+    #[test]
+    fn the_sound_server_is_named_as_what_has_the_output_device_open() {
+        // Goal: the first half of the question - what holds the device now.
+        // Every part of the answer is read from the dump: the sink the samples
+        // end at, the process that opened it, the PCM behind it, and the card
+        // object, which is the only thing a reservation rule can match on.
+        let g = path_of(DUMP, PID);
+        let held = match &g.holder {
+            DeviceHolder::Server(held) => held,
+            other => panic!("the server has this card open: {other:?}"),
+        };
+        assert_eq!(held.sink, "SMSL USB AUDIO Pro");
+        assert_eq!(
+            held.opened_by.as_deref(),
+            Some("wireplumber"),
+            "the session manager is what actually opened the PCM"
+        );
+        assert_eq!(held.pcm.as_deref(), Some("hw:2,0"));
+        assert_eq!(
+            held.card_name.as_deref(),
+            Some("alsa_card.usb-SMSL_SMSL_USB_AUDIO-00")
+        );
+    }
+
+    #[test]
+    fn a_chain_ending_on_a_sink_with_no_device_behind_it_says_unknown() {
+        // Goal: the honesty case. The chain reaches a sink and the dump says
+        // nothing about what device is behind it, so there is nothing to name -
+        // and the nearest card on the machine is a guess, not an answer.
+        assert_eq!(
+            path_of(TRUNCATING, SYNTHETIC_PID).holder,
+            DeviceHolder::Unknown {
+                sink: "Example DAC Analog Stereo".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_stream_that_reaches_no_device_is_not_reported_as_unknown() {
+        // Goal: "nothing is at the end of this chain" and "something is and
+        // priel cannot tell what" are different findings. Collapsing them would
+        // put an unanswerable question on screen where there is no question.
+        assert_eq!(
+            path_of(UNLINKED, SYNTHETIC_PID).holder,
+            DeviceHolder::NoDevice
+        );
+    }
+
+    #[test]
+    fn reserving_the_card_names_the_card_the_file_and_what_it_costs() {
+        // Goal: the second half of the question - what it would take to hand
+        // the device over. All three parts have to be there: the change, the
+        // file it goes in, and the thing that is given up by making it.
+        let text = path_of(DUMP, PID).holder.lines().join("\n");
+        assert!(
+            text.contains("wireplumber.conf.d"),
+            "the file the rule goes in: {text}"
+        );
+        assert!(
+            text.contains("alsa_card.usb-SMSL_SMSL_USB_AUDIO-00"),
+            "the card the rule matches: {text}"
+        );
+        assert!(
+            text.contains("device.disabled = true"),
+            "the change itself: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("restart"),
+            "a rule in a file does nothing until the server is restarted: {text}"
+        );
+        assert!(
+            text.contains("Nothing else on this machine"),
+            "what is given up: {text}"
+        );
+    }
+
+    #[test]
+    fn a_card_the_dump_did_not_name_gets_no_rule_to_copy() {
+        // Goal: a rule matching a card name priel invented would disable
+        // something else, or nothing at all. Knowing the server has the device
+        // and not knowing which card it is are two separate facts, and only the
+        // second one silences the advice.
+        let held = DeviceHolder::Server(HeldDevice {
+            sink: "Example DAC".to_string(),
+            opened_by: None,
+            pcm: None,
+            card_name: None,
+        });
+        let text = held.lines().join("\n");
+        assert!(
+            text.contains("has this device open"),
+            "the holder is still named: {text}"
+        );
+        assert!(
+            !text.contains("monitor.alsa.rules"),
+            "no rule can be written without the card: {text}"
+        );
+    }
+
+    #[test]
+    fn only_a_device_the_server_holds_is_advised_about() {
+        // Goal: advice printed where there is nothing to do teaches the reader
+        // to ignore it. A device priel holds itself is the destination, not a
+        // problem, and an unknown holder cannot be advised about at all.
+        assert!(
+            DeviceHolder::Direct {
+                device: "alsa/hw:2,0".to_string()
+            }
+            .lines()
+            .is_empty(),
+            "priel already has it; there is nothing to hand over"
+        );
+        assert!(DeviceHolder::NoDevice.lines().is_empty());
+        assert!(
+            DeviceHolder::Unknown {
+                sink: "Example DAC".to_string()
+            }
+            .lines()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn every_line_of_the_reservation_advice_fits_the_box_it_is_drawn_in() {
+        // Goal: the same rule the rate advice follows. A configuration line
+        // with its tail clipped still looks copyable and is not, and a card
+        // name is the longest thing in this one.
+        let held = DeviceHolder::Server(HeldDevice {
+            sink: "Some Interface".to_string(),
+            opened_by: Some("wireplumber".to_string()),
+            pcm: Some("hw:3,0".to_string()),
+            card_name: Some("alsa_card.usb-Example_Audio_Interface-00".to_string()),
+        });
+        let lines = held.lines();
+        for line in &lines {
+            assert!(line.chars().count() <= 70, "too long to draw: {line}");
+        }
+        assert!(
+            lines
+                .join("\n")
+                .contains("alsa_card.usb-Example_Audio_Interface-00"),
+            "the name survived the layout: {lines:?}"
         );
     }
 
