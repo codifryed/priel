@@ -276,6 +276,26 @@ pub struct Client {
 
 // ---- wire types ----
 
+/// Read a value that may be **missing or an explicit `null`**.
+///
+/// `#[serde(default)]` covers only the first. This service spells absence as
+/// `null` freely - `version` on most tracks, `accessType`, a playlist
+/// `description`, a whole `mixes` object on a track it built no radio for - so
+/// a defaulted non-`Option` field rejects the commonest shape it will meet, and
+/// one such field fails the entire page rather than one row.
+///
+/// Not hypothetical: it took the favorites listing down, and the guard was on
+/// the field *inside* the object rather than on the object itself. Use this on
+/// every defaulted field that is not already an `Option` and the distinction
+/// stops mattering.
+fn null_to_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct TokenFile {
     access_token: String,
@@ -295,7 +315,11 @@ struct FavTracksResp {
     /// Sent by the service on every listing, and discarded here until paging
     /// needed it. Defaulted rather than required: an answer without it is still
     /// a usable page.
-    #[serde(rename = "totalNumberOfItems", default)]
+    #[serde(
+        rename = "totalNumberOfItems",
+        default,
+        deserialize_with = "null_to_default"
+    )]
     total_number_of_items: u32,
 }
 /// The wrapper the service puts round a row it could have sent plainly.
@@ -317,14 +341,14 @@ struct ItemRow {
 /// not a good enough reason to refuse that.
 #[derive(Deserialize)]
 struct PlaylistItemRow {
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
     kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     item: PlaylistItemId,
 }
 #[derive(Deserialize, Default)]
 struct PlaylistItemId {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     id: u64,
 }
 
@@ -349,13 +373,17 @@ struct TrackBrief {
     title: Option<String>,
     #[serde(default)]
     duration: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     artists: Vec<ArtistBrief>,
     #[serde(default)]
     album: Option<AlbumBrief>,
     #[serde(rename = "audioQuality", default)]
     audio_quality: Option<String>,
-    #[serde(rename = "mediaMetadata", default)]
+    #[serde(
+        rename = "mediaMetadata",
+        default,
+        deserialize_with = "null_to_default"
+    )]
     media_metadata: MediaMeta,
     #[serde(default)]
     version: Option<String>,
@@ -369,12 +397,12 @@ struct TrackBrief {
     allow_streaming: Option<bool>,
     #[serde(rename = "streamReady", default)]
     stream_ready: Option<bool>,
-    #[serde(default)]
-    mixes: MixIds,
+    #[serde(default, deserialize_with = "null_to_default")]
+    mixes: Option<MixIds>,
 }
 #[derive(Deserialize, Default)]
 struct MediaMeta {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     tags: Vec<String>,
 }
 /// The mixes a track names, of which one can be played.
@@ -413,20 +441,24 @@ impl TrackBrief {
             copyright: self.copyright.unwrap_or_default(),
             // Both, and absent means yes. See the field's own note.
             streamable: self.allow_streaming.unwrap_or(true) && self.stream_ready.unwrap_or(true),
-            mix_id: self.mixes.track_mix.unwrap_or_default(),
+            mix_id: self.mixes.and_then(|m| m.track_mix).unwrap_or_default(),
         }
     }
 }
 
 #[derive(Deserialize)]
 struct PlaylistBrief {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     uuid: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     title: String,
-    #[serde(rename = "numberOfTracks", default)]
+    #[serde(
+        rename = "numberOfTracks",
+        default,
+        deserialize_with = "null_to_default"
+    )]
     number_of_tracks: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     duration: u32,
 }
 impl PlaylistBrief {
@@ -441,11 +473,11 @@ impl PlaylistBrief {
 }
 #[derive(Deserialize)]
 struct MixBrief {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     title: String,
-    #[serde(rename = "subTitle", default)]
+    #[serde(rename = "subTitle", default, deserialize_with = "null_to_default")]
     sub_title: String,
 }
 impl MixBrief {
@@ -474,13 +506,13 @@ impl MixBrief {
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct ScreenResp<T> {
-    #[serde(default = "Vec::new")]
+    #[serde(default = "Vec::new", deserialize_with = "null_to_default")]
     rows: Vec<ScreenRow<T>>,
 }
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct ScreenRow<T> {
-    #[serde(default = "Vec::new")]
+    #[serde(default = "Vec::new", deserialize_with = "null_to_default")]
     modules: Vec<ScreenModule<T>>,
 }
 #[derive(Deserialize)]
@@ -492,9 +524,13 @@ struct ScreenModule<T> {
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct PagedList<T> {
-    #[serde(default = "Vec::new")]
+    #[serde(default = "Vec::new", deserialize_with = "null_to_default")]
     items: Vec<T>,
-    #[serde(rename = "totalNumberOfItems", default)]
+    #[serde(
+        rename = "totalNumberOfItems",
+        default,
+        deserialize_with = "null_to_default"
+    )]
     total_number_of_items: u32,
 }
 
@@ -536,11 +572,15 @@ struct AlbumBrief {
 
 #[derive(Deserialize)]
 struct Stream {
-    #[serde(rename = "audioQuality", default)]
+    #[serde(rename = "audioQuality", default, deserialize_with = "null_to_default")]
     audio_quality: String,
-    #[serde(rename = "manifestMimeType", default)]
+    #[serde(
+        rename = "manifestMimeType",
+        default,
+        deserialize_with = "null_to_default"
+    )]
     manifest_mime_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     manifest: String,
     #[serde(rename = "bitDepth", default)]
     bit_depth: Option<u32>,
@@ -555,9 +595,9 @@ struct Stream {
 #[allow(non_snake_case)]
 #[derive(Deserialize)]
 struct BtsManifest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     codecs: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     urls: Vec<String>,
 }
 
@@ -980,9 +1020,13 @@ impl Client {
     pub fn user_playlists(&mut self, offset: u32, limit: u32) -> Result<Page<Playlist>> {
         #[derive(Deserialize)]
         struct R {
-            #[serde(default)]
+            #[serde(default, deserialize_with = "null_to_default")]
             items: Vec<PlaylistBrief>,
-            #[serde(rename = "totalNumberOfItems", default)]
+            #[serde(
+                rename = "totalNumberOfItems",
+                default,
+                deserialize_with = "null_to_default"
+            )]
             total_number_of_items: u32,
         }
 
@@ -1022,9 +1066,13 @@ impl Client {
     pub fn playlist_tracks(&mut self, uuid: &str, offset: u32, limit: u32) -> Result<Page<Track>> {
         #[derive(Deserialize)]
         struct R {
-            #[serde(default)]
+            #[serde(default, deserialize_with = "null_to_default")]
             items: Vec<TrackBrief>,
-            #[serde(rename = "totalNumberOfItems", default)]
+            #[serde(
+                rename = "totalNumberOfItems",
+                default,
+                deserialize_with = "null_to_default"
+            )]
             total_number_of_items: u32,
         }
 
@@ -1147,14 +1195,18 @@ impl Client {
         // parse failure.
         #[derive(Deserialize, Default)]
         struct Wrap {
-            #[serde(default)]
+            #[serde(default, deserialize_with = "null_to_default")]
             items: Vec<TrackBrief>,
-            #[serde(rename = "totalNumberOfItems", default)]
+            #[serde(
+                rename = "totalNumberOfItems",
+                default,
+                deserialize_with = "null_to_default"
+            )]
             total_number_of_items: u32,
         }
         #[derive(Deserialize)]
         struct R {
-            #[serde(default)]
+            #[serde(default, deserialize_with = "null_to_default")]
             tracks: Wrap,
         }
 
@@ -1379,7 +1431,7 @@ impl Client {
     fn playlist_state(&mut self, uuid: &str) -> Result<PlaylistState> {
         #[derive(Deserialize)]
         struct R {
-            #[serde(default)]
+            #[serde(default, deserialize_with = "null_to_default")]
             description: String,
         }
 
@@ -1410,9 +1462,13 @@ impl Client {
     fn playlist_position(&mut self, uuid: &str, track_id: u64) -> Result<Option<u32>> {
         #[derive(Deserialize)]
         struct R {
-            #[serde(default)]
+            #[serde(default, deserialize_with = "null_to_default")]
             items: Vec<PlaylistItemRow>,
-            #[serde(rename = "totalNumberOfItems", default)]
+            #[serde(
+                rename = "totalNumberOfItems",
+                default,
+                deserialize_with = "null_to_default"
+            )]
             total_number_of_items: u32,
         }
 
@@ -1895,6 +1951,42 @@ mod tests {
         let s = stub(vec![ok(SESSION), ok(body)]);
         let rows = connected(&s).favorite_tracks(0, 1).unwrap().items;
         assert_eq!(rows[0].mix_id, "0016d");
+    }
+
+    #[test]
+    fn a_null_mixes_object_does_not_fail_the_page() {
+        // Goal: this shipped broken and took the whole favorites listing with
+        // it. `#[serde(default)]` fills a *missing* key and rejects an explicit
+        // `null`, and this service spells absence as `null`. The guard was on
+        // `TRACK_MIX` inside the object and not on the object itself, which is
+        // one level too shallow: the whole value comes back `null` on a track
+        // the service built no radio for.
+        let body = r#"{"items":[{"item":{"id":1,"mixes":null}}]}"#;
+        let s = stub(vec![ok(SESSION), ok(body)]);
+        let rows = connected(&s)
+            .favorite_tracks(0, 1)
+            .expect("a null mixes object must not fail the page")
+            .items;
+        assert_eq!(rows[0].mix_id, "", "no radio, not a broken listing");
+    }
+
+    #[test]
+    fn a_null_anywhere_the_service_spells_absence_does_not_fail_the_page() {
+        // Goal: the same trap, swept for rather than patched once. Every
+        // defaulted non-`Option` field had the hole - and a playlist
+        // `description` is null in real captures, which #18's rename reads back
+        // before writing, so that path would have failed on an ordinary
+        // playlist.
+        let body = r#"{"items":[{"item":{"id":1,"title":null,"album":null,
+            "artists":null,"mediaMetadata":null,"mixes":null,"version":null}}]}"#;
+        let s = stub(vec![ok(SESSION), ok(body)]);
+        let rows = connected(&s)
+            .favorite_tracks(0, 1)
+            .expect("nulls must not fail the page")
+            .items;
+        assert_eq!(rows[0].id, 1, "the row still arrives");
+        assert_eq!(rows[0].mix_id, "");
+        assert!(rows[0].artists.is_empty());
     }
 
     #[test]
