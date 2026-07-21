@@ -42,6 +42,15 @@ libmpv2-sys = "4"
 # truncation that measured differently from the renderer would put every hit
 # box one cell off what was painted.
 unicode-width = "0.2"
+# The one genuinely new dependency in the tree, and the only decoder in it: a
+# pure-Rust baseline+progressive JPEG decoder for the album cover, drawn as half
+# blocks (see `docs/cover-art.md`). No C, no build-time tooling, and off the two
+# UI-agnostic libraries entirely - it lives in priel-tui alone, because a future
+# GUI frontend wants the JPEG bytes and will decode them itself. `image` was the
+# alternative and would have cost eight more crates for resampling this does not
+# need at a cover's size. `zune-core` comes with it, for the decoder options.
+zune-jpeg = "0.5"
+zune-core = "0.5"
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"

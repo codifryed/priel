@@ -834,6 +834,14 @@ pub struct App {
     /// Reading it runs `pw-dump`, and the tick that would ask runs ten times a
     /// second, so the request is spaced by [`SINK_VOLUME_INTERVAL`].
     sink_volume_asked: Option<Instant>,
+    /// The track whose cover has already been asked for, so a poll running ten
+    /// times a second sends one request per track rather than a stream of them.
+    ///
+    /// Not the same as holding the cover: a request may be in flight, or may
+    /// have failed and returned nothing, and either way asking again every tick
+    /// would be wrong. This is "asked", the cover map is "arrived", and a track
+    /// with no cover id is never asked at all.
+    cover_asked: Option<u64>,
     /// How far down the audio-graph overlay is scrolled, from the top.
     graph_scroll: usize,
     /// The output devices the player last published. Kept only while the picker
@@ -1074,6 +1082,7 @@ impl App {
             audio_graph: None,
             sink_volume: SinkVolume::Unread,
             sink_volume_asked: None,
+            cover_asked: None,
             graph_scroll: 0,
             devices: Vec::new(),
             device_selected: 0,
@@ -2217,6 +2226,7 @@ impl App {
                     // than pointing past the end of the new reading.
                     self.graph_scroll = 0;
                 }
+                FromWorker::Cover { track_id, image } => self.on_cover(track_id, image),
                 FromWorker::Failed {
                     task,
                     fault,
@@ -2487,6 +2497,7 @@ impl App {
         self.frame = self.frame.wrapping_add(1);
         self.report_device_error();
         self.poll_sink_volume();
+        self.poll_cover();
 
         let sig = self.render_sig();
         if sig != self.last_sig {
@@ -3919,6 +3930,47 @@ impl App {
         }
         self.sink_volume_asked = Some(Instant::now());
         let _ = self.worker.tx.send(ToWorker::ReadAudioGraph);
+    }
+
+    /// Ask the worker for the playing track's cover, once per track.
+    ///
+    /// The trigger for the whole feature, and a poll rather than a hook on each
+    /// place `now_playing` is set: a track can begin from a queue advance, from
+    /// mpv adopting one on its own, or from a direct play, and one poll catches
+    /// all three where three hooks would be three chances to miss one.
+    ///
+    /// Asked at most once per track: `cover_asked` records the id, so a request
+    /// in flight or one that came back empty is not re-sent every tick. A track
+    /// whose listing named no cover is never asked - there is nothing to fetch -
+    /// and the request never leaves this thread with a blocking call on it,
+    /// because the fetch and the decode are the worker's.
+    fn poll_cover(&mut self) {
+        let Some(track) = self.now_playing.as_ref() else {
+            return;
+        };
+        if self.cover_asked == Some(track.id) || track.cover.is_empty() {
+            return;
+        }
+        self.cover_asked = Some(track.id);
+        let _ = self.worker.tx.send(ToWorker::FetchCover {
+            track_id: track.id,
+            cover_id: track.cover.clone(),
+        });
+    }
+
+    /// Take a decoded cover the worker sent, if its track is still the one
+    /// playing.
+    ///
+    /// Dropped rather than stored when the track has moved on: a cover that
+    /// finished decoding just after its track stopped would otherwise be drawn
+    /// over the one now playing. `cover_for_now_playing` asks the same question
+    /// at draw time, so this is belt and braces - but storing a stale cover at
+    /// all is worth avoiding, because it would sit in memory keyed to a track
+    /// that will not come back.
+    fn on_cover(&mut self, track_id: u64, image: crate::art::Image) {
+        if self.now_playing.as_ref().is_some_and(|t| t.id == track_id) {
+            self.cover = Some((track_id, image));
+        }
     }
 
     /// Open the audio-graph overlay and ask the worker to read the chain.
@@ -11905,5 +11957,104 @@ mod tests {
         assert!(!r.app.queue_shown);
         r.app.on_key(key('W'));
         assert!(r.app.queue_shown);
+    }
+
+    /// A track that names an album cover.
+    fn track_with_cover(id: u64, cover: &str) -> Track {
+        Track {
+            cover: cover.into(),
+            ..track(id, "T", "A")
+        }
+    }
+
+    #[test]
+    fn the_cover_is_asked_for_once_per_playing_track() {
+        // Goal: the fetch is triggered by a poll, so it must fire exactly once
+        // when a track starts and not again every tick, or the worker drowns in
+        // duplicate requests. Method: put a track in the speakers, refresh
+        // twice, and count the fetches.
+        let mut r = rig();
+        r.app.now_playing = Some(track_with_cover(1, "aaaa-bbbb"));
+        r.app.refresh();
+        r.app.refresh();
+
+        let fetches: Vec<_> = requests(&r)
+            .into_iter()
+            .filter_map(|c| match c {
+                ToWorker::FetchCover { track_id, cover_id } => Some((track_id, cover_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fetches,
+            vec![(1, "aaaa-bbbb".to_string())],
+            "one fetch, carrying the track and its cover id"
+        );
+    }
+
+    #[test]
+    fn a_track_with_no_cover_is_never_asked() {
+        // Goal: an empty cover id is a track whose listing named none, so there
+        // is nothing to fetch and a request would only 404. Method: a track
+        // with no cover, refreshed.
+        let mut r = rig();
+        r.app.now_playing = Some(track(1, "T", "A"));
+        r.app.refresh();
+        assert!(
+            !requests(&r)
+                .iter()
+                .any(|c| matches!(c, ToWorker::FetchCover { .. })),
+            "a coverless track was asked for anyway"
+        );
+    }
+
+    #[test]
+    fn a_cover_that_arrives_for_the_playing_track_is_kept() {
+        // Goal: the reply lands and is stored against its track, so the renderer
+        // can find it. Method: play a track, hand back a decoded cover for it,
+        // and read it back through the accessor the renderer uses.
+        let mut r = rig();
+        r.app.now_playing = Some(track_with_cover(1, "aaaa"));
+        let image = crate::art::Image {
+            width: 1,
+            height: 1,
+            rgb: vec![1, 2, 3],
+        };
+        r.to_app
+            .send(FromWorker::Cover {
+                track_id: 1,
+                image: image.clone(),
+            })
+            .expect("send");
+        r.app.drain_worker();
+        assert_eq!(
+            r.app.cover_for_now_playing(),
+            Some(&image),
+            "the cover for the playing track is available to draw"
+        );
+    }
+
+    #[test]
+    fn a_cover_that_arrives_after_its_track_stopped_is_dropped() {
+        // Goal: a decode that finished just after the track changed must not be
+        // drawn over the one now playing. Method: hand back a cover for track 1
+        // while track 2 is in the speakers.
+        let mut r = rig();
+        r.app.now_playing = Some(track_with_cover(2, "bbbb"));
+        r.to_app
+            .send(FromWorker::Cover {
+                track_id: 1,
+                image: crate::art::Image {
+                    width: 1,
+                    height: 1,
+                    rgb: vec![9, 9, 9],
+                },
+            })
+            .expect("send");
+        r.app.drain_worker();
+        assert!(
+            r.app.cover_for_now_playing().is_none(),
+            "a stale cover was kept for the wrong track"
+        );
     }
 }

@@ -162,6 +162,17 @@ pub enum ToWorker {
     /// Read the chain to the output device. Runs `pw-dump` and waits for it,
     /// which is why it is here and not on the UI thread.
     ReadAudioGraph,
+    /// Fetch and decode a track's album cover.
+    ///
+    /// Both the fetch and the decode happen here, off the render thread: the
+    /// UI is handed pixels, never bytes, because decoding a JPEG allocates and
+    /// takes real time and the render loop may do neither. Carries the track id
+    /// so the reply can be dropped if the track has changed by the time it
+    /// lands - replies are correlated by id, never by order.
+    FetchCover {
+        track_id: u64,
+        cover_id: String,
+    },
 }
 
 /// Which request a reply belongs to.
@@ -336,6 +347,16 @@ pub enum FromWorker {
     /// it is a request that went wrong, and the overlay has its own sentence
     /// for each case.
     AudioGraph(Result<AudioGraph, GraphError>),
+    /// A decoded album cover, and the track it belongs to.
+    ///
+    /// Only ever sent on success: a cover that would not fetch or decode is
+    /// absent, the same as one that was never asked for, and the box already
+    /// knows how to draw nothing. The id is what lets the app drop a cover that
+    /// arrived after its track stopped playing.
+    Cover {
+        track_id: u64,
+        image: crate::art::Image,
+    },
     /// A request failed. `task` says which one, so the view that was waiting can
     /// stop; `fault` is what the interface branches on; `detail` is the sentence
     /// it shows. Nothing may match on `detail` - that is the whole point of
@@ -583,8 +604,35 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
             }
             FromWorker::AudioGraph(read)
         }
+        // Fetch the bytes and decode them here, on the worker: a cover is tens
+        // of kilobytes, and the cap keeps a broken or hostile response off the
+        // heap. Silence on every failure - no URL, a fetch that did not land, a
+        // body that was not a picture - because an absent cover is a state the
+        // box already draws, and an error banner over the now-playing row would
+        // be louder than a missing picture is worth.
+        ToWorker::FetchCover { track_id, cover_id } => {
+            let url = priel_core::cover_url(&cover_id, COVER_FETCH_PX)?;
+            let bytes = client.fetch_bytes(&url, COVER_FETCH_CAP).ok()?;
+            let image = crate::art::decode_jpeg(&bytes)?;
+            FromWorker::Cover { track_id, image }
+        }
     })
 }
+
+/// The square size the cover is fetched at, in pixels.
+///
+/// Close to what it is drawn at - `COVER_ROWS` rows is a block of a few dozen
+/// cells - so the downscale averages a handful of source pixels rather than
+/// resampling a large image. A little larger than the largest block, so the art
+/// is sharp rather than upscaled.
+const COVER_FETCH_PX: u32 = 160;
+
+/// The most a cover fetch will read into memory.
+///
+/// A 160px JPEG is tens of kilobytes; this is set well above that and well
+/// below anything that would matter, so a redirect to something enormous cannot
+/// fill the heap. See [`Client::fetch_bytes`].
+const COVER_FETCH_CAP: usize = 4 * 1024 * 1024;
 
 pub fn spawn_with<F>(build: F) -> Worker
 where
@@ -1162,6 +1210,7 @@ mod tests {
             FromWorker::PlaylistDeleted { .. } => "PlaylistDeleted",
             FromWorker::PlaylistTrackRemoved { .. } => "PlaylistTrackRemoved",
             FromWorker::PlaylistTrackAdded { .. } => "PlaylistTrackAdded",
+            FromWorker::Cover { .. } => "Cover",
             FromWorker::Failed { .. } => "Failed",
         }
     }

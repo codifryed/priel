@@ -85,6 +85,31 @@ impl Image {
     }
 }
 
+/// Decode JPEG bytes into an [`Image`], or `None` if they are not a picture.
+///
+/// Runs off the render thread - decoding allocates and takes real time, neither
+/// of which the UI loop may do - so the worker calls this and sends cells or
+/// pixels back, never the raw bytes. `None` rather than an error on a bad
+/// decode: a cover that will not decode is absent, the same as one that never
+/// arrived, and the box already knows how to draw nothing.
+///
+/// The output is forced to RGB, so a greyscale or `YCbCr` source comes back in
+/// the three-byte-per-pixel shape [`Image`] expects rather than in whatever the
+/// file happened to carry.
+#[must_use]
+pub fn decode_jpeg(bytes: &[u8]) -> Option<Image> {
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+    use zune_jpeg::JpegDecoder;
+
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    // A `Cursor`, because the reader trait wants `Seek` and a bare slice is not.
+    let mut decoder = JpegDecoder::new_with_options(std::io::Cursor::new(bytes), options);
+    let rgb = decoder.decode().ok()?;
+    let (width, height) = decoder.dimensions()?;
+    Some(Image { width, height, rgb })
+}
+
 /// Draw `image` into a block `rows` tall and `cols` wide.
 ///
 /// The result is `rows` lines of `cols` `▀` glyphs, each carrying two pixels, so
@@ -138,8 +163,14 @@ fn span_of(i: usize, n: usize, len: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HALF, Image, draw, span_of};
+    use super::{HALF, Image, decode_jpeg, draw, span_of};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use ratatui::style::Color;
+
+    /// A real 16x16 JPEG, red in its left half and blue in its right, quality
+    /// 95. Embedded rather than fetched, because tests reach no network and read
+    /// no fixture; small enough to paste, real enough to exercise the decoder.
+    const SPLIT_JPEG: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUEBAMEBgUGBgYFBgYGBwkIBgcJBwYGCAsICQoKCgoKBggLDAsKDAkKCgr/2wBDAQICAgICAgUDAwUKBwYHCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgr/wAARCAAQABADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD4/r5rr6Ur5rr+hPoGf81F/wByn/u0f1R9NL/mQ/8Ac1/7rn//2Q==";
 
     /// A picture of one flat colour.
     fn flat(w: usize, h: usize, rgb: (u8, u8, u8)) -> Image {
@@ -165,6 +196,42 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn a_real_jpeg_decodes_to_rgb_the_right_way_round() {
+        // Goal: the decoder actually runs, produces three bytes a pixel, and
+        // does not flip the picture - a cover drawn mirrored is worse than none.
+        // Method: a 16x16 that is red on the left and blue on the right, checked
+        // at a pixel well inside each half so the JPEG's soft edge is not read.
+        let bytes = STANDARD.decode(SPLIT_JPEG).expect("valid base64");
+        let image = decode_jpeg(&bytes).expect("a picture");
+
+        assert_eq!((image.width, image.height), (16, 16), "the size is read");
+        assert_eq!(image.rgb.len(), 16 * 16 * 3, "three bytes to a pixel");
+
+        let (lr, _, lb) = image.pixel(3, 8);
+        assert!(lr > 150 && lb < 100, "the left is red, got {:?}", (lr, lb));
+        let (rr, _, rb) = image.pixel(12, 8);
+        assert!(
+            rb > 150 && rr < 100,
+            "the right is blue, got {:?}",
+            (rr, rb)
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_jpeg_decode_to_nothing_rather_than_an_error() {
+        // Goal: a cover that will not decode is absent, the same as one that
+        // never arrived - the render thread may not be handed a panic or an
+        // error to render. Method: obvious rubbish, and a truncated real file.
+        assert!(decode_jpeg(b"not a jpeg at all").is_none(), "rubbish");
+        assert!(decode_jpeg(&[]).is_none(), "nothing at all");
+        let bytes = STANDARD.decode(SPLIT_JPEG).expect("valid base64");
+        assert!(
+            decode_jpeg(&bytes[..bytes.len() / 2]).is_none(),
+            "half a file is not a picture"
+        );
     }
 
     #[test]
