@@ -103,6 +103,24 @@ pub struct Theme {
     pub selection_fg: Color,
     /// The highlighted row of a list or a picker.
     pub selection_bg: Color,
+    /// The highlighted row of the list the keyboard is **not** driving.
+    ///
+    /// Two lists are focusable - the browse list and the queue in the
+    /// now-playing panel - so two cursors are on screen at once and each has to
+    /// say which it is. This is the quiet one: the selection backing stepped
+    /// most of the way back toward the surface, so focusing a list can only
+    /// make its cursor louder and never dimmer.
+    ///
+    /// It carries a foreground of its own rather than borrowing
+    /// [`Theme::selection_fg`], and that is measured rather than tidy: on the
+    /// eight palettes whose selected row is the *background* colour on a bright
+    /// backing, that same foreground lands at about 1.6:1 on a backing this
+    /// close to the surface. What reads there is the ordinary [`Theme::text`],
+    /// which is also the honest answer - the row the listener is not driving is
+    /// not disabled, so its words are the words every other row wears.
+    pub selection_idle_fg: Color,
+    /// The highlighted row of the list the keyboard is not driving.
+    pub selection_idle_bg: Color,
     /// The backing of every other row in a list, and of the tabs that are not
     /// the one you are on. A whisper away from [`Theme::background`]: enough to
     /// carry the eye along a row two hundred cells wide, never enough to be
@@ -222,6 +240,23 @@ impl Theme {
         Style::new().fg(self.selection_fg).bg(self.selection_bg)
     }
 
+    /// The cursor of a list, loud or quiet by whether it holds the keyboard.
+    ///
+    /// A full pair either way rather than a backing the caller adds a
+    /// foreground to, because a cursor owns the row it is on: the row in the
+    /// speakers already gives up `active` under the focused cursor, and a
+    /// second rule for the idle one would be two answers to one question.
+    #[must_use]
+    pub const fn cursor(&self, focused: bool) -> Style {
+        if focused {
+            self.selection()
+        } else {
+            Style::new()
+                .fg(self.selection_idle_fg)
+                .bg(self.selection_idle_bg)
+        }
+    }
+
     /// The backing a row sits on: the surface, or the stripe on every other
     /// one. Foregroundless on purpose - a stripe changes what a row is drawn
     /// on and never what it says, so the caller adds its own `fg` and the row
@@ -279,6 +314,12 @@ const TERMINAL: Theme = Theme {
     accent: Color::Cyan,
     selection_fg: Color::Black,
     selection_bg: Color::Cyan,
+    // A neutral rather than a hue, which is this palette's own way of saying
+    // quiet: the focused cursor is `Cyan` and both are pinned, because `text`
+    // here is `Reset` and a foreground priel cannot see cannot be measured
+    // against any backing at all.
+    selection_idle_fg: Color::Black,
+    selection_idle_bg: Color::Gray,
     stripe_bg: Color::Reset,
     control_fg: Color::Cyan,
     control_bg: Color::DarkGray,
@@ -314,6 +355,8 @@ const NORD: Theme = Theme {
     accent: Color::Rgb(0x88, 0xc0, 0xd0),
     selection_fg: Color::Rgb(0xec, 0xef, 0xf4),
     selection_bg: Color::Rgb(0x5e, 0x81, 0xac),
+    selection_idle_fg: Color::Rgb(0xec, 0xef, 0xf4),
+    selection_idle_bg: Color::Rgb(0x41, 0x53, 0x6b),
     stripe_bg: Color::Rgb(0x34, 0x3b, 0x49),
     control_fg: Color::Rgb(0x88, 0xc0, 0xd0),
     control_bg: Color::Rgb(0x43, 0x4c, 0x5e),
@@ -347,6 +390,8 @@ const GRUVBOX_DARK: Theme = Theme {
     accent: Color::Rgb(0x83, 0xa5, 0x98),
     selection_fg: Color::Rgb(0x28, 0x28, 0x28),
     selection_bg: Color::Rgb(0x83, 0xa5, 0x98),
+    selection_idle_fg: Color::Rgb(0xeb, 0xdb, 0xb2),
+    selection_idle_bg: Color::Rgb(0x43, 0x4e, 0x4a),
     stripe_bg: Color::Rgb(0x32, 0x30, 0x2f),
     control_fg: Color::Rgb(0x83, 0xa5, 0x98),
     control_bg: Color::Rgb(0x3c, 0x38, 0x36),
@@ -381,6 +426,8 @@ const GRUVBOX_LIGHT: Theme = Theme {
     accent: Color::Rgb(0x07, 0x66, 0x78),
     selection_fg: Color::Rgb(0xfb, 0xf1, 0xc7),
     selection_bg: Color::Rgb(0x07, 0x66, 0x78),
+    selection_idle_fg: Color::Rgb(0x3c, 0x38, 0x36),
+    selection_idle_bg: Color::Rgb(0xb2, 0xc7, 0xaf),
     stripe_bg: Color::Rgb(0xf2, 0xe5, 0xbc),
     control_fg: Color::Rgb(0x07, 0x66, 0x78),
     control_bg: Color::Rgb(0xeb, 0xdb, 0xb2),
@@ -420,6 +467,8 @@ const ONE_LIGHT: Theme = Theme {
     accent: Color::Rgb(0x40, 0x78, 0xf2),
     selection_fg: Color::Rgb(0xfa, 0xfa, 0xfa),
     selection_bg: Color::Rgb(0x40, 0x78, 0xf2),
+    selection_idle_fg: Color::Rgb(0x38, 0x3a, 0x42),
+    selection_idle_bg: Color::Rgb(0xb9, 0xcc, 0xf7),
     stripe_bg: Color::Rgb(0xff, 0xff, 0xff),
     control_fg: Color::Rgb(0x40, 0x78, 0xf2),
     control_bg: Color::Rgb(0xe5, 0xe5, 0xe6),
@@ -467,6 +516,8 @@ const DRACULA: Theme = Theme {
     accent: Color::Rgb(0xbd, 0x93, 0xf9),
     selection_fg: Color::Rgb(0x28, 0x2a, 0x36),
     selection_bg: Color::Rgb(0xbd, 0x93, 0xf9),
+    selection_idle_fg: Color::Rgb(0xf8, 0xf8, 0xf2),
+    selection_idle_bg: Color::Rgb(0x55, 0x4a, 0x70),
     stripe_bg: Color::Rgb(0x2f, 0x31, 0x3f),
     control_fg: Color::Rgb(0xbd, 0x93, 0xf9),
     control_bg: Color::Rgb(0x44, 0x47, 0x5a),
@@ -511,6 +562,8 @@ const ONE_DARK: Theme = Theme {
     accent: Color::Rgb(0x61, 0xaf, 0xef),
     selection_fg: Color::Rgb(0x28, 0x2c, 0x34),
     selection_bg: Color::Rgb(0x61, 0xaf, 0xef),
+    selection_idle_fg: Color::Rgb(0xab, 0xb2, 0xbf),
+    selection_idle_bg: Color::Rgb(0x36, 0x4d, 0x63),
     stripe_bg: Color::Rgb(0x2e, 0x32, 0x3b),
     control_fg: Color::Rgb(0x61, 0xaf, 0xef),
     control_bg: Color::Rgb(0x3e, 0x44, 0x51),
@@ -574,6 +627,8 @@ const TRUE_BLACK: Theme = Theme {
     accent: Color::Rgb(0x00, 0xbc, 0xff),
     selection_fg: Color::Rgb(0xe6, 0xe6, 0xe6),
     selection_bg: Color::Rgb(0x5a, 0x5a, 0x5a),
+    selection_idle_fg: Color::Rgb(0xe6, 0xe6, 0xe6),
+    selection_idle_bg: Color::Rgb(0x2d, 0x2d, 0x2d),
     stripe_bg: Color::Rgb(0x10, 0x10, 0x10),
     control_fg: Color::Rgb(0x00, 0xbc, 0xff),
     control_bg: Color::Rgb(0x30, 0x30, 0x30),
@@ -627,6 +682,8 @@ const CATPPUCCIN: Theme = Theme {
     accent: Color::Rgb(0xcb, 0xa6, 0xf7),
     selection_fg: Color::Rgb(0x1e, 0x1e, 0x2e),
     selection_bg: Color::Rgb(0xcb, 0xa6, 0xf7),
+    selection_idle_fg: Color::Rgb(0xcd, 0xd6, 0xf4),
+    selection_idle_bg: Color::Rgb(0x52, 0x47, 0x6a),
     stripe_bg: Color::Rgb(0x18, 0x18, 0x25),
     control_fg: Color::Rgb(0xcb, 0xa6, 0xf7),
     control_bg: Color::Rgb(0x31, 0x32, 0x44),
@@ -672,6 +729,8 @@ const TOKYO_NIGHT: Theme = Theme {
     accent: Color::Rgb(0x7a, 0xa2, 0xf7),
     selection_fg: Color::Rgb(0x1a, 0x1b, 0x26),
     selection_bg: Color::Rgb(0x7a, 0xa2, 0xf7),
+    selection_idle_fg: Color::Rgb(0xc0, 0xca, 0xf5),
+    selection_idle_bg: Color::Rgb(0x37, 0x44, 0x65),
     stripe_bg: Color::Rgb(0x16, 0x16, 0x1e),
     control_fg: Color::Rgb(0x7a, 0xa2, 0xf7),
     control_bg: Color::Rgb(0x29, 0x2e, 0x42),
@@ -731,6 +790,8 @@ const TOKYO_NIGHT_DAY: Theme = Theme {
     accent: Color::Rgb(0x25, 0x64, 0xba),
     selection_fg: Color::Rgb(0xe1, 0xe2, 0xe7),
     selection_bg: Color::Rgb(0x25, 0x64, 0xba),
+    selection_idle_fg: Color::Rgb(0x26, 0x43, 0x86),
+    selection_idle_bg: Color::Rgb(0xa9, 0xbc, 0xda),
     stripe_bg: Color::Rgb(0xe9, 0xe9, 0xec),
     control_fg: Color::Rgb(0x25, 0x64, 0xba),
     control_bg: Color::Rgb(0xc4, 0xc8, 0xda),
@@ -847,6 +908,15 @@ mod tests {
         for (name, t) in all() {
             let pairs = [
                 ("selection", t.selection_fg, t.selection_bg, MARK_FLOOR),
+                // The second cursor. It repaints the row exactly as the first
+                // one does - a cursor owns the row it is on, focused or not -
+                // so it is one pair here and not one per foreground.
+                (
+                    "selection_idle",
+                    t.selection_idle_fg,
+                    t.selection_idle_bg,
+                    MARK_FLOOR,
+                ),
                 ("control", t.control_fg, t.control_bg, MARK_FLOOR),
                 ("toggle_on", t.toggle_on_fg, t.toggle_on_bg, MARK_FLOOR),
                 ("stripe/text", t.text, t.stripe_bg, PROSE_FLOOR),
@@ -862,6 +932,67 @@ mod tests {
                     "{name:?}: {role} is {ratio:.2}:1 against its own backing, under {floor}"
                 );
             }
+        }
+    }
+
+    /// The least the idle cursor may differ from the surface. Above
+    /// [`STRIPE_MAX`] on purpose: a cursor inside the range a stripe lives in
+    /// is a cursor a striped row can be mistaken for.
+    const CURSOR_FROM_SURFACE: f64 = 1.35;
+
+    /// The least the two cursors may differ from each other. Below this,
+    /// "which of the two lists am I driving?" is answered by a shade nobody
+    /// can name.
+    const CURSOR_FROM_CURSOR: f64 = 1.5;
+
+    /// The least the idle cursor may differ from the stripe it lands on.
+    const CURSOR_FROM_STRIPE: f64 = 1.25;
+
+    /// Goal: two focusable lists put two cursors on screen at once, and the
+    /// pair has to answer three questions at a glance - which row the cursor is
+    /// on, which of the two lists is being driven, and neither of those
+    /// confused with a striped row. Method: measure the idle cursor's backing
+    /// against all three of the backings it has to be told apart from.
+    ///
+    /// The last assertion is the one that says which of them is the quiet one:
+    /// the idle cursor sits *between* the surface and the focused cursor, so
+    /// focusing a list can only make its cursor louder. A palette that inverted
+    /// that would be saying the list nobody is driving is the important one.
+    #[test]
+    fn the_idle_cursor_is_the_quiet_one_and_is_never_a_stripe() {
+        for (name, t) in all() {
+            // `None` is the terminal palette, whose backings are the user's.
+            let Some(surface) = contrast(t.selection_idle_bg, t.background) else {
+                continue;
+            };
+            assert!(
+                surface >= CURSOR_FROM_SURFACE,
+                "{name:?}: the idle cursor is {surface:.2}:1 on the surface, inside the \
+                 range a stripe lives in"
+            );
+            let Some(apart) = contrast(t.selection_idle_bg, t.selection_bg) else {
+                continue;
+            };
+            assert!(
+                apart >= CURSOR_FROM_CURSOR,
+                "{name:?}: the two cursors are {apart:.2}:1 apart, under {CURSOR_FROM_CURSOR}"
+            );
+            let Some(striped) = contrast(t.selection_idle_bg, t.stripe_bg) else {
+                continue;
+            };
+            assert!(
+                striped >= CURSOR_FROM_STRIPE,
+                "{name:?}: the idle cursor is {striped:.2}:1 from the stripe, under \
+                 {CURSOR_FROM_STRIPE}"
+            );
+            let Some(focused) = contrast(t.selection_bg, t.background) else {
+                continue;
+            };
+            assert!(
+                surface < focused,
+                "{name:?}: the idle cursor is {surface:.2}:1 off the surface and the focused \
+                 one is {focused:.2}:1, so the quiet cursor is the loud one"
+            );
         }
     }
 
@@ -974,6 +1105,8 @@ mod tests {
             t.accent,
             t.selection_fg,
             t.selection_bg,
+            t.selection_idle_fg,
+            t.selection_idle_bg,
             t.stripe_bg,
             t.control_fg,
             t.control_bg,

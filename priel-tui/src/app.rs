@@ -66,6 +66,20 @@ pub enum View {
     Search,
 }
 
+/// Which of the two lists the keyboard is driving.
+///
+/// Two rather than a list of regions, and that is the whole reason the focus
+/// key can be a single press: vim's `Ctrl-W` is a *prefix* because vim has any
+/// number of windows to name, and priel has exactly two, so the prefix is the
+/// move. A third region would have to grow a direction after it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    /// The browse list: whatever [`View`] is showing.
+    List,
+    /// The play queue, in the now-playing panel.
+    Queue,
+}
+
 /// What a left click at one cell means, read off the geometry the renderer
 /// published for this frame.
 ///
@@ -83,6 +97,12 @@ pub enum Click {
     Seek(f64),
     /// A loaded list row, by index into the visible list.
     Row(usize),
+    /// A queue entry in the now-playing panel, by index into the queue.
+    ///
+    /// An index into `queue` rather than into a visible list: the queue has no
+    /// filter of its own, and it is the one list on screen whose order is the
+    /// order it will be played in.
+    QueueRow(usize),
     /// Bare surface, or a bar with nothing playing to seek within.
     Nothing,
 }
@@ -149,6 +169,11 @@ pub enum Hit {
     /// routinely different tracks, and the heart beside each one has to mean it.
     FavoriteNowPlaying,
     CycleView,
+    /// Hand the keyboard to the other of the two lists.
+    ///
+    /// Only ever on screen where there are two: the panel that holds the queue
+    /// arrives at 120 columns, and below that this control does not appear.
+    CycleFocus,
     Help,
     Log,
     Graph,
@@ -521,6 +546,15 @@ pub struct App {
     pub selected: usize,
     pub list_offset: usize,
 
+    /// Which list the keyboard was last asked for, which is not the same thing
+    /// as which list has it: see [`App::focus`].
+    focus_wanted: Focus,
+    /// The queue entry under the queue's own cursor.
+    pub queue_selected: usize,
+    /// The first queue entry on screen, maintained by the renderer exactly as
+    /// `list_offset` is.
+    pub queue_offset: usize,
+
     pub now_playing: Option<Track>,
     pub now_meta: StreamMeta,
     pub status: PlaybackStatus,
@@ -692,10 +726,18 @@ pub struct App {
     pub should_quit: bool,
 
     pub list_inner: Rect,
+    /// Where the queue's entries were painted, or a zero rect where there is no
+    /// panel to paint them in. Written by the renderer every frame, and the one
+    /// thing that says whether there is a second region at all.
+    pub queue_inner: Rect,
     pub progress_rect: Rect,
     /// Clickable regions, rebuilt by the renderer every frame.
     pub hits: Vec<(Rect, Hit)>,
-    last_click: Option<(u16, Instant)>,
+    /// What the last click meant, and when. The *meaning* rather than the row:
+    /// the two lists sit side by side, so one screen row is a row in each, and
+    /// a clock keyed on the row number read a click in each region as a double
+    /// click on the second.
+    last_click: Option<(Click, Instant)>,
     dirty: bool,
     last_sig: RenderSig,
     /// Where the credentials file should live, and the state of any attempt to
@@ -812,6 +854,9 @@ impl App {
             search_paging: Paging::default(),
             selected: 0,
             list_offset: 0,
+            focus_wanted: Focus::List,
+            queue_selected: 0,
+            queue_offset: 0,
             now_playing: None,
             now_meta: StreamMeta::default(),
             status: PlaybackStatus::default(),
@@ -848,6 +893,7 @@ impl App {
             frame: 0,
             should_quit: false,
             list_inner: Rect::default(),
+            queue_inner: Rect::default(),
             progress_rect: Rect::default(),
             hits: Vec::new(),
             last_click: None,
@@ -2252,6 +2298,7 @@ impl App {
         self.advanced = true;
         if let Some(p) = self.queue.iter().position(|t| t.id == id) {
             self.queue_pos = p;
+            self.follow_queue_cursor();
             self.now_playing = Some(self.queue[p].clone());
         }
         self.now_meta = self.metas.get(&id).cloned().unwrap_or_default();
@@ -2391,6 +2438,13 @@ impl App {
     }
 
     fn on_enter(&mut self) {
+        // The queue is a list of tracks whatever view is behind it, so Enter
+        // there always means play - never "open", which is what it means on the
+        // two views that hold something to open.
+        if self.focus() == Focus::Queue {
+            self.play_queue_selected();
+            return;
+        }
         match self.view {
             View::Playlists => self.open_selected_playlist(),
             View::Mixes => self.open_selected_mix(),
@@ -2398,22 +2452,106 @@ impl App {
         }
     }
 
+    /// Play the queue entry under the queue's cursor, forward or back.
+    ///
+    /// Straight to [`Self::load_fresh`] rather than through the skip keys: this
+    /// names a place in the queue, and the skip keys name a direction from
+    /// where it is now. Going back through what has played is what makes the
+    /// history above the current track navigation rather than a readout.
+    fn play_queue_selected(&mut self) {
+        if self.queue_selected < self.queue.len() {
+            self.load_fresh(self.queue_selected);
+        }
+    }
+
     // ---- navigation ----
 
+    /// Which list the keyboard is actually driving.
+    ///
+    /// Derived rather than stored, and that is what keeps the width out of the
+    /// key handler: the queue can only hold the keyboard where the renderer
+    /// published a region for it, and it publishes one only in the now-playing
+    /// panel, which exists at 120 columns and up. A terminal narrowed under the
+    /// listener's fingers hands the keys back on the next frame with nothing
+    /// having to notice.
+    #[must_use]
+    pub fn focus(&self) -> Focus {
+        if self.queue_inner.height > 0 {
+            self.focus_wanted
+        } else {
+            Focus::List
+        }
+    }
+
+    /// Hand the keyboard to the other list. **The one way in**, for the key and
+    /// for a click alike.
+    fn cycle_focus(&mut self) {
+        if self.queue_inner.height == 0 {
+            // Two reasons there is nothing to hand the keyboard to, and they
+            // want different things of the listener. Naming the width on a
+            // two-hundred-column terminal with an empty queue would be telling
+            // them to fix something that is not wrong.
+            self.notice = Some(
+                if self.queue.is_empty() {
+                    "Nothing is queued yet: press Enter on a track."
+                } else {
+                    "The queue needs the now-playing panel: 120 columns, and rows to spare."
+                }
+                .into(),
+            );
+            return;
+        }
+        self.give_focus(match self.focus_wanted {
+            Focus::List => Focus::Queue,
+            Focus::Queue => Focus::List,
+        });
+    }
+
+    /// Point the keyboard at a region, clamping the cursor it finds there.
+    ///
+    /// The queue is the one list that changes length without anybody moving
+    /// through it - the radio extends it, and a new one replaces it - so its
+    /// cursor is checked on the way in rather than trusted.
+    fn give_focus(&mut self, focus: Focus) {
+        self.focus_wanted = focus;
+        self.queue_selected = self.queue_selected.min(self.queue.len().saturating_sub(1));
+    }
+
     fn move_down(&mut self, by: usize) {
-        let n = self.visible().len();
-        if n > 0 {
-            self.selected = (self.selected + by).min(n - 1);
+        match self.focus() {
+            Focus::List => {
+                let n = self.visible().len();
+                if n > 0 {
+                    self.selected = (self.selected + by).min(n - 1);
+                }
+            }
+            Focus::Queue => {
+                let n = self.queue.len();
+                if n > 0 {
+                    self.queue_selected = (self.queue_selected + by).min(n - 1);
+                }
+            }
         }
     }
     fn move_up(&mut self, by: usize) {
-        self.selected = self.selected.saturating_sub(by);
+        match self.focus() {
+            Focus::List => self.selected = self.selected.saturating_sub(by),
+            Focus::Queue => self.queue_selected = self.queue_selected.saturating_sub(by),
+        }
+    }
+    /// The height of whichever region the keys are moving through, because a
+    /// page is a screenful of the list being paged and not of the other one.
+    fn page_rows(&self) -> usize {
+        match self.focus() {
+            Focus::List => self.list_inner.height as usize,
+            Focus::Queue => self.queue_inner.height as usize,
+        }
     }
     fn half_page(&self) -> usize {
-        (self.list_inner.height as usize / 2).max(1)
+        (self.page_rows() / 2).max(1)
     }
     fn full_page(&self) -> usize {
-        (self.list_inner.height as usize).max(1)
+        self.page_rows().max(1)
     }
 
     // ---- queue + gapless playback ----
@@ -2450,6 +2588,8 @@ impl App {
     /// a queue is a different thing and goes through [`App::on_radio_page`].
     fn set_queue(&mut self, tracks: Vec<Track>) {
         self.queue = tracks;
+        self.queue_selected = 0;
+        self.queue_offset = 0;
         self.radio_from = None;
         self.radio_asked = None;
     }
@@ -2460,6 +2600,7 @@ impl App {
         }
         self.mint_play();
         self.queue_pos = pos;
+        self.follow_queue_cursor();
         self.next_intended = None;
         let t = self.queue[pos].clone();
         self.current_target = Some(t.id);
@@ -2467,6 +2608,19 @@ impl App {
         self.now_playing = Some(t.clone());
         self.now_meta = StreamMeta::default();
         self.ask(ToWorker::Resolve(t.id));
+    }
+
+    /// Keep the queue's cursor on what is playing, unless the listener has the
+    /// keyboard there.
+    ///
+    /// Called from the two places `queue_pos` moves and nowhere else, so the
+    /// panel is a readout of where the music is right up until somebody starts
+    /// driving it - and from that moment the music stops moving the cursor out
+    /// from under their fingers.
+    fn follow_queue_cursor(&mut self) {
+        if self.focus() != Focus::Queue {
+            self.queue_selected = self.queue_pos;
+        }
     }
 
     fn schedule_next(&mut self) {
@@ -2591,7 +2745,32 @@ impl App {
     /// it was suggested.
     #[must_use]
     pub fn playing_from_radio(&self) -> bool {
-        self.radio_from.is_some_and(|start| self.queue_pos >= start)
+        self.suggested(self.queue_pos)
+    }
+
+    /// Is the entry at this place in the queue the service's suggestion rather
+    /// than the listener's choice?
+    ///
+    /// The same positional rule [`Self::playing_from_radio`] answers with, asked
+    /// of any entry rather than only of the one playing - one rule with two
+    /// callers, so the mark on a queue row and the word beside the playing
+    /// track cannot come to disagree. Out-of-range indices answer `false`: an
+    /// entry that is not there was suggested by nobody.
+    /// Has the radio put anything in this queue?
+    ///
+    /// What the legend beside the queue's heading is drawn on: a mark is
+    /// explained where there is a mark to explain and nowhere else, because a
+    /// thirty-two cell panel has no room for a glossary of what is not there.
+    #[must_use]
+    pub fn queue_has_suggestions(&self) -> bool {
+        self.radio_from
+            .is_some_and(|start| start < self.queue.len())
+    }
+
+    #[must_use]
+    pub fn suggested(&self, index: usize) -> bool {
+        self.radio_from
+            .is_some_and(|start| index >= start && index < self.queue.len())
     }
 
     fn advance_fresh(&mut self) {
@@ -2615,11 +2794,17 @@ impl App {
     }
 
     fn goto_top(&mut self) {
-        self.selected = 0;
+        match self.focus() {
+            Focus::List => self.selected = 0,
+            Focus::Queue => self.queue_selected = 0,
+        }
     }
 
     fn goto_bottom(&mut self) {
-        self.selected = self.visible().len().saturating_sub(1);
+        match self.focus() {
+            Focus::List => self.selected = self.visible().len().saturating_sub(1),
+            Focus::Queue => self.queue_selected = self.queue.len().saturating_sub(1),
+        }
     }
 
     fn start_filter(&mut self) {
@@ -3784,6 +3969,11 @@ impl App {
             match key.code {
                 KeyCode::Char('d') => self.move_down(self.half_page()),
                 KeyCode::Char('u') => self.move_up(self.half_page()),
+                // Vim's own window key. Taken rather than invented because a
+                // VIM-first client should spend a letter only where vim has
+                // nothing to say, and `Tab` - the other obvious candidate - is
+                // already the view cycle.
+                KeyCode::Char('w') => self.cycle_focus(),
                 _ => {}
             }
             return;
@@ -4032,8 +4222,8 @@ impl App {
             return;
         }
         match m.kind {
-            MouseEventKind::ScrollDown => self.move_down(1),
-            MouseEventKind::ScrollUp => self.move_up(1),
+            MouseEventKind::ScrollDown => self.wheel(m.column, m.row, 1),
+            MouseEventKind::ScrollUp => self.wheel(m.column, m.row, 0),
             MouseEventKind::Down(MouseButton::Left) => self.on_click(m.column, m.row),
             MouseEventKind::Drag(MouseButton::Left) if hit(self.progress_rect, m.column, m.row) => {
                 self.seek_to_x(m.column);
@@ -4043,6 +4233,25 @@ impl App {
             _ => return,
         }
         self.dirty = true;
+    }
+
+    /// The wheel, aimed at whichever list is under the pointer.
+    ///
+    /// It gives that list the keyboard for the same reason a click does: a
+    /// gesture aimed at a region is a request for that region, and a wheel that
+    /// scrolled the *other* list would be the one mouse action on screen whose
+    /// answer depends on something the pointer is not touching.
+    fn wheel(&mut self, col: u16, row: u16, down: u8) {
+        if hit(self.queue_inner, col, row) {
+            self.give_focus(Focus::Queue);
+        } else {
+            self.give_focus(Focus::List);
+        }
+        if down > 0 {
+            self.move_down(1);
+        } else {
+            self.move_up(1);
+        }
     }
 
     /// Act on a control the renderer registered a hit box for.
@@ -4075,6 +4284,7 @@ impl App {
             Hit::EditSearch => self.edit_search(),
             Hit::Reload => self.reload_view(),
             Hit::CycleView => self.cycle_view(),
+            Hit::CycleFocus => self.cycle_focus(),
             Hit::Help => self.open_help(),
             Hit::Log => self.open_log(),
             Hit::Graph => self.open_graph(),
@@ -4129,28 +4339,49 @@ impl App {
                 return Click::Row(vi);
             }
         }
+        if hit(self.queue_inner, col, row) {
+            let qi = self.queue_offset + (row - self.queue_inner.y) as usize;
+            if qi < self.queue.len() {
+                return Click::QueueRow(qi);
+            }
+        }
         Click::Nothing
     }
 
     fn on_click(&mut self, col: u16, row: u16) {
-        match self.click_at(col, row) {
+        let landed = self.click_at(col, row);
+        match landed {
             Click::Control(h) => self.dispatch(h),
             Click::Seek(secs) => self.player.seek(secs),
+            // Clicking into a region is asking for it, which is the gesture
+            // nobody has to be taught and the mouse's half of the focus key.
             Click::Row(vi) => {
-                let now = Instant::now();
-                let is_double = matches!(
-                    self.last_click,
-                    Some((prow, t)) if prow == row && now.duration_since(t) < Duration::from_millis(400)
-                );
+                self.give_focus(Focus::List);
                 self.selected = vi;
-                if is_double {
-                    self.on_enter();
-                    self.last_click = None;
-                } else {
-                    self.last_click = Some((row, now));
-                }
+                self.on_row_click(landed);
+            }
+            Click::QueueRow(qi) => {
+                self.give_focus(Focus::Queue);
+                self.queue_selected = qi;
+                self.on_row_click(landed);
             }
             Click::Nothing => {}
+        }
+    }
+
+    /// One click puts the cursor on a row; a second one within the double-click
+    /// window acts on it. Shared by both lists so the gesture is one gesture.
+    fn on_row_click(&mut self, landed: Click) {
+        let now = Instant::now();
+        let is_double = matches!(
+            self.last_click,
+            Some((was, t)) if was == landed && now.duration_since(t) < Duration::from_millis(400)
+        );
+        if is_double {
+            self.on_enter();
+            self.last_click = None;
+        } else {
+            self.last_click = Some((landed, now));
         }
     }
 
@@ -4589,6 +4820,15 @@ mod tests {
     fn click(col: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn wheel_down(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
             column: col,
             row,
             modifiers: KeyModifiers::NONE,
@@ -10188,5 +10428,342 @@ mod tests {
             r.app.on_key(key('x'));
         }
         assert_eq!(r.app.prompt_text.chars().count(), PLAYLIST_NAME_MAX);
+    }
+
+    // ---- the queue in the panel: a second focusable region ----
+
+    /// The keyboard's way between the two lists. Vim's own window prefix, and
+    /// with exactly two regions the prefix *is* the move.
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Put a queue region on screen without rendering one.
+    ///
+    /// `focus` answers `Queue` only where the renderer published a region to
+    /// focus, which is what makes "there is no panel below 120 columns" a fact
+    /// about geometry rather than a second breakpoint in the key handler. A
+    /// test that is not rendering says so by hand.
+    fn with_panel(app: &mut App) {
+        app.queue_inner = Rect {
+            x: 84,
+            y: 10,
+            width: 32,
+            height: 6,
+        };
+    }
+
+    fn queued(r: &mut Rig, n: u64) {
+        let tracks: Vec<Track> = (1..=n)
+            .map(|i| track(i, &format!("T{i}"), "Artist"))
+            .collect();
+        r.app.set_queue(tracks);
+    }
+
+    #[test]
+    fn the_focus_key_moves_between_the_two_lists_and_back() {
+        // Goal: one key changes which list the keyboard drives, and it toggles
+        // rather than latching - with two regions the window prefix is the
+        // whole move. Method: press it twice and read the focus after each.
+        let mut r = rig();
+        with_panel(&mut r.app);
+        assert_eq!(r.app.focus(), Focus::List, "the list starts with the keys");
+        r.app.on_key(ctrl('w'));
+        assert_eq!(r.app.focus(), Focus::Queue);
+        r.app.on_key(ctrl('w'));
+        assert_eq!(r.app.focus(), Focus::List);
+    }
+
+    #[test]
+    fn without_the_panel_there_is_nothing_to_focus_and_the_key_says_so() {
+        // Goal: below 120 columns the panel is not on screen, so there is no
+        // second region - and the key must leave the list driving rather than
+        // moving the keyboard somewhere invisible. Method: press it with no
+        // region published and check both the focus and what the user is told.
+        let mut r = rig();
+        queued(&mut r, 4);
+        r.app.on_key(ctrl('w'));
+        assert_eq!(r.app.focus(), Focus::List);
+        let said = r.app.notice.clone().unwrap_or_default();
+        assert!(
+            said.contains("120"),
+            "the key says nothing about the width that brings the queue back: {said:?}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_narrowed_under_the_panel_hands_the_keyboard_back() {
+        // Goal: the region can go away under the listener's fingers - a resize
+        // takes the panel with it - and j must not then move something nobody
+        // can see. Method: focus the queue, take the region away as a narrow
+        // frame does, and check the browse list moves again.
+        let mut r = rig();
+        with_panel(&mut r.app);
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X")];
+        queued(&mut r, 4);
+        r.app.on_key(ctrl('w'));
+        r.app.queue_inner = Rect::default();
+        assert_eq!(r.app.focus(), Focus::List);
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.selected, 1, "j went to the region that is on screen");
+    }
+
+    #[test]
+    fn j_and_k_move_whichever_list_holds_the_keyboard() {
+        // Goal: the same keys drive both regions, so there is one movement
+        // idiom rather than two. Method: move with the list focused, focus the
+        // queue, move again, and check each cursor moved only on its own turn.
+        let mut r = rig();
+        with_panel(&mut r.app);
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X"), track(3, "C", "X")];
+        queued(&mut r, 5);
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.selected, 1);
+        assert_eq!(r.app.queue_selected, 0);
+        r.app.on_key(ctrl('w'));
+        r.app.on_key(key('j'));
+        r.app.on_key(key('j'));
+        assert_eq!(r.app.queue_selected, 2);
+        assert_eq!(r.app.selected, 1, "the browse list stayed where it was");
+        r.app.on_key(key('k'));
+        assert_eq!(r.app.queue_selected, 1);
+    }
+
+    #[test]
+    fn the_ends_belong_to_the_focused_region_too() {
+        // Goal: g and G are the same two keys in both regions - a second
+        // scrolling idiom would be its own bug. Method: send them with the
+        // queue focused and check the queue's cursor, not the list's, moved.
+        let mut r = rig();
+        with_panel(&mut r.app);
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X")];
+        queued(&mut r, 5);
+        r.app.on_key(ctrl('w'));
+        r.app.on_key(key('G'));
+        assert_eq!(r.app.queue_selected, 4, "the last entry in the queue");
+        assert_eq!(r.app.selected, 0);
+        r.app.on_key(key('g'));
+        assert_eq!(r.app.queue_selected, 0);
+    }
+
+    #[test]
+    fn enter_on_a_queue_entry_plays_it() {
+        // Goal: the queue is navigable in both directions, and the way back
+        // through what has played is Enter on the row itself. Method: focus the
+        // queue, walk to the third entry, press Enter, and check the queue
+        // moved there and that entry was asked for.
+        let mut r = rig();
+        with_panel(&mut r.app);
+        queued(&mut r, 5);
+        r.app.on_key(ctrl('w'));
+        r.app.on_key(key('j'));
+        r.app.on_key(key('j'));
+        let _ = requests(&r);
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.queue_pos, 2);
+        assert_eq!(
+            r.app.now_playing.as_ref().map(|t| t.id),
+            Some(3),
+            "the entry under the cursor is the one that plays"
+        );
+        assert_eq!(resolved_ids(&requests(&r)), vec![3]);
+    }
+
+    #[test]
+    fn the_queue_cursor_follows_the_music_until_the_listener_takes_it() {
+        // Goal: the panel is a readout before it is a list, so while nobody is
+        // driving it the cursor stays on what is playing - and the moment it is
+        // driven, the music must stop dragging it about under the listener's
+        // fingers. Method: advance the queue with each focus in turn.
+        let mut r = rig();
+        with_panel(&mut r.app);
+        queued(&mut r, 6);
+        r.app.load_fresh(3);
+        assert_eq!(r.app.queue_selected, 3, "the cursor came along");
+        r.app.on_key(ctrl('w'));
+        r.app.on_key(key('g'));
+        r.app.load_fresh(4);
+        assert_eq!(
+            r.app.queue_selected, 0,
+            "the music moved the cursor out from under the listener"
+        );
+    }
+
+    #[test]
+    fn the_queue_tells_a_suggestion_from_a_choice_entry_by_entry() {
+        // Goal: what the radio added is a suggestion and what the listener
+        // queued is not, and a view of the queue must not blur the two. The
+        // rule is the positional one `playing_from_radio` already answers with,
+        // asked of any entry rather than only of the one playing. Method: mark
+        // where the radio took over and read the answer either side of it.
+        let mut r = rig();
+        queued(&mut r, 6);
+        r.app.set_radio_from_for_test(Some(4));
+        assert!(!r.app.suggested(3), "the listener queued this one");
+        assert!(r.app.suggested(4), "the radio added this one");
+        assert!(r.app.suggested(5));
+        r.app.set_radio_from_for_test(None);
+        assert!(!r.app.suggested(5), "nothing here was suggested");
+    }
+
+    #[test]
+    fn the_playing_track_answers_the_same_rule_the_rows_do() {
+        // Goal: one rule with two callers rather than two rules that can come
+        // to disagree - the badge beside the playing track and the mark on the
+        // queue row are the same question about the same index. Method: walk
+        // the queue position across the join and check the two agree at every
+        // step.
+        let mut r = rig();
+        queued(&mut r, 6);
+        r.app.set_radio_from_for_test(Some(3));
+        for pos in 0..6 {
+            r.app.queue_pos = pos;
+            assert_eq!(
+                r.app.playing_from_radio(),
+                r.app.suggested(pos),
+                "the two disagree at {pos}"
+            );
+        }
+    }
+
+    #[test]
+    fn favouriting_the_playing_track_works_from_either_focus() {
+        // Goal: F is not a list action and must not become one - the heart
+        // belongs to what is in the speakers whatever has the keyboard.
+        // Method: press it with the queue focused.
+        let mut r = rig();
+        with_panel(&mut r.app);
+        queued(&mut r, 3);
+        r.app.load_fresh(1);
+        r.app.on_key(ctrl('w'));
+        assert_eq!(r.app.focus(), Focus::Queue);
+        r.app.on_key(key('F'));
+        assert!(r.app.is_favorite(2), "the playing track was not kept");
+    }
+
+    #[test]
+    fn a_click_in_a_region_gives_it_the_keyboard() {
+        // Goal: the mouse path for focus is the natural gesture - clicking into
+        // a region is asking for it - so the key and the pointer cannot leave
+        // focus in two different places. Method: click a queue entry, then a
+        // browse row, and read the focus after each.
+        let mut r = rig();
+        r.app.list_inner = Rect {
+            x: 1,
+            y: 2,
+            width: 40,
+            height: 6,
+        };
+        with_panel(&mut r.app);
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X")];
+        queued(&mut r, 4);
+        r.app.on_mouse(click(86, 11));
+        assert_eq!(r.app.focus(), Focus::Queue);
+        assert_eq!(r.app.queue_selected, 1, "the entry that was clicked");
+        r.app.on_mouse(click(3, 3));
+        assert_eq!(r.app.focus(), Focus::List);
+        assert_eq!(r.app.selected, 1);
+    }
+
+    #[test]
+    fn a_queue_entry_is_read_off_the_rect_the_renderer_published() {
+        // Goal: a click on the queue is answered by the same pure seam a click
+        // on the list is, so there is one place where a cell becomes an intent.
+        // Method: ask what a cell inside and a cell past the entries mean.
+        let mut r = rig();
+        with_panel(&mut r.app);
+        queued(&mut r, 3);
+        assert_eq!(r.app.click_at(86, 10), Click::QueueRow(0));
+        assert_eq!(r.app.click_at(86, 12), Click::QueueRow(2));
+        assert_eq!(
+            r.app.click_at(86, 14),
+            Click::Nothing,
+            "past the last entry is not an entry"
+        );
+    }
+
+    #[test]
+    fn a_second_click_on_a_queue_entry_plays_it() {
+        // Goal: the queue answers the pointer the way the list does - one click
+        // to put the cursor there, a second to play - so there is one gesture
+        // to learn. Method: click the same entry twice.
+        let mut r = rig();
+        with_panel(&mut r.app);
+        queued(&mut r, 4);
+        let _ = requests(&r);
+        r.app.on_mouse(click(86, 12));
+        assert!(
+            r.app.now_playing.is_none(),
+            "one click only moves the cursor"
+        );
+        r.app.on_mouse(click(86, 12));
+        assert_eq!(r.app.now_playing.as_ref().map(|t| t.id), Some(3));
+    }
+
+    #[test]
+    fn two_regions_do_not_share_one_double_click() {
+        // Goal: the two lists sit side by side, so the same screen row exists
+        // in both - and a double click was once a row number and a clock, which
+        // would read a click in each region as a double click on the second.
+        // Method: click a browse row, then the queue entry on the same row.
+        let mut r = rig();
+        r.app.list_inner = Rect {
+            x: 1,
+            y: 10,
+            width: 40,
+            height: 6,
+        };
+        with_panel(&mut r.app);
+        r.app.favorites = vec![track(9, "A", "X"), track(8, "B", "X")];
+        queued(&mut r, 4);
+        r.app.on_mouse(click(3, 10));
+        r.app.on_mouse(click(86, 10));
+        assert!(
+            r.app.now_playing.is_none(),
+            "a click in each region played something"
+        );
+    }
+
+    #[test]
+    fn the_wheel_moves_the_list_under_the_pointer() {
+        // Goal: the wheel is a gesture aimed at a region, so it moves what is
+        // under the pointer rather than whatever the keyboard happens to hold.
+        // Method: scroll over the queue, then over the browse list.
+        let mut r = rig();
+        r.app.list_inner = Rect {
+            x: 1,
+            y: 10,
+            width: 40,
+            height: 6,
+        };
+        with_panel(&mut r.app);
+        r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X")];
+        queued(&mut r, 5);
+        r.app.on_mouse(wheel_down(86, 11));
+        assert_eq!(r.app.queue_selected, 1);
+        assert_eq!(r.app.selected, 0);
+        r.app.on_mouse(wheel_down(3, 11));
+        assert_eq!(r.app.selected, 1);
+        assert_eq!(r.app.queue_selected, 1, "the queue stayed where it was");
+    }
+
+    #[test]
+    fn an_empty_queue_says_it_is_empty_rather_than_blaming_the_width() {
+        // Goal: there are two reasons there is no queue to focus - the terminal
+        // is too narrow for the panel, or nothing has been queued yet - and a
+        // key that named the width on a two-hundred-column terminal would be
+        // telling the listener to fix something that is not wrong. Method: ask
+        // for the queue with the panel up and nothing in it.
+        let mut r = rig();
+        r.app.on_key(ctrl('w'));
+        let said = r.app.notice.clone().unwrap_or_default();
+        assert!(
+            said.to_lowercase().contains("queue"),
+            "an empty queue is not named: {said:?}"
+        );
+        assert!(
+            !said.contains("120"),
+            "an empty queue was blamed on the width: {said:?}"
+        );
     }
 }
