@@ -3418,15 +3418,18 @@ mod tests {
     fn nothing_playing_offers_no_heart_to_click() {
         // Goal: a control that could not act on anything must not be on screen.
         // Registering its hit box anyway is how a click lands on a no-op that
-        // looks like a bug.
-        let mut sc = screen();
-        let _ = draw(&mut sc.app, 100, 20);
-        assert!(
-            !sc.app
-                .hits
-                .iter()
-                .any(|(_, h)| *h == Hit::FavoriteNowPlaying)
-        );
+        // looks like a bug. Both layouts draw the heart, so both are checked.
+        for (w, h) in [(100u16, 20u16), (WIDE_COLS, 30)] {
+            let mut sc = screen();
+            let _ = draw(&mut sc.app, w, h);
+            assert!(
+                !sc.app
+                    .hits
+                    .iter()
+                    .any(|(_, h)| *h == Hit::FavoriteNowPlaying),
+                "a heart with nothing to keep was clickable at {w}x{h}"
+            );
+        }
     }
 
     // ---- the overlay ----
@@ -4141,6 +4144,29 @@ mod tests {
     // ---- one breakpoint: the now-playing block becomes a side panel ----
 
     #[test]
+    fn the_breakpoint_and_the_panel_are_the_widths_that_were_written_down() {
+        // Goal: every other test here is written in terms of these two, so they
+        // would all move together if one were edited. The numbers are a
+        // decision - 120 is where the list still reads after giving the panel
+        // its column - so changing one is a decision to take again, not a
+        // refactor. Spelled out once, here.
+        assert_eq!(WIDE_COLS, 120);
+        assert_eq!(PANEL_COLS, 36);
+        // Which leaves the list wider than an eighty-column terminal gives it,
+        // so the panel never costs the list more than it already lived with.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, WIDE_COLS, 24);
+        let panelled = sc.app.list_inner.width;
+        let _ = draw(&mut sc.app, 80, 24);
+        assert!(
+            panelled > sc.app.list_inner.width,
+            "the panel took the list under the width it already ran at: \
+             {panelled} against {}",
+            sc.app.list_inner.width
+        );
+    }
+
+    #[test]
     fn below_the_breakpoint_the_now_playing_block_is_three_rows_along_the_bottom() {
         // Goal: the narrow side of the one breakpoint is exactly what it was, so
         // nothing changes for the terminal widths most people run. Method: a
@@ -4240,6 +4266,21 @@ mod tests {
             assert!(
                 boxes.iter().any(|s| s == "✓ bit-perfect"),
                 "the verdict must be clickable at {w}x{h}: {boxes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verdict_with_no_word_in_it_offers_nothing_to_click() {
+        // Goal: nothing playing means nothing graded, and a hit box over an
+        // empty span is a control that was never painted. The block only
+        // registers one when there is a word; the panel has to do the same.
+        for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30)] {
+            let mut sc = screen();
+            let boxes = painted_all(&mut sc.app, w, h, Hit::Graph);
+            assert!(
+                !boxes.iter().any(String::is_empty),
+                "an empty verdict registered a hit box at {w}x{h}: {boxes:?}"
             );
         }
     }
