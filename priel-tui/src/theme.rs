@@ -530,6 +530,7 @@ mod tests {
         let sources = [
             ("ui.rs", include_str!("ui.rs")),
             ("app.rs", include_str!("app.rs")),
+            ("main.rs", include_str!("main.rs")),
         ];
         for (file, src) in sources {
             // The tests below a `#[cfg(test)]` may name colours: asserting on
