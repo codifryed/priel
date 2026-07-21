@@ -3288,4 +3288,42 @@ mod tests {
             "still on the sign-in screen: {out}"
         );
     }
+
+    // ---- measurement harness ----
+    //
+    // Outside the normal suite: it times thousands of frames. Run deliberately:
+    //   cargo test -p priel-tui -- --ignored --nocapture measure_
+    //
+    // What it settled is written up in
+    // `docs/adr/0002-a-display-of-the-audio-costs-the-gapless-transition.md`.
+
+    #[test]
+    #[ignore = "times thousands of frames"]
+    fn measure_what_redrawing_on_every_tick_would_cost() {
+        // Goal: `run` draws only when the app says something changed, because
+        // priel runs for hours in front of a screen that mostly does not move.
+        // Anything driven by the audio marks the screen changed on every tick
+        // for as long as a track plays, so this is the saving that would be
+        // handed back. Each frame is built from nothing, which is what a screen
+        // that changed everywhere amounts to; the terminal write is not
+        // included, so the number is a floor rather than the whole bill.
+        const FRAMES: u32 = 500;
+        let mut sc = screen();
+        sc.app.favorites = (1..=500)
+            .map(|id| track(id, "A track with a plausible sort of title"))
+            .collect();
+        let started = std::time::Instant::now();
+        for _ in 0..FRAMES {
+            let mut term = Terminal::new(TestBackend::new(120, 40)).expect("backend");
+            term.draw(|f| render(f, &mut sc.app)).expect("render");
+        }
+        let per_frame = started.elapsed().as_secs_f64() / f64::from(FRAMES);
+        println!(
+            "MEASURE a full 120x40 frame costs {:.0} us; at the 10 fps the event loop allows that \
+             is {:.1}% of one core, at 30 fps {:.1}%",
+            per_frame * 1e6,
+            per_frame * 10.0 * 100.0,
+            per_frame * 30.0 * 100.0
+        );
+    }
 }
