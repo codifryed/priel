@@ -19,7 +19,7 @@
 //! Rendering. Also records list/progress rects into `App` for mouse hit-testing.
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use std::fmt::Write as _;
@@ -27,7 +27,7 @@ use std::fmt::Write as _;
 use priel_player::graph::{SinkStage, SinkVolume};
 use priel_player::{Alteration, Fidelity, OutputAccess, StreamVolume, Verdict};
 
-use crate::app::{App, GraphRow, GraphRowKind, Hit, Mode, View};
+use crate::app::{App, Focus, GraphRow, GraphRowKind, Hit, Mode, View};
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
 
@@ -77,10 +77,18 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if wide {
         let cols =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(PANEL_COLS)]).split(rows[1]);
-        list(f, app, cols[0]);
+        // The panel first, because it is what publishes the queue's rect and
+        // the list draws its own cursor by whether that rect exists. Reading
+        // last frame's would put the focus ring a frame behind the layout on
+        // the one frame a resize crosses the breakpoint.
         now_panel(f, app, cols[1]);
+        list(f, app, cols[0]);
         key_row(f, app, rows[2]);
     } else {
+        // No panel means no second region: the queue's rect goes away with it,
+        // so nothing below the breakpoint is focusable or clickable, and the
+        // list keeps the single cursor it has always had.
+        app.queue_inner = Rect::default();
         list(f, app, rows[1]);
         now_playing(f, app, rows[2]);
     }
@@ -715,6 +723,9 @@ const HELP_LEFT: &[(&str, &[HelpRow])] = &[
                 &[("g", Some(Hit::Top)), ("G", Some(Hit::Bottom))],
                 "first / last row",
             ),
+            // The keys above all act on whichever of the two lists this one
+            // last pointed at, which is why it sits at the end of them.
+            row(&[("Ctrl-W", Some(Hit::CycleFocus))], "browse list / queue"),
         ],
     ),
     (
@@ -772,6 +783,10 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
             // The vocabulary, not an action: this is the word the queue counter
             // wears once the music stopped being something anybody picked.
             row(&[("radio", None)], "suggested, not chosen"),
+            // The vocabulary again: the mark the queue puts on the entries the
+            // radio added, so the glyph is explained where the keys are read as
+            // well as in the panel it appears in.
+            row(&[("~", None)], "the radio queued it"),
             row(
                 &[("f", Some(Hit::FavoriteSelected))],
                 "favorite selected track",
@@ -1696,9 +1711,15 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
     let vis = app.visible();
     let title = list_title(app, vis.len(), area.width as usize);
+    // Below the breakpoint there is one region, so there is nothing to be
+    // focused *away* from and the box wears exactly what it always has.
+    let focused = !two_regions(app) || app.focus() == Focus::List;
+    let (ring, edge) = focus_ring(app, focused, &t);
     let block = Block::default()
         .borders(Borders::ALL)
         .style(t.surface())
+        .border_style(ring)
+        .border_type(edge)
         .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1735,7 +1756,7 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
         // keeps whichever stripe its place in the list gives it.
         let base = t.stripe(vi % 2 == 1);
         let style = if selected {
-            t.selection()
+            t.cursor(focused)
         } else if is_now {
             base.fg(t.active)
         } else {
@@ -2190,7 +2211,9 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     }
     bar.label(act_text, Style::default().fg(act_color));
     bar.label("  ", Style::default());
-    push_hints(&mut bar, &t);
+    // The bottom block only exists below the breakpoint, where the panel that
+    // holds the queue does not, so there is never a second region down here.
+    push_hints(&mut bar, &t, false);
     app.hits.extend(bar.hits);
     f.render_widget(Paragraph::new(Line::from(bar.spans)), l2);
 }
@@ -2261,7 +2284,8 @@ fn key_row(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
     let mut bar = ControlBar::new(area);
     bar.label(" ", Style::default());
-    push_hints(&mut bar, &t);
+    let second_region = two_regions(app);
+    push_hints(&mut bar, &t, second_region);
     app.hits.extend(bar.hits);
     f.render_widget(Paragraph::new(Line::from(bar.spans)), area);
 }
@@ -2269,6 +2293,153 @@ fn key_row(f: &mut Frame, app: &mut App, area: Rect) {
 /// The state glyph and the heart, so the artist starts under the title rather
 /// than under the two glyphs that lead the line above it.
 const PANEL_NAME_INDENT: u16 = 4;
+
+/// Is there a second region on screen to hand the keyboard to?
+///
+/// The queue's rect and nothing else, because that rect is the panel: it is
+/// written every frame by the renderer and cleared where there is no panel, so
+/// the breakpoint is asked about once, here, rather than being a width the key
+/// handler has to know as well.
+fn two_regions(app: &App) -> bool {
+    app.queue_inner.height > 0
+}
+
+/// The box's border, lifted while it is the one being driven.
+///
+/// A second carrier for the same fact the cursor carries, and a **glyph** one:
+/// the two cursors differ by a backing, and a backing is the one thing a
+/// monochrome terminal cannot show, so the focused box is drawn in the heavy
+/// box-drawing set as well as in the accent. That is the house rule about hue
+/// never standing alone, applied to the question two focusable regions raise -
+/// which of them am I driving? - and it is why this is readable in a plain text
+/// dump of a frame.
+///
+/// Deliberately only ever an *addition*: below the breakpoint there is one
+/// region and the box wears exactly the border it always has, and the box that
+/// is not focused keeps it too, because the list nobody is driving is not
+/// disabled.
+fn focus_ring(app: &App, focused: bool, t: &Theme) -> (Style, BorderType) {
+    if two_regions(app) && focused {
+        (
+            t.on(t.accent).add_modifier(Modifier::BOLD),
+            BorderType::Thick,
+        )
+    } else {
+        (t.surface(), BorderType::Plain)
+    }
+}
+
+/// The lead of a queue row: where the music is, and where the entry came from.
+///
+/// Two cells rather than one, and that is the point. Position and provenance
+/// are independent - the radio's suggestions get played and become history like
+/// anything else - so they are two columns and never one blended glyph.
+fn queue_marks(app: &App, index: usize) -> String {
+    let playing = if index == app.queue_pos { '♪' } else { ' ' };
+    let source = if app.suggested(index) { '~' } else { ' ' };
+    format!("{playing}{source} ")
+}
+
+/// The line above the entries: where in the queue the music is, and - only
+/// where there is one to explain - what the mark on a row means.
+fn queue_heading(app: &App) -> Vec<Span<'static>> {
+    let t = app.theme();
+    let mut spans = vec![Span::styled(
+        format!("Queue {}/{}", app.queue_pos + 1, app.queue.len()),
+        Style::default().fg(t.queue),
+    )];
+    if app.queue_has_suggestions() {
+        // The colour the counter in the header already wears for music the
+        // service chose, so the panel and the header say it the same way.
+        spans.push(Span::styled("  ~ radio", Style::default().fg(t.notice)));
+    }
+    spans
+}
+
+/// The queue, under the readouts in the now-playing panel.
+///
+/// **History is above the current track and dimmed**, which is what makes
+/// "backward" real navigation: the tracks already played are on screen and
+/// Enter on one plays it, rather than the previous-track key being restated as
+/// a list. What is still to come is below it in ordinary text.
+///
+/// **The rows are read straight off `queue` and `queue_pos` every frame.** The
+/// queue is a snapshot taken when Enter was pressed and does not grow when a
+/// later page of the listing lands - showing it makes that visible, which is
+/// the point - so there is no second copy here that could come to disagree with
+/// the one the player is working through.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "row index is bounded by the rect height, itself a u16"
+)]
+fn queue_panel(f: &mut Frame, app: &mut App, area: Rect) {
+    app.queue_inner = Rect::default();
+    // A heading and one entry, plus the blank line that separates the queue
+    // from the readouts above it. Under that there is no queue worth the rows.
+    if area.height < 3 || app.queue.is_empty() {
+        return;
+    }
+    let t = app.theme();
+    // The spacer is inside this rect rather than a constraint of the panel's
+    // own: a tenth fixed row up there changed how a short panel is squeezed and
+    // took the verdict badge off it.
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    f.render_widget(Paragraph::new(Line::from(queue_heading(app))), rows[1]);
+
+    let inner = rows[2];
+    app.queue_inner = inner;
+    let h = inner.height as usize;
+    if h == 0 {
+        return;
+    }
+    // The same scroll idiom the browse list uses, for the same reason: a window
+    // that recentred on every keystroke would move the whole panel under a
+    // cursor that moved one row.
+    if app.queue_selected < app.queue_offset {
+        app.queue_offset = app.queue_selected;
+    } else if app.queue_selected >= app.queue_offset + h {
+        app.queue_offset = app.queue_selected + 1 - h;
+    }
+    if app.queue_offset >= app.queue.len() {
+        app.queue_offset = 0;
+    }
+
+    let focused = app.focus() == Focus::Queue;
+    let width = inner.width as usize;
+    for (i, qi) in (app.queue_offset..(app.queue_offset + h).min(app.queue.len())).enumerate() {
+        let Some(entry) = app.queue.get(qi) else {
+            break;
+        };
+        let lead = queue_marks(app, qi);
+        let line = trunc(&format!("{lead}{}", entry.title), width);
+        // The cursor owns the row it is on, exactly as it does in the browse
+        // list: a row that was both the cursor and the one in the speakers
+        // would otherwise be asked to wear two foregrounds.
+        let style = if qi == app.queue_selected {
+            t.cursor(focused)
+        } else if qi == app.queue_pos {
+            t.on(t.active)
+        } else if qi < app.queue_pos {
+            t.on(t.faint)
+        } else {
+            t.on(t.text)
+        };
+        f.render_widget(
+            Paragraph::new(line).style(style),
+            Rect {
+                x: inner.x,
+                y: inner.y + i as u16,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+}
 
 /// The now-playing block as a column down the right-hand side.
 ///
@@ -2285,9 +2456,12 @@ const PANEL_NAME_INDENT: u16 = 4;
 /// of which order a single line should use is still open.
 fn now_panel(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
+    let (ring, edge) = focus_ring(app, app.focus() == Focus::Queue, &t);
     let block = Block::default()
         .borders(Borders::ALL)
         .style(t.surface())
+        .border_style(ring)
+        .border_type(edge)
         .title(" Now playing ");
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2311,7 +2485,7 @@ fn now_panel(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(1), // what it is going into
         Constraint::Length(1), // and what arrives there
         Constraint::Length(1), // the activity slot
-        Constraint::Min(0),
+        Constraint::Min(0),    // and the queue takes whatever is left
     ])
     .split(body);
 
@@ -2383,6 +2557,8 @@ fn now_panel(f: &mut Frame, app: &mut App, area: Rect) {
     }
     app.hits.extend(said.hits);
     f.render_widget(Paragraph::new(Line::from(said.spans)), rows[7]);
+
+    queue_panel(f, app, rows[9]);
 }
 
 /// One entry in the bottom keyboard reference.
@@ -2452,6 +2628,18 @@ const HINTS: &[Hint] = &[
     },
 ];
 
+/// Shown only where there is a second region to move the keyboard to.
+///
+/// Off the end of [`HINTS`] rather than in it, so it is the first hint the row
+/// gives up: the two things that make this binding findable at every width are
+/// the `?` reference, where it is listed and clickable, and the heavy border
+/// that says which box has the keys. Below the breakpoint it is not a control
+/// at all, because there is nothing there for it to do.
+const FOCUS_HINT: Hint = Hint {
+    keys: &[("Ctrl-W", Hit::CycleFocus)],
+    label: "focus",
+};
+
 /// Never dropped, however narrow the row: `?` is how everything else is found,
 /// and `q` is the one binding a user cannot guess their way out of without.
 const HINTS_ESSENTIAL: &[Hint] = &[
@@ -2487,9 +2675,9 @@ fn push_hint(bar: &mut ControlBar, h: &Hint, t: &Theme) {
 
 /// Fill the row with hints, reserving room for the essential ones so they are
 /// never the ones clipped off the right edge.
-fn push_hints(bar: &mut ControlBar, t: &Theme) {
+fn push_hints(bar: &mut ControlBar, t: &Theme, second_region: bool) {
     let reserved: u16 = HINTS_ESSENTIAL.iter().map(hint_width).sum();
-    for h in HINTS {
+    for h in HINTS.iter().chain(second_region.then_some(&FOCUS_HINT)) {
         if bar.remaining() < hint_width(h).saturating_add(reserved) {
             break;
         }
@@ -3008,10 +3196,10 @@ fn fmt_hms(secs: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlBar, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, PANEL_COLS, WIDE_COLS,
-        hint_width, push_hints, render,
+        ControlBar, FOCUS_HINT, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, PANEL_COLS,
+        WIDE_COLS, hint_width, push_hints, render,
     };
-    use crate::app::{App, Click, Hit, Mode, View};
+    use crate::app::{App, Click, Focus, Hit, Mode, View};
     use crate::cli::ThemeName;
     use crate::theme::Theme;
     use crate::worker::{FromWorker, ToWorker};
@@ -3219,7 +3407,7 @@ mod tests {
         // for, so optional hints get dropped before they do.
         for width in [24u16, 40, 60, 80, 120, 200] {
             let mut bar = ControlBar::new(row(width));
-            push_hints(&mut bar, &Theme::default());
+            push_hints(&mut bar, &Theme::default(), true);
             let text: String = bar.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(
                 text.contains("quit") && text.contains("keys"),
@@ -3238,9 +3426,10 @@ mod tests {
         // Goal: the reference doubles as the mouse strip, so each key glyph must
         // register a hit box - that is why there is no separate quit button.
         let mut bar = ControlBar::new(row(200));
-        push_hints(&mut bar, &Theme::default());
+        push_hints(&mut bar, &Theme::default(), true);
         let keys: usize = HINTS
             .iter()
+            .chain(std::iter::once(&FOCUS_HINT))
             .chain(HINTS_ESSENTIAL)
             .map(|h| h.keys.len())
             .sum();
@@ -6491,5 +6680,328 @@ mod tests {
         // cell wider than the field it was asked to fit.
         assert_eq!(super::trunc("Nude", 0), "");
         assert_eq!(super::field("Nude", 0), "");
+    }
+
+    // ---- the queue in the panel, and the second cursor ----
+
+    /// A rendered app with a queue in the panel and something playing from it.
+    fn queued(n: u64, pos: usize) -> Screen {
+        let mut sc = screen();
+        sc.app.favorites = (1..=n).map(|i| track(i, &format!("Track {i}"))).collect();
+        sc.app.queue = (1..=n).map(|i| track(i, &format!("Track {i}"))).collect();
+        sc.app.queue_pos = pos;
+        sc.app.queue_selected = pos;
+        sc.app.now_playing = Some(track(
+            u64::try_from(pos).unwrap_or(0) + 1,
+            &format!("Track {}", pos + 1),
+        ));
+        sc
+    }
+
+    /// The rows the queue painted, read out of the rect the renderer published.
+    fn queue_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let inner = app.queue_inner;
+        let buf = term.backend().buffer().clone();
+        (inner.y..inner.y.saturating_add(inner.height))
+            .map(|y| {
+                (inner.x..inner.x.saturating_add(inner.width))
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The backing of one queue row.
+    fn queue_backing(app: &mut App, w: u16, h: u16, entry: usize) -> Color {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let inner = app.queue_inner;
+        let offset = u16::try_from(entry.saturating_sub(app.queue_offset)).unwrap_or(0);
+        let buf = term.backend().buffer().clone();
+        buf[(inner.x, inner.y + offset)].bg
+    }
+
+    #[test]
+    fn the_panel_carries_the_queue_with_what_has_played_above_it() {
+        // Goal: the queue is navigable in both directions, and what makes
+        // "backward" real is that the tracks already played are on screen above
+        // the current one rather than only reachable by a key. Method: render a
+        // queue mid-way through and read the rows out of the panel in order.
+        let mut sc = queued(6, 3);
+        let rows = queue_rows(&mut sc.app, WIDE_COLS, 30);
+        let played: Vec<&String> = rows.iter().take(3).collect();
+        assert!(
+            played.iter().any(|r| r.contains("Track 1")),
+            "what has played is not above the current track: {rows:?}"
+        );
+        let current = rows
+            .iter()
+            .position(|r| r.contains("Track 4"))
+            .expect("the current track is in the queue");
+        assert_eq!(
+            current, 3,
+            "the current track is under its history: {rows:?}"
+        );
+        assert!(rows[current].contains('♪'), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("Track 5")),
+            "what is still to come is below it: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn what_has_played_is_dimmed_and_what_is_playing_is_not() {
+        // Goal: history is shown *as* history - it has to be legible without
+        // competing with the two rows that say where the music actually is.
+        // Method: read the foregrounds of a played row and of the current one.
+        let mut sc = queued(6, 3);
+        let t = sc.app.theme();
+        let mut term = Terminal::new(TestBackend::new(WIDE_COLS, 30)).expect("backend");
+        term.draw(|f| render(f, &mut sc.app)).expect("render");
+        let inner = sc.app.queue_inner;
+        let buf = term.backend().buffer().clone();
+        assert_eq!(
+            buf[(inner.x + 3, inner.y)].fg,
+            t.faint,
+            "history is not dim"
+        );
+        assert_eq!(
+            buf[(inner.x + 3, inner.y + 4)].fg,
+            t.text,
+            "what is still to come is not ordinary text"
+        );
+    }
+
+    #[test]
+    fn the_focused_list_wears_the_loud_cursor_and_the_other_the_quiet_one() {
+        // Goal: two focusable lists put two cursors on screen at once, so each
+        // has to say whether it is the one being driven - and the one that is
+        // not must still show where its cursor is rather than looking switched
+        // off. Method: read both backings out of a real frame, before and after
+        // the focus key.
+        let mut sc = queued(6, 2);
+        let t = sc.app.theme();
+        assert_eq!(one_backing(&mut sc.app, WIDE_COLS, 30, 0), t.selection_bg);
+        assert_eq!(
+            queue_backing(&mut sc.app, WIDE_COLS, 30, 2),
+            t.selection_idle_bg,
+            "the queue shows no cursor while the list is being driven"
+        );
+        sc.app
+            .on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            queue_backing(&mut sc.app, WIDE_COLS, 30, 2),
+            t.selection_bg,
+            "the queue took the keyboard and not the cursor"
+        );
+        assert_eq!(
+            one_backing(&mut sc.app, WIDE_COLS, 30, 0),
+            t.selection_idle_bg,
+            "the browse list lost its cursor rather than quietening it"
+        );
+    }
+
+    #[test]
+    fn the_queue_marks_the_radios_entries_and_says_what_the_mark_means() {
+        // Goal: what the radio added is a suggestion and what the listener
+        // queued is not, and the panel must not blur them. The mark is a glyph
+        // in a column of its own, so provenance and position are two answers
+        // rather than one blended one - and the legend appears where the mark
+        // does. Method: hand the queue a join and read the rows.
+        let mut sc = queued(6, 1);
+        sc.app.set_radio_from_for_test(Some(4));
+        let mut term = Terminal::new(TestBackend::new(WIDE_COLS, 30)).expect("backend");
+        term.draw(|f| render(f, &mut sc.app)).expect("render");
+        let rows = queue_rows(&mut sc.app, WIDE_COLS, 30);
+        let chosen = rows.iter().find(|r| r.contains("Track 3")).expect("chosen");
+        let added = rows.iter().find(|r| r.contains("Track 5")).expect("added");
+        assert!(
+            !chosen.contains('~'),
+            "a chosen entry is marked: {chosen:?}"
+        );
+        assert!(
+            added.contains('~'),
+            "an added entry is not marked: {added:?}"
+        );
+        let out = text(&mut sc.app, WIDE_COLS, 30);
+        assert!(
+            out.contains("~ radio"),
+            "the mark appears with nothing saying what it means: {out}"
+        );
+    }
+
+    #[test]
+    fn a_queue_with_nothing_the_radio_added_explains_no_mark() {
+        // Goal: a legend for a mark that is not on screen is noise in a
+        // thirty-two cell panel. Method: render a queue nobody extended.
+        let mut sc = queued(4, 0);
+        let out = text(&mut sc.app, WIDE_COLS, 30);
+        assert!(out.contains("Queue"), "{out}");
+        assert!(!out.contains("~ radio"), "{out}");
+    }
+
+    #[test]
+    fn a_queue_entry_is_clickable_where_it_was_drawn() {
+        // Goal: the rect the click handler measures against is the rect the
+        // entries were painted in - the defect that puts every click one row
+        // off. Method: render, then ask what a click on the cell holding a
+        // named title means.
+        let mut sc = queued(6, 0);
+        let rows = queue_rows(&mut sc.app, WIDE_COLS, 30);
+        let which = rows
+            .iter()
+            .position(|r| r.contains("Track 3"))
+            .expect("the entry is on screen");
+        let inner = sc.app.queue_inner;
+        let y = inner.y + u16::try_from(which).expect("a row inside a u16 frame");
+        assert_eq!(
+            sc.app.click_at(inner.x + 2, y),
+            Click::QueueRow(sc.app.queue_offset + which)
+        );
+    }
+
+    #[test]
+    fn below_the_breakpoint_there_is_no_queue_region_at_all() {
+        // Goal: the queue lives in the panel and the panel arrives at 120
+        // columns, so under that there is nothing to focus and nothing to
+        // click. Method: render a queue at both widths and read the rect the
+        // renderer publishes.
+        let mut sc = queued(6, 2);
+        let _ = draw(&mut sc.app, WIDE_COLS, 30);
+        assert!(sc.app.queue_inner.height > 0, "the panel carries the queue");
+        let out = draw(&mut sc.app, WIDE_COLS - 1, 30).join("\n");
+        assert_eq!(
+            sc.app.queue_inner,
+            Rect::default(),
+            "a narrow frame left last frame's queue clickable"
+        );
+        assert!(
+            !out.contains("Queue "),
+            "there is no panel, so there is no queue heading: {out}"
+        );
+    }
+
+    #[test]
+    fn an_overlay_takes_the_pointer_from_the_queue_too() {
+        // Goal: an overlay owns the pointer while it is up, and the queue is a
+        // second region behind one. Method: put the reference up and click
+        // where a queue entry was.
+        let mut sc = queued(6, 0);
+        let _ = draw(&mut sc.app, WIDE_COLS, 30);
+        let inner = sc.app.queue_inner;
+        sc.app.set_mode_for_test(Mode::Help);
+        let _ = draw(&mut sc.app, WIDE_COLS, 30);
+        sc.app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: inner.x + 2,
+            row: inner.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        sc.app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: inner.x + 2,
+            row: inner.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            sc.app.queue_pos, 0,
+            "a click through the overlay played a track"
+        );
+    }
+
+    #[test]
+    fn the_focus_key_is_in_the_reference_and_clicks_where_it_is_printed() {
+        // Goal: every key on the bottom row is itself the control, and the
+        // focus key is no exception - the mouse's path to the other region is
+        // the same walk that paints it. Method: render wide enough for the hint
+        // and click it where it was drawn.
+        let mut sc = queued(6, 0);
+        assert_eq!(painted(&mut sc.app, 200, 30, Hit::CycleFocus), "Ctrl-W");
+        click_hit(&mut sc.app, Hit::CycleFocus);
+        assert_eq!(sc.app.focus(), Focus::Queue);
+    }
+
+    #[test]
+    fn which_box_has_the_keyboard_is_readable_with_no_colour_at_all() {
+        // Goal: the two cursors differ by a backing, and a backing is the one
+        // thing a monochrome terminal cannot show - so the focused box says so
+        // in glyphs as well, by wearing the heavy box-drawing set. Method: read
+        // the corners out of a plain text dump, before and after the key.
+        let mut sc = queued(6, 2);
+        let out = draw(&mut sc.app, WIDE_COLS, 30);
+        let top = out.first().map_or(String::new(), Clone::clone);
+        let boxes = out.get(1).map_or(String::new(), Clone::clone);
+        assert!(top.is_empty() || !top.is_empty());
+        assert!(
+            boxes.starts_with('┏'),
+            "the browse list has the keys and does not say so: {boxes:?}"
+        );
+        assert!(
+            boxes.contains("┌ Now playing"),
+            "the panel has no keys and is drawn as though it had: {boxes:?}"
+        );
+        sc.app
+            .on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        let boxes = draw(&mut sc.app, WIDE_COLS, 30)
+            .get(1)
+            .map_or(String::new(), Clone::clone);
+        assert!(
+            boxes.starts_with('┌'),
+            "the browse list kept the heavy border it had given up: {boxes:?}"
+        );
+        assert!(
+            boxes.contains("┏ Now playing"),
+            "the panel took the keyboard and did not say so: {boxes:?}"
+        );
+    }
+
+    #[test]
+    fn one_region_is_drawn_exactly_as_it_always_was() {
+        // Goal: below the breakpoint there is nothing to be focused away from,
+        // so the list must not grow a focus ring that means nothing. Method:
+        // render narrow and check the box is the plain one.
+        let mut sc = queued(6, 2);
+        let out = draw(&mut sc.app, WIDE_COLS - 1, 30);
+        let boxes = out.get(1).map_or(String::new(), Clone::clone);
+        assert!(boxes.starts_with('┌'), "{boxes:?}");
+        assert!(!boxes.contains('┏'), "{boxes:?}");
+    }
+
+    #[test]
+    fn a_queue_longer_than_the_panel_scrolls_and_stays_clickable() {
+        // Goal: a queue may hold five hundred entries and the panel shows about
+        // fifteen, so the window has to move with the cursor - and the offset
+        // that moves it is the same one a click is measured against. Method:
+        // walk to the end of a long queue and click the row the cursor is on.
+        let mut sc = queued(40, 0);
+        // A frame first, because the region a key can be handed to is one the
+        // renderer has published.
+        let _ = draw(&mut sc.app, WIDE_COLS, 30);
+        sc.app
+            .on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        sc.app
+            .on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        let rows = queue_rows(&mut sc.app, WIDE_COLS, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("Track 40")),
+            "the last entry never came into view: {rows:?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("Track 1 ") || r == "   Track 1"),
+            "the window did not move: {rows:?}"
+        );
+        let which = rows
+            .iter()
+            .position(|r| r.contains("Track 40"))
+            .expect("on screen");
+        let inner = sc.app.queue_inner;
+        let y = inner.y + u16::try_from(which).expect("a row inside a u16 frame");
+        assert_eq!(sc.app.click_at(inner.x + 2, y), Click::QueueRow(39));
     }
 }
