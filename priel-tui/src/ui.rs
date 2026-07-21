@@ -1676,6 +1676,7 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
         .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let inner = track_header(f, app, inner);
     app.list_inner = inner;
 
     let h = inner.height as usize;
@@ -1917,9 +1918,12 @@ fn track_columns(width: usize) -> TrackColumns {
 
 /// One column of a track row, in the order the row lays them out.
 ///
-/// Naming the columns is what lets anything else be laid out over them: which
-/// columns exist is decided once, in [`track_columns`], and walked once, in
-/// [`lay_out`], with the caller supplying only what goes in each.
+/// The row and the header above it are the *same* walk over this list, handed
+/// different things to put in each column: a track's fields for one, the
+/// column's own name for the other. That is what makes a header naming a column
+/// the row has dropped inexpressible rather than merely tested against - there
+/// is one decision about which columns exist ([`track_columns`]) and one walk
+/// over the result ([`lay_out`]), and the header cannot reach past either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Column {
     Title,
@@ -1927,6 +1931,23 @@ enum Column {
     Album,
     Quality,
     Duration,
+}
+
+impl Column {
+    /// The one place a column is named.
+    ///
+    /// The row never spells a column name, so there is no second list here to
+    /// drift from. `Length` rather than `Duration` because the name has to fit
+    /// the column, and [`DURATION_CELLS`] is what `999:59` needs and no more.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::Artist => "Artist",
+            Self::Album => "Album",
+            Self::Quality => "Quality",
+            Self::Duration => "Length",
+        }
+    }
 }
 
 /// Lay one line of the track list across `width` cells.
@@ -1960,6 +1981,65 @@ fn lay_out(width: usize, lead: &str, mut cell: impl FnMut(Column) -> String) -> 
     line.push_str(&" ".repeat(DURATION_CELLS.saturating_sub(cells(&tail))));
     line.push_str(&tail);
     line
+}
+
+/// The column names, over the columns they name.
+fn header_text(width: usize) -> String {
+    lay_out(width, &" ".repeat(LEAD), |col| col.label().to_string())
+}
+
+/// Whether a header is worth the line of list it costs at this size.
+///
+/// **Not at every width, and the rule is read off [`track_columns`] rather than
+/// being a fourth breakpoint with a life of its own.** A header costs a row,
+/// and it costs it on exactly the terminals that just got two rows back by
+/// moving the now-playing block into the side panel, so it has to be worth more
+/// than the track it replaces.
+///
+/// What it is worth is settling *which column is which without reading the
+/// content*, and that is only ever a question where two columns of free text
+/// sit side by side. The artist is the column that puts a second one there:
+/// with it the row is a title beside a name, and below it the row is a title
+/// and a time, neither of which anybody has to be told what it is.
+fn header_earns_its_line(view: View, inner: Rect) -> bool {
+    // A playlist or a mix row is a different row entirely - a name, a count and
+    // a running time - built by `row_text`'s own branches and never by
+    // `track_columns`. These names over those rows would be the exact failure
+    // this whole arrangement exists to make impossible.
+    if matches!(view, View::Playlists | View::Mixes) {
+        return false;
+    }
+    // A header over a single row labels more than it lists, so it waits until
+    // two rows are left underneath it.
+    if inner.height < 3 {
+        return false;
+    }
+    track_columns(inner.width as usize).artist > 0
+}
+
+/// Draw the column header, and hand back the lines that leaves for the rows.
+///
+/// The header sits *outside* the rect this returns, and that rect is what
+/// `App::list_inner` is set to: it is the one a click is measured against, and
+/// a header counted among the rows would put every row one cell above where it
+/// was clicked.
+fn track_header(f: &mut Frame, app: &App, inner: Rect) -> Rect {
+    if !header_earns_its_line(app.view, inner) {
+        return inner;
+    }
+    let t = app.theme();
+    // The border's colour, because that is what this is: structure, not a row.
+    // Deliberately not the raised control styling - nothing here sorts, and a
+    // header that looked like a button would be a worse lie than a plain label.
+    f.render_widget(
+        Paragraph::new(header_text(inner.width as usize)).style(t.on(t.accent)),
+        Rect { height: 1, ..inner },
+    );
+    Rect {
+        y: inner.y + 1,
+        height: inner.height - 1,
+        ..inner
+    }
 }
 
 /// Returns (rendered row text, `is_now_playing`).
@@ -6137,14 +6217,17 @@ mod tests {
         let mut sc = screen();
         sc.app.favorites = vec![track(1, "Nude"), track(2, "Weird Fishes")];
         for w in [60u16, 80, 120, 200] {
-            let first = column_of(&mut sc.app, w, 20, 2, "4:05");
-            let second = column_of(&mut sc.app, w, 20, 3, "4:05");
+            // The rows start at `list_inner`, which is below the column header
+            // wherever one was drawn.
+            let _ = draw(&mut sc.app, w, 20);
+            let inner = sc.app.list_inner;
+            let first = column_of(&mut sc.app, w, 20, inner.y, "4:05");
+            let second = column_of(&mut sc.app, w, 20, inner.y + 1, "4:05");
             assert_eq!(first, second, "{w}: the two durations are not a column");
             // The list's own right-hand edge, which is the terminal's below the
             // breakpoint and the panel's left border above it. The last cell a
             // row may paint is the one before it, and a four-digit time starts
             // three cells before that.
-            let inner = sc.app.list_inner;
             assert_eq!(
                 first,
                 Some(inner.x + inner.width - 4),
@@ -6171,6 +6254,133 @@ mod tests {
     }
 
     #[test]
+    fn the_header_sits_over_the_columns_it_names_at_every_breakpoint() {
+        // Goal: a header one cell out of step names the column beside the one
+        // it sits over, which is worse than no header at all. Read off real
+        // frames at the four sizes the audit uses, because alignment is a
+        // property of what was painted and not of what the code meant to paint.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Nude"), track(2, "Weird Fishes")];
+        for (w, h) in [(60u16, 20u16), (80, 24), (120, 30), (200, 40)] {
+            let _ = draw(&mut sc.app, w, h);
+            let inner = sc.app.list_inner;
+            let head = inner.y - 1;
+            let c = super::track_columns(inner.width as usize);
+            let mut named = vec![("Title", "Nude")];
+            if c.artist > 0 {
+                named.push(("Artist", "Artist"));
+            }
+            if c.album > 0 {
+                named.push(("Album", "Album"));
+            }
+            if c.quality > 0 {
+                named.push(("Quality", "HI-RES"));
+            }
+            for (label, value) in named {
+                let over = column_of(&mut sc.app, w, h, head, label);
+                let under = column_of(&mut sc.app, w, h, inner.y, value);
+                assert!(over.is_some(), "{w}: no {label} header was drawn");
+                assert_eq!(over, under, "{w}: {label} is not over its own column");
+            }
+            // The times are pinned to the right-hand edge, so their header
+            // lines up on that edge rather than on its first letter.
+            let length = column_of(&mut sc.app, w, h, head, "Length");
+            assert_eq!(
+                length.map(|x| x + 6),
+                Some(inner.x + inner.width),
+                "{w}: the Length header is not against the right-hand edge"
+            );
+        }
+    }
+
+    #[test]
+    fn the_header_names_a_column_exactly_when_the_row_draws_one() {
+        // Goal: the failure this must not have is a header naming a column the
+        // row gave up. Swept across every width rather than checked at the four
+        // breakpoints, because the drop order is a budget and its edges are
+        // where a second list of names would first disagree with the first.
+        for w in 12..=240usize {
+            let c = super::track_columns(w);
+            let head = super::header_text(w);
+            assert_eq!(head.contains("Artist"), c.artist > 0, "{w}: {head:?}");
+            assert_eq!(head.contains("Album"), c.album > 0, "{w}: {head:?}");
+            assert_eq!(head.contains("Quality"), c.quality > 0, "{w}: {head:?}");
+            assert_eq!(drawn(&head), w, "{w}: the header overruns its box");
+        }
+    }
+
+    #[test]
+    fn a_row_of_a_name_and_a_time_is_not_given_a_header_to_explain_it() {
+        // Goal: the header costs a line of list, which is the line stage 2
+        // bought back by moving the block into the panel. Where the row is a
+        // title and a duration there are no two columns an eye could confuse,
+        // so the line stays a track.
+        let mut sc = screen();
+        sc.app.favorites = (1..=8).map(|i| track(i, "Nude")).collect();
+        let out = text(&mut sc.app, 44, 20);
+        assert!(!out.contains("Title"), "a header was charged for: {out}");
+        assert!(!out.contains("Length"), "a header was charged for: {out}");
+    }
+
+    #[test]
+    fn a_click_lands_on_the_row_it_was_painted_over() {
+        // Goal: `list_inner` is what a click is measured against, so a header
+        // counted among the rows would put every row one cell above where it
+        // was clicked. Anchored on the line the track was actually painted on
+        // rather than on `list_inner`, which is the value under test.
+        let mut sc = screen();
+        sc.app.favorites = (1..=6).map(|i| track(i, &format!("Track {i}"))).collect();
+        let lines = draw(&mut sc.app, 80, 24);
+        let third = lines
+            .iter()
+            .position(|l| l.contains("Track 3"))
+            .expect("the third track was not painted");
+        let y = u16::try_from(third).expect("a frame is twenty-four rows tall");
+        assert_eq!(sc.app.click_at(4, y), Click::Row(2), "the wrong row");
+        // Three rows up is the header, the first track being directly below it.
+        assert_eq!(
+            sc.app.click_at(4, y - 3),
+            Click::Nothing,
+            "the header answered a click as though it were a track"
+        );
+    }
+
+    #[test]
+    fn a_list_with_no_room_beneath_a_header_spends_the_line_on_a_track() {
+        // Goal: a header over a single row labels more than it lists. The line
+        // is only worth taking while there are rows left to explain.
+        let mut sc = screen();
+        sc.app.favorites = (1..=6).map(|i| track(i, "Nude")).collect();
+        // One row of tabs, three of the block below, and the box's own two
+        // borders: two lines are left inside it.
+        let out = text(&mut sc.app, 80, 8);
+        assert!(
+            !out.contains("Title"),
+            "the last lines went to a header: {out}"
+        );
+        assert!(out.contains("Nude"), "no track is left: {out}");
+    }
+
+    #[test]
+    fn a_list_of_playlists_is_not_given_the_track_columns_header() {
+        // Goal: the playlist and mix rows are a different row entirely - a
+        // name, a count and a running time, built by `row_text`'s own branches
+        // and not by `track_columns` at all. A header over them would name
+        // three columns none of which is there.
+        let mut sc = screen();
+        sc.app.view = View::Playlists;
+        sc.app.playlists = vec![Playlist {
+            uuid: "u".into(),
+            title: "Mine".into(),
+            num_tracks: 4,
+            duration_secs: 600,
+        }];
+        let out = text(&mut sc.app, 120, 30);
+        assert!(!out.contains("Quality"), "the wrong header: {out}");
+        assert!(!out.contains("Length"), "the wrong header: {out}");
+    }
+
+    #[test]
     fn a_wide_title_leaves_the_columns_beside_it_where_they_were() {
         // Goal: read off a rendered frame, not asserted in the abstract. A CJK
         // title is ordinary in a catalogue and paints two cells per character,
@@ -6188,8 +6398,10 @@ mod tests {
                 ..Track::default()
             },
         ];
-        let plain = column_of(&mut sc.app, 80, 24, 2, "HI-RES");
-        let wide = column_of(&mut sc.app, 80, 24, 3, "HI-RES");
+        let _ = draw(&mut sc.app, 80, 24);
+        let top = sc.app.list_inner.y;
+        let plain = column_of(&mut sc.app, 80, 24, top, "HI-RES");
+        let wide = column_of(&mut sc.app, 80, 24, top + 1, "HI-RES");
         assert!(plain.is_some(), "the plain row lost its quality column");
         assert_eq!(wide, plain, "the wide row's quality column moved");
     }
