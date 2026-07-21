@@ -254,6 +254,13 @@ Typing is the one thing the mouse is not asked to do: the filter box, the search
 query and the pasted sign-in address are text, so the keys that accept or cancel
 them belong to the box being typed in and have no control of their own.
 
+A track row spends the width the terminal actually has. The title and the
+duration are on every row, the duration against the right-hand edge so the times
+read as a column; the artist, the album and the quality tier appear as the width
+allows and are given up in that order — the album first, then the artist, then
+the tier — as it shrinks. A column is either wide enough to read or it is not
+drawn, so nothing is clipped away without the row changing shape to say so.
+
 A `♥` on a row means the track is in your favorites and a `♡` means it is not,
 as far as priel has been told. The service reports no favorite flag on a track,
 so the favorites listing itself is the only thing that ever says so, and priel

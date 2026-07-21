@@ -1645,7 +1645,7 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
     for (i, vi) in (app.list_offset..(app.list_offset + h).min(vis.len())).enumerate() {
         let y = inner.y + i as u16;
         let selected = vi == app.selected;
-        let (text, is_now) = row_text(app, &vis, vi);
+        let (text, is_now) = row_text(app, &vis, vi, inner.width as usize);
         let style = if selected {
             t.selection()
         } else if is_now {
@@ -1709,11 +1709,115 @@ fn list_title(app: &App, count: usize) -> String {
     }
 }
 
+/// Which columns a track row can afford at `width` cells, and how wide each is.
+///
+/// Zero means the column is not drawn at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrackColumns {
+    title: usize,
+    artist: usize,
+    album: usize,
+    quality: usize,
+}
+
+/// The two cells that separate one column from the next.
+const GAP: usize = 2;
+/// The now-playing mark plus the favourite heart plus a space.
+const LEAD: usize = 4;
+/// `LOSSLESS`, the longest tier `short_quality` produces.
+const QUALITY_CELLS: usize = 8;
+/// `999:59`, longer than any track the service carries.
+const DURATION_CELLS: usize = 6;
+/// Under this a title says nothing an eye can catch, so a column goes instead.
+const TITLE_MIN: usize = 16;
+/// The audit's figure: below about twelve cells an artist name is an ellipsis.
+const ARTIST_MIN: usize = 12;
+/// Wider than the artist's floor deliberately. The album is the column that is
+/// there because there is room, so it has to earn more than a bare minimum.
+const ALBUM_MIN: usize = 18;
+
+/// What a track row shows, and the order it gives things up as the box narrows.
+///
+/// The row used to be a fixed 72-cell block whatever the terminal was: at 200
+/// columns 116 cells of it were blank, and below 74 columns the quality and the
+/// duration were clipped away with nothing to say they had ever been there. So
+/// it is a budget now, and the order it spends it in is written down rather
+/// than being whatever the format string happened to do.
+///
+/// **Kept at every width**: the title, and the duration pinned to the right
+/// edge. `number-tabular`: a column of times is only scannable when the digits
+/// line up, and it is the figure a listener actually compares between rows.
+///
+/// **Dropped in this order as the width falls**: the album first, then the
+/// artist, then the quality tier.
+///
+/// - The **album** is the one that is only there because the width is otherwise
+///   wasted, so it is the first thing the width stops paying for.
+/// - The **tier** outlives the artist because grading the fidelity is what this
+///   client is for (ADR-0002), and it costs eight fixed cells where an artist
+///   column worth reading costs a dozen that grow with the box.
+///
+/// A column is dropped rather than shaved: below its floor it would be an
+/// ellipsis with a letter in front of it, and four such columns say less than
+/// two full ones.
+///
+/// **What is deliberately not a column.** `explicit` and `version` are false or
+/// empty on the great majority of rows, so either would be a column of blanks
+/// paid for by every row that has nothing to put in it - and `version` belongs
+/// against the title rather than beside it. `isrc` and `copyright` are an
+/// identifier and a rights line: neither is read while scanning for something to
+/// play. `streamable` is true on nearly every row, so it belongs where a play
+/// fails, not on every row that will not. Sample rate and bit depth are exact
+/// and per-track and would be the best columns here, but they are only known
+/// after `resolve_stream`, which happens for the track being played and no other
+/// - a column that could be filled in for one row in a listing is not a column.
+fn track_columns(width: usize) -> TrackColumns {
+    // Title, artist, album, tier, duration.
+    let flex = width.saturating_sub(LEAD + 4 * GAP + QUALITY_CELLS + DURATION_CELLS);
+    let side = flex * 3 / 11;
+    if flex.saturating_sub(2 * side) >= TITLE_MIN && side >= ARTIST_MIN && side >= ALBUM_MIN {
+        return TrackColumns {
+            title: flex - 2 * side,
+            artist: side,
+            album: side,
+            quality: QUALITY_CELLS,
+        };
+    }
+    // Title, artist, tier, duration.
+    let flex = width.saturating_sub(LEAD + 3 * GAP + QUALITY_CELLS + DURATION_CELLS);
+    let artist = flex * 2 / 5;
+    if flex.saturating_sub(artist) >= TITLE_MIN && artist >= ARTIST_MIN {
+        return TrackColumns {
+            title: flex - artist,
+            artist,
+            album: 0,
+            quality: QUALITY_CELLS,
+        };
+    }
+    // Title, tier, duration.
+    let flex = width.saturating_sub(LEAD + 2 * GAP + QUALITY_CELLS + DURATION_CELLS);
+    if flex >= TITLE_MIN {
+        return TrackColumns {
+            title: flex,
+            artist: 0,
+            album: 0,
+            quality: QUALITY_CELLS,
+        };
+    }
+    // Title and duration. The floor: neither is ever given up.
+    TrackColumns {
+        title: width.saturating_sub(LEAD + GAP + DURATION_CELLS),
+        artist: 0,
+        album: 0,
+        quality: 0,
+    }
+}
+
 /// Returns (rendered row text, `is_now_playing`).
 ///
 /// `visible` is passed in rather than recomputed: this runs once per rendered
 /// row, and rebuilding the index list here made rendering O(rows x tracks).
-fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
+fn row_text(app: &App, visible: &[usize], vi: usize, width: usize) -> (String, bool) {
     let idx = visible[vi];
     if app.view == View::Playlists {
         if let Some(p) = app.playlists.get(idx) {
@@ -1751,22 +1855,39 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
         // make a click mean two different things a cell apart. The keyboard row
         // carries the control, and it acts on whatever the click selected.
         let kept = heart(app.is_favorite(t.id));
-        (
-            format!(
-                "{mark}{kept} {} {} {}{:>6}",
-                field(&t.title, 32),
-                field(&t.artist, 20),
-                // The same spelling the badge beside the playing track uses.
-                // The raw wire token does not fit this column, so a row that
-                // printed it named the track's quality one way while the row
-                // above the progress bar named it another.
-                field(&short_quality(&t.quality), 8),
-                fmt_dur(t.duration_secs),
-            ),
-            is_now,
-        )
+        let c = track_columns(width);
+        let mut row = String::with_capacity(width * 4);
+        row.push_str(mark);
+        row.push_str(kept);
+        row.push(' ');
+        row.push_str(&field(&t.title, c.title));
+        for (text, cells) in [
+            (&t.artist, c.artist),
+            (&t.album, c.album),
+            // The same spelling the badge beside the playing track uses. The raw
+            // wire token does not fit this column, so a row that printed it
+            // named the track's quality one way while the row above the progress
+            // bar named it another.
+            (&short_quality(&t.quality), c.quality),
+        ] {
+            if cells > 0 {
+                push_gap(&mut row);
+                row.push_str(&field(text, cells));
+            }
+        }
+        push_gap(&mut row);
+        let secs = fmt_dur(t.duration_secs);
+        row.push_str(&" ".repeat(DURATION_CELLS.saturating_sub(cells(&secs))));
+        row.push_str(&secs);
+        (row, is_now)
     } else {
         (String::new(), false)
+    }
+}
+
+fn push_gap(row: &mut String) {
+    for _ in 0..GAP {
+        row.push(' ');
     }
 }
 
@@ -4835,6 +4956,137 @@ mod tests {
         for s in ["Nude", "夜に駆ける夜に駆ける", "Bjo\u{308}rk", "🎵 mix", ""] {
             assert_eq!(drawn(&super::field(s, 20)), 20, "{s:?}");
             assert_eq!(drawn(&super::field(s, 6)), 6, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn the_track_columns_drop_in_a_documented_order() {
+        // Goal: the row is a budget, not a constant, and what it gives up as it
+        // narrows is written down. Duration is not in this table because it is
+        // never dropped: it is pinned to the right edge at every width.
+        let cols = super::track_columns;
+
+        // Widest: title, artist, album, quality.
+        for w in [92, 118, 198] {
+            let c = cols(w);
+            assert!(c.album > 0, "{w}: the album is what the width is for");
+            assert!(c.artist > 0, "{w}");
+            assert_eq!(c.quality, 8, "{w}");
+        }
+        // The album goes first.
+        for w in [54, 78, 91] {
+            let c = cols(w);
+            assert_eq!(c.album, 0, "{w}: the album is the first column to go");
+            assert!(c.artist > 0, "{w}: the artist outlives the album");
+            assert_eq!(c.quality, 8, "{w}");
+        }
+        // Then the artist.
+        for w in [38, 53] {
+            let c = cols(w);
+            assert_eq!(c.artist, 0, "{w}");
+            assert_eq!(c.quality, 8, "{w}: the tier outlives the artist");
+        }
+        // Then the quality tier. The title and the duration are all that is left.
+        for w in [20, 37] {
+            let c = cols(w);
+            assert_eq!(c.quality, 0, "{w}");
+            assert!(c.title > 0, "{w}: the title is never dropped");
+        }
+    }
+
+    #[test]
+    fn a_column_that_is_drawn_is_wide_enough_to_read() {
+        // Goal: the alternative to dropping a column is shaving every column
+        // into uselessness, which is the failure this replaces. A column either
+        // has room to say something or it is not there.
+        for w in 12..=240usize {
+            let c = super::track_columns(w);
+            assert!(c.title >= 8 || w < 24, "{w}: {c:?}");
+            assert!(c.artist == 0 || c.artist >= 12, "{w}: {c:?}");
+            assert!(c.album == 0 || c.album >= 18, "{w}: {c:?}");
+            assert!(
+                c.album == 0 || c.artist > 0,
+                "{w}: an album without an artist is out of order: {c:?}"
+            );
+            assert!(
+                c.artist == 0 || c.quality > 0,
+                "{w}: an artist without a tier is out of order: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_fills_the_width_it_was_given_and_never_overruns_it() {
+        // Goal: the duration is pinned right, which is only true if the row is
+        // exactly as wide as the box. One cell over and the box eats it; one
+        // cell under and the column of times stops lining up.
+        let mut sc = screen();
+        sc.app.favorites = vec![
+            track(1, "Nude"),
+            Track {
+                id: 2,
+                title: "夜に駆ける夜に駆ける夜に駆ける夜に駆ける".into(),
+                artist: "Some Extremely Long Artist Name Indeed".into(),
+                album: "An Album With A Rather Long Name Too".into(),
+                duration_secs: 3671,
+                quality: "LOSSLESS".into(),
+                ..Track::default()
+            },
+        ];
+        for w in 12..=240usize {
+            for vi in 0..2 {
+                let (text, _) = super::row_text(&sc.app, &[0, 1], vi, w);
+                assert_eq!(drawn(&text), w, "row {vi} at {w}: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_list_keeps_the_quality_and_the_duration() {
+        // Goal: at sixty columns the fixed block ran past the right-hand edge
+        // and the two right-most columns were silently clipped away. Nothing
+        // told the user they existed.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Everything In Its Right Place")];
+        let out = text(&mut sc.app, 60, 20);
+        assert!(out.contains("HI-RES"), "the tier was clipped away: {out}");
+        assert!(out.contains("4:05"), "the duration was clipped away: {out}");
+    }
+
+    #[test]
+    fn a_wide_list_spends_the_width_on_the_album_rather_than_on_blanks() {
+        // Goal: at two hundred columns a hundred and sixteen cells of every row
+        // were blank while `Track::album` was fetched, stored and never drawn.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Nude")];
+        let wide = text(&mut sc.app, 200, 20);
+        assert!(wide.contains("Album"), "the album is not drawn: {wide}");
+        let narrow = text(&mut sc.app, 80, 20);
+        assert!(
+            !narrow.contains("Album"),
+            "the album should have been dropped first: {narrow}"
+        );
+    }
+
+    #[test]
+    fn the_duration_is_pinned_to_the_right_edge_at_every_width() {
+        // Goal: `number-tabular` - a column of times is only scannable when the
+        // digits line up, and a duration floating at column 66 in a 198-cell
+        // box is not a column at all.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Nude"), track(2, "Weird Fishes")];
+        for w in [60u16, 80, 120, 200] {
+            let first = column_of(&mut sc.app, w, 20, 2, "4:05");
+            let second = column_of(&mut sc.app, w, 20, 3, "4:05");
+            assert_eq!(first, second, "{w}: the two durations are not a column");
+            // The box's own right-hand border sits at `w - 1`, so the last cell
+            // a row may paint is `w - 2` and a four-digit time starts three
+            // cells before it.
+            assert_eq!(
+                first,
+                Some(w - 5),
+                "{w}: the duration is not against the right-hand edge"
+            );
         }
     }
 
