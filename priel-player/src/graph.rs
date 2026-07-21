@@ -681,9 +681,12 @@ impl AudioGraph {
         let compared = match observed {
             Some(Alteration::Resampled) => self.compared_rates(source),
             Some(Alteration::Truncated) => self.compared_widths(source),
-            Some(Alteration::VolumeScaled | Alteration::ServerVolumeScaled) | None => {
-                self.compared_rates(source) || self.compared_widths(source)
-            }
+            Some(
+                Alteration::VolumeScaled
+                | Alteration::ServerVolumeScaled
+                | Alteration::SinkVolumeScaled,
+            )
+            | None => self.compared_rates(source) || self.compared_widths(source),
         };
         if !compared {
             return Attribution::NothingToCompare;

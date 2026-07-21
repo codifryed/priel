@@ -1557,7 +1557,7 @@ fn fidelity_badge(app: &App) -> (String, Color) {
             format!("  ⚠ volume {}% · 0 for unity", app.status.volume as u32),
             Color::Yellow,
         ),
-        Fidelity::Altered(Alteration::ServerVolumeScaled) => {
+        Fidelity::Altered(Alteration::ServerVolumeScaled | Alteration::SinkVolumeScaled) => {
             ("  ⚠ system volume below unity".to_string(), Color::Yellow)
         }
     }
