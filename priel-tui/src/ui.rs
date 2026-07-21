@@ -20,6 +20,7 @@
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use std::fmt::Write as _;
 
@@ -294,8 +295,8 @@ fn add_to_rows(f: &mut Frame, app: &mut App, body: Rect) {
     for (i, index) in (app.add_offset..(app.add_offset + h).min(total)).enumerate() {
         let p = &app.playlists[index];
         let text = format!(
-            "  {:name_width$}  {:>5} tracks",
-            trunc(&p.title, name_width),
+            "  {}  {:>5} tracks",
+            field(&p.title, name_width),
             p.num_tracks
         );
         let style = if index == selected {
@@ -1618,7 +1619,7 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
 fn list(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
     let vis = app.visible();
-    let title = list_title(app, vis.len());
+    let title = list_title(app, vis.len(), area.width as usize);
     let block = Block::default()
         .borders(Borders::ALL)
         .style(t.surface())
@@ -1644,7 +1645,7 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
     for (i, vi) in (app.list_offset..(app.list_offset + h).min(vis.len())).enumerate() {
         let y = inner.y + i as u16;
         let selected = vi == app.selected;
-        let (text, is_now) = row_text(app, &vis, vi);
+        let (text, is_now) = row_text(app, &vis, vi, inner.width as usize);
         let style = if selected {
             t.selection()
         } else if is_now {
@@ -1664,47 +1665,185 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn list_title(app: &App, count: usize) -> String {
-    // Rows loaded against rows there are, while those differ. Without it a list
-    // that has only paged in its first hundred reads as the whole thing, and
-    // the user has no reason to keep scrolling.
+/// The line the list box wears: which list this is, and how much of it is here.
+///
+/// It used to carry per-view key hints as well, and they were about eighty-five
+/// cells in a seventy-eight cell box, so an eighty-column terminal - the
+/// commonest width there is - deleted a binding mid-word. That is the same
+/// silent clip `push_hints` was hardened against. They were also five different
+/// grammars for what the bottom row and the `?` reference already say, and since
+/// the reference became a complete clickable menu, nothing became unreachable
+/// when they went.
+///
+/// What is left is the one thing only this line can say: where you are, the
+/// trail if you are a level down, and the figure the row below cannot repeat.
+/// `width` is the whole box, so the name is cut to fit rather than the count
+/// being clipped off the end of it.
+fn list_title(app: &App, count: usize, width: usize) -> String {
+    let (place, typing) = title_place(app);
+    let tail = title_count(app, count);
+    // The two corners the border draws, then one space either side of the text.
+    let inside = width.saturating_sub(2);
+    let room = inside.saturating_sub(2 + cells(&tail));
+    if room == 0 {
+        // No room for both. The count is the half that would be clipped, so on
+        // a box this narrow the name goes and the line stays inside its border.
+        return trunc(&place, inside);
+    }
+    // A query is cut from the front: the caret and the letters just typed are
+    // what a cut from the back would take, and they are the whole point of it.
+    let place = if typing {
+        trunc_start(&place, room)
+    } else {
+        trunc(&place, room)
+    };
+    format!(" {place}{tail} ")
+}
+
+/// Where you are, and whether the user is typing into it.
+fn title_place(app: &App) -> (String, bool) {
+    match app.view {
+        View::Favorites => ("Favorites".to_string(), false),
+        View::Playlists => ("Playlists".to_string(), false),
+        View::PlaylistTracks => {
+            let name = app.open_playlist.as_ref().map_or("", |(_, t)| t.as_str());
+            (format!("Playlists › {name}"), false)
+        }
+        View::Mixes => ("Mixes".to_string(), false),
+        View::MixTracks => {
+            let name = app.open_mix.as_ref().map_or("", |(_, t)| t.as_str());
+            (format!("Mixes › {name}"), false)
+        }
+        View::Search if app.mode == Mode::Search => {
+            (format!("Search › {}▏", app.search_query), true)
+        }
+        View::Search if app.search_query.is_empty() => ("Search".to_string(), false),
+        View::Search => (format!("Search › {}", app.search_query), false),
+    }
+}
+
+/// How much of the list is here, and how much of it there is.
+///
+/// The second figure only while the two differ: a list that has paged in its
+/// first hundred must not read as the whole library, or there is no reason to
+/// keep scrolling, and once it has all arrived the total only repeats the count
+/// beside it.
+fn title_count(app: &App, count: usize) -> String {
+    if app.view == View::Search && (app.mode == Mode::Search || app.search_query.is_empty()) {
+        return String::new();
+    }
     let of_total = app
         .rows_available()
         .map_or(String::new(), |total| format!(" of {total}"));
     match app.view {
-        View::Favorites => format!(
-            "Favorites — {count}{of_total} tracks   \
-             (Tab views · j/k move · Enter play · / filter · s shuffle)"
-        ),
-        View::Playlists => {
-            format!("Playlists — {count}{of_total}   (Enter to open · j/k move)")
-        }
-        View::PlaylistTracks => {
-            let name = app.open_playlist.as_ref().map_or("", |(_, t)| t.as_str());
-            format!("▸ {name} — {count}{of_total} tracks   (Esc back · Enter play)")
-        }
-        View::Mixes => {
-            format!("Mixes — {count}{of_total}   (Enter to open · r refresh · j/k move)")
-        }
-        View::MixTracks => {
-            let name = app.open_mix.as_ref().map_or("", |(_, t)| t.as_str());
-            format!("▸ {name} — {count}{of_total} tracks   (Esc back · Enter play)")
-        }
-        View::Search => {
-            if app.mode == Mode::Search {
-                format!(
-                    "Search: {}▏   (Enter to search · Esc cancel)",
-                    app.search_query
-                )
-            } else if app.search_query.is_empty() {
-                "Search   (i or type to search TIDAL)".to_string()
-            } else {
-                format!(
-                    "Search: {} — {count}{of_total} results   (i to edit)",
-                    app.search_query
-                )
-            }
-        }
+        // Neither noun adds anything the word before it has not just said.
+        View::Playlists | View::Mixes => format!(" — {count}{of_total}"),
+        View::Search => format!(" — {count}{of_total} results"),
+        _ => format!(" — {count}{of_total} tracks"),
+    }
+}
+
+/// Which columns a track row can afford at `width` cells, and how wide each is.
+///
+/// Zero means the column is not drawn at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrackColumns {
+    title: usize,
+    artist: usize,
+    album: usize,
+    quality: usize,
+}
+
+/// The two cells that separate one column from the next.
+const GAP: usize = 2;
+/// The now-playing mark plus the favourite heart plus a space.
+const LEAD: usize = 4;
+/// `LOSSLESS`, the longest tier `short_quality` produces.
+const QUALITY_CELLS: usize = 8;
+/// `999:59`, longer than any track the service carries.
+const DURATION_CELLS: usize = 6;
+/// Under this a title says nothing an eye can catch, so a column goes instead.
+const TITLE_MIN: usize = 16;
+/// The audit's figure: below about twelve cells an artist name is an ellipsis.
+const ARTIST_MIN: usize = 12;
+/// Wider than the artist's floor deliberately. The album is the column that is
+/// there because there is room, so it has to earn more than a bare minimum.
+const ALBUM_MIN: usize = 18;
+
+/// What a track row shows, and the order it gives things up as the box narrows.
+///
+/// The row used to be a fixed 72-cell block whatever the terminal was: at 200
+/// columns 116 cells of it were blank, and below 74 columns the quality and the
+/// duration were clipped away with nothing to say they had ever been there. So
+/// it is a budget now, and the order it spends it in is written down rather
+/// than being whatever the format string happened to do.
+///
+/// **Kept at every width**: the title, and the duration pinned to the right
+/// edge. `number-tabular`: a column of times is only scannable when the digits
+/// line up, and it is the figure a listener actually compares between rows.
+///
+/// **Dropped in this order as the width falls**: the album first, then the
+/// artist, then the quality tier.
+///
+/// - The **album** is the one that is only there because the width is otherwise
+///   wasted, so it is the first thing the width stops paying for.
+/// - The **tier** outlives the artist because grading the fidelity is what this
+///   client is for (ADR-0002), and it costs eight fixed cells where an artist
+///   column worth reading costs a dozen that grow with the box.
+///
+/// A column is dropped rather than shaved: below its floor it would be an
+/// ellipsis with a letter in front of it, and four such columns say less than
+/// two full ones.
+///
+/// **What is deliberately not a column.** `explicit` and `version` are false or
+/// empty on the great majority of rows, so either would be a column of blanks
+/// paid for by every row that has nothing to put in it - and `version` belongs
+/// against the title rather than beside it. `isrc` and `copyright` are an
+/// identifier and a rights line: neither is read while scanning for something to
+/// play. `streamable` is true on nearly every row, so it belongs where a play
+/// fails, not on every row that will not. Sample rate and bit depth are exact
+/// and per-track and would be the best columns here, but they are only known
+/// after `resolve_stream`, which happens for the track being played and no other
+/// - a column that could be filled in for one row in a listing is not a column.
+fn track_columns(width: usize) -> TrackColumns {
+    // Title, artist, album, tier, duration.
+    let flex = width.saturating_sub(LEAD + 4 * GAP + QUALITY_CELLS + DURATION_CELLS);
+    let side = flex * 3 / 11;
+    if flex.saturating_sub(2 * side) >= TITLE_MIN && side >= ARTIST_MIN && side >= ALBUM_MIN {
+        return TrackColumns {
+            title: flex - 2 * side,
+            artist: side,
+            album: side,
+            quality: QUALITY_CELLS,
+        };
+    }
+    // Title, artist, tier, duration.
+    let flex = width.saturating_sub(LEAD + 3 * GAP + QUALITY_CELLS + DURATION_CELLS);
+    let artist = flex * 2 / 5;
+    if flex.saturating_sub(artist) >= TITLE_MIN && artist >= ARTIST_MIN {
+        return TrackColumns {
+            title: flex - artist,
+            artist,
+            album: 0,
+            quality: QUALITY_CELLS,
+        };
+    }
+    // Title, tier, duration.
+    let flex = width.saturating_sub(LEAD + 2 * GAP + QUALITY_CELLS + DURATION_CELLS);
+    if flex >= TITLE_MIN {
+        return TrackColumns {
+            title: flex,
+            artist: 0,
+            album: 0,
+            quality: QUALITY_CELLS,
+        };
+    }
+    // Title and duration. The floor: neither is ever given up.
+    TrackColumns {
+        title: width.saturating_sub(LEAD + GAP + DURATION_CELLS),
+        artist: 0,
+        album: 0,
+        quality: 0,
     }
 }
 
@@ -1712,14 +1851,14 @@ fn list_title(app: &App, count: usize) -> String {
 ///
 /// `visible` is passed in rather than recomputed: this runs once per rendered
 /// row, and rebuilding the index list here made rendering O(rows x tracks).
-fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
+fn row_text(app: &App, visible: &[usize], vi: usize, width: usize) -> (String, bool) {
     let idx = visible[vi];
     if app.view == View::Playlists {
         if let Some(p) = app.playlists.get(idx) {
             return (
                 format!(
-                    "  {:<44} {:>4} tracks   {}",
-                    trunc(&p.title, 44),
+                    "  {} {:>4} tracks   {}",
+                    field(&p.title, 44),
                     p.num_tracks,
                     fmt_hms(p.duration_secs)
                 ),
@@ -1735,7 +1874,7 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
         // that instead of on two figures that would have to be invented.
         if let Some(m) = app.mixes.get(idx) {
             return (
-                format!("  {:<44} {}", trunc(&m.title, 44), trunc(&m.subtitle, 30)),
+                format!("  {} {}", field(&m.title, 44), trunc(&m.subtitle, 30)),
                 false,
             );
         }
@@ -1750,22 +1889,39 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
         // make a click mean two different things a cell apart. The keyboard row
         // carries the control, and it acts on whatever the click selected.
         let kept = heart(app.is_favorite(t.id));
-        (
-            format!(
-                "{mark}{kept} {:<32} {:<20} {:<8}{:>6}",
-                trunc(&t.title, 32),
-                trunc(&t.artist, 20),
-                // The same spelling the badge beside the playing track uses.
-                // The raw wire token does not fit this column, so a row that
-                // printed it named the track's quality one way while the row
-                // above the progress bar named it another.
-                trunc(&short_quality(&t.quality), 8),
-                fmt_dur(t.duration_secs),
-            ),
-            is_now,
-        )
+        let c = track_columns(width);
+        let mut row = String::with_capacity(width * 4);
+        row.push_str(mark);
+        row.push_str(kept);
+        row.push(' ');
+        row.push_str(&field(&t.title, c.title));
+        for (text, cells) in [
+            (&t.artist, c.artist),
+            (&t.album, c.album),
+            // The same spelling the badge beside the playing track uses. The raw
+            // wire token does not fit this column, so a row that printed it
+            // named the track's quality one way while the row above the progress
+            // bar named it another.
+            (&short_quality(&t.quality), c.quality),
+        ] {
+            if cells > 0 {
+                push_gap(&mut row);
+                row.push_str(&field(text, cells));
+            }
+        }
+        push_gap(&mut row);
+        let secs = fmt_dur(t.duration_secs);
+        row.push_str(&" ".repeat(DURATION_CELLS.saturating_sub(cells(&secs))));
+        row.push_str(&secs);
+        (row, is_now)
     } else {
         (String::new(), false)
+    }
+}
+
+fn push_gap(row: &mut String) {
+    for _ in 0..GAP {
+        row.push(' ');
     }
 }
 
@@ -2330,6 +2486,29 @@ fn short_quality(q: &str) -> String {
     }
 }
 
+/// A column of exactly `n` cells: cut to fit, then padded out to the full width.
+///
+/// `format!("{:<n$}")` cannot do this. It pads to a *character* count, so a CJK
+/// title of sixteen characters was thirty-two cells wide and then had sixteen
+/// spaces added after it - forty-eight cells in a thirty-two cell column, with
+/// every column to its right pushed off the grid.
+fn field(s: &str, n: usize) -> String {
+    let mut out = trunc(s, n);
+    for _ in cells(&out)..n {
+        out.push(' ');
+    }
+    out
+}
+
+/// Cut `s` down to at most `n` display cells, marking the cut with an ellipsis.
+///
+/// Cells, not characters: a wide glyph paints two of them and a combining mark
+/// paints none, so a character count is not a width. Measured with
+/// `unicode-width`, which is the crate ratatui measures `Span::width` with, so
+/// what this reserves and what the renderer paints cannot disagree.
+///
+/// A wide glyph straddling the last cell is dropped rather than half-drawn, so
+/// the result is occasionally one cell short of `n`. Never longer.
 fn trunc(s: &str, n: usize) -> String {
     // A field with no room holds nothing. Returning the ellipsis alone made the
     // result one cell wider than the field it was asked to fit, which on a
@@ -2337,13 +2516,55 @@ fn trunc(s: &str, n: usize) -> String {
     if n == 0 {
         return String::new();
     }
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut r: String = s.chars().take(n.saturating_sub(1)).collect();
-        r.push('…');
-        r
+    if cells(s) <= n {
+        return s.to_string();
     }
+    // One cell is spoken for by the ellipsis that says the rest was cut.
+    let budget = n - 1;
+    let mut used = 0;
+    let mut out = String::with_capacity(s.len().min(n * 4));
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// Cut `s` down to its last `n` display cells, marking the cut at the front.
+///
+/// The mirror of `trunc`, for a field whose end is the part that matters: a
+/// query being typed, where a cut from the back takes the caret and the letters
+/// that were just entered.
+fn trunc_start(s: &str, n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    if cells(s) <= n {
+        return s.to_string();
+    }
+    // One cell is spoken for by the ellipsis that says the rest was cut.
+    let budget = n - 1;
+    let mut used = 0;
+    let mut start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    format!("…{}", &s[start..])
+}
+
+/// How many cells a string paints, the way ratatui measures it to draw it.
+fn cells(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
 }
 
 /// Sample rates the way the people who care about them write them.
@@ -4734,5 +4955,375 @@ mod tests {
             assert!(out.contains(", Esc or q to close"), "{name}: {out}");
             assert!(!out.contains("press "), "{name} says it its own way: {out}");
         }
+    }
+
+    /// Display width, measured through ratatui rather than through the crate
+    /// `ui` measures with: an independent oracle for the same number.
+    fn drawn(s: &str) -> usize {
+        ratatui::text::Span::raw(s).width()
+    }
+
+    #[test]
+    fn truncation_cuts_at_a_cell_count_not_a_character_count() {
+        // Goal: a CJK title paints two cells per character, so a field asked
+        // for twelve cells was painting up to twenty-four and shifting every
+        // column to its right off the grid. Measured with `Span::width`, which
+        // is what ratatui itself draws with.
+        let wide = "夜に駆ける夜に駆ける夜に駆ける夜に駆ける";
+        let cut = super::trunc(wide, 12);
+        assert!(
+            drawn(&cut) <= 12,
+            "{cut:?} paints {} cells in a 12-cell field",
+            drawn(&cut)
+        );
+        assert!(cut.ends_with('…'), "a cut field says it was cut: {cut:?}");
+    }
+
+    #[test]
+    fn a_string_that_fits_in_cells_is_left_alone() {
+        // Goal: the other half of the same bug. Six wide characters are twelve
+        // cells, so a twelve-cell field holds them whole - and a character
+        // count would have kept sixteen of them.
+        let six = "夜に駆ける夜";
+        assert_eq!(drawn(six), 12);
+        assert_eq!(super::trunc(six, 12), six);
+        assert!(super::trunc(six, 11).ends_with('…'));
+    }
+
+    #[test]
+    fn combining_marks_cost_no_cells_of_their_own() {
+        // Goal: an accent is a separate character that paints on the letter
+        // before it. Counting characters would cut a name in half for accents
+        // that take no room at all.
+        let accented = "Bjo\u{308}rk Guðmundsdóttir";
+        assert!(accented.chars().count() > drawn(accented));
+        assert_eq!(super::trunc(accented, drawn(accented)), accented);
+    }
+
+    #[test]
+    fn a_two_cell_emoji_is_measured_as_two() {
+        // Goal: a title with an emoji in it is ordinary in a catalogue, and it
+        // paints two cells per glyph like any other wide character.
+        let s = "🎵🎵🎵🎵";
+        assert_eq!(drawn(&super::trunc(s, 5)), 5);
+        assert!(drawn(&super::trunc(s, 4)) <= 4);
+    }
+
+    #[test]
+    fn a_field_is_exactly_as_many_cells_as_it_was_asked_for() {
+        // Goal: `format!("{:<32}")` pads by character count, so a padded CJK
+        // title ran to sixty-four cells with thirty-two spaces after it. A
+        // column that pads by cells cannot push the column beside it along.
+        for s in ["Nude", "夜に駆ける夜に駆ける", "Bjo\u{308}rk", "🎵 mix", ""] {
+            assert_eq!(drawn(&super::field(s, 20)), 20, "{s:?}");
+            assert_eq!(drawn(&super::field(s, 6)), 6, "{s:?}");
+        }
+    }
+
+    /// The box's own line: the top border, with the list title on it.
+    fn title_line(app: &mut App, w: u16) -> String {
+        draw(app, w, 12).remove(1)
+    }
+
+    #[test]
+    fn the_list_title_carries_no_key_hints() {
+        // Goal: the hints were about eighty-five cells in a seventy-eight cell
+        // box, so an eighty-column terminal deleted a binding mid-word - the
+        // failure class `push_hints` was hardened against, on the commonest
+        // terminal width there is. They were also five different grammars for
+        // what the bottom row and the `?` reference already say, and since the
+        // reference became a complete clickable menu nothing is lost with them.
+        let mut sc = screen();
+        sc.app.playlists = vec![Playlist {
+            uuid: "u".into(),
+            title: "Deep Cuts".into(),
+            num_tracks: 18,
+            duration_secs: 60,
+        }];
+        sc.app.open_playlist = Some(("u".into(), "Deep Cuts".into()));
+        sc.app.open_mix = Some(("m".into(), "My Mix 1".into()));
+        sc.app.search_query = "blue".into();
+        sc.app.search_tracks = vec![track(9, "Blue in Green")];
+        for view in [
+            View::Favorites,
+            View::Playlists,
+            View::PlaylistTracks,
+            View::Mixes,
+            View::MixTracks,
+            View::Search,
+        ] {
+            sc.app.view = view;
+            for mode in ["Normal", "Search"] {
+                sc.app.mode = if mode == "Search" {
+                    Mode::Search
+                } else {
+                    Mode::Normal
+                };
+                for w in [60u16, 80, 120] {
+                    let line = title_line(&mut sc.app, w);
+                    for hint in ["j/k", "Enter", "Esc", "(", "refresh", "shuffle"] {
+                        assert!(
+                            !line.contains(hint),
+                            "{view:?} {mode} at {w}: the title still names {hint}: {line}"
+                        );
+                    }
+                }
+            }
+        }
+        sc.app.mode = Mode::Normal;
+    }
+
+    #[test]
+    fn an_opened_playlist_names_the_list_it_was_opened_from() {
+        // Goal: opening a playlist used to change one character at the far left
+        // of the title and nothing else, so the tab strip highlighted the same
+        // tab one level up and one level down. The title carries the trail.
+        let mut sc = screen();
+        sc.app.view = View::PlaylistTracks;
+        sc.app.open_playlist = Some(("u".into(), "Deep Cuts".into()));
+        sc.app.playlist_tracks = vec![track(1, "One"), track(2, "Two")];
+        sc.app.playlist_tracks_paging.total = 18;
+        let line = title_line(&mut sc.app, 120);
+        assert!(
+            line.contains("Playlists › Deep Cuts — 2 of 18 tracks"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_opened_mix_names_the_list_it_was_opened_from() {
+        // Goal: the same trail from the other drill-down, so `Esc` has a
+        // visible destination rather than one the user has to remember.
+        let mut sc = screen();
+        sc.app.view = View::MixTracks;
+        sc.app.open_mix = Some(("m".into(), "My Mix 1".into()));
+        sc.app.mix_tracks = vec![track(1, "One")];
+        let line = title_line(&mut sc.app, 120);
+        assert!(line.contains("Mixes › My Mix 1 — 1 tracks"), "{line}");
+    }
+
+    #[test]
+    fn a_long_name_in_the_title_is_cut_so_the_count_survives() {
+        // Goal: the title is the thing that was being clipped, and what a clip
+        // takes is whatever is on the right - which is the count. Cut the name,
+        // which the row below repeats, rather than the figure only this line
+        // carries.
+        let mut sc = screen();
+        sc.app.view = View::PlaylistTracks;
+        sc.app.open_playlist = Some((
+            "u".into(),
+            "A Playlist Whose Name Nobody Could Reasonably Have Expected To Fit".into(),
+        ));
+        sc.app.playlist_tracks = vec![track(1, "One")];
+        sc.app.playlist_tracks_paging.total = 312;
+        for w in [60u16, 80, 120] {
+            let line = title_line(&mut sc.app, w);
+            assert_eq!(drawn(&line), usize::from(w), "{w}: the box lost a cell");
+            assert!(line.starts_with('┌') && line.ends_with('┐'), "{w}: {line}");
+            assert!(
+                line.contains("1 of 312 tracks"),
+                "{w}: the count was clipped away: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_query_being_typed_keeps_its_caret_however_long_it_is() {
+        // Goal: the title doubles as the search box, so what a clip takes is
+        // the caret and the characters just typed. A text field cut from the
+        // front keeps the end, which is where the typing is.
+        let mut sc = screen();
+        sc.app.view = View::Search;
+        sc.app.mode = Mode::Search;
+        sc.app.search_query = "a very long query that nobody would type but which must not \
+             lose the cursor off the right hand end of the box"
+            .into();
+        let line = title_line(&mut sc.app, 60);
+        assert_eq!(drawn(&line), 60, "the box lost a cell");
+        assert!(
+            line.contains("box ▏") || line.contains("box▏"),
+            "the caret and the last words typed are gone: {line}"
+        );
+        assert!(line.contains('…'), "the cut is not marked: {line}");
+    }
+
+    #[test]
+    fn the_track_columns_drop_in_a_documented_order() {
+        // Goal: the row is a budget, not a constant, and what it gives up as it
+        // narrows is written down. Duration is not in this table because it is
+        // never dropped: it is pinned to the right edge at every width.
+        let cols = super::track_columns;
+
+        // Widest: title, artist, album, quality.
+        for w in [92, 118, 198] {
+            let c = cols(w);
+            assert!(c.album > 0, "{w}: the album is what the width is for");
+            assert!(c.artist > 0, "{w}");
+            assert_eq!(c.quality, 8, "{w}");
+        }
+        // The album goes first.
+        for w in [54, 78, 91] {
+            let c = cols(w);
+            assert_eq!(c.album, 0, "{w}: the album is the first column to go");
+            assert!(c.artist > 0, "{w}: the artist outlives the album");
+            assert_eq!(c.quality, 8, "{w}");
+        }
+        // Then the artist.
+        for w in [38, 53] {
+            let c = cols(w);
+            assert_eq!(c.artist, 0, "{w}");
+            assert_eq!(c.quality, 8, "{w}: the tier outlives the artist");
+        }
+        // Then the quality tier. The title and the duration are all that is left.
+        for w in [20, 37] {
+            let c = cols(w);
+            assert_eq!(c.quality, 0, "{w}");
+            assert!(c.title > 0, "{w}: the title is never dropped");
+        }
+    }
+
+    #[test]
+    fn a_column_that_is_drawn_is_wide_enough_to_read() {
+        // Goal: the alternative to dropping a column is shaving every column
+        // into uselessness, which is the failure this replaces. A column either
+        // has room to say something or it is not there.
+        for w in 12..=240usize {
+            let c = super::track_columns(w);
+            assert!(c.title >= 8 || w < 24, "{w}: {c:?}");
+            assert!(c.artist == 0 || c.artist >= 12, "{w}: {c:?}");
+            assert!(c.album == 0 || c.album >= 18, "{w}: {c:?}");
+            assert!(
+                c.album == 0 || c.artist > 0,
+                "{w}: an album without an artist is out of order: {c:?}"
+            );
+            assert!(
+                c.artist == 0 || c.quality > 0,
+                "{w}: an artist without a tier is out of order: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_fills_the_width_it_was_given_and_never_overruns_it() {
+        // Goal: the duration is pinned right, which is only true if the row is
+        // exactly as wide as the box. One cell over and the box eats it; one
+        // cell under and the column of times stops lining up.
+        let mut sc = screen();
+        sc.app.favorites = vec![
+            track(1, "Nude"),
+            Track {
+                id: 2,
+                title: "夜に駆ける夜に駆ける夜に駆ける夜に駆ける".into(),
+                artist: "Some Extremely Long Artist Name Indeed".into(),
+                album: "An Album With A Rather Long Name Too".into(),
+                duration_secs: 3671,
+                quality: "LOSSLESS".into(),
+                ..Track::default()
+            },
+        ];
+        for w in 12..=240usize {
+            for vi in 0..2 {
+                let (text, _) = super::row_text(&sc.app, &[0, 1], vi, w);
+                assert_eq!(drawn(&text), w, "row {vi} at {w}: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_list_keeps_the_quality_and_the_duration() {
+        // Goal: at sixty columns the fixed block ran past the right-hand edge
+        // and the two right-most columns were silently clipped away. Nothing
+        // told the user they existed.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Everything In Its Right Place")];
+        let out = text(&mut sc.app, 60, 20);
+        assert!(out.contains("HI-RES"), "the tier was clipped away: {out}");
+        assert!(out.contains("4:05"), "the duration was clipped away: {out}");
+    }
+
+    #[test]
+    fn a_wide_list_spends_the_width_on_the_album_rather_than_on_blanks() {
+        // Goal: at two hundred columns a hundred and sixteen cells of every row
+        // were blank while `Track::album` was fetched, stored and never drawn.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Nude")];
+        let wide = text(&mut sc.app, 200, 20);
+        assert!(wide.contains("Album"), "the album is not drawn: {wide}");
+        let narrow = text(&mut sc.app, 80, 20);
+        assert!(
+            !narrow.contains("Album"),
+            "the album should have been dropped first: {narrow}"
+        );
+    }
+
+    #[test]
+    fn the_duration_is_pinned_to_the_right_edge_at_every_width() {
+        // Goal: `number-tabular` - a column of times is only scannable when the
+        // digits line up, and a duration floating at column 66 in a 198-cell
+        // box is not a column at all.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Nude"), track(2, "Weird Fishes")];
+        for w in [60u16, 80, 120, 200] {
+            let first = column_of(&mut sc.app, w, 20, 2, "4:05");
+            let second = column_of(&mut sc.app, w, 20, 3, "4:05");
+            assert_eq!(first, second, "{w}: the two durations are not a column");
+            // The box's own right-hand border sits at `w - 1`, so the last cell
+            // a row may paint is `w - 2` and a four-digit time starts three
+            // cells before it.
+            assert_eq!(
+                first,
+                Some(w - 5),
+                "{w}: the duration is not against the right-hand edge"
+            );
+        }
+    }
+
+    /// The column an ASCII needle starts at on row `y`, scanned cell by cell.
+    ///
+    /// A character index into a joined line is not a column: a wide glyph fills
+    /// one cell and leaves the next one blank, so the two disagree by one per
+    /// wide glyph - which is the whole bug under test.
+    fn column_of(app: &mut App, w: u16, h: u16, y: u16, needle: &str) -> Option<u16> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let buf = term.backend().buffer().clone();
+        (0..w).find(|x| {
+            (*x..w)
+                .map(|i| buf[(i, y)].symbol())
+                .collect::<String>()
+                .starts_with(needle)
+        })
+    }
+
+    #[test]
+    fn a_wide_title_leaves_the_columns_beside_it_where_they_were() {
+        // Goal: read off a rendered frame, not asserted in the abstract. A CJK
+        // title is ordinary in a catalogue and paints two cells per character,
+        // and the row carrying one used to push the artist, the quality and the
+        // duration rightwards - off the edge of the box on a narrow terminal.
+        let mut sc = screen();
+        sc.app.favorites = vec![
+            track(1, "Nude"),
+            Track {
+                id: 2,
+                title: "夜に駆ける夜に駆ける夜に駆ける夜に駆ける".into(),
+                artist: "Artist".into(),
+                quality: "HI-RES".into(),
+                duration_secs: 245,
+                ..Track::default()
+            },
+        ];
+        let plain = column_of(&mut sc.app, 80, 24, 2, "HI-RES");
+        let wide = column_of(&mut sc.app, 80, 24, 3, "HI-RES");
+        assert!(plain.is_some(), "the plain row lost its quality column");
+        assert_eq!(wide, plain, "the wide row's quality column moved");
+    }
+
+    #[test]
+    fn a_field_with_no_room_holds_nothing() {
+        // Goal: a zero-width field once returned the ellipsis on its own, one
+        // cell wider than the field it was asked to fit.
+        assert_eq!(super::trunc("Nude", 0), "");
+        assert_eq!(super::field("Nude", 0), "");
     }
 }

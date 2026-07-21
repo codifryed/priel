@@ -771,6 +771,7 @@ dependencies = [
  "priel-player",
  "rand",
  "ratatui",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
