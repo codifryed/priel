@@ -65,6 +65,27 @@ pub enum View {
     Search,
 }
 
+/// What a left click at one cell means, read off the geometry the renderer
+/// published for this frame.
+///
+/// A separate answer from acting on it, for the same reason [`App::decide`] is
+/// separate from carrying a plan out: a player command is fire-and-forget, so a
+/// test that clicks the progress bar has nothing to assert on afterwards. Here
+/// the *intent* is a value, so a test can render a real frame, name a cell and
+/// check the seconds a click there asks for - which is the one assertion that
+/// catches `progress_rect` drifting away from the bar that was painted.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Click {
+    /// A control registered a hit box over this cell.
+    Control(Hit),
+    /// The progress bar, at the position in seconds the cell stands for.
+    Seek(f64),
+    /// A loaded list row, by index into the visible list.
+    Row(usize),
+    /// Bare surface, or a bar with nothing playing to seek within.
+    Nothing,
+}
+
 /// A clickable region recorded by the renderer.
 ///
 /// Parity runs both ways: every action has a VIM-style key binding *and* a hit
@@ -3858,19 +3879,36 @@ impl App {
             .map(|(_, h)| *h)
     }
 
-    fn on_click(&mut self, col: u16, row: u16) {
+    /// What a click at this cell means. Pure: it reads the rects the renderer
+    /// wrote and decides nothing else, so a test can ask it the question a user
+    /// asks with the pointer.
+    ///
+    /// Order matters. A control that was painted over the list or the bar owns
+    /// its own cells, so the hit boxes answer first.
+    pub fn click_at(&self, col: u16, row: u16) -> Click {
         if let Some(h) = self.hit_at(col, row) {
-            self.dispatch(h);
-            return;
+            return Click::Control(h);
         }
         if hit(self.progress_rect, col, row) {
-            self.seek_to_x(col);
-            return;
+            return match self.seek_target(col) {
+                Some(secs) => Click::Seek(secs),
+                None => Click::Nothing,
+            };
         }
         if hit(self.list_inner, col, row) {
-            let vis_len = self.visible().len();
             let vi = self.list_offset + (row - self.list_inner.y) as usize;
-            if vi < vis_len {
+            if vi < self.visible().len() {
+                return Click::Row(vi);
+            }
+        }
+        Click::Nothing
+    }
+
+    fn on_click(&mut self, col: u16, row: u16) {
+        match self.click_at(col, row) {
+            Click::Control(h) => self.dispatch(h),
+            Click::Seek(secs) => self.player.seek(secs),
+            Click::Row(vi) => {
                 let now = Instant::now();
                 let is_double = matches!(
                     self.last_click,
@@ -3884,16 +3922,25 @@ impl App {
                     self.last_click = Some((row, now));
                 }
             }
+            Click::Nothing => {}
         }
     }
 
-    fn seek_to_x(&self, col: u16) {
+    /// The position a pointer at column `col` names, or `None` when there is no
+    /// bar on screen or no track to seek within.
+    fn seek_target(&self, col: u16) -> Option<f64> {
         let pr = self.progress_rect;
         if pr.width == 0 || self.status.duration <= 0.0 {
-            return;
+            return None;
         }
         let rel = f64::from(col.saturating_sub(pr.x)) / f64::from(pr.width);
-        self.player.seek(rel.clamp(0.0, 1.0) * self.status.duration);
+        Some(rel.clamp(0.0, 1.0) * self.status.duration)
+    }
+
+    fn seek_to_x(&self, col: u16) {
+        if let Some(secs) = self.seek_target(col) {
+            self.player.seek(secs);
+        }
     }
 
     pub fn queue_indicator(&self) -> Option<String> {
@@ -8293,8 +8340,20 @@ mod tests {
         };
         r.app.status.duration = 0.0;
         r.app.on_mouse(click(50, 9)); // must not panic
+        assert_eq!(
+            r.app.click_at(50, 9),
+            Click::Nothing,
+            "a zero-length track has no position to seek to"
+        );
 
         r.app.status.duration = 200.0;
+        assert_eq!(r.app.click_at(50, 9), Click::Seek(100.0));
+        assert_eq!(r.app.click_at(0, 9), Click::Seek(0.0));
+        assert_eq!(
+            r.app.click_at(99, 9),
+            Click::Seek(198.0),
+            "the last cell of the bar is the end of the track, not past it"
+        );
         r.app.on_mouse(click(50, 9));
         r.app.on_mouse(MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Left),

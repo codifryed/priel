@@ -272,6 +272,16 @@ allows and are given up in that order — the album first, then the artist, then
 the tier — as it shrinks. A column is either wide enough to read or it is not
 drawn, so nothing is clipped away without the row changing shape to say so.
 
+On a terminal 120 columns or wider, what is playing moves out of the three rows
+along the bottom and into a panel down the right-hand side: the track and the
+artist, the progress bar and the two times, what it is being played into, and
+the verdict on what arrives there. The bottom row is then the keyboard reference
+and nothing else, which gives the list two more rows to use — and the bar is
+still click-and-drag to seek, in its new place. Below 120 columns the three rows
+along the bottom are exactly as they were. That one width is the only
+breakpoint; the list simply has less room once the panel is there, and the row
+gives its columns up in the order above.
+
 A `♥` on a row means the track is in your favorites and a `♡` means it is not,
 as far as priel has been told. The service reports no favorite flag on a track,
 so the favorites listing itself is the only thing that ever says so, and priel

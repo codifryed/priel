@@ -31,11 +31,38 @@ use crate::app::{App, GraphRow, GraphRowKind, Hit, Mode, View};
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
 
+/// The width at which the now-playing block stops being three rows along the
+/// bottom and becomes a column down the right.
+///
+/// **One breakpoint, not a ladder.** A second one would be a third layout to
+/// keep the hit boxes right in, and the row's own drop order
+/// (`track_columns`) already covers the list being narrower once the panel is
+/// there - the two decisions compose rather than fight, which is why the panel
+/// hands the reduced width straight on rather than adding a rule of its own.
+///
+/// 120 because that is where a list still reads comfortably after giving
+/// [`PANEL_COLS`] away: it leaves the box wider than an 80-column terminal
+/// gives it today, so the panel never costs the list more than it was already
+/// living with.
+const WIDE_COLS: u16 = 120;
+
+/// The cells the now-playing panel occupies, borders included.
+///
+/// Fixed rather than a share of the width: everything in it is a fixed-length
+/// readout - `DAC S32 · 192 kHz`, `≈ near bit-perfect`, `0:00 / 4:05` - so a
+/// panel that grew with the terminal would be padding a column of short lines
+/// while taking the width from the list, which is the one part of the screen
+/// that can always use more.
+const PANEL_COLS: u16 = 36;
+
 pub fn render(f: &mut Frame, app: &mut App) {
+    // Two of the three chrome rows move into the panel at [`WIDE_COLS`], which
+    // is two more list rows on a 24-row terminal.
+    let wide = f.area().width >= WIDE_COLS;
     let rows = Layout::vertical([
-        Constraint::Length(1), // header / tabs
-        Constraint::Min(1),    // list
-        Constraint::Length(3), // now-playing
+        Constraint::Length(1),                        // header / tabs
+        Constraint::Min(1),                           // list, and the panel
+        Constraint::Length(if wide { 1 } else { 3 }), // keys, and the block
     ])
     .split(f.area());
 
@@ -47,8 +74,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Hit boxes are geometry, so the renderer owns them. Rebuilt every frame.
     app.hits.clear();
     header(f, app, rows[0]);
-    list(f, app, rows[1]);
-    now_playing(f, app, rows[2]);
+    if wide {
+        let cols =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(PANEL_COLS)]).split(rows[1]);
+        list(f, app, cols[0]);
+        now_panel(f, app, cols[1]);
+        key_row(f, app, rows[2]);
+    } else {
+        list(f, app, rows[1]);
+        now_playing(f, app, rows[2]);
+    }
 
     // Drawn last so it sits over everything, and after the hit boxes above have
     // been registered - `App` ignores them while the overlay is up.
@@ -1927,11 +1962,7 @@ fn push_gap(row: &mut String) {
     }
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "display-only: seconds and volume percent are non-negative and rendered whole"
-)]
+/// The now-playing block as three rows along the bottom, below [`WIDE_COLS`].
 fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
     // Split rather than offset from `area.y`: on a terminal too short for three
@@ -1946,56 +1977,26 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     let (l0, l1, l2) = (rows[0], rows[1], rows[2]);
     app.progress_rect = l1;
 
-    let s = &app.status;
     let title = match &app.now_playing {
         Some(t) => format!("{} — {}", t.artist, t.title),
         None => "Nothing playing".into(),
-    };
-    let state = if s.paused {
-        "⏸"
-    } else if s.playing {
-        "▶"
-    } else {
-        "·"
     };
     // Built through a `ControlBar` rather than as raw spans so the heart's hit
     // box comes out of the same left-to-right walk that paints it. The state and
     // the button are one glyph on purpose: a separate control elsewhere would be
     // a second thing to keep in step with what this row already says.
-    let kept = app
-        .now_playing
-        .as_ref()
-        .is_some_and(|t| app.is_favorite(t.id));
     let mut top = ControlBar::new(l0);
-    top.label(format!(" {state} "), Style::default().fg(t.accent));
-    if app.now_playing.is_some() {
-        top.button(
-            format!("{} ", heart(kept)),
-            Hit::FavoriteNowPlaying,
-            heart_style(kept, &t),
-        );
-    }
+    top.label(
+        format!(" {} ", play_state(app)),
+        Style::default().fg(t.accent),
+    );
+    push_heart(&mut top, app, &t);
     top.label(title, Style::default());
     top.label(source_badge(app), Style::default().fg(t.faint));
     app.hits.extend(top.hits);
     f.render_widget(Paragraph::new(Line::from(top.spans)), l0);
 
-    let ratio = if s.duration > 0.0 {
-        (s.position / s.duration).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    f.render_widget(
-        Gauge::default()
-            .gauge_style(t.on(t.accent))
-            .ratio(ratio)
-            .label(format!(
-                "{} / {}",
-                fmt_dur(s.position as u32),
-                fmt_dur(s.duration as u32)
-            )),
-        l1,
-    );
+    f.render_widget(progress_bar(app, &t), l1);
 
     // DAC badge, the shared activity slot (resolving / buffering / buffered),
     // then the keyboard reference. The clickable controls live in the header.
@@ -2021,6 +2022,196 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     push_hints(&mut bar, &t);
     app.hits.extend(bar.hits);
     f.render_widget(Paragraph::new(Line::from(bar.spans)), l2);
+}
+
+/// Playing, paused, or neither, as one glyph. Shared by both layouts so they
+/// cannot come to different conclusions about one moment.
+fn play_state(app: &App) -> &'static str {
+    if app.status.paused {
+        "⏸"
+    } else if app.status.playing {
+        "▶"
+    } else {
+        "·"
+    }
+}
+
+/// The favourite control for the playing track, pushed onto whichever bar is
+/// being laid out. Nothing playing means nothing to keep, so no button.
+fn push_heart(bar: &mut ControlBar, app: &App, t: &Theme) {
+    if app.now_playing.is_none() {
+        return;
+    }
+    let kept = app
+        .now_playing
+        .as_ref()
+        .is_some_and(|track| app.is_favorite(track.id));
+    bar.button(
+        format!("{} ", heart(kept)),
+        Hit::FavoriteNowPlaying,
+        heart_style(kept, t),
+    );
+}
+
+/// The bar and the two times, as one widget both layouts render.
+///
+/// Whoever renders it must record the rect it went into as `App::progress_rect`:
+/// that is what a click and a drag are measured within, so a bar drawn in one
+/// place and hit-tested in another seeks to the wrong second silently.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "display-only: elapsed and total seconds are non-negative and rendered whole"
+)]
+fn progress_bar(app: &App, t: &Theme) -> Gauge<'static> {
+    let s = &app.status;
+    let ratio = if s.duration > 0.0 {
+        (s.position / s.duration).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Gauge::default()
+        .gauge_style(t.on(t.accent))
+        .ratio(ratio)
+        .label(format!(
+            "{} / {}",
+            fmt_dur(s.position as u32),
+            fmt_dur(s.duration as u32)
+        ))
+}
+
+/// The keyboard reference, and nothing else, on the bottom row.
+///
+/// What the row looks like at [`WIDE_COLS`] and above, once the panel has taken
+/// the readouts off it. One leading space so the row starts where the block's
+/// did, and `push_hints` still reserves for `[?]` and `[q]` - the extra width is
+/// spent on showing more of the reference, never on letting it run off the edge.
+fn key_row(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme();
+    let mut bar = ControlBar::new(area);
+    bar.label(" ", Style::default());
+    push_hints(&mut bar, &t);
+    app.hits.extend(bar.hits);
+    f.render_widget(Paragraph::new(Line::from(bar.spans)), area);
+}
+
+/// The state glyph and the heart, so the artist starts under the title rather
+/// than under the two glyphs that lead the line above it.
+const PANEL_NAME_INDENT: u16 = 4;
+
+/// The now-playing block as a column down the right-hand side.
+///
+/// Same facts as the three rows along the bottom, in the same words: what is
+/// playing, where it has got to, what it is being played into, and the verdict
+/// on what arrives there. Stacked rather than laid end to end, which is the
+/// whole reason for the panel - the bottom row was spending about 108 cells on
+/// badges before the first key hint, and dropping hints at 80 columns to do it.
+///
+/// **What the two lines at the top do that the one line cannot.** The block
+/// writes `Artist — Title` because it has one line and must join them; the panel
+/// has two and joins nothing, so it leads with the title, which is what the list
+/// column beside it leads with. The block's line is untouched, so the question
+/// of which order a single line should use is still open.
+fn now_panel(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(t.surface())
+        .title(" Now playing ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    // One cell in from the border on both sides, so the panel has one left edge
+    // rather than text against the frame and a bar clear of it.
+    let body = Rect {
+        x: inner.x.saturating_add(1),
+        width: inner.width.saturating_sub(2),
+        ..inner
+    };
+    // A layout rather than offsets from `body.y`: on a short terminal a
+    // hand-computed row addresses cells outside the buffer and ratatui panics,
+    // where this yields empty rects that render nothing.
+    let rows = Layout::vertical([
+        Constraint::Length(1), // what is playing
+        Constraint::Length(1), // who by
+        Constraint::Length(1),
+        Constraint::Length(1), // the bar and the two times
+        Constraint::Length(1),
+        Constraint::Length(1), // what the stream is
+        Constraint::Length(1), // what it is going into
+        Constraint::Length(1), // and what arrives there
+        Constraint::Length(1), // the activity slot
+        Constraint::Min(0),
+    ])
+    .split(body);
+
+    let mut top = ControlBar::new(rows[0]);
+    top.label(
+        format!("{} ", play_state(app)),
+        Style::default().fg(t.accent),
+    );
+    push_heart(&mut top, app, &t);
+    let title = match &app.now_playing {
+        Some(track) => track.title.clone(),
+        None => "Nothing playing".into(),
+    };
+    let room = usize::from(top.remaining());
+    top.label(
+        trunc(&title, room),
+        Style::default().add_modifier(Modifier::BOLD),
+    );
+    app.hits.extend(top.hits);
+    f.render_widget(Paragraph::new(Line::from(top.spans)), rows[0]);
+
+    // Under the title rather than beside it, indented to the width of the state
+    // glyph and the heart so the two names share a left edge.
+    let artist = app
+        .now_playing
+        .as_ref()
+        .map_or_else(String::new, |track| track.artist.clone());
+    let named = Rect {
+        x: rows[1].x.saturating_add(PANEL_NAME_INDENT),
+        width: rows[1].width.saturating_sub(PANEL_NAME_INDENT),
+        ..rows[1]
+    };
+    f.render_widget(
+        Paragraph::new(trunc(&artist, usize::from(named.width)))
+            .style(Style::default().fg(t.faint)),
+        named,
+    );
+
+    f.render_widget(progress_bar(app, &t), rows[3]);
+    app.progress_rect = rows[3];
+
+    let width = usize::from(body.width);
+    let (act_text, act_color) = activity_words(app);
+    let (verdict_text, verdict_color) = verdict_badge(app);
+    for (text, style, row) in [
+        (source_words(app), Style::default().fg(t.faint), rows[5]),
+        (
+            device_readout(&app.status),
+            Style::default().fg(t.active),
+            rows[6],
+        ),
+        (act_text, Style::default().fg(act_color), rows[8]),
+    ] {
+        f.render_widget(Paragraph::new(trunc(&text, width)).style(style), row);
+    }
+
+    // The verdict says *whether*; clicking it says *why*, through the same
+    // method `[D]` runs - as on the bottom row, and registered in the same walk
+    // that paints it so the two cannot drift apart.
+    let mut said = ControlBar::new(rows[7]);
+    if !verdict_text.is_empty() {
+        said.button(
+            trunc(&verdict_text, width),
+            Hit::Graph,
+            Style::default()
+                .fg(verdict_color)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    app.hits.extend(said.hits);
+    f.render_widget(Paragraph::new(Line::from(said.spans)), rows[7]);
 }
 
 /// One entry in the bottom keyboard reference.
@@ -2203,8 +2394,23 @@ impl ControlBar {
 )]
 fn activity(app: &App) -> (String, Color) {
     const W: usize = 16; // widest content ("⤓ 214s buffered" ≈ 15)
+    let (text, color) = activity_words(app);
+    (format!("  {text:<W$}"), color)
+}
+
+/// The activity slot's words, with no padding and no leading gap.
+///
+/// Split out for the panel, where the slot is a line of its own and the row's
+/// fixed width would be trailing blanks - and where padding to sixteen cells in
+/// a box that narrow would push the line into its own border.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "display-only: buffered seconds are non-negative and rendered whole"
+)]
+fn activity_words(app: &App) -> (String, Color) {
     let t = app.theme();
-    let (text, color) = if app.is_resolving() {
+    if app.is_resolving() {
         (format!("{} resolving…", app.spinner()), t.notice)
     } else if app.is_buffering() {
         (format!("{} buffering…", app.spinner()), t.notice)
@@ -2217,11 +2423,26 @@ fn activity(app: &App) -> (String, Color) {
         (format!("⤓ {}s buffered", app.status.cache_secs as u32), c)
     } else {
         (String::new(), t.faint)
-    };
-    (format!("  {text:<W$}"), color)
+    }
 }
 
 fn source_badge(app: &App) -> String {
+    let words = source_words(app);
+    if words.is_empty() {
+        String::new()
+    } else {
+        // Two cells either side of the separator that joins the title to the
+        // badge, against one either side of the separators inside it: enough of
+        // a gap to read as a group, and even, which three-then-two was not.
+        format!("  ·  {words}")
+    }
+}
+
+/// What the stream itself is: depth, rate, codec, tier, bitrate.
+///
+/// The words alone, with nothing joining them to a title, because in the panel
+/// they are a line rather than a tail.
+fn source_words(app: &App) -> String {
     if app.now_playing.is_none() {
         return String::new();
     }
@@ -2243,14 +2464,7 @@ fn source_badge(app: &App) -> String {
     if app.status.bitrate > 0 {
         parts.push(format!("~{} kbps", app.status.bitrate / 1000));
     }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        // Two cells either side of the separator that joins the title to the
-        // badge, against one either side of the separators inside it: enough of
-        // a gap to read as a group, and even, which three-then-two was not.
-        format!("  ·  {}", parts.join(" · "))
-    }
+    parts.join(" · ")
 }
 
 /// The verdict: one word for what is reaching the device, and nothing else.
@@ -2619,9 +2833,10 @@ fn fmt_hms(secs: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlBar, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, hint_width, push_hints, render,
+        ControlBar, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, PANEL_COLS, WIDE_COLS,
+        hint_width, push_hints, render,
     };
-    use crate::app::{App, Hit, Mode, View};
+    use crate::app::{App, Click, Hit, Mode, View};
     use crate::theme::Theme;
     use crate::worker::{FromWorker, ToWorker};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2713,6 +2928,38 @@ mod tests {
         let buf = term.backend().buffer().clone();
         (rect.x..rect.x.saturating_add(rect.width))
             .map(|x| buf[(x, rect.y)].symbol().to_string())
+            .collect()
+    }
+
+    /// The same, for a `Hit` that legitimately appears more than once - the
+    /// report is opened both by the verdict badge and by its own key hint.
+    fn painted_all(app: &mut App, w: u16, h: u16, wanted: Hit) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let buf = term.backend().buffer().clone();
+        app.hits
+            .iter()
+            .filter(|(_, h)| *h == wanted)
+            .map(|(r, _)| {
+                (r.x..r.x.saturating_add(r.width))
+                    .map(|x| buf[(x, r.y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Render a frame and return the cells `progress_rect` covers.
+    ///
+    /// The bar is the one rect a click is measured *within* rather than merely
+    /// dispatched from, so the rect drifting off what was painted is a seek to
+    /// the wrong second - and nothing on screen says so.
+    fn painted_bar(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let r = app.progress_rect;
+        let buf = term.backend().buffer().clone();
+        (r.x..r.x.saturating_add(r.width))
+            .map(|x| buf[(x, r.y)].symbol().to_string())
             .collect()
     }
 
@@ -3171,15 +3418,18 @@ mod tests {
     fn nothing_playing_offers_no_heart_to_click() {
         // Goal: a control that could not act on anything must not be on screen.
         // Registering its hit box anyway is how a click lands on a no-op that
-        // looks like a bug.
-        let mut sc = screen();
-        let _ = draw(&mut sc.app, 100, 20);
-        assert!(
-            !sc.app
-                .hits
-                .iter()
-                .any(|(_, h)| *h == Hit::FavoriteNowPlaying)
-        );
+        // looks like a bug. Both layouts draw the heart, so both are checked.
+        for (w, h) in [(100u16, 20u16), (WIDE_COLS, 30)] {
+            let mut sc = screen();
+            let _ = draw(&mut sc.app, w, h);
+            assert!(
+                !sc.app
+                    .hits
+                    .iter()
+                    .any(|(_, h)| *h == Hit::FavoriteNowPlaying),
+                "a heart with nothing to keep was clickable at {w}x{h}"
+            );
+        }
     }
 
     // ---- the overlay ----
@@ -3853,6 +4103,234 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert_eq!(sc.app.selected, 2, "the third visible row");
+    }
+
+    #[test]
+    fn a_click_on_the_painted_bar_seeks_to_the_fraction_it_landed_on() {
+        // Goal: `progress_rect` is written by the renderer and read by the click
+        // handler, and a click that lands on the wrong seconds is invisible in a
+        // screenshot. The bar moves between the two layouts, so both sides of
+        // the breakpoint are checked. Method: render a real frame, read the
+        // cells the rect covers, then ask what a click on a known cell means.
+        for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30)] {
+            let mut sc = screen();
+            sc.app.now_playing = Some(track(1, "Blue in Green"));
+            sc.app.status.duration = 200.0;
+
+            let bar = painted_bar(&mut sc.app, w, h);
+            assert!(
+                bar.contains("0:00 / 3:20"),
+                "the rect must cover the bar that was painted, not a row beside \
+                 it: {bar:?} at {w}x{h}"
+            );
+
+            let pr = sc.app.progress_rect;
+            assert!(pr.width > 0, "the bar must have a rect at {w}x{h}");
+            assert_eq!(sc.app.click_at(pr.x, pr.y), Click::Seek(0.0), "at {w}x{h}");
+            assert_eq!(
+                sc.app.click_at(pr.x + pr.width / 2, pr.y),
+                Click::Seek(100.0),
+                "halfway along the bar is halfway through the track at {w}x{h}"
+            );
+            assert_ne!(
+                sc.app.click_at(pr.x + pr.width, pr.y),
+                Click::Seek(200.0),
+                "the cell past the end of the bar is not the end of the track \
+                 at {w}x{h}"
+            );
+        }
+    }
+
+    // ---- one breakpoint: the now-playing block becomes a side panel ----
+
+    #[test]
+    fn the_breakpoint_and_the_panel_are_the_widths_that_were_written_down() {
+        // Goal: every other test here is written in terms of these two, so they
+        // would all move together if one were edited. The numbers are a
+        // decision - 120 is where the list still reads after giving the panel
+        // its column - so changing one is a decision to take again, not a
+        // refactor. Spelled out once, here.
+        assert_eq!(WIDE_COLS, 120);
+        assert_eq!(PANEL_COLS, 36);
+        // Which leaves the list wider than an eighty-column terminal gives it,
+        // so the panel never costs the list more than it already lived with.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, WIDE_COLS, 24);
+        let panelled = sc.app.list_inner.width;
+        let _ = draw(&mut sc.app, 80, 24);
+        assert!(
+            panelled > sc.app.list_inner.width,
+            "the panel took the list under the width it already ran at: \
+             {panelled} against {}",
+            sc.app.list_inner.width
+        );
+    }
+
+    #[test]
+    fn below_the_breakpoint_the_now_playing_block_is_three_rows_along_the_bottom() {
+        // Goal: the narrow side of the one breakpoint is exactly what it was, so
+        // nothing changes for the terminal widths most people run. Method: a
+        // real frame one column under it, read row by row.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "Blue in Green"));
+        sc.app.status.duration = 245.0;
+        let out = draw(&mut sc.app, WIDE_COLS - 1, 30);
+
+        assert!(out[27].contains("Blue in Green"), "{:?}", out[27]);
+        assert!(out[28].contains("0:00 / 4:05"), "{:?}", out[28]);
+        assert!(
+            out[29].contains("OUT —"),
+            "the readout is here: {:?}",
+            out[29]
+        );
+        assert!(out[29].contains("[q] quit"), "{:?}", out[29]);
+        assert_eq!(
+            sc.app.list_inner.width,
+            WIDE_COLS - 3,
+            "the list has the whole width, less its own border"
+        );
+        assert_eq!(sc.app.progress_rect.y, 28, "the bar is the middle row");
+    }
+
+    #[test]
+    fn at_the_breakpoint_the_now_playing_block_becomes_a_column_on_the_right() {
+        // Goal: at WIDE_COLS the block moves into a fixed column and the bottom
+        // row keeps only the key hints. Method: a real frame at exactly the
+        // breakpoint, checking both that the panel carries what the block
+        // carried and that the bottom row no longer does.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "Blue in Green"));
+        sc.app.status.duration = 245.0;
+        let out = draw(&mut sc.app, WIDE_COLS, 30);
+        let all = out.join("\n");
+
+        assert!(out[29].contains("[q] quit"), "{:?}", out[29]);
+        assert!(
+            !out[29].contains("OUT"),
+            "the readout moved off the bottom row: {:?}",
+            out[29]
+        );
+        assert!(all.contains("Blue in Green"), "{all}");
+        assert!(all.contains("Artist"), "{all}");
+        assert!(all.contains("0:00 / 4:05"), "{all}");
+        assert!(all.contains("OUT —"), "the device readout: {all}");
+
+        let left = WIDE_COLS - PANEL_COLS;
+        assert_eq!(
+            sc.app.list_inner.width,
+            left - 2,
+            "the list gives the panel a fixed column and keeps the rest"
+        );
+        assert!(
+            sc.app.progress_rect.x >= left,
+            "the bar is inside the panel: {:?}",
+            sc.app.progress_rect
+        );
+        let heart = sc
+            .app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == Hit::FavoriteNowPlaying)
+            .map_or_else(|| panic!("the heart has no hit box"), |(r, _)| *r);
+        assert!(heart.x >= left, "and so is the heart: {heart:?}");
+    }
+
+    #[test]
+    fn the_side_panel_buys_two_more_list_rows() {
+        // Goal: the panel pays for itself in height - the bottom block's three
+        // chrome rows become one. Method: the same terminal height either side
+        // of the breakpoint, comparing the rect the list was given.
+        let mut sc = screen();
+        sc.app.favorites = (0..40).map(|i| track(i, "T")).collect();
+        let _ = draw(&mut sc.app, WIDE_COLS - 1, 24);
+        let narrow = sc.app.list_inner.height;
+        let _ = draw(&mut sc.app, WIDE_COLS, 24);
+        let wide = sc.app.list_inner.height;
+
+        assert_eq!(
+            wide,
+            narrow + 2,
+            "two of the three chrome rows go into the panel"
+        );
+    }
+
+    #[test]
+    fn the_verdict_is_the_button_for_the_report_in_both_layouts() {
+        // Goal: the verdict says whether, and clicking it says why - in the
+        // bottom block and in the panel alike. Method: render both and check a
+        // hit box was painted over the words themselves.
+        for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30)] {
+            let mut sc = screen();
+            chain(&mut sc, 24, 96_000, 96_000, "s32");
+            let boxes = painted_all(&mut sc.app, w, h, Hit::Graph);
+            assert!(
+                boxes.iter().any(|s| s == "✓ bit-perfect"),
+                "the verdict must be clickable at {w}x{h}: {boxes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verdict_with_no_word_in_it_offers_nothing_to_click() {
+        // Goal: nothing playing means nothing graded, and a hit box over an
+        // empty span is a control that was never painted. The block only
+        // registers one when there is a word; the panel has to do the same.
+        for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30)] {
+            let mut sc = screen();
+            let boxes = painted_all(&mut sc.app, w, h, Hit::Graph);
+            assert!(
+                !boxes.iter().any(String::is_empty),
+                "an empty verdict registered a hit box at {w}x{h}: {boxes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_modal_overlay_owns_the_pointer_in_the_wide_layout_too() {
+        // Goal: an overlay draws over everything and answers the pointer
+        // itself. The panel registers hit boxes of its own, so that has to hold
+        // on both sides of the breakpoint. Method: note where the heart and the
+        // list rows were painted, put an overlay up, and click both.
+        for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30)] {
+            let mut sc = screen();
+            favorites_arrive(&mut sc, (0..8).map(|i| track(i, "T")).collect());
+            sc.app.now_playing = Some(track(1, "T"));
+            let _ = draw(&mut sc.app, w, h);
+            let heart = sc
+                .app
+                .hits
+                .iter()
+                .find(|(_, h)| *h == Hit::FavoriteNowPlaying)
+                .map_or_else(|| panic!("the heart has no hit box"), |(r, _)| *r);
+            let listed = sc.app.list_inner;
+            assert!(sc.app.is_favorite(1), "the page said it was kept");
+
+            sc.app.mode = Mode::Log;
+            let _ = draw(&mut sc.app, w, h);
+            sc.app.on_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: heart.x,
+                row: heart.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            });
+            assert!(
+                sc.app.is_favorite(1),
+                "the heart behind the overlay was pressed at {w}x{h}"
+            );
+
+            sc.app.mode = Mode::Log;
+            let _ = draw(&mut sc.app, w, h);
+            sc.app.on_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: listed.x + 1,
+                row: listed.y + 3,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            });
+            assert_eq!(
+                sc.app.selected, 0,
+                "the list behind the overlay moved at {w}x{h}"
+            );
+        }
     }
 
     #[test]
@@ -4862,7 +5340,10 @@ mod tests {
         // Goal: the separator between the title and the badge carried three
         // spaces on its left and two on its right, where every separator inside
         // the badge carries one of each. An uneven gap around one glyph reads
-        // as a misalignment rather than as a grouping.
+        // as a misalignment rather than as a grouping. Below the breakpoint,
+        // because the separator only exists where the title and the badge share
+        // one line: the panel gives the badge a line of its own and joins it to
+        // nothing.
         let mut sc = screen();
         sc.app.now_playing = Some(track(1, "So What"));
         sc.app.now_meta = crate::app::StreamMeta {
@@ -4871,7 +5352,7 @@ mod tests {
             codec: "flac".into(),
             quality: "HI_RES_LOSSLESS".into(),
         };
-        let out = text(&mut sc.app, 130, 12);
+        let out = text(&mut sc.app, WIDE_COLS - 1, 12);
         assert!(out.contains("  ·  24-bit · 192 kHz"), "{out}");
         assert!(
             !out.contains("   ·  24-bit"),
@@ -5274,12 +5755,14 @@ mod tests {
             let first = column_of(&mut sc.app, w, 20, 2, "4:05");
             let second = column_of(&mut sc.app, w, 20, 3, "4:05");
             assert_eq!(first, second, "{w}: the two durations are not a column");
-            // The box's own right-hand border sits at `w - 1`, so the last cell
-            // a row may paint is `w - 2` and a four-digit time starts three
-            // cells before it.
+            // The list's own right-hand edge, which is the terminal's below the
+            // breakpoint and the panel's left border above it. The last cell a
+            // row may paint is the one before it, and a four-digit time starts
+            // three cells before that.
+            let inner = sc.app.list_inner;
             assert_eq!(
                 first,
-                Some(w - 5),
+                Some(inner.x + inner.width - 4),
                 "{w}: the duration is not against the right-hand edge"
             );
         }
