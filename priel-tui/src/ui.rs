@@ -58,10 +58,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let area = f.area();
         credentials_overlay(f, app, area);
     }
-    if app.mode == Mode::Login
-        && let Some(flow) = app.login()
-    {
-        login_overlay(f, f.area(), flow);
+    if app.mode == Mode::Login {
+        let area = f.area();
+        login_overlay(f, app, area);
     }
 }
 
@@ -71,7 +70,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
 /// so the last step is unavoidably a paste. Everything around it is made as
 /// short as possible: the browser is already open, the box is already focused,
 /// and one paste plus Enter finishes the job.
-fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
+fn login_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(flow) = app.login() else {
+        return;
+    };
+    // Read before the mutable borrow the hit boxes need, as the header does.
+    let (busy, pasted, status) = (flow.is_busy(), flow.pasted.clone(), flow.status.clone());
+    // Modal: whatever the header and the bottom row registered this frame is
+    // behind this screen and must not be reachable through it.
+    app.hits.clear();
     let width = area.width.min(76);
     let height = 16u16.min(area.height);
     let rect = Rect {
@@ -108,7 +115,7 @@ fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
         Line::raw(""),
     ];
 
-    if flow.is_busy() {
+    if busy {
         lines.push(Line::from(Span::styled(
             "    signing in…",
             Style::default().fg(Color::Yellow),
@@ -116,7 +123,7 @@ fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
     } else {
         // A pasted URL is far wider than the box; show the tail, which is where
         // the code sits, so the user can see something arrived.
-        let shown = tail(&flow.pasted, inner.width.saturating_sub(6) as usize);
+        let shown = tail(&pasted, inner.width.saturating_sub(6) as usize);
         lines.push(Line::from(vec![
             Span::styled("    ", dim),
             Span::styled(
@@ -125,7 +132,7 @@ fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
                 } else {
                     shown
                 },
-                if flow.pasted.is_empty() {
+                if pasted.is_empty() {
                     Style::default().fg(Color::DarkGray)
                 } else {
                     Style::default().fg(Color::White)
@@ -136,27 +143,58 @@ fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
     }
 
     lines.push(Line::raw(""));
-    if let Some(status) = &flow.status {
+    if let Some(status) = &status {
         lines.push(Line::from(Span::styled(
             format!("    {status}"),
             Style::default().fg(Color::Yellow),
         )));
         lines.push(Line::raw(""));
     }
-    lines.push(Line::from(vec![
-        Span::styled("    [Enter]", key),
-        Span::styled(" sign in   ", dim),
-        Span::styled("[Ctrl-O]", key),
-        Span::styled(" reopen browser   ", dim),
-        Span::styled("[Ctrl-U]", key),
-        Span::styled(" clear", dim),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("    [Esc]", key),
-        Span::styled(" cancel", dim),
-    ]));
-
+    // The rows of actions are placed by hand rather than pushed onto the
+    // paragraph, because a control needs a rect of its own to register the hit
+    // box that makes it one. Everything above is prose.
+    let used = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     f.render_widget(Paragraph::new(lines), inner);
+    login_controls(f, app, inner, used);
+}
+
+/// The sign-in screen's four actions, as controls.
+///
+/// Laid out and hit-boxed in the same left-to-right walk the header's are, from
+/// the row `used` lines down. A row the box was too short to draw registers
+/// nothing: a control that was never painted must not answer to a click.
+fn login_controls(f: &mut Frame, app: &mut App, inner: Rect, used: u16) {
+    let dim = Style::default().fg(Color::Gray);
+    let key = Style::default().fg(Color::Cyan);
+    let mut row = |y: u16, build: &dyn Fn(&mut ControlBar)| {
+        if y >= inner.height {
+            return;
+        }
+        let line = Rect {
+            y: inner.y.saturating_add(y),
+            height: 1,
+            ..inner
+        };
+        let mut bar = ControlBar::new(line);
+        build(&mut bar);
+        app.hits.extend(bar.hits.iter().copied());
+        f.render_widget(Paragraph::new(Line::from(bar.spans)), line);
+    };
+
+    row(used, &|bar: &mut ControlBar| {
+        bar.label("    [", dim);
+        bar.button("Enter", Hit::SubmitLogin, key);
+        bar.label("] sign in   [", dim);
+        bar.button("Ctrl-O", Hit::ReopenBrowser, key);
+        bar.label("] reopen browser   [", dim);
+        bar.button("Ctrl-U", Hit::ClearPaste, key);
+        bar.label("] clear", dim);
+    });
+    row(used.saturating_add(1), &|bar: &mut ControlBar| {
+        bar.label("    [", dim);
+        bar.button("Esc", Hit::CancelLogin, key);
+        bar.label("] cancel", dim);
+    });
 }
 
 /// The last `width` characters, so a long URL shows its tail.
@@ -3130,6 +3168,47 @@ mod tests {
         let path = dir.join("credentials.json");
         std::fs::write(&path, r#"{"client_id":"cid","client_secret":"sec"}"#).expect("write");
         path.to_str().expect("path").to_string()
+    }
+
+    #[test]
+    fn the_sign_in_screens_actions_are_painted_where_a_click_lands() {
+        // Goal: four actions, none of which could be pointed at. Each is a
+        // control on the cells its key printed, and cancelling runs the same
+        // shared method `Esc` does.
+        let mut sc = screen();
+        signing_in(&mut sc);
+        for (hit, key) in [
+            (Hit::SubmitLogin, "Enter"),
+            (Hit::ReopenBrowser, "Ctrl-O"),
+            (Hit::ClearPaste, "Ctrl-U"),
+            (Hit::CancelLogin, "Esc"),
+        ] {
+            assert_eq!(painted(&mut sc.app, 88, 24, hit), key);
+        }
+        click_hit(&mut sc.app, Hit::CancelLogin);
+        assert_eq!(sc.app.mode, Mode::Normal);
+        assert!(sc.app.login().is_none(), "and drops the flow with it");
+    }
+
+    #[test]
+    fn the_sign_in_screen_takes_the_hit_boxes_over_from_the_row_behind_it() {
+        // Goal: modal means a click cannot reach a control underneath, and this
+        // screen covers a header whose controls were registered before it drew.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 88, 24);
+        let header_row = sc
+            .app
+            .hits
+            .iter()
+            .map(|(r, _)| r.y)
+            .min()
+            .expect("the header should publish controls");
+        signing_in(&mut sc);
+        let _ = draw(&mut sc.app, 88, 24);
+        assert!(
+            !sc.app.hits.iter().any(|(r, _)| r.y == header_row),
+            "nothing behind the sign-in screen may still be clickable"
+        );
     }
 
     #[test]

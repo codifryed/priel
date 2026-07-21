@@ -91,6 +91,14 @@ pub enum Hit {
     FetchCredentials,
     /// Carry on without one, from the same screen.
     DeclineCredentials,
+    /// Hand the pasted redirect back for a session, from the sign-in screen.
+    SubmitLogin,
+    /// Open the authorization page again, from the same screen.
+    ReopenBrowser,
+    /// Empty the paste box, from the same screen.
+    ClearPaste,
+    /// Abandon the sign-in.
+    CancelLogin,
     Quit,
 }
 
@@ -729,31 +737,45 @@ impl App {
         }
     }
 
+    /// Open the authorization page again.
+    ///
+    /// The one way in: `Ctrl-O` and the screen's own control both come through
+    /// here, as with the three below. A browser that was closed, or never
+    /// opened because there is no desktop session, is the whole reason this is
+    /// an action rather than something that only happens once.
+    fn reopen_browser(&self) {
+        if let Some(flow) = &self.login {
+            open_in_browser(&flow.url);
+        }
+    }
+
+    /// Empty the paste box and forget what the last attempt said about it.
+    fn clear_paste(&mut self) {
+        if let Some(flow) = self.login.as_mut() {
+            flow.pasted.clear();
+            flow.status = None;
+        }
+    }
+
+    /// Abandon the sign-in, dropping the flow with it.
+    fn cancel_login(&mut self) {
+        self.login = None;
+        self.mode = Mode::Normal;
+    }
+
     fn on_key_login(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 // Letters go into the pasted text, so the actions take a
                 // modifier rather than stealing characters from a URL.
-                KeyCode::Char('o') => {
-                    if let Some(flow) = &self.login {
-                        open_in_browser(&flow.url);
-                    }
-                }
-                KeyCode::Char('u') => {
-                    if let Some(flow) = self.login.as_mut() {
-                        flow.pasted.clear();
-                        flow.status = None;
-                    }
-                }
+                KeyCode::Char('o') => self.reopen_browser(),
+                KeyCode::Char('u') => self.clear_paste(),
                 _ => {}
             }
             return;
         }
         match key.code {
-            KeyCode::Esc => {
-                self.login = None;
-                self.mode = Mode::Normal;
-            }
+            KeyCode::Esc => self.cancel_login(),
             KeyCode::Enter => self.submit_login(),
             KeyCode::Backspace => {
                 if let Some(flow) = self.login.as_mut() {
@@ -2409,6 +2431,10 @@ impl App {
             Hit::SignIn => self.start_login(),
             Hit::FetchCredentials => self.fetch_credentials(),
             Hit::DeclineCredentials => self.decline_credentials(),
+            Hit::SubmitLogin => self.submit_login(),
+            Hit::ReopenBrowser => self.reopen_browser(),
+            Hit::ClearPaste => self.clear_paste(),
+            Hit::CancelLogin => self.cancel_login(),
             Hit::Quit => self.should_quit = true,
         }
     }
