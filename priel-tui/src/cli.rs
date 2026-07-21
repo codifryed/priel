@@ -127,6 +127,12 @@ pub enum ThemeName {
     GruvboxLight,
     /// Light, cool.
     OneLight,
+    /// Dark, vivid.
+    Dracula,
+    /// Dark, cool.
+    OneDark,
+    /// Dark on pure black, for an OLED panel.
+    TrueBlack,
     /// Your terminal's own sixteen colours
     Terminal,
 }

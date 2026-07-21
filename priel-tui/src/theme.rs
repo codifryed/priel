@@ -44,12 +44,15 @@
 //! ## Where the palettes come from
 //!
 //! Published palettes, not invented ones: they are cheaper to get right, and a
-//! terminal user often already knows them. One deviation is made deliberately
-//! and always in the same direction. Every one of these palettes puts its
-//! comment grey below the contrast floor, because in an editor that grey marks
-//! text you are meant to skip. In priel `faint` carries the keyboard reference
-//! along the bottom row, which is how bindings are discovered, so it is
-//! lightened on a dark theme and darkened on a light one until it clears.
+//! terminal user often already knows them. Every deviation from what a palette
+//! publishes is deliberate, and each is recorded on the palette that made it
+//! with the ratio that forced it. Nearly all of them are the same deviation:
+//! an editor palette puts its comment grey below the contrast floor, because
+//! there that grey marks text you are meant to skip. In priel `faint` carries
+//! the keyboard reference along the bottom row, which is how bindings are
+//! discovered, so it is lightened on a dark theme and darkened on a light one
+//! until it clears - and where a palette publishes no second grey at all,
+//! `muted` is lightened out of the same one rather than invented beside it.
 
 use clap::ValueEnum as _;
 use ratatui::style::{Color, Style};
@@ -58,8 +61,8 @@ use crate::cli::ThemeName;
 
 /// The colours priel paints, one field per role.
 ///
-/// Add a field rather than reaching for a literal: the four palettes below then
-/// stop compiling until each has answered for the new role, which is the only
+/// Add a field rather than reaching for a literal: every palette below then
+/// stops compiling until each has answered for the new role, which is the only
 /// way a theme set stays complete.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
@@ -118,6 +121,9 @@ pub const OFFERED: &[ThemeName] = &[
     ThemeName::GruvboxDark,
     ThemeName::GruvboxLight,
     ThemeName::OneLight,
+    ThemeName::Dracula,
+    ThemeName::OneDark,
+    ThemeName::TrueBlack,
     ThemeName::Terminal,
 ];
 
@@ -156,6 +162,9 @@ impl Theme {
             ThemeName::GruvboxDark => GRUVBOX_DARK,
             ThemeName::GruvboxLight => GRUVBOX_LIGHT,
             ThemeName::OneLight => ONE_LIGHT,
+            ThemeName::Dracula => DRACULA,
+            ThemeName::OneDark => ONE_DARK,
+            ThemeName::TrueBlack => TRUE_BLACK,
         }
     }
 
@@ -332,6 +341,135 @@ const ONE_LIGHT: Theme = Theme {
     verdict_near: Color::Rgb(0x98, 0x68, 0x01),
     verdict_altered: Color::Rgb(0xca, 0x12, 0x43),
     verdict_unknown: Color::Rgb(0x8a, 0x8c, 0x94),
+};
+
+/// Dracula, by Zeno Rocha. Dark, and the most saturated palette on offer.
+///
+/// Published as one background and eleven colours, with **one foreground and
+/// one comment grey and nothing in between** - so the two steps priel wants
+/// below `text` are the comment lightened along its own hue rather than a
+/// second grey invented from nothing. Comment `#6272a4` measures 3.03:1, which
+/// clears the mark floor by three hundredths and is the thinnest `faint` in the
+/// set; `muted` is prose and needs 4.5. So `muted` is that comment at 4.97:1
+/// and `faint` at 3.56:1, which is where nord's sits.
+///
+/// Dracula gives Selection and Current Line the same value, so the highlighted
+/// row takes the accent as gruvbox-dark's does and `#44475a` becomes the raised
+/// chip a control is drawn on. `notice` is Orange rather than Yellow: Dracula's
+/// Yellow is a lime at hue 65 and would be read next to its Green at hue 135,
+/// which is the one distinction the fidelity grades cannot afford to lose.
+const DRACULA: Theme = Theme {
+    background: Color::Rgb(0x28, 0x2a, 0x36),
+    text: Color::Rgb(0xf8, 0xf8, 0xf2),
+    muted: Color::Rgb(0x8c, 0x98, 0xbc),
+    faint: Color::Rgb(0x6f, 0x7e, 0xab),
+    accent: Color::Rgb(0xbd, 0x93, 0xf9),
+    selection_fg: Color::Rgb(0x28, 0x2a, 0x36),
+    selection_bg: Color::Rgb(0xbd, 0x93, 0xf9),
+    control_fg: Color::Rgb(0xbd, 0x93, 0xf9),
+    control_bg: Color::Rgb(0x44, 0x47, 0x5a),
+    toggle_on_fg: Color::Rgb(0x28, 0x2a, 0x36),
+    toggle_on_bg: Color::Rgb(0x50, 0xfa, 0x7b),
+    active: Color::Rgb(0x50, 0xfa, 0x7b),
+    notice: Color::Rgb(0xff, 0xb8, 0x6c),
+    error: Color::Rgb(0xff, 0x55, 0x55),
+    favorite: Color::Rgb(0xff, 0x79, 0xc6),
+    queue: Color::Rgb(0x8b, 0xe9, 0xfd),
+    verdict_clean: Color::Rgb(0x50, 0xfa, 0x7b),
+    verdict_near: Color::Rgb(0xff, 0xb8, 0x6c),
+    verdict_altered: Color::Rgb(0xff, 0x55, 0x55),
+    verdict_unknown: Color::Rgb(0x6f, 0x7e, 0xab),
+};
+
+/// One Dark, from the Atom editor: the dark half of the pair `one-light` is the
+/// light half of, and the same roles read off the same variables.
+///
+/// Two deviations, both the lightening the module docs describe. mono-3, the
+/// comment grey, measures 2.32:1 and carries `faint` at 3.57:1; mono-2 measures
+/// 3.98:1, which is fine for a comment and short of the 4.5 `muted` owes a body
+/// of prose, and carries it at 4.72:1.
+///
+/// Where One Dark publishes two of a hue, the light sibling takes the darker
+/// and this one takes the lighter, which is the same judgement made from
+/// opposite ends: `error` is hue-5 rather than hue-5-2 (2.95:1 here, under the
+/// floor), and `notice` is hue-6-2 rather than the hue-6 `one-light` uses.
+/// `control_bg` is the theme's own raised surface - `lighten(@syntax-bg, 10%)`,
+/// what it paints a selected line with.
+const ONE_DARK: Theme = Theme {
+    background: Color::Rgb(0x28, 0x2c, 0x34),
+    text: Color::Rgb(0xab, 0xb2, 0xbf),
+    muted: Color::Rgb(0x90, 0x96, 0xa3),
+    faint: Color::Rgb(0x79, 0x81, 0x91),
+    accent: Color::Rgb(0x61, 0xaf, 0xef),
+    selection_fg: Color::Rgb(0x28, 0x2c, 0x34),
+    selection_bg: Color::Rgb(0x61, 0xaf, 0xef),
+    control_fg: Color::Rgb(0x61, 0xaf, 0xef),
+    control_bg: Color::Rgb(0x3e, 0x44, 0x51),
+    toggle_on_fg: Color::Rgb(0x28, 0x2c, 0x34),
+    toggle_on_bg: Color::Rgb(0x98, 0xc3, 0x79),
+    active: Color::Rgb(0x98, 0xc3, 0x79),
+    notice: Color::Rgb(0xe5, 0xc0, 0x7b),
+    error: Color::Rgb(0xe0, 0x6c, 0x75),
+    favorite: Color::Rgb(0xc6, 0x78, 0xdd),
+    queue: Color::Rgb(0x56, 0xb6, 0xc2),
+    verdict_clean: Color::Rgb(0x98, 0xc3, 0x79),
+    verdict_near: Color::Rgb(0xe5, 0xc0, 0x7b),
+    verdict_altered: Color::Rgb(0xe0, 0x6c, 0x75),
+    verdict_unknown: Color::Rgb(0x79, 0x81, 0x91),
+};
+
+/// True black: Modus Vivendi's colours on the `#000000` this theme is named
+/// for. The one to pick on an OLED panel, where a black pixel is an unlit pixel
+/// and the surface costs no light at all.
+///
+/// Named for the surface rather than the panel. `oled` would name the hardware,
+/// and the reason to want an unlit background outlives the display technology -
+/// a dark room, a projector, a photophobic reader; `black` on its own would sit
+/// in the list next to `terminal` and read as one of the sixteen ANSI names.
+/// `true-black` says the one thing that distinguishes it: not dark, `#000000`.
+///
+/// The palette is the only one here designed to a contrast standard rather than
+/// to a look. Protesilaos Stavrou's Modus themes ship with GNU Emacs and hold
+/// every foreground to 7:1 (WCAG AAA) against a `bg-main` that is already pure
+/// black, which is what makes them the honest source for this: nothing had to
+/// be moved to survive the drop to `#000000`, because that is where they were
+/// drawn.
+///
+/// **One deviation, and it is the only one in the set that goes down.**
+/// `fg-main` is `#ffffff`, which scores 21:1 - the highest ratio there is, and
+/// a known readability problem: at that luminance small glyphs bloom into the
+/// black around them, which is tiring over an album rather than a line. `text`
+/// is white at 90% instead, 16.83:1, still more than twice the AAA floor the
+/// palette was built to. No measurement can make that call - 21:1 is a perfect
+/// score - which is why the test guarding it asserts what the colour is *not*.
+///
+/// Nothing else needed a lift, which is what a palette built to 7:1 buys:
+/// `muted` is `fg-dim` unmodified at 7.28:1, and `faint` is `border` at 3.55:1,
+/// which is where nord's and gruvbox's sit. Modus publishes exactly one dim
+/// foreground, and the border is the step below it. The row backgrounds are its
+/// own too: `bg-region` is what it selects with, `bg-inactive` what it raises a
+/// surface with.
+const TRUE_BLACK: Theme = Theme {
+    background: Color::Rgb(0x00, 0x00, 0x00),
+    text: Color::Rgb(0xe6, 0xe6, 0xe6),
+    muted: Color::Rgb(0x98, 0x98, 0x98),
+    faint: Color::Rgb(0x64, 0x64, 0x64),
+    accent: Color::Rgb(0x00, 0xbc, 0xff),
+    selection_fg: Color::Rgb(0xe6, 0xe6, 0xe6),
+    selection_bg: Color::Rgb(0x5a, 0x5a, 0x5a),
+    control_fg: Color::Rgb(0x00, 0xbc, 0xff),
+    control_bg: Color::Rgb(0x30, 0x30, 0x30),
+    toggle_on_fg: Color::Rgb(0x00, 0x00, 0x00),
+    toggle_on_bg: Color::Rgb(0x44, 0xbc, 0x44),
+    active: Color::Rgb(0x44, 0xbc, 0x44),
+    notice: Color::Rgb(0xfe, 0xc4, 0x3f),
+    error: Color::Rgb(0xff, 0x5f, 0x59),
+    favorite: Color::Rgb(0xf7, 0x8f, 0xe7),
+    queue: Color::Rgb(0x00, 0xd3, 0xd0),
+    verdict_clean: Color::Rgb(0x44, 0xbc, 0x44),
+    verdict_near: Color::Rgb(0xfe, 0xc4, 0x3f),
+    verdict_altered: Color::Rgb(0xff, 0x5f, 0x59),
+    verdict_unknown: Color::Rgb(0x64, 0x64, 0x64),
 };
 
 #[cfg(test)]
@@ -516,6 +654,36 @@ mod tests {
         assert!(all().iter().any(|(_, t)| bright(t)), "no light theme");
         assert!(all().iter().any(|(_, t)| dark(t)), "no dark theme");
         assert!(dark(&Theme::default()), "the default is not a dark theme");
+    }
+
+    /// Goal: an OLED panel spends no light on a black pixel, so one palette
+    /// takes the surface all the way down - and that surface is the one pure
+    /// white must not be painted on. White on black blooms into the space
+    /// around each glyph, which is tiring over an album rather than a line, and
+    /// no contrast test can catch it: `#ffffff` on `#000000` scores 21:1, the
+    /// highest ratio there is. So this is the judgement the measurements cannot
+    /// make, written down as the one thing the text is not.
+    ///
+    /// Method: find the palette that takes the background to `#000000`, and
+    /// hold it to both halves - the text is not pure white, and it still clears
+    /// the 7:1 its own source palette was built to.
+    #[test]
+    fn the_true_black_palette_does_not_paint_pure_white_on_pure_black() {
+        let (name, t) = all()
+            .into_iter()
+            .find(|(_, t)| t.background == Color::Rgb(0, 0, 0))
+            .expect("one palette should take the surface to #000000");
+        assert_ne!(
+            t.text,
+            Color::Rgb(0xff, 0xff, 0xff),
+            "{name:?}: pure white on pure black is the readability problem \
+             true black exists to avoid, not a score to max out"
+        );
+        let ratio = contrast(t.text, t.background).expect("both are known values");
+        assert!(
+            ratio >= 7.0,
+            "{name:?}: text is {ratio:.2}:1, under WCAG AAA"
+        );
     }
 
     /// Goal: the renderer must not name a colour of its own. One
