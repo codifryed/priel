@@ -60,6 +60,12 @@ Where a seam does not exist yet, adding one is the preferred fix.
   reverse-engineering the assertions.
 - Cover the negative space too: malformed manifests, an empty queue, a filter matching nothing, a
   zero-length track. The API lies and the network truncates.
+- **A test binary can die on a signal instead of failing a test.** `cargo` then prints no `FAILED`
+  line and no assertion - only a non-zero exit and a `signal: 11` buried in its error. Grepping the
+  log for a failing test finds nothing, which reads as "could not reproduce" and is how a
+  use-after-free across the mpv FFI boundary survived a day and six core dumps. If the gate fails
+  with nothing named, run `make check-signals`, and look at `coredumpctl list | grep priel` before
+  concluding anything. The stack trace names the faulting frame; guessing does not.
 
 ## Correctness
 
