@@ -476,3 +476,71 @@ question about where something lives, which issue #15 explicitly reserved.
 6. Findings 7, 10, 11, 12 as taste, in any order or not at all.
 </content>
 </invoke>
+
+---
+
+## Settled decisions
+
+Worked through with the maintainer question by question. These supersede the
+"left for a decision" items above. **They are recorded here rather than only in
+the issue, because `tea` truncates every comment body at about 80 characters in
+all of its output formats including JSON - so a decision that lives only in a
+comment cannot be read by anyone working from the tracker.** Two implementations
+proceeded partly blind before that was noticed.
+
+1. **The row is a verdict; the overlay is the report.** The bottom row had grown
+   to ~108 columns of badges before a single key hint, so at 80 columns every
+   hint was already being dropped. The row answers *whether*; `D` answers *why*.
+
+2. **The row keeps the verdict and the device readout; access moved to the
+   overlay.** Access is a session-long setting rather than something that
+   changes per track.
+
+3. **One short vocabulary, no numbers**: `✓ bit-perfect`, `≈ near bit-perfect`,
+   `⚠ resampled`, `⚠ truncated`. The rates are already on screen twice - the
+   source badge carries the track, the device readout carries the output - so
+   repeating them is redundant. What cannot be derived at a glance is *which
+   kind* of alteration.
+
+4. **No remedy on the row.** Dropping the inline `0 for unity` is not about
+   width: that remedy only ever fixed priel's own volume, and once the sink is a
+   possible cause an inline remedy would be actively wrong.
+
+5. **`D` is a sectioned output report**, each section rendering on its own
+   evidence. It previously short-circuited entirely on the direct path, which
+   would have hidden the volume section from exclusive users.
+
+6. **Grade on what was read, and label it**: `✓?` when a stage exists and could
+   not be read. Follows the `DAC`/`OUT` precedent - still grade, but say what the
+   grade rests on.
+
+7. **Absent is not unreadable.** A stage that cannot exist counts as fully
+   evidenced, so the direct path keeps a clean `✓`. Without this the cleanest
+   chain the player can produce would carry a permanent question mark.
+
+8. **The partial mark is a glyph, not a colour**, so it survives a light theme,
+   a dark theme, a monochrome terminal, and the red/green deficiency.
+
+9. **More detail on the main screen.** A row was a fixed 72-cell block: 116
+   cells blank at 200 columns, while below 74 columns quality and duration were
+   silently clipped. Progressive disclosure by width, documented drop order
+   (album → artist → tier), duration pinned right.
+
+10. **Now-playing becomes a side panel at 120 columns and up**, freeing two of
+    the three chrome lines. Below that, the three-line bottom block, unchanged.
+
+11. **Zebra striping is a theme role, and `terminal` opts out** - it inherits a
+    palette priel cannot read, so guessing a stripe there is the overstatement
+    that theme exists to avoid. Precedence is cursor > playing > stripe.
+
+12. **The active tab carries a background**, herdr-style, and the title carries
+    the path (`Playlists › Deep Cuts`).
+
+13. **The list title's per-view key hints are deleted.** They were clipped
+    mid-word at 80 columns, deleting a binding, and duplicated the bottom row.
+
+14. **Truncation measures display width**, via `unicode-width` named directly -
+    already in the tree via ratatui, so no new crate compiles.
+
+15. **The verdict badge opens the report when clicked**, through the same method
+    `[D]` uses.
