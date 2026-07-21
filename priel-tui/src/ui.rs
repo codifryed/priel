@@ -2255,7 +2255,11 @@ pub(crate) fn device_readout(s: &priel_player::PlaybackStatus) -> String {
     } else {
         "?".to_string()
     };
-    format!(" {label} {fmt} · {rate}")
+    // No leading space, exactly as the `OUT —` case above returns none: the
+    // callers add their own. One branch that padded itself and one that did not
+    // moved the whole bottom row - and every hit box on it - one cell right the
+    // moment an output opened.
+    format!("{label} {fmt} · {rate}")
 }
 
 /// How the output device is being held.
@@ -4542,5 +4546,34 @@ mod tests {
                 "and nothing behind the {name} is clickable"
             );
         }
+    }
+
+    // ---- readability: alignment, truncation and one spelling per fact ----
+
+    /// The leading blanks on a line, which is where its content starts.
+    fn indent(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    #[test]
+    fn the_output_badge_starts_in_the_same_column_whether_or_not_one_is_open() {
+        // Goal: the bottom row must not move when an output opens.
+        // `device_readout` returned a leading space in one case and not in the
+        // other, so the verdict, the activity slot and every key hint - and
+        // every one of their hit boxes - stepped one cell right the moment
+        // playback started.
+        // Method: render both states and compare where the row's content
+        // begins.
+        let mut sc = screen();
+        let idle = draw(&mut sc.app, 130, 12);
+        let idle_row = idle.last().cloned().unwrap_or_default();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        let open = draw(&mut sc.app, 130, 12);
+        let open_row = open.last().cloned().unwrap_or_default();
+        assert_eq!(
+            indent(&idle_row),
+            indent(&open_row),
+            "idle: {idle_row}\nopen: {open_row}"
+        );
     }
 }
