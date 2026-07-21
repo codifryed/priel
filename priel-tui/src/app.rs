@@ -76,7 +76,7 @@ pub enum View {
 pub enum Focus {
     /// The browse list: whatever [`View`] is showing.
     List,
-    /// The play queue, in the now-playing panel.
+    /// The play queue, in its column beside the list.
     Queue,
 }
 
@@ -189,7 +189,7 @@ pub enum Click {
     Seek(f64),
     /// A loaded list row, by index into the visible list.
     Row(usize),
-    /// A queue entry in the now-playing panel, by index into the queue.
+    /// A queue entry in the queue's own column, by index into the queue.
     ///
     /// An index into `queue` rather than into a visible list: the queue has no
     /// filter of its own, and it is the one list on screen whose order is the
@@ -272,8 +272,8 @@ pub enum Hit {
     CycleView,
     /// Hand the keyboard to the other of the two lists.
     ///
-    /// Only ever on screen where there are two: the panel that holds the queue
-    /// arrives at 120 columns, and below that this control does not appear.
+    /// Only ever on screen where there are two: the queue's column arrives at
+    /// 120 columns, and below that this control does not appear.
     CycleFocus,
     Help,
     Log,
@@ -321,6 +321,12 @@ pub enum Hit {
     ConfirmYes,
     /// Leave things as they are.
     ConfirmNo,
+    /// Show or hide the queue's column beside the list.
+    ///
+    /// Registered only where there is a column to act on, which is the same
+    /// rule `x` follows in the output picker: a control that would do nothing
+    /// where it was clicked is not a control.
+    QueueColumn,
     Quit,
 }
 
@@ -834,9 +840,17 @@ pub struct App {
 
     pub list_inner: Rect,
     /// Where the queue's entries were painted, or a zero rect where there is no
-    /// panel to paint them in. Written by the renderer every frame, and the one
-    /// thing that says whether there is a second region at all.
+    /// column to paint them in. Written by the renderer every frame, and the
+    /// one thing that says whether there is a second region at all.
     pub queue_inner: Rect,
+    /// Whether the queue is given its column when the terminal is wide enough.
+    ///
+    /// An *intent*, not a geometry: the renderer still asks the width, and
+    /// `queue_inner` is still the only answer to whether there is a region on
+    /// screen. Kept for the session and never written to the settings file -
+    /// the file holds what a flag can set, and this is a gesture rather than a
+    /// setting.
+    pub queue_shown: bool,
     pub progress_rect: Rect,
     /// Clickable regions, rebuilt by the renderer every frame.
     pub hits: Vec<(Rect, Hit)>,
@@ -1002,6 +1016,7 @@ impl App {
             should_quit: false,
             list_inner: Rect::default(),
             queue_inner: Rect::default(),
+            queue_shown: true,
             progress_rect: Rect::default(),
             hits: Vec::new(),
             last_click: None,
@@ -2586,7 +2601,8 @@ impl App {
     /// Derived rather than stored, and that is what keeps the width out of the
     /// key handler: the queue can only hold the keyboard where the renderer
     /// published a region for it, and it publishes one only in the now-playing
-    /// panel, which exists at 120 columns and up. A terminal narrowed under the
+    /// column, which exists at 120 columns and up unless it has been folded
+    /// away. A terminal narrowed under the
     /// listener's fingers hands the keys back on the next frame with nothing
     /// having to notice.
     #[must_use]
@@ -2602,15 +2618,19 @@ impl App {
     /// for a click alike.
     fn cycle_focus(&mut self) {
         if self.queue_inner.height == 0 {
-            // Two reasons there is nothing to hand the keyboard to, and they
+            // Three reasons there is nothing to hand the keyboard to, and they
             // want different things of the listener. Naming the width on a
             // two-hundred-column terminal with an empty queue would be telling
-            // them to fix something that is not wrong.
+            // them to fix something that is not wrong, and naming it while the
+            // column is merely folded away would send them to resize a terminal
+            // that is already wide enough.
             self.notice = Some(
                 if self.queue.is_empty() {
                     "Nothing is queued yet: press Enter on a track."
+                } else if !self.queue_shown {
+                    "The queue column is hidden: press W to bring it back."
                 } else {
-                    "The queue needs the now-playing panel: 120 columns, and rows to spare."
+                    "The queue needs a terminal 120 columns wide, and rows to spare."
                 }
                 .into(),
             );
@@ -2620,6 +2640,18 @@ impl App {
             Focus::List => Focus::Queue,
             Focus::Queue => Focus::List,
         });
+    }
+
+    /// Show or hide the queue's column. **The one way in**, for the key and for
+    /// the header control alike.
+    ///
+    /// It changes an intent and nothing else. Whether there is a region on
+    /// screen is still the renderer's answer, published as `queue_inner`, so
+    /// hiding the column hands the keyboard back on the next frame by exactly
+    /// the route narrowing the terminal does - there is no second path to keep
+    /// in step with that one.
+    fn toggle_queue_column(&mut self) {
+        self.queue_shown = !self.queue_shown;
     }
 
     /// Point the keyboard at a region, clamping the cursor it finds there.
@@ -2729,7 +2761,7 @@ impl App {
     /// keyboard there.
     ///
     /// Called from the two places `queue_pos` moves and nowhere else, so the
-    /// panel is a readout of where the music is right up until somebody starts
+    /// column is a readout of where the music is right up until somebody starts
     /// driving it - and from that moment the music stops moving the cursor out
     /// from under their fingers.
     fn follow_queue_cursor(&mut self) {
@@ -2872,7 +2904,7 @@ impl App {
     ///
     /// What the legend beside the queue's heading is drawn on: a mark is
     /// explained where there is a mark to explain and nowhere else, because a
-    /// thirty-two cell panel has no room for a glossary of what is not there.
+    /// thirty-four cell column has no room for a glossary of what is not there.
     #[must_use]
     pub fn queue_has_suggestions(&self) -> bool {
         self.radio_from
@@ -4232,6 +4264,11 @@ impl App {
             KeyCode::Char('N') => self.new_playlist(),
             KeyCode::Char('R') => self.rename_selected_playlist(),
             KeyCode::Char('X') => self.remove_selected(),
+            // The window key's shifted sibling: `Ctrl-W` moves the keyboard
+            // between the two regions and this one takes the second region
+            // away, so the pair names the same thing rather than spending a
+            // second idiom on it.
+            KeyCode::Char('W') => self.toggle_queue_column(),
             _ => {}
         }
     }
@@ -4499,6 +4536,7 @@ impl App {
             Hit::Reload => self.reload_view(),
             Hit::CycleView => self.cycle_view(),
             Hit::CycleFocus => self.cycle_focus(),
+            Hit::QueueColumn => self.toggle_queue_column(),
             Hit::Help => self.open_help(),
             Hit::Log => self.open_log(),
             Hit::Graph => self.open_graph(),
@@ -10858,7 +10896,7 @@ mod tests {
         assert_eq!(r.app.prompt_text.chars().count(), PLAYLIST_NAME_MAX);
     }
 
-    // ---- the queue in the panel: a second focusable region ----
+    // ---- the queue in its column: a second focusable region ----
 
     /// The keyboard's way between the two lists. Vim's own window prefix, and
     /// with exactly two regions the prefix *is* the move.
@@ -10869,10 +10907,10 @@ mod tests {
     /// Put a queue region on screen without rendering one.
     ///
     /// `focus` answers `Queue` only where the renderer published a region to
-    /// focus, which is what makes "there is no panel below 120 columns" a fact
+    /// focus, which is what makes "there is no column below 120 columns" a fact
     /// about geometry rather than a second breakpoint in the key handler. A
     /// test that is not rendering says so by hand.
-    fn with_panel(app: &mut App) {
+    fn with_column(app: &mut App) {
         app.queue_inner = Rect {
             x: 84,
             y: 10,
@@ -10894,7 +10932,7 @@ mod tests {
         // rather than latching - with two regions the window prefix is the
         // whole move. Method: press it twice and read the focus after each.
         let mut r = rig();
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         assert_eq!(r.app.focus(), Focus::List, "the list starts with the keys");
         r.app.on_key(ctrl('w'));
         assert_eq!(r.app.focus(), Focus::Queue);
@@ -10903,8 +10941,8 @@ mod tests {
     }
 
     #[test]
-    fn without_the_panel_there_is_nothing_to_focus_and_the_key_says_so() {
-        // Goal: below 120 columns the panel is not on screen, so there is no
+    fn without_the_column_there_is_nothing_to_focus_and_the_key_says_so() {
+        // Goal: below 120 columns the column is not on screen, so there is no
         // second region - and the key must leave the list driving rather than
         // moving the keyboard somewhere invisible. Method: press it with no
         // region published and check both the focus and what the user is told.
@@ -10920,13 +10958,13 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_narrowed_under_the_panel_hands_the_keyboard_back() {
+    fn a_terminal_narrowed_under_the_column_hands_the_keyboard_back() {
         // Goal: the region can go away under the listener's fingers - a resize
-        // takes the panel with it - and j must not then move something nobody
+        // takes the column with it - and j must not then move something nobody
         // can see. Method: focus the queue, take the region away as a narrow
         // frame does, and check the browse list moves again.
         let mut r = rig();
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X")];
         queued(&mut r, 4);
         r.app.on_key(ctrl('w'));
@@ -10942,7 +10980,7 @@ mod tests {
         // idiom rather than two. Method: move with the list focused, focus the
         // queue, move again, and check each cursor moved only on its own turn.
         let mut r = rig();
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X"), track(3, "C", "X")];
         queued(&mut r, 5);
         r.app.on_key(key('j'));
@@ -10963,7 +11001,7 @@ mod tests {
         // scrolling idiom would be its own bug. Method: send them with the
         // queue focused and check the queue's cursor, not the list's, moved.
         let mut r = rig();
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X")];
         queued(&mut r, 5);
         r.app.on_key(ctrl('w'));
@@ -10981,7 +11019,7 @@ mod tests {
         // queue, walk to the third entry, press Enter, and check the queue
         // moved there and that entry was asked for.
         let mut r = rig();
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         queued(&mut r, 5);
         r.app.on_key(ctrl('w'));
         r.app.on_key(key('j'));
@@ -10999,12 +11037,12 @@ mod tests {
 
     #[test]
     fn the_queue_cursor_follows_the_music_until_the_listener_takes_it() {
-        // Goal: the panel is a readout before it is a list, so while nobody is
+        // Goal: the column is a readout before it is a list, so while nobody is
         // driving it the cursor stays on what is playing - and the moment it is
         // driven, the music must stop dragging it about under the listener's
         // fingers. Method: advance the queue with each focus in turn.
         let mut r = rig();
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         queued(&mut r, 6);
         r.app.load_fresh(3);
         assert_eq!(r.app.queue_selected, 3, "the cursor came along");
@@ -11060,7 +11098,7 @@ mod tests {
         // belongs to what is in the speakers whatever has the keyboard.
         // Method: press it with the queue focused.
         let mut r = rig();
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         queued(&mut r, 3);
         r.app.load_fresh(1);
         r.app.on_key(ctrl('w'));
@@ -11082,7 +11120,7 @@ mod tests {
             width: 40,
             height: 6,
         };
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X")];
         queued(&mut r, 4);
         r.app.on_mouse(click(86, 11));
@@ -11099,7 +11137,7 @@ mod tests {
         // on the list is, so there is one place where a cell becomes an intent.
         // Method: ask what a cell inside and a cell past the entries mean.
         let mut r = rig();
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         queued(&mut r, 3);
         assert_eq!(r.app.click_at(86, 10), Click::QueueRow(0));
         assert_eq!(r.app.click_at(86, 12), Click::QueueRow(2));
@@ -11116,7 +11154,7 @@ mod tests {
         // to put the cursor there, a second to play - so there is one gesture
         // to learn. Method: click the same entry twice.
         let mut r = rig();
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         queued(&mut r, 4);
         let _ = requests(&r);
         r.app.on_mouse(click(86, 12));
@@ -11141,7 +11179,7 @@ mod tests {
             width: 40,
             height: 6,
         };
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         r.app.favorites = vec![track(9, "A", "X"), track(8, "B", "X")];
         queued(&mut r, 4);
         r.app.on_mouse(click(3, 10));
@@ -11164,7 +11202,7 @@ mod tests {
             width: 40,
             height: 6,
         };
-        with_panel(&mut r.app);
+        with_column(&mut r.app);
         r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X")];
         queued(&mut r, 5);
         r.app.on_mouse(wheel_down(86, 11));
@@ -11177,11 +11215,11 @@ mod tests {
 
     #[test]
     fn an_empty_queue_says_it_is_empty_rather_than_blaming_the_width() {
-        // Goal: there are two reasons there is no queue to focus - the terminal
-        // is too narrow for the panel, or nothing has been queued yet - and a
-        // key that named the width on a two-hundred-column terminal would be
-        // telling the listener to fix something that is not wrong. Method: ask
-        // for the queue with the panel up and nothing in it.
+        // Goal: there are three reasons there is no queue to focus - the
+        // terminal is too narrow, the column is folded away, or nothing has been
+        // queued yet - and a key that named the width on a two-hundred-column
+        // terminal would be telling the listener to fix something that is not
+        // wrong. Method: ask for the queue with nothing in it.
         let mut r = rig();
         r.app.on_key(ctrl('w'));
         let said = r.app.notice.clone().unwrap_or_default();
@@ -11193,5 +11231,55 @@ mod tests {
             !said.contains("120"),
             "an empty queue was blamed on the width: {said:?}"
         );
+    }
+
+    #[test]
+    fn a_folded_column_is_named_as_such_rather_than_blamed_on_the_width() {
+        // Goal: the third reason. A listener who folded the column away is on a
+        // terminal that is already wide enough, so telling them to widen it
+        // sends them to fix what is not broken - the answer is the key that
+        // brings it back. Method: hide it with a queue in hand, then ask for
+        // the queue.
+        let mut r = rig();
+        queued(&mut r, 4);
+        r.app.on_key(key('W'));
+        r.app.on_key(ctrl('w'));
+        let said = r.app.notice.clone().unwrap_or_default();
+        assert!(
+            said.contains('W'),
+            "the key that brings it back is not named: {said:?}"
+        );
+        assert!(
+            !said.contains("120"),
+            "a folded column was blamed on the width: {said:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_queue_is_said_before_anything_about_the_column() {
+        // Goal: the two reasons can hold at once, and only one of them is worth
+        // acting on - bringing an empty column back shows nothing. Method: fold
+        // the column away with nothing queued and read which answer came out.
+        let mut r = rig();
+        r.app.on_key(key('W'));
+        r.app.on_key(ctrl('w'));
+        let said = r.app.notice.clone().unwrap_or_default();
+        assert!(
+            said.contains("Enter"),
+            "the empty queue was not the answer: {said:?}"
+        );
+    }
+
+    #[test]
+    fn folding_the_column_away_and_back_is_one_key() {
+        // Goal: one binding does both halves, so there is no state a listener
+        // can get into where the key they pressed will not undo itself.
+        // Method: press it twice and read the intent after each.
+        let mut r = rig();
+        assert!(r.app.queue_shown, "the column starts shown");
+        r.app.on_key(key('W'));
+        assert!(!r.app.queue_shown);
+        r.app.on_key(key('W'));
+        assert!(r.app.queue_shown);
     }
 }

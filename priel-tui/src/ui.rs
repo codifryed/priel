@@ -75,7 +75,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Hit boxes are geometry, so the renderer owns them. Rebuilt every frame.
     app.hits.clear();
     header(f, app, rows[0]);
-    if f.area().width >= WIDE_COLS {
+    if f.area().width >= WIDE_COLS && app.queue_shown {
         let cols =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(QUEUE_COLS)]).split(rows[1]);
         // The queue first, because it is what publishes its own rect and both
@@ -727,6 +727,10 @@ const HELP_LEFT: &[(&str, &[HelpRow])] = &[
             // The keys above all act on whichever of the two lists this one
             // last pointed at, which is why it sits at the end of them.
             row(&[("Ctrl-W", Some(Hit::CycleFocus))], "browse list / queue"),
+            // Its shifted sibling, and the only place either is named at an
+            // ordinary width: the bottom row gives the focus hint up first and
+            // never had room for this one.
+            row(&[("W", Some(Hit::QueueColumn))], "show / hide the queue"),
         ],
     ),
     (
@@ -1627,6 +1631,7 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     // Not `continue_radio`: a control lit up for something a repeating queue
     // will never reach is a control telling the listener a lie.
     let carrying_on = app.radio_follows();
+    let queue_column = app.queue_shown;
     let queue = app.queue_indicator();
     let from_radio = app.playing_from_radio();
     let filtering = app.mode == Mode::Filter;
@@ -1697,6 +1702,17 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     // codepoints: those all have emoji presentation, and an emoji font paints
     // them two cells wide while unicode-width calls them one.
     bar.button(" ◐ ", Hit::Themes, t.control());
+    // Last of that cluster, because it is the third thing about the screen
+    // rather than about the playback. Drawn only where there is a column to
+    // act on: below the breakpoint it would be a control that did nothing
+    // where it was clicked, which is the rule `x` follows in the picker.
+    //
+    // A ruled square rather than any of the list or panel codepoints, which
+    // are emoji: an emoji font paints those two cells wide while unicode-width
+    // calls them one, and every hit box after it would move.
+    if area.width >= WIDE_COLS {
+        bar.button(" ▤ ", Hit::QueueColumn, t.toggle(queue_column));
+    }
     bar.label("  ", Style::default());
 
     if let Some(q) = queue {
@@ -4798,11 +4814,20 @@ mod tests {
     fn a_click_on_the_painted_bar_seeks_to_the_fraction_it_landed_on() {
         // Goal: `progress_rect` is written by the renderer and read by the click
         // handler, and a click that lands on the wrong seconds is invisible in a
-        // screenshot. The bar moves between the two layouts, so both sides of
-        // the breakpoint are checked. Method: render a real frame, read the
-        // cells the rect covers, then ask what a click on a known cell means.
-        for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30)] {
-            let mut sc = screen();
+        // screenshot. The bar has moved between layouts twice now, so every
+        // layout there is gets asked: no column, a column, and a column the
+        // listener collapsed. Method: render a real frame, read the cells the
+        // rect covers, then ask what a click on a known cell means.
+        for (w, h, collapsed) in [
+            (80u16, 24u16, false),
+            (WIDE_COLS, 30, false),
+            (WIDE_COLS, 30, true),
+            (200, 40, false),
+        ] {
+            let mut sc = queued(6, 2);
+            if collapsed {
+                sc.app.on_key(collapse());
+            }
             sc.app.now_playing = Some(track(1, "Blue in Green"));
             // The listing's length is what a seek is a fraction of, so the
             // track says 200s and mpv is left believing something else - which
@@ -4814,7 +4839,7 @@ mod tests {
             assert!(
                 bar.contains("0:00 / 3:20"),
                 "the rect must cover the bar that was painted, not a row beside \
-                 it: {bar:?} at {w}x{h}"
+                 it: {bar:?} at {w}x{h}, collapsed={collapsed}"
             );
 
             let pr = sc.app.progress_rect;
@@ -5057,6 +5082,122 @@ mod tests {
         let wide = sc.app.list_inner.height;
 
         assert_eq!(wide, narrow, "the block changed height with the terminal");
+    }
+
+    // ---- collapsing the column ----
+
+    /// The key that hides the column and brings it back.
+    fn collapse() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('W'), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn the_column_is_shown_by_default_and_the_key_gives_the_width_back() {
+        // Goal: a wide terminal shows the queue without being asked, and one
+        // key takes the column away and returns it - a listener who wants the
+        // whole width for the list has to be able to say so. Method: render at
+        // the breakpoint, press it, render again and read both rects.
+        let mut sc = queued(6, 2);
+        let _ = draw(&mut sc.app, WIDE_COLS, 30);
+        assert!(
+            sc.app.queue_inner.height > 0,
+            "the column is not shown by default"
+        );
+
+        sc.app.on_key(collapse());
+        let out = draw(&mut sc.app, WIDE_COLS, 30).join("\n");
+        assert_eq!(
+            sc.app.queue_inner,
+            Rect::default(),
+            "a collapsed column left a clickable rect behind"
+        );
+        assert_eq!(
+            sc.app.list_inner.width,
+            WIDE_COLS - 2,
+            "the list did not take the width back"
+        );
+        assert!(!out.contains("Queue "), "the column is still drawn: {out}");
+
+        sc.app.on_key(collapse());
+        let _ = draw(&mut sc.app, WIDE_COLS, 30);
+        assert!(
+            sc.app.queue_inner.height > 0,
+            "the same key did not bring it back"
+        );
+    }
+
+    #[test]
+    fn an_empty_queue_is_a_box_with_nothing_to_drive() {
+        // Goal: the column is there before anything is queued, because that is
+        // where a queue will appear - but there is nothing in it to move a
+        // cursor through, so it must publish no region. Method: render with an
+        // empty queue and read both the words and the rect.
+        let mut sc = screen();
+        let out = draw(&mut sc.app, WIDE_COLS, 30).join("\n");
+        assert!(
+            out.contains("Nothing queued yet"),
+            "an empty column says nothing at all: {out}"
+        );
+        assert_eq!(
+            sc.app.queue_inner,
+            Rect::default(),
+            "an empty queue published a region the keyboard could be handed to"
+        );
+    }
+
+    #[test]
+    fn the_header_control_collapses_the_column_where_it_was_painted() {
+        // Goal: the key and the pointer run one method, and the control's hit
+        // box is the cells it was painted on. Method: read the glyph out of the
+        // rect the renderer registered, then click that rect.
+        let mut sc = queued(6, 2);
+        assert_eq!(painted(&mut sc.app, WIDE_COLS, 30, Hit::QueueColumn), " ▤ ");
+        click_hit(&mut sc.app, Hit::QueueColumn);
+        let _ = draw(&mut sc.app, WIDE_COLS, 30);
+        assert_eq!(
+            sc.app.queue_inner,
+            Rect::default(),
+            "the control did not hide the column"
+        );
+    }
+
+    #[test]
+    fn there_is_no_column_control_where_there_is_no_column() {
+        // Goal: a control that would do nothing where it was clicked is not a
+        // control, and below the breakpoint there is no column to hide. Method:
+        // render narrow and look for the hit box.
+        let mut sc = queued(6, 2);
+        let _ = draw(&mut sc.app, WIDE_COLS - 1, 30);
+        assert!(
+            !sc.app.hits.iter().any(|(_, h)| *h == Hit::QueueColumn),
+            "the header offered a control for a column that is not there"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_column_is_not_focusable_and_not_clickable() {
+        // Goal: hiding the column must take the keyboard and the pointer with
+        // it - a queue that still answers `j` or a click while nothing of it is
+        // on screen is worse than no queue at all. Method: focus the queue,
+        // collapse it, and ask both questions of the cells it was drawn in.
+        let mut sc = queued(6, 0);
+        let _ = draw(&mut sc.app, WIDE_COLS, 30);
+        sc.app
+            .on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(sc.app.focus(), Focus::Queue, "the queue took the keyboard");
+        let was = sc.app.queue_inner;
+
+        sc.app.on_key(collapse());
+        let _ = draw(&mut sc.app, WIDE_COLS, 30);
+        assert_eq!(
+            sc.app.focus(),
+            Focus::List,
+            "the keyboard stayed on a column that is not there"
+        );
+        assert!(
+            !matches!(sc.app.click_at(was.x + 2, was.y + 1), Click::QueueRow(_)),
+            "a click landed on a queue entry that was not drawn"
+        );
     }
 
     #[test]
