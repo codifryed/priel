@@ -123,6 +123,7 @@ pub const OFFERED: &[ThemeName] = &[
     ThemeName::OneLight,
     ThemeName::Dracula,
     ThemeName::OneDark,
+    ThemeName::TrueBlack,
     ThemeName::Terminal,
 ];
 
@@ -163,6 +164,7 @@ impl Theme {
             ThemeName::OneLight => ONE_LIGHT,
             ThemeName::Dracula => DRACULA,
             ThemeName::OneDark => ONE_DARK,
+            ThemeName::TrueBlack => TRUE_BLACK,
         }
     }
 
@@ -416,6 +418,60 @@ const ONE_DARK: Theme = Theme {
     verdict_unknown: Color::Rgb(0x79, 0x81, 0x91),
 };
 
+/// True black: Modus Vivendi's colours on the `#000000` this theme is named
+/// for. The one to pick on an OLED panel, where a black pixel is an unlit pixel
+/// and the surface costs no light at all.
+///
+/// Named for the surface rather than the panel. `oled` would name the hardware,
+/// and the reason to want an unlit background outlives the display technology -
+/// a dark room, a projector, a photophobic reader; `black` on its own would sit
+/// in the list next to `terminal` and read as one of the sixteen ANSI names.
+/// `true-black` says the one thing that distinguishes it: not dark, `#000000`.
+///
+/// The palette is the only one here designed to a contrast standard rather than
+/// to a look. Protesilaos Stavrou's Modus themes ship with GNU Emacs and hold
+/// every foreground to 7:1 (WCAG AAA) against a `bg-main` that is already pure
+/// black, which is what makes them the honest source for this: nothing had to
+/// be moved to survive the drop to `#000000`, because that is where they were
+/// drawn.
+///
+/// **One deviation, and it is the only one in the set that goes down.**
+/// `fg-main` is `#ffffff`, which scores 21:1 - the highest ratio there is, and
+/// a known readability problem: at that luminance small glyphs bloom into the
+/// black around them, which is tiring over an album rather than a line. `text`
+/// is white at 90% instead, 16.83:1, still more than twice the AAA floor the
+/// palette was built to. No measurement can make that call - 21:1 is a perfect
+/// score - which is why the test guarding it asserts what the colour is *not*.
+///
+/// Nothing else needed a lift, which is what a palette built to 7:1 buys:
+/// `muted` is `fg-dim` unmodified at 7.28:1, and `faint` is `border` at 3.55:1,
+/// which is where nord's and gruvbox's sit. Modus publishes exactly one dim
+/// foreground, and the border is the step below it. The row backgrounds are its
+/// own too: `bg-region` is what it selects with, `bg-inactive` what it raises a
+/// surface with.
+const TRUE_BLACK: Theme = Theme {
+    background: Color::Rgb(0x00, 0x00, 0x00),
+    text: Color::Rgb(0xe6, 0xe6, 0xe6),
+    muted: Color::Rgb(0x98, 0x98, 0x98),
+    faint: Color::Rgb(0x64, 0x64, 0x64),
+    accent: Color::Rgb(0x00, 0xbc, 0xff),
+    selection_fg: Color::Rgb(0xe6, 0xe6, 0xe6),
+    selection_bg: Color::Rgb(0x5a, 0x5a, 0x5a),
+    control_fg: Color::Rgb(0x00, 0xbc, 0xff),
+    control_bg: Color::Rgb(0x30, 0x30, 0x30),
+    toggle_on_fg: Color::Rgb(0x00, 0x00, 0x00),
+    toggle_on_bg: Color::Rgb(0x44, 0xbc, 0x44),
+    active: Color::Rgb(0x44, 0xbc, 0x44),
+    notice: Color::Rgb(0xfe, 0xc4, 0x3f),
+    error: Color::Rgb(0xff, 0x5f, 0x59),
+    favorite: Color::Rgb(0xf7, 0x8f, 0xe7),
+    queue: Color::Rgb(0x00, 0xd3, 0xd0),
+    verdict_clean: Color::Rgb(0x44, 0xbc, 0x44),
+    verdict_near: Color::Rgb(0xfe, 0xc4, 0x3f),
+    verdict_altered: Color::Rgb(0xff, 0x5f, 0x59),
+    verdict_unknown: Color::Rgb(0x64, 0x64, 0x64),
+};
+
 #[cfg(test)]
 mod tests {
     use super::{Theme, ThemeName};
@@ -598,6 +654,36 @@ mod tests {
         assert!(all().iter().any(|(_, t)| bright(t)), "no light theme");
         assert!(all().iter().any(|(_, t)| dark(t)), "no dark theme");
         assert!(dark(&Theme::default()), "the default is not a dark theme");
+    }
+
+    /// Goal: an OLED panel spends no light on a black pixel, so one palette
+    /// takes the surface all the way down - and that surface is the one pure
+    /// white must not be painted on. White on black blooms into the space
+    /// around each glyph, which is tiring over an album rather than a line, and
+    /// no contrast test can catch it: `#ffffff` on `#000000` scores 21:1, the
+    /// highest ratio there is. So this is the judgement the measurements cannot
+    /// make, written down as the one thing the text is not.
+    ///
+    /// Method: find the palette that takes the background to `#000000`, and
+    /// hold it to both halves - the text is not pure white, and it still clears
+    /// the 7:1 its own source palette was built to.
+    #[test]
+    fn the_true_black_palette_does_not_paint_pure_white_on_pure_black() {
+        let (name, t) = all()
+            .into_iter()
+            .find(|(_, t)| t.background == Color::Rgb(0, 0, 0))
+            .expect("one palette should take the surface to #000000");
+        assert_ne!(
+            t.text,
+            Color::Rgb(0xff, 0xff, 0xff),
+            "{name:?}: pure white on pure black is the readability problem \
+             true black exists to avoid, not a score to max out"
+        );
+        let ratio = contrast(t.text, t.background).expect("both are known values");
+        assert!(
+            ratio >= 7.0,
+            "{name:?}: text is {ratio:.2}:1, under WCAG AAA"
+        );
     }
 
     /// Goal: the renderer must not name a colour of its own. One
