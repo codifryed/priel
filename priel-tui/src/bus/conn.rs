@@ -44,7 +44,25 @@ use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 
-use super::wire::{Serials, WireError};
+use super::wire::{
+    Arg, Endian, Message, MessageType, Serials, Value, WireError, frame_len, marshal, parse,
+};
+
+/// The bus's own name, path and interface. Every call in this module is to
+/// these three, because the bus is the only peer priel talks to unprompted.
+const BUS_NAME: &str = "org.freedesktop.DBus";
+const BUS_PATH: &str = "/org/freedesktop/DBus";
+
+/// Spec 0.43 `DBUS_NAME_FLAG_DO_NOT_QUEUE`.
+///
+/// priel wants the name now or wants to be told it cannot have it. Standing in
+/// the queue would mean the name arriving whenever the current owner exits,
+/// with nothing watching for the signal that says so.
+const NAME_FLAG_DO_NOT_QUEUE: u32 = 0x4;
+
+/// The most reads one reply may take. At the socket's read timeout this bounds
+/// a bus that accepted a call and then went quiet.
+const MAX_REPLY_READS: usize = 100;
 
 /// How much of one read is taken at a time. A message priel is sent is a few
 /// hundred bytes, so this is a ceiling rather than a size to tune.
@@ -129,6 +147,16 @@ enum Fill {
     Idle,
     /// The peer hung up.
     Closed,
+}
+
+/// What the bus said about a name priel asked for.
+///
+/// `Taken` is not an error: spec 0.43 provides a second spelling for exactly
+/// this case, and a player that is not on the bus is still a player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameOutcome {
+    Acquired,
+    Taken,
 }
 
 /// A connection to the session bus.
@@ -232,6 +260,138 @@ impl<S: Read + Write> Connection<S> {
         Err(refused("the bus did not finish a line of the handshake"))
     }
 
+    /// The name the bus gave this connection, which is empty until
+    /// [`Connection::hello`] has been answered.
+    pub(crate) fn unique_name(&self) -> &str {
+        &self.unique_name
+    }
+
+    /// `Hello`, which is the first message on every connection and the one that
+    /// makes the bus willing to route any other.
+    pub(crate) fn hello(&mut self) -> Result<()> {
+        let reply = self.call(Self::to_bus("Hello"))?;
+        match reply.body.first() {
+            Some(Arg::Value(Value::Str(name))) => {
+                self.unique_name.clone_from(name);
+                Ok(())
+            }
+            _ => Err(refused("the bus answered Hello with something but a name")),
+        }
+    }
+
+    /// Ask the bus for a well-known name.
+    pub(crate) fn request_name(&mut self, name: &str) -> Result<NameOutcome> {
+        let call = Self::to_bus("RequestName").with_body(vec![
+            Arg::Value(Value::Str(name.to_owned())),
+            Arg::Value(Value::Uint32(NAME_FLAG_DO_NOT_QUEUE)),
+        ]);
+        let reply = self.call(call)?;
+        match reply.body.first() {
+            // Spec 0.43: 1 is primary owner and 4 is already the owner, which
+            // both leave priel holding the name.
+            Some(Arg::Value(Value::Uint32(1 | 4))) => Ok(NameOutcome::Acquired),
+            // 3 is someone else's; 2 is a place in the queue, which
+            // `NAME_FLAG_DO_NOT_QUEUE` rules out and which would be no use
+            // anyway - both leave priel without the name.
+            Some(Arg::Value(Value::Uint32(2 | 3))) => Ok(NameOutcome::Taken),
+            _ => Err(refused(
+                "the bus answered RequestName with something but a code",
+            )),
+        }
+    }
+
+    /// The well-known name priel ended up with, or `None` if it ended up with
+    /// none - which is a working player that is not on the bus, never a
+    /// failure.
+    ///
+    /// Two attempts and no loop: the name, then the per-instance spelling spec
+    /// 0.43 provides for exactly this. That suffix adds no further dot, because
+    /// playerctl derives a player's name by splitting on the first one and
+    /// `playerctl -p priel` has to match both spellings.
+    pub(crate) fn acquire_name(&mut self, base: &str) -> Result<Option<String>> {
+        if self.request_name(base)? == NameOutcome::Acquired {
+            return Ok(Some(base.to_owned()));
+        }
+        let instance = format!("{base}.instance{}", std::process::id());
+        log::info!("the bus name {base} is already owned, so priel asks for {instance} instead");
+        if self.request_name(&instance)? == NameOutcome::Acquired {
+            return Ok(Some(instance));
+        }
+        Ok(None)
+    }
+
+    /// A call to the bus's own object, which is the only peer this module
+    /// addresses. The serial is minted by [`Connection::call`].
+    fn to_bus(member: &str) -> Message {
+        Message::method_call(0, BUS_NAME, BUS_PATH, BUS_NAME, member)
+    }
+
+    /// Send a call and wait for the reply that answers it.
+    ///
+    /// The serial is minted here, and the reply is matched on it rather than on
+    /// arrival order: the bus is entitled to put a signal in between, and a
+    /// reply correlated by order is a reply to the wrong call.
+    fn call(&mut self, mut message: Message) -> Result<Message> {
+        let serial = self.serials.mint();
+        message.serial = serial;
+        let member = message.member().unwrap_or_default().to_owned();
+        let bytes = marshal(&message, Endian::NATIVE)?;
+        self.write(&bytes)?;
+
+        for _ in 0..MAX_REPLY_READS {
+            while let Some(reply) = self.take_message()? {
+                if reply.reply_serial() != Some(serial) {
+                    continue;
+                }
+                return match reply.kind {
+                    MessageType::MethodReturn => Ok(reply),
+                    MessageType::Error => Err(refused(format!(
+                        "the bus answered {member} with {}",
+                        error_text(&reply)
+                    ))),
+                    _ => Err(refused(format!(
+                        "the bus answered {member} with something that is not a reply"
+                    ))),
+                };
+            }
+            if self.fill()? == Fill::Closed {
+                return Err(refused(format!(
+                    "the bus closed the connection without answering {member}"
+                )));
+            }
+        }
+        Err(refused(format!("the bus never answered {member}")))
+    }
+
+    /// The next whole message the inbox holds.
+    ///
+    /// A frame that is well-framed but malformed costs itself and nothing more:
+    /// [`crate::bus::wire::frame_len`] has already said how long it is, so the
+    /// bytes are dropped and the connection carries on. That split is the whole
+    /// reason [`WireError`] has two variants, and honouring it is what stops one
+    /// peer's bad message from taking priel off the bus.
+    fn take_message(&mut self) -> Result<Option<Message>> {
+        while let Some(frame) = self.take_frame()? {
+            match parse(&frame) {
+                Ok(message) => return Ok(Some(message)),
+                Err(WireError::Message(what)) => {
+                    log::warn!("the bus sent a message priel skipped: {what}");
+                }
+                Err(error) => return Err(BusError::Wire(error)),
+            }
+        }
+        Ok(None)
+    }
+
+    /// The bytes of the next whole frame, or `None` while the inbox holds less
+    /// than one - which is the ordinary answer between reads.
+    fn take_frame(&mut self) -> Result<Option<Vec<u8>>> {
+        let Some(total) = frame_len(&self.inbox)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.inbox.drain(..total).collect()))
+    }
+
     /// One read off the socket into the inbox.
     fn fill(&mut self) -> Result<Fill> {
         if self.inbox.len() >= MAX_INBOX {
@@ -268,6 +428,18 @@ fn is_idle(error: &io::Error) -> bool {
         error.kind(),
         ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
     )
+}
+
+/// An error reply, spelled for the log.
+///
+/// The name is what a reader can act on and the text is only ever displayed, so
+/// the name comes first and is never left out.
+fn error_text(reply: &Message) -> String {
+    let name = reply.error_name().unwrap_or("an error with no name");
+    match reply.body.first() {
+        Some(Arg::Value(Value::Str(text))) => format!("{name}: {text}"),
+        _ => name.to_owned(),
+    }
 }
 
 /// The lowercase hex an auth line carries its payload as.
@@ -363,6 +535,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::bus::wire::{Field, NO_REPLY_EXPECTED, frame_len};
 
     /// What the far end does next.
     #[derive(Debug, Clone)]
@@ -431,6 +604,278 @@ mod tests {
 
     /// The line a real `dbus-broker` answers a good identity with.
     const OK_LINE: &[u8] = b"OK cc77a0b34c4180aa095b63544170c683\r\n";
+
+    /// The bytes of a reply from the bus, the way the bus spells one: the
+    /// serial it chose, the serial it is answering, and its own name.
+    fn bus_reply(serial: u32, answering: u32, body: Vec<Arg>) -> Vec<u8> {
+        let reply = Message {
+            kind: MessageType::MethodReturn,
+            flags: NO_REPLY_EXPECTED,
+            serial,
+            fields: vec![
+                Field::ReplySerial(answering),
+                Field::Sender(BUS_NAME.to_owned()),
+                Field::Destination(":1.42".to_owned()),
+            ],
+            body: Vec::new(),
+        }
+        .with_body(body);
+        marshal(&reply, Endian::NATIVE).expect("a reply the tests built")
+    }
+
+    /// The bytes of an error from the bus.
+    fn bus_error(serial: u32, answering: u32, name: &str, text: &str) -> Vec<u8> {
+        let error = Message {
+            kind: MessageType::Error,
+            flags: NO_REPLY_EXPECTED,
+            serial,
+            fields: vec![
+                Field::ReplySerial(answering),
+                Field::ErrorName(name.to_owned()),
+                Field::Sender(BUS_NAME.to_owned()),
+            ],
+            body: Vec::new(),
+        }
+        .with_body(vec![Arg::Value(Value::Str(text.to_owned()))]);
+        marshal(&error, Endian::NATIVE).expect("an error the tests built")
+    }
+
+    /// A connection that has already authenticated, so a test scripts what
+    /// comes after the handshake and nothing else.
+    fn greeted(duplex: &mut Duplex) -> Connection<&mut Duplex> {
+        let mut conn = Connection::new(duplex, None);
+        conn.authenticate(Some(1000))
+            .expect("the scripted handshake");
+        conn
+    }
+
+    /// A script that begins with the handshake the bus always answers.
+    fn after_handshake(turns: Vec<Turn>) -> Duplex {
+        let mut all = vec![Turn::Bytes(OK_LINE.to_vec())];
+        all.extend(turns);
+        Duplex::new(all)
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    /// Every message priel wrote, once the handshake's own lines are past.
+    fn sent(duplex: &Duplex) -> Vec<Message> {
+        let begin = b"BEGIN\r\n";
+        let at = find(&duplex.written, begin).map_or(0, |at| at + begin.len());
+        let mut rest = &duplex.written[at..];
+        let mut out = Vec::new();
+        while let Some(total) = frame_len(rest).expect("priel writes well-framed messages") {
+            out.push(parse(&rest[..total]).expect("priel writes messages it can read back"));
+            rest = &rest[total..];
+        }
+        out
+    }
+
+    /// Goal: `Hello` goes to the bus's own object and the name that comes back
+    /// is kept, because every later message is addressed from it. Method: the
+    /// reply a real bus sends, and read the call back off the wire.
+    #[test]
+    fn hello_is_addressed_to_the_bus_and_its_answer_is_kept() {
+        let mut duplex = after_handshake(vec![Turn::Bytes(bus_reply(
+            1,
+            1,
+            vec![Arg::Value(Value::Str(":1.4242".into()))],
+        ))]);
+        {
+            let mut conn = greeted(&mut duplex);
+            conn.hello().expect("the scripted Hello");
+            assert_eq!(conn.unique_name(), ":1.4242");
+        }
+        let calls = sent(&duplex);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].destination(), Some(BUS_NAME));
+        assert_eq!(calls[0].path(), Some(BUS_PATH));
+        assert_eq!(calls[0].interface(), Some(BUS_NAME));
+        assert_eq!(calls[0].member(), Some("Hello"));
+        assert_eq!(calls[0].serial, 1);
+    }
+
+    /// Goal: `RequestName` asks for the name with the flag that says priel will
+    /// not queue for it. Method: read the body back off the wire - a queued
+    /// request succeeds later, with nothing watching, which is worse than a
+    /// clean no.
+    #[test]
+    fn request_name_asks_without_queueing() {
+        let mut duplex = after_handshake(vec![Turn::Bytes(bus_reply(
+            1,
+            1,
+            vec![Arg::Value(Value::Uint32(1))],
+        ))]);
+        {
+            let mut conn = greeted(&mut duplex);
+            let outcome = conn
+                .request_name("org.mpris.MediaPlayer2.priel")
+                .expect("the scripted RequestName");
+            assert_eq!(outcome, NameOutcome::Acquired);
+        }
+        let calls = sent(&duplex);
+        assert_eq!(calls[0].member(), Some("RequestName"));
+        assert_eq!(calls[0].signature(), "su");
+        assert_eq!(
+            calls[0].body,
+            vec![
+                Arg::Value(Value::Str("org.mpris.MediaPlayer2.priel".into())),
+                Arg::Value(Value::Uint32(NAME_FLAG_DO_NOT_QUEUE)),
+            ]
+        );
+    }
+
+    /// Goal: each code spec 0.43 defines is read as the answer it is. Method: a
+    /// table - 1 and 4 both mean priel owns the name, and 2 and 3 both mean it
+    /// does not.
+    #[test]
+    fn every_name_code_is_read_as_what_it_means() {
+        for (code, expected) in [
+            (1, NameOutcome::Acquired),
+            (4, NameOutcome::Acquired),
+            (2, NameOutcome::Taken),
+            (3, NameOutcome::Taken),
+        ] {
+            let mut duplex = after_handshake(vec![Turn::Bytes(bus_reply(
+                1,
+                1,
+                vec![Arg::Value(Value::Uint32(code))],
+            ))]);
+            let mut conn = greeted(&mut duplex);
+            assert_eq!(
+                conn.request_name("org.mpris.MediaPlayer2.priel").ok(),
+                Some(expected),
+                "code {code}"
+            );
+        }
+    }
+
+    /// Goal: a name someone else owns is retried once under the per-instance
+    /// spelling spec 0.43 provides, and that spelling carries no further dot -
+    /// playerctl derives the player's name by splitting on the first one, so
+    /// `-p priel` has to match both. Method: refuse the first, grant the
+    /// second, and read the name back off the wire.
+    #[test]
+    fn a_name_already_owned_falls_back_to_the_instance_spelling() {
+        let mut duplex = after_handshake(vec![
+            Turn::Bytes(bus_reply(1, 1, vec![Arg::Value(Value::Uint32(3))])),
+            Turn::Bytes(bus_reply(2, 2, vec![Arg::Value(Value::Uint32(1))])),
+        ]);
+        let acquired = {
+            let mut conn = greeted(&mut duplex);
+            conn.acquire_name("org.mpris.MediaPlayer2.priel")
+                .expect("the scripted names")
+        };
+        let expected = format!(
+            "org.mpris.MediaPlayer2.priel.instance{}",
+            std::process::id()
+        );
+        assert_eq!(acquired, Some(expected.clone()));
+        assert_eq!(
+            expected.strip_prefix("org.mpris.MediaPlayer2.").map(|tail| tail.split('.').next()),
+            Some(Some("priel")),
+            "playerctl splits on the first dot, so the suffix may not add one"
+        );
+        let calls = sent(&duplex);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].body.first(),
+            Some(&Arg::Value(Value::Str(expected)))
+        );
+    }
+
+    /// Goal: both spellings being owned leaves priel a working player rather
+    /// than an error to report. Method: refuse both, and check the result is
+    /// an absence and not a failure.
+    #[test]
+    fn both_spellings_owned_leaves_priel_off_the_bus() {
+        let mut duplex = after_handshake(vec![
+            Turn::Bytes(bus_reply(1, 1, vec![Arg::Value(Value::Uint32(3))])),
+            Turn::Bytes(bus_reply(2, 2, vec![Arg::Value(Value::Uint32(3))])),
+        ]);
+        let mut conn = greeted(&mut duplex);
+        assert_eq!(conn.acquire_name("org.mpris.MediaPlayer2.priel").ok(), Some(None));
+    }
+
+    /// Goal: an error reply is reported with the name the bus put on it, since
+    /// that name is the only part of it a reader can act on. Method: answer
+    /// `Hello` with the error a bus sends a connection that already said it.
+    #[test]
+    fn an_error_reply_is_reported_with_its_name() {
+        let mut duplex = after_handshake(vec![Turn::Bytes(bus_error(
+            1,
+            1,
+            "org.freedesktop.DBus.Error.Failed",
+            "Already handled an Hello message",
+        ))]);
+        let mut conn = greeted(&mut duplex);
+        let error = conn.hello().expect_err("an error reply");
+        assert!(
+            error.to_string().contains("org.freedesktop.DBus.Error.Failed"),
+            "the log has to carry the error name: {error}"
+        );
+    }
+
+    /// Goal: a reply is matched by the serial it answers and never by arrival
+    /// order, so a message landing in between cannot be mistaken for the
+    /// answer. Method: put a reply to a serial priel never sent in front of the
+    /// real one.
+    #[test]
+    fn a_reply_is_matched_by_serial_and_not_by_order() {
+        let mut duplex = after_handshake(vec![
+            Turn::Bytes(bus_reply(9, 77, vec![Arg::Value(Value::Str(":1.9".into()))])),
+            Turn::Bytes(bus_reply(1, 1, vec![Arg::Value(Value::Str(":1.4242".into()))])),
+        ]);
+        let mut conn = greeted(&mut duplex);
+        conn.hello().expect("the scripted Hello");
+        assert_eq!(conn.unique_name(), ":1.4242");
+    }
+
+    /// Goal: a bus that takes the call and then hangs up is reported rather
+    /// than waited on. Method: nothing after the handshake.
+    #[test]
+    fn a_bus_that_hangs_up_before_answering_is_reported() {
+        let mut duplex = after_handshake(Vec::new());
+        let mut conn = greeted(&mut duplex);
+        let error = conn.hello().expect_err("a bus that hung up");
+        assert!(
+            error.to_string().contains("closed"),
+            "the log has to say the bus hung up: {error}"
+        );
+    }
+
+    /// Goal: a bus that never answers is given up on rather than waited on
+    /// forever. Method: nothing but read timeouts, past the bound.
+    #[test]
+    fn a_bus_that_never_answers_a_call_is_given_up_on() {
+        let mut duplex = after_handshake(vec![Turn::Idle; MAX_REPLY_READS * 2]);
+        let mut conn = greeted(&mut duplex);
+        assert!(conn.hello().is_err());
+    }
+
+    /// Goal: an answer that is not the shape the specification names is
+    /// refused, not read as something else. Method: answer `Hello` with a
+    /// number and `RequestName` with a string.
+    #[test]
+    fn an_answer_of_the_wrong_shape_is_refused() {
+        let mut duplex = after_handshake(vec![Turn::Bytes(bus_reply(
+            1,
+            1,
+            vec![Arg::Value(Value::Uint32(7))],
+        ))]);
+        assert!(greeted(&mut duplex).hello().is_err());
+
+        let mut duplex = after_handshake(vec![Turn::Bytes(bus_reply(
+            1,
+            1,
+            vec![Arg::Value(Value::Str("yes".into()))],
+        ))]);
+        assert!(greeted(&mut duplex).request_name("org.a.b").is_err());
+    }
 
     /// Goal: the handshake is the three things spec 0.43 requires, in order and
     /// with nothing in between. Method: replay the `OK` a real bus sends and
