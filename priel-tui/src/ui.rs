@@ -1249,14 +1249,15 @@ const THEME_NAME_FIELD: usize = 15;
 /// The three fidelity grades are the reason a palette is a decision and not a
 /// preference, so every row carries `✓ ≈ ⚠` in that theme's own three colours,
 /// on that theme's own background. Painting them in the current theme would
-/// draw five identical rows and answer the one question the picker is for.
+/// draw one identical row per palette and answer none of the question the
+/// picker is for.
 fn theme_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme();
     let current = app.theme_name();
     let selected = app.theme_selected();
     let width = area.width.saturating_sub(4).min(72);
     // Two for the border, two for the footer. Sized to the content, as the
-    // graph overlay is: a full-height box around five rows reads as a failure
+    // graph overlay is: a full-height box around a handful of rows reads as a failure
     // to load.
     let wanted = u16::try_from(theme::OFFERED.len().saturating_add(4)).unwrap_or(u16::MAX);
     let height = wanted.min(area.height);
@@ -1316,7 +1317,8 @@ fn theme_overlay(f: &mut Frame, area: Rect, app: &mut App) {
 
 /// The theme rows, each registering its hit box in the walk that draws it.
 ///
-/// No windowing: the list is five entries and cannot grow past what a usable
+/// No windowing: the list is the built-in palettes and cannot grow past what a
+/// usable
 /// terminal shows, so a row that does not fit is simply not drawn - and not
 /// registered either, since a control that was never painted must not answer to
 /// a click.
