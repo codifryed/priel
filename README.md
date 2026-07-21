@@ -65,12 +65,13 @@ water in and out of the flats twice a day, on the pull of the moon.*
   reference rather than making you read this file. Parity runs both ways: there
   is no control that only the mouse can reach, and none that only the keyboard
   can.
-- **Built-in themes, light and dark, that keep the indicator honest.** Seven
+- **Built-in themes, light and dark, that keep the indicator honest.** Ten
   published palettes — `nord` (the default), `gruvbox-dark`, `gruvbox-light`,
-  `one-light`, `dracula`, `one-dark` and `true-black` for an OLED panel, where
-  the background is `#000000` and costs no light — plus `terminal`, which paints
-  with your terminal's own sixteen colours and follows a palette you have
-  already chosen rather than fighting it.
+  `one-light`, `dracula`, `one-dark`, `catppuccin` (Mocha), `tokyo-night` and
+  `tokyo-night-day`, plus `true-black` for an OLED panel, where the background is
+  `#000000` and costs no light — and `terminal`, which paints with your
+  terminal's own sixteen colours and follows a palette you have already chosen
+  rather than fighting it.
   Every colour priel draws comes from one table of *roles*, so a theme is
   complete by construction and a test refuses any bare colour written into the
   renderer. The fidelity grades are held to a contrast floor on their own
@@ -147,8 +148,9 @@ failed track shows both halves together — `[file] Cannot open file ...` next t
 priel's own account of what it was trying to play.
 
 `--theme` picks the palette: `nord` (the default), `gruvbox-dark`,
-`gruvbox-light`, `one-light`, `dracula`, `one-dark`, `true-black`, or
-`terminal` to defer to your terminal's own colours. `t` opens the same list while priel is running, but **priel reads no
+`gruvbox-light`, `one-light`, `dracula`, `one-dark`, `true-black`, `catppuccin`,
+`tokyo-night`, `tokyo-night-day`, or `terminal` to defer to your terminal's own
+colours. `t` opens the same list while priel is running, but **priel reads no
 configuration file**, so a choice made there lasts for that session only and the
 picker says so; the flag is how one is kept.
 
