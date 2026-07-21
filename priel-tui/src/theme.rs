@@ -53,6 +53,8 @@
 //! discovered, so it is lightened on a dark theme and darkened on a light one
 //! until it clears - and where a palette publishes no second grey at all,
 //! `muted` is lightened out of the same one rather than invented beside it.
+//! Not every palette needs it. Both gruvbox halves and `catppuccin` draw their
+//! comment grey above the floor to begin with, and ship here unmodified.
 
 use clap::ValueEnum as _;
 use ratatui::style::{Color, Style};
@@ -124,6 +126,9 @@ pub const OFFERED: &[ThemeName] = &[
     ThemeName::Dracula,
     ThemeName::OneDark,
     ThemeName::TrueBlack,
+    ThemeName::Catppuccin,
+    ThemeName::TokyoNight,
+    ThemeName::TokyoNightDay,
     ThemeName::Terminal,
 ];
 
@@ -165,6 +170,9 @@ impl Theme {
             ThemeName::Dracula => DRACULA,
             ThemeName::OneDark => ONE_DARK,
             ThemeName::TrueBlack => TRUE_BLACK,
+            ThemeName::Catppuccin => CATPPUCCIN,
+            ThemeName::TokyoNight => TOKYO_NIGHT,
+            ThemeName::TokyoNightDay => TOKYO_NIGHT_DAY,
         }
     }
 
@@ -472,11 +480,146 @@ const TRUE_BLACK: Theme = Theme {
     verdict_unknown: Color::Rgb(0x64, 0x64, 0x64),
 };
 
+/// Catppuccin Mocha, the darkest of the four flavours the Catppuccin project
+/// publishes and the one it leads with. Pastel where dracula is neon, on much
+/// the same charcoal.
+///
+/// Named for the project rather than the flavour, because the four flavours are
+/// one palette at four depths: Latte, Frappé, Macchiato and Mocha share every
+/// hue and differ only in how far down the surface sits. Four rows that a reader
+/// would have to try one at a time to tell apart would pad the picker rather
+/// than widen it, so Mocha stands for the family: the flavour the project leads
+/// with, and the one that answers a question the set had not already answered.
+///
+/// The role map is the project's own tiers rather than a reading of them: Text,
+/// Subtext 0 and Overlay 1 are what its style guide calls the primary, secondary
+/// and subtle foregrounds, and Surface 0 is the raised surface it names for a
+/// chip. Mauve is the accent its editor ports take by default.
+///
+/// **Nothing here needed correcting, and the comment grey is why.** Most of
+/// these palettes put theirs under the floor, which is what earns each of them a
+/// paragraph like this one; Catppuccin calls comments Overlay 2 and that
+/// measures 5.81:1 on Base. `faint` sits one tier below it at Overlay 1 and
+/// measures 4.44:1, the widest margin any `faint` here has, and still a
+/// published step rather than a value invented beside one.
+const CATPPUCCIN: Theme = Theme {
+    background: Color::Rgb(0x1e, 0x1e, 0x2e),
+    text: Color::Rgb(0xcd, 0xd6, 0xf4),
+    muted: Color::Rgb(0xa6, 0xad, 0xc8),
+    faint: Color::Rgb(0x7f, 0x84, 0x9c),
+    accent: Color::Rgb(0xcb, 0xa6, 0xf7),
+    selection_fg: Color::Rgb(0x1e, 0x1e, 0x2e),
+    selection_bg: Color::Rgb(0xcb, 0xa6, 0xf7),
+    control_fg: Color::Rgb(0xcb, 0xa6, 0xf7),
+    control_bg: Color::Rgb(0x31, 0x32, 0x44),
+    toggle_on_fg: Color::Rgb(0x1e, 0x1e, 0x2e),
+    toggle_on_bg: Color::Rgb(0xa6, 0xe3, 0xa1),
+    active: Color::Rgb(0xa6, 0xe3, 0xa1),
+    notice: Color::Rgb(0xf9, 0xe2, 0xaf),
+    error: Color::Rgb(0xf3, 0x8b, 0xa8),
+    favorite: Color::Rgb(0xf5, 0xc2, 0xe7),
+    queue: Color::Rgb(0x89, 0xb4, 0xfa),
+    verdict_clean: Color::Rgb(0xa6, 0xe3, 0xa1),
+    verdict_near: Color::Rgb(0xf9, 0xe2, 0xaf),
+    verdict_altered: Color::Rgb(0xf3, 0x8b, 0xa8),
+    verdict_unknown: Color::Rgb(0x7f, 0x84, 0x9c),
+};
+
+/// Tokyo Night, dark: the `night` style of `folke/tokyonight.nvim`, which is
+/// its `storm` palette with the surface taken down to `#1a1b26`.
+///
+/// Taken from the plugin rather than from the `enkia/tokyo-night-vscode-theme`
+/// it grew out of, for a reason that is about the source and not about the
+/// look: the plugin publishes the palette as data with one name per colour, so
+/// a role can be mapped onto a name and checked, where a VS Code theme
+/// publishes scopes and leaves the palette to be read back out of them.
+///
+/// One deviation, and it is the usual one. `comment` measures 2.76:1 against
+/// `bg`, under the floor a mark owes. Nothing here is lightened by hand,
+/// though: Tokyo Night publishes a whole grey ramp - `comment`, `dark3`,
+/// `dark5` - so `faint` is `dark5` at 4.10:1, a step the palette already
+/// drew. `bg_highlight` is what the theme raises a highlighted line with, and
+/// it carries the control chip here.
+const TOKYO_NIGHT: Theme = Theme {
+    background: Color::Rgb(0x1a, 0x1b, 0x26),
+    text: Color::Rgb(0xc0, 0xca, 0xf5),
+    muted: Color::Rgb(0xa9, 0xb1, 0xd6),
+    faint: Color::Rgb(0x73, 0x7a, 0xa2),
+    accent: Color::Rgb(0x7a, 0xa2, 0xf7),
+    selection_fg: Color::Rgb(0x1a, 0x1b, 0x26),
+    selection_bg: Color::Rgb(0x7a, 0xa2, 0xf7),
+    control_fg: Color::Rgb(0x7a, 0xa2, 0xf7),
+    control_bg: Color::Rgb(0x29, 0x2e, 0x42),
+    toggle_on_fg: Color::Rgb(0x1a, 0x1b, 0x26),
+    toggle_on_bg: Color::Rgb(0x9e, 0xce, 0x6a),
+    active: Color::Rgb(0x9e, 0xce, 0x6a),
+    notice: Color::Rgb(0xe0, 0xaf, 0x68),
+    error: Color::Rgb(0xf7, 0x76, 0x8e),
+    favorite: Color::Rgb(0xbb, 0x9a, 0xf7),
+    queue: Color::Rgb(0x7d, 0xcf, 0xff),
+    verdict_clean: Color::Rgb(0x9e, 0xce, 0x6a),
+    verdict_near: Color::Rgb(0xe0, 0xaf, 0x68),
+    verdict_altered: Color::Rgb(0xf7, 0x76, 0x8e),
+    verdict_unknown: Color::Rgb(0x73, 0x7a, 0xa2),
+};
+
+/// Tokyo Night Day, the light sibling: the same plugin's `day` style, which it
+/// derives by inverting the night palette and ships ready-made under `extras/`.
+/// A third light option, and the only one whose foreground is a colour rather
+/// than a near-black.
+///
+/// **The tightest palette in the set, and the only one whose whole grey ladder
+/// had to be redrawn.** `fg` measures 4.52:1 on `bg` - two hundredths above what
+/// prose owes - and two roles have to fit underneath it, one of which is prose
+/// too and owes the same 4.5. The published greys do not reach it: `fg_dark` is
+/// 3.57:1 and `comment` 2.54:1. There is no ladder to be had under a 4.52 top
+/// step, so the top step moves. `text` is `fg` darkened to 7.28:1 and `muted` is
+/// `fg_dark` darkened to 5.07:1, each along its own hue; `faint` is `dark5`
+/// unchanged at 3.71:1, the one rung that already cleared.
+///
+/// `accent` is `blue` darkened for the same kind of reason. Published it is
+/// 3.11:1 on the background, which passes, and 2.41:1 on `bg_highlight` - the
+/// chip a control is drawn on - which does not, and a control is the one thing
+/// that must be legible before it can be pointed at. Darkened it is 4.50:1 and
+/// 3.50:1.
+///
+/// `error` is `red1` rather than `red`, which is the mapping the theme makes
+/// itself: it paints its own error group with `red1`. `red` measures 3.01:1, and
+/// a hundredth above the floor is not a margin.
+///
+/// Nothing else moved. The three grades are the palette's own `green`, `yellow`
+/// and `red1` - `yellow` is literally what the theme names its warning colour -
+/// and the olive and the ochre sit about as far apart here as gruvbox-light's
+/// pair do, which is the closest any shipped palette puts them.
+const TOKYO_NIGHT_DAY: Theme = Theme {
+    background: Color::Rgb(0xe1, 0xe2, 0xe7),
+    text: Color::Rgb(0x26, 0x43, 0x86),
+    muted: Color::Rgb(0x4e, 0x5b, 0x8d),
+    faint: Color::Rgb(0x68, 0x70, 0x9a),
+    accent: Color::Rgb(0x25, 0x64, 0xba),
+    selection_fg: Color::Rgb(0xe1, 0xe2, 0xe7),
+    selection_bg: Color::Rgb(0x25, 0x64, 0xba),
+    control_fg: Color::Rgb(0x25, 0x64, 0xba),
+    control_bg: Color::Rgb(0xc4, 0xc8, 0xda),
+    toggle_on_fg: Color::Rgb(0xe1, 0xe2, 0xe7),
+    toggle_on_bg: Color::Rgb(0x58, 0x75, 0x39),
+    active: Color::Rgb(0x58, 0x75, 0x39),
+    notice: Color::Rgb(0x8c, 0x6c, 0x3e),
+    error: Color::Rgb(0xc6, 0x43, 0x43),
+    favorite: Color::Rgb(0x98, 0x54, 0xf1),
+    queue: Color::Rgb(0x00, 0x71, 0x97),
+    verdict_clean: Color::Rgb(0x58, 0x75, 0x39),
+    verdict_near: Color::Rgb(0x8c, 0x6c, 0x3e),
+    verdict_altered: Color::Rgb(0xc6, 0x43, 0x43),
+    verdict_unknown: Color::Rgb(0x68, 0x70, 0x9a),
+};
+
 #[cfg(test)]
 mod tests {
     use super::{Theme, ThemeName};
     use clap::ValueEnum;
     use ratatui::style::Color;
+    use ratatui::text::Span;
 
     /// The contrast a body of prose has to clear: WCAG AA for normal text.
     const PROSE_FLOOR: f64 = 4.5;
@@ -641,6 +784,32 @@ mod tests {
             assert!(super::OFFERED.contains(name), "the picker hides {name:?}");
             assert!(!super::label(*name).is_empty(), "{name:?} has no name");
             assert!(!super::note(*name).is_empty(), "{name:?} says nothing");
+        }
+    }
+
+    /// Goal: the picker lays every palette's name into one fixed-width field and
+    /// draws that palette's three grade marks immediately after it, so a name
+    /// wider than the field shunts the swatch out of line for every row below
+    /// it. `tokyo-night-day` fills the field exactly, which is close enough to
+    /// the edge to be worth a guard rather than a look.
+    ///
+    /// Method: read the width out of the renderer's own constant rather than
+    /// writing 15 down a second time here, and measure each name the way
+    /// ratatui measures what it paints.
+    #[test]
+    fn every_name_fits_the_field_the_picker_lays_it_into() {
+        let field: usize = include_str!("ui.rs")
+            .split_once("const THEME_NAME_FIELD: usize = ")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .and_then(|(width, _)| width.trim().parse().ok())
+            .expect("ui.rs declares how wide the name field is");
+        for name in super::OFFERED {
+            let label = super::label(*name);
+            let width = Span::raw(&label).width();
+            assert!(
+                width <= field,
+                "{name:?} is {width} cells wide, over the {field} the picker lays out"
+            );
         }
     }
 
