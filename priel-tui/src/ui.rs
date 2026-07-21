@@ -2173,6 +2173,32 @@ mod tests {
     }
 
     #[test]
+    fn a_header_too_narrow_for_a_control_still_leaves_the_reference() {
+        // Goal: the header runs out of width like any row, and the rule does not
+        // stop being true at 60 columns. What survives every width is the `[?]`
+        // hint, which `push_hints` reserves space for, and the overlay it opens -
+        // where the same action is clickable whatever the header had room for.
+        // That is the whole reason the reference carries hit boxes.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 60, 30);
+        assert!(
+            !sc.app.hits.iter().any(|(_, h)| *h == Hit::Devices),
+            "a control the header could not paint must not answer to a click"
+        );
+        assert!(
+            sc.app.hits.iter().any(|(_, h)| *h == Hit::Help),
+            "but the way to the reference is reserved and cannot be dropped"
+        );
+
+        sc.app.mode = Mode::Help;
+        assert_eq!(
+            painted(&mut sc.app, 60, 30, Hit::Devices),
+            "d",
+            "and the reference still offers the picker at that width"
+        );
+    }
+
+    #[test]
     fn a_word_the_reference_only_explains_offers_nothing_to_click() {
         // Goal: half of the Output section is the vocabulary of the badges, not
         // actions. Making those clickable would promise a control that could not
