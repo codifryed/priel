@@ -456,6 +456,29 @@ mod tests {
     }
 
     #[test]
+    fn what_moves_on_its_own_is_no_setting_and_the_file_says_so() {
+        // Goal: the ADR's own membership test, applied rather than assumed.
+        // "Can a flag already set it, and does it mean the same thing on the
+        // next start?" - no flag says how the queue repeats, whether it is
+        // shuffled or whether the radio follows it, and the exclusion list names
+        // "anything that moves on its own" for exactly this. A file carrying one
+        // of these is a stale line, so it is dropped and named rather than
+        // silently obeyed.
+        let loaded = parse("repeat = all\nshuffle = true\ntheme = nord\n");
+        assert_eq!(
+            loaded.settings,
+            Settings {
+                theme: Some(ThemeName::Nord),
+                ..Settings::default()
+            }
+        );
+        let warned = warnings(&loaded);
+        assert_eq!(warned.len(), 2, "each is named: {warned:?}");
+        assert!(warned[0].contains("repeat"), "{warned:?}");
+        assert!(warned[1].contains("shuffle"), "{warned:?}");
+    }
+
+    #[test]
     fn an_empty_value_is_no_value_at_all() {
         // Goal: `device =` reads as "I have deleted this", not as a device
         // called the empty string, which mpv would refuse to open.
