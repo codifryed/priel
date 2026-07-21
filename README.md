@@ -193,6 +193,8 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 | Reload the current list | `r` | click `↻` |
 | Search the catalogue | `3`, type, `Enter`; `i` to re-edit | click the `3` tab; `[?]` then `i` |
 | Shuffle the current view | `s` | click `⇄` |
+| Favorite the selected track | `f` | click `[f]` |
+| Favorite the playing track | `F` | click the `♥` beside the title |
 | Volume | `+` / `-` | click `-` / `+` |
 | Restore unity gain | `0` | click the percentage |
 | Quit | `q` | click `[q]` |
@@ -200,6 +202,19 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 Typing is the one thing the mouse is not asked to do: the filter box, the search
 query and the pasted sign-in address are text, so the keys that accept or cancel
 them belong to the box being typed in and have no control of their own.
+
+A `♥` on a row means the track is in your favorites and a `♡` means it is not,
+as far as priel has been told. The service reports no favorite flag on a track,
+so the favorites listing itself is the only thing that ever says so, and priel
+knows what it has loaded: a favorited track met in the search results, whose own
+page of the listing has not been reached, wears a hollow heart until you press
+`f` on it or reload the favorites.
+
+The heart changes the moment you press the key, before the service has answered,
+and changes back with a message on the notice line if the change is refused. A
+track you take off the favorites keeps its row in the list until the list is
+reloaded with `r`: removing the row would move every row below it out from under
+the cursor, including the one you just acted on.
 
 `Esc` cancels: it leaves a filter or search box, and steps back out of an opened
 playlist. It never quits.
@@ -220,7 +235,7 @@ lost with a `⚠`, reporting the rates the sound server is permitted to clock
 at with the change to make when the track's rate is not one of them, and naming
 what has the output device open with what it would take to reserve it; a `d`
 picker for moving the output between devices, with an `x` toggle for taking a
-device exclusively.
+device exclusively; favoriting and unfavoriting the selected or playing track.
 
 The `D` overlay names a node only when the chain accounts for what was measured.
 Where the device is clocked elsewhere and every node on the path still reports
