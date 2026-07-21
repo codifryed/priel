@@ -443,7 +443,9 @@ change to make when the track's rate is not one of them, and naming what has the
 output device open with what it would take to reserve it; a `d` picker for moving
 the output between devices, with an `x` toggle for taking a device exclusively; favoriting and unfavoriting the selected or playing track; MPRIS, so the
 media keys, the desktop's own controls and `playerctl` drive the same actions
-the keyboard and the mouse do.
+the keyboard and the mouse do — including the shuffle and the repeat, which are
+readable and settable from the desktop and end up in the very methods `s` and `e`
+run.
 
 Each section renders on its own evidence, so a directly held card — which has no
 graph by design — still gets its verdict, its device readout and its volume

@@ -130,6 +130,30 @@ impl Repeat {
         }
     }
 
+    /// The MPRIS spelling. Spec 2.2 allows exactly these three words, and they
+    /// map onto the three states one for one - which is what made publishing
+    /// `LoopStatus` a translation rather than a design.
+    #[must_use]
+    pub(crate) const fn loop_status(self) -> &'static str {
+        match self {
+            Self::Off => "None",
+            Self::All => "All",
+            Self::One => "Track",
+        }
+    }
+
+    /// And back, or `None` for a word the specification does not name - which
+    /// the consumer is told about rather than being guessed at.
+    #[must_use]
+    pub(crate) fn from_loop_status(word: &str) -> Option<Self> {
+        match word {
+            "None" => Some(Self::Off),
+            "All" => Some(Self::All),
+            "Track" => Some(Self::One),
+            _ => None,
+        }
+    }
+
     /// The glyph and mark a control paints, which says which of three it is in
     /// **without any colour at all** - the rule the verdict badges follow. The
     /// backing says on or off; only these say which kind of on.
@@ -2240,6 +2264,7 @@ impl App {
             BusCommand::PlayPause => self.player.toggle_pause(),
             BusCommand::SeekTo(position_us) => self.player.seek(seconds(position_us)),
             BusCommand::Shuffle(on) => self.set_shuffle(on),
+            BusCommand::Loop(repeat) => self.set_repeat(repeat),
             BusCommand::Volume(unity) => self.player.set_volume(unity * 100.0),
             BusCommand::Quit => self.should_quit = true,
         }
@@ -2291,6 +2316,7 @@ impl App {
                 }),
                 paused: self.status.paused,
                 shuffle: self.shuffle,
+                repeat: self.repeat,
                 // Rounded, so that a float wobbling in its last bits is not a
                 // property change announced ten times a second.
                 volume: (self.status.volume * 10.0).round() / 1000.0,
@@ -6276,6 +6302,12 @@ mod tests {
 
         on.rig.app.apply(BusCommand::Shuffle(true));
         assert!(on.rig.app.shuffle, "Shuffle is what `s` does");
+        on.rig.app.apply(BusCommand::Loop(Repeat::One));
+        assert_eq!(
+            on.rig.app.repeat,
+            Repeat::One,
+            "LoopStatus is what `e` does"
+        );
         on.rig.app.apply(BusCommand::Quit);
         assert!(on.rig.app.should_quit, "Quit is what `q` does");
     }
@@ -6291,6 +6323,22 @@ mod tests {
         assert!(r.app.shuffle, "asking twice is not a cycle");
         r.app.on_key(key('s'));
         assert!(!r.app.shuffle, "and the key still toggles");
+    }
+
+    /// Goal: `LoopStatus` is absolute where the key cycles, in the way `Shuffle`
+    /// already is: three states make the difference plainer than two, because a
+    /// cycle asked for twice lands somewhere the consumer never named. Method:
+    /// ask twice, then check the key still cycles from where the desktop left
+    /// it, and that the state reaches the desktop's own snapshot.
+    #[test]
+    fn a_repeat_from_the_desktop_is_absolute_where_the_key_cycles() {
+        let mut r = rig();
+        r.app.apply(BusCommand::Loop(Repeat::All));
+        r.app.apply(BusCommand::Loop(Repeat::All));
+        assert_eq!(r.app.repeat, Repeat::All, "asking twice is not a cycle");
+        assert_eq!(r.app.bus_snapshot().now.repeat, Repeat::All);
+        r.app.on_key(key('e'));
+        assert_eq!(r.app.repeat, Repeat::One, "and the key carries on from it");
     }
 
     /// Goal: commands arrive over a channel the app drains on its own tick, so
