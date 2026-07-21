@@ -122,6 +122,7 @@ pub const OFFERED: &[ThemeName] = &[
     ThemeName::GruvboxLight,
     ThemeName::OneLight,
     ThemeName::Dracula,
+    ThemeName::OneDark,
     ThemeName::Terminal,
 ];
 
@@ -161,6 +162,7 @@ impl Theme {
             ThemeName::GruvboxLight => GRUVBOX_LIGHT,
             ThemeName::OneLight => ONE_LIGHT,
             ThemeName::Dracula => DRACULA,
+            ThemeName::OneDark => ONE_DARK,
         }
     }
 
@@ -375,6 +377,43 @@ const DRACULA: Theme = Theme {
     verdict_near: Color::Rgb(0xff, 0xb8, 0x6c),
     verdict_altered: Color::Rgb(0xff, 0x55, 0x55),
     verdict_unknown: Color::Rgb(0x6f, 0x7e, 0xab),
+};
+
+/// One Dark, from the Atom editor: the dark half of the pair `one-light` is the
+/// light half of, and the same roles read off the same variables.
+///
+/// Two deviations, both the lightening the module docs describe. mono-3, the
+/// comment grey, measures 2.32:1 and carries `faint` at 3.57:1; mono-2 measures
+/// 3.98:1, which is fine for a comment and short of the 4.5 `muted` owes a body
+/// of prose, and carries it at 4.72:1.
+///
+/// Where One Dark publishes two of a hue, the light sibling takes the darker
+/// and this one takes the lighter, which is the same judgement made from
+/// opposite ends: `error` is hue-5 rather than hue-5-2 (2.95:1 here, under the
+/// floor), and `notice` is hue-6-2 rather than the hue-6 `one-light` uses.
+/// `control_bg` is the theme's own raised surface - `lighten(@syntax-bg, 10%)`,
+/// what it paints a selected line with.
+const ONE_DARK: Theme = Theme {
+    background: Color::Rgb(0x28, 0x2c, 0x34),
+    text: Color::Rgb(0xab, 0xb2, 0xbf),
+    muted: Color::Rgb(0x90, 0x96, 0xa3),
+    faint: Color::Rgb(0x79, 0x81, 0x91),
+    accent: Color::Rgb(0x61, 0xaf, 0xef),
+    selection_fg: Color::Rgb(0x28, 0x2c, 0x34),
+    selection_bg: Color::Rgb(0x61, 0xaf, 0xef),
+    control_fg: Color::Rgb(0x61, 0xaf, 0xef),
+    control_bg: Color::Rgb(0x3e, 0x44, 0x51),
+    toggle_on_fg: Color::Rgb(0x28, 0x2c, 0x34),
+    toggle_on_bg: Color::Rgb(0x98, 0xc3, 0x79),
+    active: Color::Rgb(0x98, 0xc3, 0x79),
+    notice: Color::Rgb(0xe5, 0xc0, 0x7b),
+    error: Color::Rgb(0xe0, 0x6c, 0x75),
+    favorite: Color::Rgb(0xc6, 0x78, 0xdd),
+    queue: Color::Rgb(0x56, 0xb6, 0xc2),
+    verdict_clean: Color::Rgb(0x98, 0xc3, 0x79),
+    verdict_near: Color::Rgb(0xe5, 0xc0, 0x7b),
+    verdict_altered: Color::Rgb(0xe0, 0x6c, 0x75),
+    verdict_unknown: Color::Rgb(0x79, 0x81, 0x91),
 };
 
 #[cfg(test)]

@@ -129,6 +129,8 @@ pub enum ThemeName {
     OneLight,
     /// Dark, vivid.
     Dracula,
+    /// Dark, cool.
+    OneDark,
     /// Your terminal's own sixteen colours
     Terminal,
 }
