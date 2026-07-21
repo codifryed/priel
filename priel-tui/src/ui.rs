@@ -2072,9 +2072,8 @@ fn header_text(width: usize) -> String {
 ///
 /// **Not at every width, and the rule is read off [`track_columns`] rather than
 /// being a fourth breakpoint with a life of its own.** A header costs a row,
-/// and it costs it on exactly the terminals that just got two rows back by
-/// moving the now-playing block into the side panel, so it has to be worth more
-/// than the track it replaces.
+/// and a row of the list is the scarcest thing on the screen, so it has to be
+/// worth more than the track it replaces.
 ///
 /// What it is worth is settling *which column is which without reading the
 /// content*, and that is only ever a question where two columns of free text
@@ -2689,9 +2688,9 @@ fn activity(app: &App) -> (String, Color) {
 
 /// The activity slot's words, with no padding and no leading gap.
 ///
-/// Split out for the panel, where the slot is a line of its own and the row's
-/// fixed width would be trailing blanks - and where padding to sixteen cells in
-/// a box that narrow would push the line into its own border.
+/// Split out from [`activity`] so the words and the fixed-width slot they are
+/// padded into are two questions: anywhere the slot is a line of its own rather
+/// than a stretch of the bottom row, that padding would be trailing blanks.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -2729,8 +2728,9 @@ fn source_badge(app: &App) -> String {
 
 /// What the stream itself is: depth, rate, codec, tier, bitrate.
 ///
-/// The words alone, with nothing joining them to a title, because in the panel
-/// they are a line rather than a tail.
+/// The words alone, with nothing joining them to a title: [`source_badge`] is
+/// what adds the separator, so the two are one decision each rather than one
+/// string that has to be unpicked to be reused.
 fn source_words(app: &App) -> String {
     if app.now_playing.is_none() {
         return String::new();
@@ -5212,8 +5212,8 @@ mod tests {
     #[test]
     fn the_verdict_is_the_button_for_the_report_in_both_layouts() {
         // Goal: the verdict says whether, and clicking it says why - in the
-        // bottom block and in the panel alike. Method: render both and check a
-        // hit box was painted over the words themselves.
+        // bottom block, on both sides of the breakpoint. Method: render both
+        // and check a hit box was painted over the words themselves.
         for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30)] {
             let mut sc = screen();
             chain(&mut sc, 24, 96_000, 96_000, "s32");
@@ -5229,7 +5229,7 @@ mod tests {
     fn a_verdict_with_no_word_in_it_offers_nothing_to_click() {
         // Goal: nothing playing means nothing graded, and a hit box over an
         // empty span is a control that was never painted. The block only
-        // registers one when there is a word; the panel has to do the same.
+        // registers one only when there is a word, at every width.
         for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30)] {
             let mut sc = screen();
             let boxes = painted_all(&mut sc.app, w, h, Hit::Graph);
@@ -5243,9 +5243,9 @@ mod tests {
     #[test]
     fn a_modal_overlay_owns_the_pointer_in_the_wide_layout_too() {
         // Goal: an overlay draws over everything and answers the pointer
-        // itself. The panel registers hit boxes of its own, so that has to hold
-        // on both sides of the breakpoint. Method: note where the heart and the
-        // list rows were painted, put an overlay up, and click both.
+        // itself. The wide layout registers hit boxes of its own, so that has
+        // to hold on both sides of the breakpoint. Method: note where the heart
+        // and the list rows were painted, put an overlay up, and click both.
         for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30)] {
             let mut sc = screen();
             favorites_arrive(&mut sc, (0..8).map(|i| track(i, "T")).collect());
@@ -6296,10 +6296,7 @@ mod tests {
         // Goal: the separator between the title and the badge carried three
         // spaces on its left and two on its right, where every separator inside
         // the badge carries one of each. An uneven gap around one glyph reads
-        // as a misalignment rather than as a grouping. Below the breakpoint,
-        // because the separator only exists where the title and the badge share
-        // one line: the panel gives the badge a line of its own and joins it to
-        // nothing.
+        // as a misalignment rather than as a grouping.
         let mut sc = screen();
         sc.app.now_playing = Some(track(1, "So What"));
         sc.app.now_meta = crate::app::StreamMeta {
@@ -6718,7 +6715,7 @@ mod tests {
             let second = column_of(&mut sc.app, w, 20, inner.y + 1, "4:05");
             assert_eq!(first, second, "{w}: the two durations are not a column");
             // The list's own right-hand edge, which is the terminal's below the
-            // breakpoint and the panel's left border above it. The last cell a
+            // breakpoint and the queue column's left border above it. The last cell a
             // row may paint is the one before it, and a four-digit time starts
             // three cells before that.
             assert_eq!(
@@ -6804,10 +6801,10 @@ mod tests {
 
     #[test]
     fn a_row_of_a_name_and_a_time_is_not_given_a_header_to_explain_it() {
-        // Goal: the header costs a line of list, which is the line stage 2
-        // bought back by moving the block into the panel. Where the row is a
-        // title and a duration there are no two columns an eye could confuse,
-        // so the line stays a track.
+        // Goal: the header costs a line of list, and a line of list is the
+        // scarcest thing on the screen. Where the row is a title and a duration
+        // there are no two columns an eye could confuse, so the line stays a
+        // track.
         let mut sc = screen();
         sc.app.favorites = (1..=8).map(|i| track(i, "Nude")).collect();
         let out = text(&mut sc.app, 44, 20);
@@ -6907,9 +6904,9 @@ mod tests {
         assert_eq!(super::field("Nude", 0), "");
     }
 
-    // ---- the queue in the panel, and the second cursor ----
+    // ---- the queue in its column, and the second cursor ----
 
-    /// A rendered app with a queue in the panel and something playing from it.
+    /// A rendered app with a queue in the column and something playing from it.
     fn queued(n: u64, pos: usize) -> Screen {
         let mut sc = screen();
         sc.app.favorites = (1..=n).map(|i| track(i, &format!("Track {i}"))).collect();
@@ -6951,11 +6948,11 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_carries_the_queue_with_what_has_played_above_it() {
+    fn the_column_carries_the_queue_with_what_has_played_above_it() {
         // Goal: the queue is navigable in both directions, and what makes
         // "backward" real is that the tracks already played are on screen above
         // the current one rather than only reachable by a key. Method: render a
-        // queue mid-way through and read the rows out of the panel in order.
+        // queue mid-way through and read the rows out of the column in order.
         let mut sc = queued(6, 3);
         let rows = queue_rows(&mut sc.app, WIDE_COLS, 30);
         let played: Vec<&String> = rows.iter().take(3).collect();
@@ -7033,7 +7030,7 @@ mod tests {
     #[test]
     fn the_queue_marks_the_radios_entries_and_says_what_the_mark_means() {
         // Goal: what the radio added is a suggestion and what the listener
-        // queued is not, and the panel must not blur them. The mark is a glyph
+        // queued is not, and the column must not blur them. The mark is a glyph
         // in a column of its own, so provenance and position are two answers
         // rather than one blended one - and the legend appears where the mark
         // does. Method: hand the queue a join and read the rows.
@@ -7062,7 +7059,7 @@ mod tests {
     #[test]
     fn a_queue_with_nothing_the_radio_added_explains_no_mark() {
         // Goal: a legend for a mark that is not on screen is noise in a
-        // thirty-two cell panel. Method: render a queue nobody extended.
+        // thirty-four cell column. Method: render a queue nobody extended.
         let mut sc = queued(4, 0);
         let out = text(&mut sc.app, WIDE_COLS, 30);
         assert!(out.contains("Queue"), "{out}");
@@ -7091,13 +7088,16 @@ mod tests {
 
     #[test]
     fn below_the_breakpoint_there_is_no_queue_region_at_all() {
-        // Goal: the queue lives in the panel and the panel arrives at 120
+        // Goal: the queue lives in a column and the column arrives at 120
         // columns, so under that there is nothing to focus and nothing to
         // click. Method: render a queue at both widths and read the rect the
         // renderer publishes.
         let mut sc = queued(6, 2);
         let _ = draw(&mut sc.app, WIDE_COLS, 30);
-        assert!(sc.app.queue_inner.height > 0, "the panel carries the queue");
+        assert!(
+            sc.app.queue_inner.height > 0,
+            "the column carries the queue"
+        );
         let out = draw(&mut sc.app, WIDE_COLS - 1, 30).join("\n");
         assert_eq!(
             sc.app.queue_inner,
@@ -7106,7 +7106,7 @@ mod tests {
         );
         assert!(
             !out.contains("Queue "),
-            "there is no panel, so there is no queue heading: {out}"
+            "there is no column, so there is no queue heading: {out}"
         );
     }
 
@@ -7224,8 +7224,8 @@ mod tests {
     }
 
     #[test]
-    fn a_queue_longer_than_the_panel_scrolls_and_stays_clickable() {
-        // Goal: a queue may hold five hundred entries and the panel shows about
+    fn a_queue_longer_than_the_column_scrolls_and_stays_clickable() {
+        // Goal: a queue may hold five hundred entries and the column shows about
         // fifteen, so the window has to move with the cursor - and the offset
         // that moves it is the same one a click is measured against. Method:
         // walk to the end of a long queue and click the row the cursor is on.
