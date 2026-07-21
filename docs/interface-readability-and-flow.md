@@ -60,7 +60,7 @@ and web typography and does not transfer; I have not cited it where it does not.
 | 8 | The elapsed time is centred and drifts | medium | medium | guidance | **done** |
 | 9 | Overlay body text hugs the border, footers do not | low | none | guidance | **done** |
 | 10 | Overlay widths are an arbitrary ladder | low | low | taste | propose |
-| 11 | The report and the device picker are both "Output" | low | low | taste | propose |
+| 11 | The report and the device picker are both "Output" | low | low | taste | **done** |
 | 12 | Overlay footers are dead text | low | medium | taste | propose |
 | 13 | Small wording and spacing inconsistencies | low | none | mixed | **done** |
 
@@ -435,7 +435,7 @@ identity, themes), narrow (a question: prompt, confirm) - one margin rule, and
 content-height wherever the content is bounded. I have no evidence any specific
 number is better than any other, which is why this is taste.
 
-## 11. The report and the device picker are both called "Output"
+## 11. The report and the device picker are both called "Output" — **done**
 
 **Taste.** The `D` overlay is titled `" Output "` and the `d` overlay is titled
 `" Output device "`. The keyboard reference already calls the first one "the
@@ -448,6 +448,17 @@ empty value when nothing is playing, because `verdict_words` returns an empty
 string for `Fidelity::Unknown`. A heading with nothing under it reads as a
 failure to load (`empty-states`). Worth a word like "nothing playing", which is
 the same answer `access_words` already gives.
+
+**Settled: `D` is now titled " Output report ".** It is what the keyboard
+reference had been calling it all along, so the surface that teaches the binding
+and the overlay it opens no longer disagree, and the collision with the adjacent
+`d` is gone. Its test reads all three - report, reference, picker - out of real
+frames, so they cannot drift apart again.
+
+The empty heading is fixed too, and was never taste: the report substitutes
+"nothing playing" where the shared `verdict_words` answers with an empty string.
+The substitution is in the *report*, not in `verdict_words`, because that empty
+string is what suppresses the badge on the bottom row and must keep doing so.
 
 ## 12. Overlay footers are dead text where the bottom row's keys are live
 

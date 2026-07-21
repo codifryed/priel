@@ -1066,7 +1066,7 @@ fn graph_overlay(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .style(t.surface())
         .border_style(Style::default().fg(t.accent))
-        .title(" Output ");
+        .title(" Output report ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     if inner.height == 0 {
@@ -5182,6 +5182,63 @@ mod tests {
             "the row {row:?} and the now-playing line {now:?} disagree"
         );
         assert!(order(&now), "and both lead with the title");
+    }
+
+    #[test]
+    fn the_report_is_titled_what_the_keyboard_reference_calls_it() {
+        // Goal: audit finding 11. Two adjacent keys opened two overlays that
+        // shared a word - `d` gave " Output device " and `D` gave " Output " -
+        // while the keyboard reference had been calling the second one "the
+        // output report" all along. The surface that teaches a binding and the
+        // overlay it opens must not disagree about the name of the thing.
+        // Method: render both overlays and the reference, and read the words
+        // back out of the frames.
+        let mut sc = screen();
+        sc.app.mode = Mode::Graph;
+        let report = text(&mut sc.app, 100, 30);
+        assert!(
+            report.contains("Output report"),
+            "the report is not named after itself: {report}"
+        );
+
+        sc.app.mode = Mode::Help;
+        let reference = text(&mut sc.app, 100, 30);
+        assert!(
+            reference.contains("the output report"),
+            "the reference stopped saying it: {reference}"
+        );
+
+        sc.app.mode = Mode::Devices;
+        let picker = text(&mut sc.app, 100, 30);
+        assert!(
+            picker.contains("Output device"),
+            "the picker lost its name: {picker}"
+        );
+        assert!(
+            !picker.contains("Output report"),
+            "the two overlays are the same word again: {picker}"
+        );
+    }
+
+    #[test]
+    fn the_report_says_what_it_means_when_nothing_is_playing() {
+        // Goal: the other half of finding 11. `verdict_words` answers with an
+        // empty string when there is nothing to grade, which is right on the
+        // bottom row - it is what suppresses the badge. Under a *heading* it
+        // reads as a section that failed to load (`empty-states`). Method: open
+        // the report with nothing playing and read the Verdict row.
+        let mut sc = screen();
+        sc.app.mode = Mode::Graph;
+        let out = draw(&mut sc.app, 100, 30);
+        let verdict = out
+            .iter()
+            .find(|l| l.contains("Verdict"))
+            .map_or_else(|| panic!("no verdict row: {out:?}"), Clone::clone);
+        assert!(
+            verdict.contains("nothing playing"),
+            "a heading with nothing under it reads as a failure to load: \
+             {verdict:?}"
+        );
     }
 
     #[test]

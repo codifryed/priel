@@ -3965,10 +3965,20 @@ impl App {
     /// theme, a dark one, a monochrome terminal, and to the red/green
     /// deficiency these grades already lean on.
     fn verdict_rows(&self) -> Vec<GraphRow> {
-        vec![reading(
-            "  Verdict",
-            crate::ui::verdict_words(self.verdict()),
-        )]
+        // `verdict_words` answers with an empty string when there is nothing to
+        // grade, and on the bottom row that is exactly right - it is what
+        // suppresses the badge while nothing is playing. A *heading* with
+        // nothing under it is a different statement: it reads as a section that
+        // failed to load. So the report says what the silence means, the same
+        // way `access_words` already does, and the shared function is left
+        // alone rather than taught to answer two questions at once.
+        let words = crate::ui::verdict_words(self.verdict());
+        let words = if words.is_empty() {
+            "nothing playing".to_string()
+        } else {
+            words
+        };
+        vec![reading("  Verdict", words)]
     }
 
     /// What is being played into, and how it is being held.
