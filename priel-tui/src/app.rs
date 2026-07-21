@@ -57,6 +57,22 @@ pub enum View {
 /// Parity runs both ways: every action has a VIM-style key binding *and* a hit
 /// box, so this enum is the list of everything priel can be asked to do. The
 /// renderer knows the geometry, and only the renderer should have to.
+///
+/// Three things deliberately have no variant here, and saying so is the point -
+/// an admitted gap beats a silent one:
+///
+/// - **Typing.** The filter box, the search query and the pasted sign-in address
+///   are text, and the keys that edit, accept or cancel them belong to the box
+///   being typed in. A button standing for a keystroke aimed at a text field
+///   would be a control that could not do what it named.
+/// - **Scroll positions.** `g`, `G`, `J`, `K` and the half-page pair name
+///   *distances*, not destinations the mouse cannot otherwise reach: the wheel
+///   moves the same selection and a click lands on any row directly. They are
+///   listed in the reference all the same, and clickable there, so the keyboard
+///   idiom is never the only route.
+/// - **`x` outside the output picker.** Exclusivity is a property of the picker
+///   and the picker draws its own toggle. A control for it anywhere else would
+///   do nothing where it was clicked.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
     View(View),
@@ -5928,26 +5944,6 @@ mod tests {
         fire(&mut r.app, Hit::EditSearch);
         assert_eq!(r.app.view, View::Search);
         assert_eq!(r.app.mode, Mode::Search);
-        // Nowhere to sign in to and nowhere to download to without a client
-        // identity, and a rigged app has neither: what these assert is that the
-        // controls are wired to the attempt rather than to nothing.
-        fire(&mut r.app, Hit::SignIn);
-        assert_eq!(r.app.mode, Mode::Normal);
-        fire(&mut r.app, Hit::FetchCredentials);
-        assert!(r.app.credential_status().is_none());
-        r.app.mode = Mode::Credentials;
-        r.app.hits = vec![(
-            Rect {
-                x: 0,
-                y: 0,
-                width: 4,
-                height: 1,
-            },
-            Hit::DeclineCredentials,
-        )];
-        r.app.on_mouse(click(1, 0));
-        assert_eq!(r.app.mode, Mode::Normal);
-
         r.app.view = View::Favorites;
         r.app.selected = 2;
         fire(&mut r.app, Hit::Enter);
@@ -5971,8 +5967,50 @@ mod tests {
             fire(&mut r.app, h);
         }
 
+        fire(&mut r.app, Hit::SignIn);
+        assert_eq!(
+            r.app.mode,
+            Mode::Normal,
+            "no client identity, so nowhere to sign in to - but it is wired"
+        );
+
         fire(&mut r.app, Hit::Quit);
         assert!(r.app.should_quit);
+    }
+
+    #[test]
+    fn every_control_on_the_two_modal_screens_dispatches_to_a_real_action() {
+        // Goal: the consent and sign-in screens took no mouse input at all, so
+        // their controls are the newest and the least exercised. A rigged app has
+        // no client identity and no flow in progress, so what this asserts is
+        // that each is wired to a method rather than to nothing - and that the
+        // two that leave a screen do leave it.
+        let mut r = rig();
+        let press = |app: &mut App, mode: Mode, h: Hit| {
+            app.set_mode_for_test(mode);
+            app.hits = vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                },
+                h,
+            )];
+            app.on_mouse(click(1, 0));
+        };
+
+        press(&mut r.app, Mode::Credentials, Hit::FetchCredentials);
+        assert!(r.app.credential_status().is_none(), "nowhere to save it to");
+        press(&mut r.app, Mode::Credentials, Hit::DeclineCredentials);
+        assert_eq!(r.app.mode, Mode::Normal, "not now continues without it");
+
+        for h in [Hit::SubmitLogin, Hit::ReopenBrowser, Hit::ClearPaste] {
+            press(&mut r.app, Mode::Login, h);
+            assert_eq!(r.app.mode, Mode::Login, "these all stay on the screen");
+        }
+        press(&mut r.app, Mode::Login, Hit::CancelLogin);
+        assert_eq!(r.app.mode, Mode::Normal, "cancelling leaves it");
     }
 
     #[test]
