@@ -8719,13 +8719,20 @@ mod tests {
         r.app.queue[QUEUE_MAX - 1].mix_id = "0016d".into();
         r.app.queue_pos = QUEUE_MAX - 1;
         r.app.refresh_for_test();
+        assert!(
+            radios_asked(&r).is_empty(),
+            "a full queue does not ask for what it cannot hold"
+        );
+        assert!(
+            r.app.notice.is_some(),
+            "and it says so rather than stopping silently"
+        );
+
+        // And a page that was already in flight when it filled up cannot get
+        // past the ceiling either.
         r.to_app.send(radio_page("0016d", 9000..9010)).unwrap();
         r.app.drain_worker();
         assert_eq!(r.app.queue.len(), QUEUE_MAX, "there was no room left");
-        assert!(
-            r.app.notice.is_some(),
-            "and it says so rather than stopping"
-        );
     }
 
     #[test]
