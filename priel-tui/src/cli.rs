@@ -139,7 +139,7 @@ pub enum ThemeName {
     TokyoNight,
     /// Light, indigo.
     TokyoNightDay,
-    /// Your terminal's own sixteen colours
+    /// Your terminal's own colours; no row stripe
     Terminal,
 }
 

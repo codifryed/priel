@@ -1683,12 +1683,23 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
         let y = inner.y + i as u16;
         let selected = vi == app.selected;
         let (text, is_now) = row_text(app, &vis, vi, inner.width as usize);
+        // Striped by where the track sits in the list, never by where the row
+        // landed on screen: keyed to the screen row, a one-line scroll repaints
+        // every backing at once and the list reads as flickering rather than as
+        // moving.
+        //
+        // The three states are a precedence, not a blend. The cursor wins
+        // outright, because a selection tinted by the stripe under it is a
+        // fourth backing nobody chose. The row in the speakers says so with a
+        // foreground and a `♪` rather than with a backing of its own, so it
+        // keeps whichever stripe its place in the list gives it.
+        let base = t.stripe(vi % 2 == 1);
         let style = if selected {
             t.selection()
         } else if is_now {
-            Style::default().fg(t.active)
+            base.fg(t.active)
         } else {
-            Style::default()
+            base
         };
         f.render_widget(
             Paragraph::new(text).style(style),
@@ -2837,6 +2848,7 @@ mod tests {
         hint_width, push_hints, render,
     };
     use crate::app::{App, Click, Hit, Mode, View};
+    use crate::cli::ThemeName;
     use crate::theme::Theme;
     use crate::worker::{FromWorker, ToWorker};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2847,6 +2859,7 @@ mod tests {
         SinkLevels, SinkVolume,
     };
     use ratatui::layout::Rect;
+    use ratatui::style::Color;
     use ratatui::style::Style;
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::mpsc::{Receiver, Sender};
@@ -3095,6 +3108,194 @@ mod tests {
         assert!(out.contains("HI-RES"), "{out}");
         assert!(out.contains("4:05"), "245s should render as 4:05: {out}");
         assert!(out.contains("Favorites"), "{out}");
+    }
+
+    /// The backing of every cell of one list row, read out of a real frame.
+    ///
+    /// A stripe is a background and nothing else, so it is invisible in a text
+    /// dump: the only way to see it is to read the cells' `bg` back, and the
+    /// only way to see that it lines up with the row is to read every one of
+    /// them rather than a sample.
+    fn row_backing(app: &mut App, w: u16, h: u16, visible_row: usize) -> Vec<Color> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let inner = app.list_inner;
+        let y = inner.y + u16::try_from(visible_row).expect("a row inside a u16 frame");
+        let buf = term.backend().buffer().clone();
+        (inner.x..inner.x.saturating_add(inner.width))
+            .map(|x| buf[(x, y)].bg)
+            .collect()
+    }
+
+    /// The one backing every cell of a row carries, or a panic naming the row
+    /// that came out ragged. A stripe painting a different number of cells from
+    /// the row it backs is exactly the defect this catches.
+    fn one_backing(app: &mut App, w: u16, h: u16, visible_row: usize) -> Color {
+        let cells = row_backing(app, w, h, visible_row);
+        let first = *cells.first().expect("a row of at least one cell");
+        assert!(
+            cells.iter().all(|c| *c == first),
+            "row {visible_row} at {w}x{h} is backed by {cells:?}, not one colour"
+        );
+        first
+    }
+
+    /// A list of `n` tracks in favourites, ready to render.
+    fn listing(n: u64) -> Screen {
+        let mut sc = screen();
+        sc.app.favorites = (1..=n).map(|i| track(i, &format!("Track {i}"))).collect();
+        sc
+    }
+
+    #[test]
+    fn every_other_row_of_a_list_is_backed_by_the_stripe() {
+        // Goal: a track row can be two hundred cells wide, and an eye that
+        // starts at the title and ends at the duration has nothing to hold on
+        // to in between. The stripe is that hold: rows alternate between the
+        // surface and a backing a whisper away from it.
+        //
+        // Method: read the backings out of a real frame rather than the source.
+        // The selection sits on the first row, so the check starts below it.
+        let mut sc = listing(6);
+        let t = sc.app.theme();
+        for r in 1..6 {
+            let want = if r % 2 == 1 {
+                t.stripe_bg
+            } else {
+                t.background
+            };
+            assert_eq!(
+                one_backing(&mut sc.app, 120, 12, r),
+                want,
+                "row {r} is not the backing its place in the list calls for"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stripe_fills_the_row_and_stops_at_the_border() {
+        // Goal: stage 1 made a row fill its width in cells exactly. A stripe
+        // that paints a different number of cells than the row occupies shows
+        // as a ragged edge down the list, and it would only ever show at one
+        // width - so this measures every cell of a striped row at five, from
+        // the narrowest layout to the widest.
+        let mut sc = listing(6);
+        let t = sc.app.theme();
+        for (w, h) in [(60, 20), (80, 24), (119, 30), (120, 30), (200, 40)] {
+            let cells = row_backing(&mut sc.app, w, h, 1);
+            assert_eq!(
+                cells.len(),
+                sc.app.list_inner.width as usize,
+                "the stripe covers {} cells of a {}-cell row at {w}x{h}",
+                cells.len(),
+                sc.app.list_inner.width
+            );
+            assert!(
+                cells.iter().all(|c| *c == t.stripe_bg),
+                "the stripe is ragged at {w}x{h}: {cells:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_border_beside_a_striped_row_stays_the_surface() {
+        // Goal: the other half of the same guard. A stripe that ran one cell
+        // wide would paint over the box's own border, and reading only the
+        // inner cells would never show it.
+        let mut sc = listing(6);
+        let t = sc.app.theme();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        term.draw(|f| render(f, &mut sc.app)).expect("render");
+        let inner = sc.app.list_inner;
+        let buf = term.backend().buffer().clone();
+        let y = inner.y + 1;
+        assert_eq!(buf[(inner.x - 1, y)].bg, t.background, "left border");
+        assert_eq!(buf[(inner.x + inner.width, y)].bg, t.background, "right");
+    }
+
+    #[test]
+    fn a_selected_row_reads_as_selected_even_where_a_stripe_falls() {
+        // Goal: the row the cursor is on and the row a stripe falls on are
+        // independent, and when they coincide the cursor has to win outright.
+        // A selection tinted by the stripe underneath it would be a fourth
+        // backing nobody chose. Method: put the cursor on a striped row.
+        let mut sc = listing(6);
+        sc.app.selected = 3;
+        let t = sc.app.theme();
+        assert_eq!(one_backing(&mut sc.app, 120, 12, 3), t.selection_bg);
+    }
+
+    #[test]
+    fn the_playing_row_keeps_the_stripe_it_falls_on() {
+        // Goal: the other half of the precedence. The row in the speakers says
+        // so with a foreground and a `♪`, not with a backing of its own, so it
+        // takes whichever backing its place in the list gives it - and stays
+        // identifiable either way. Method: play a striped row that the cursor
+        // is not on.
+        let mut sc = listing(6);
+        sc.app.now_playing = Some(track(4, "Track 4"));
+        sc.app.selected = 0;
+        let t = sc.app.theme();
+        assert_eq!(one_backing(&mut sc.app, 120, 12, 3), t.stripe_bg);
+        assert_eq!(one_backing(&mut sc.app, 120, 12, 2), t.background);
+        let out = text(&mut sc.app, 120, 12);
+        assert!(out.contains("♪ ♡ Track 4"), "{out}");
+    }
+
+    #[test]
+    fn the_stripe_belongs_to_the_track_and_not_to_the_screen_row() {
+        // Goal: striping by screen row would repaint every row of the list on
+        // a one-row scroll, which reads as the whole list flickering rather
+        // than as movement. The stripe is a property of where a track sits in
+        // the list, so a track keeps its own backing as the window moves over
+        // it. Method: scroll one row and follow the same track.
+        let mut sc = listing(40);
+        let t = sc.app.theme();
+        assert_eq!(one_backing(&mut sc.app, 120, 12, 1), t.stripe_bg);
+        // One row past the last one on screen, which moves the window by one.
+        sc.app.selected = sc.app.list_inner.height as usize;
+        let mut term = Terminal::new(TestBackend::new(120, 12)).expect("backend");
+        term.draw(|f| render(f, &mut sc.app)).expect("render");
+        assert_eq!(
+            sc.app.list_offset, 1,
+            "the window should have moved one row"
+        );
+        // The second track was the striped row above; it is the topmost one
+        // now, and it keeps the stripe it had.
+        assert_eq!(one_backing(&mut sc.app, 120, 12, 0), t.stripe_bg);
+    }
+
+    #[test]
+    fn the_palette_that_declines_a_stripe_draws_none() {
+        // Goal: `terminal` cannot see the surface it is painting on, so it
+        // takes no stripe - and that has to be true of the frame, not only of
+        // the palette. Method: choose it the way a user does - a click on its
+        // row of the picker - then read the backings back: every row alike, and
+        // none of them pinned to a value of priel's own.
+        let mut sc = listing(6);
+        sc.app.mode = Mode::Themes;
+        draw(&mut sc.app, 100, 20);
+        let (rect, _) = sc
+            .app
+            .theme_rows
+            .iter()
+            .copied()
+            .find(|(_, n)| *n == ThemeName::Terminal)
+            .expect("the picker offers the terminal palette");
+        sc.app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(sc.app.theme_name(), ThemeName::Terminal);
+        for r in 0..4 {
+            assert_eq!(
+                one_backing(&mut sc.app, 120, 12, r + 1),
+                Color::Reset,
+                "row {r} under the terminal palette carries a backing of its own"
+            );
+        }
     }
 
     #[test]
