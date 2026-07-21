@@ -1,0 +1,31 @@
+[
+  {
+    "id": 300,
+    "type": "PipeWire:Interface:Client",
+    "version": 3,
+    "info": {
+      "props": {
+        "application.name": "priel",
+        "application.process.binary": "priel",
+        "application.process.id": 4242
+      }
+    }
+  },
+  {
+    "id": 301,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "info": {
+      "state": "suspended",
+      "props": {
+        "client.id": 300,
+        "media.class": "Stream/Output/Audio",
+        "node.name": "mpv",
+        "node.description": "priel"
+      },
+      "params": {
+        "Format": []
+      }
+    }
+  }
+]

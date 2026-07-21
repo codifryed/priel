@@ -33,7 +33,8 @@ use priel_core::auth::{Credentials, Pkce};
 use priel_core::{Fault, Playlist, Track};
 use priel_player::Alteration;
 use priel_player::graph::{
-    Attribution, AudioGraph, ClockRates, GraphError, GraphNode, NodeRole, RateAdvice, SourceFormat,
+    Attribution, AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, NodeRole, RateAdvice,
+    SourceFormat,
 };
 use priel_player::{AudioDevice, PlaybackStatus, Player, PlayerConfig};
 
@@ -1861,6 +1862,15 @@ impl App {
             Some(Err(e)) => {
                 let mut rows = vec![note(&e.to_string())];
                 rows.extend(e.hint().map(note));
+                // The one failure that is not a failure: there is no graph
+                // because priel has the device itself. That is the only thing
+                // the ownership section can say without a dump, and the player
+                // knows which device it is holding.
+                if matches!(e, GraphError::Bypassed) {
+                    rows.extend(holder_rows(&DeviceHolder::Direct {
+                        device: self.status.audio_device.clone(),
+                    }));
+                }
                 rows
             }
             Some(Ok(g)) => {
@@ -1876,6 +1886,11 @@ impl App {
                 // before any node on the path sees a sample, which is how the
                 // chain can diverge nowhere and something still move.
                 rows.extend(clock_rows(&g.clock, source));
+                // Last, because it is the one section that is true whatever the
+                // rest of them found: a chain that alters nothing is still a
+                // chain the sound server owns and can reshape when the next
+                // application starts.
+                rows.extend(holder_rows(&g.holder));
                 rows
             }
         }
@@ -2577,6 +2592,53 @@ fn clock_rows(clock: &ClockRates, source: SourceFormat) -> Vec<GraphRow> {
     rows
 }
 
+/// What has the output device open, and what it would take to reserve it.
+///
+/// Pure, like `clock_rows`: the determination arrives already made - from the
+/// dump, through `AudioGraph::holder`, or from the player on the direct path -
+/// and this only lays it out.
+///
+/// Always drawn, unlike the two sections above it. Those answer a question the
+/// reader had; this one is the question they did not know to ask, and a
+/// well-behaved server passing samples through untouched is exactly the case
+/// where it would otherwise never come up.
+fn holder_rows(holder: &DeviceHolder) -> Vec<GraphRow> {
+    let mut rows = vec![note(""), note("  Output device")];
+    match holder {
+        DeviceHolder::NoDevice => rows.push(reading(
+            "    held by",
+            "no output device on this chain".to_string(),
+        )),
+        DeviceHolder::Unknown { sink } => {
+            rows.push(reading("    held by", "unknown".to_string()));
+            rows.push(reading("    chain ends at", sink.clone()));
+        }
+        DeviceHolder::Direct { device } => {
+            rows.push(reading("    held by", "priel".to_string()));
+            rows.push(reading("    device", device.clone()));
+        }
+        DeviceHolder::Server(held) => {
+            // The session manager rather than the server itself is what opened
+            // the PCM, and naming it is the difference between a fact and a
+            // slogan. Where the dump did not carry the client, the sentence
+            // stops at what it did say.
+            let by = held.opened_by.as_deref().map_or_else(
+                || "the sound server".to_string(),
+                |who| format!("the sound server ({who})"),
+            );
+            rows.push(reading("    held by", by));
+            rows.push(reading("    device", held.sink.clone()));
+            // Labelled `pcm` rather than `card`: `hw:2,0` is the PCM the server
+            // opened, and the card is the `alsa_card.` name the rule below
+            // matches on. Calling both of them the card is how a reader ends up
+            // putting one where the other belongs.
+            rows.extend(held.pcm.as_ref().map(|pcm| reading("    pcm", pcm.clone())));
+        }
+    }
+    rows.extend(holder.lines().iter().map(|line| note(&format!("  {line}"))));
+    rows
+}
+
 /// A labelled reading: what it is on the left, what it says on the right.
 fn reading(label: &str, detail: String) -> GraphRow {
     GraphRow {
@@ -2658,6 +2720,7 @@ fn row_matches(primary: &str, secondary: &str, filter_lower: &str) -> bool {
 mod tests {
     use super::*;
     use priel_core::{PlayableSource, ResolvedStream};
+    use priel_player::graph::HeldDevice;
     use priel_player::hw::HwParams;
 
     struct Rig {
@@ -3854,8 +3917,16 @@ mod tests {
     }
 
     /// A two-node chain: priel's stream straight into a DAC, no resample.
+    ///
+    /// The holder is `Unknown` because a hand-built path carries no dump behind
+    /// it to name the device from, which is exactly what the parser reports for
+    /// a sink with nothing behind it. Tests that are about the holder set their
+    /// own.
     fn chain() -> AudioGraph {
         AudioGraph {
+            holder: DeviceHolder::Unknown {
+                sink: "Studio DAC".into(),
+            },
             path: vec![
                 GraphNode {
                     id: 58,
@@ -4016,8 +4087,13 @@ mod tests {
         r.to_app.send(FromWorker::AudioGraph(Ok(g))).expect("send");
         r.app.drain_worker();
         let rows = r.app.graph_rows();
-        let last = rows.last().expect("a row");
-        assert_eq!(last.detail, "no format yet");
+        // The device row, not the last row: the ownership section is drawn
+        // below the chain and this is about what the chain says.
+        let device = rows
+            .iter()
+            .rfind(|row| row.kind == GraphRowKind::Node)
+            .expect("a node row");
+        assert_eq!(device.detail, "no format yet");
     }
 
     /// A three-node chain with a loopback wedged in that moves the rate to
@@ -4172,10 +4248,20 @@ mod tests {
             .send(FromWorker::AudioGraph(Ok(chain())))
             .expect("send");
         r.app.drain_worker();
+        assert!(
+            r.app
+                .graph_rows()
+                .iter()
+                .all(|row| row.kind != GraphRowKind::Culprit),
+            "nothing is accused: {}",
+            overlay_text(&r.app)
+        );
         assert_eq!(
             r.app.graph_rows().len(),
-            3,
-            "two nodes and the connector, and nothing else: {}",
+            // Two nodes, the connector, and the ownership section, which is
+            // drawn whatever the chain found - and nothing else.
+            3 + 4,
+            "{}",
             overlay_text(&r.app)
         );
     }
@@ -4406,10 +4492,11 @@ mod tests {
         assert_eq!(r.app.graph_offset(), 0);
         r.app.on_key(key('k'));
         assert_eq!(r.app.graph_offset(), 0, "and stops at the top");
+        let last = r.app.graph_rows().len() - 1;
         r.app.on_key(key('G'));
-        assert_eq!(r.app.graph_offset(), 2, "G reaches the last line");
+        assert_eq!(r.app.graph_offset(), last, "G reaches the last line");
         r.app.on_key(key('j'));
-        assert_eq!(r.app.graph_offset(), 2, "and stops there");
+        assert_eq!(r.app.graph_offset(), last, "and stops there");
         r.app.on_key(key('g'));
         assert_eq!(r.app.graph_offset(), 0, "g returns to the top");
     }
@@ -4436,6 +4523,146 @@ mod tests {
             r.app.graph_rows().len(),
             1,
             "and shows nothing until the new answer lands"
+        );
+    }
+
+    // ---- what has the output device open ----
+
+    /// The same chain with the sound server holding the card it ends on.
+    ///
+    /// Clocked at the track's own rate so the only `unknown` these tests can
+    /// find is the one they are about: the clock section says `unknown` too
+    /// when the dump published no rates, and a test that cannot tell the two
+    /// apart passes on the wrong answer.
+    fn chain_held_by_the_server(card_name: Option<&str>) -> AudioGraph {
+        let mut g = chain_clocked(&[44_100], 44_100);
+        g.holder = DeviceHolder::Server(HeldDevice {
+            sink: "Studio DAC".into(),
+            opened_by: Some("wireplumber".into()),
+            pcm: Some("hw:2,0".into()),
+            card_name: card_name.map(ToString::to_string),
+        });
+        g
+    }
+
+    #[test]
+    fn the_overlay_names_the_sound_server_as_what_has_the_device_open() {
+        // Goal: the prerequisite for wanting the DAC out of the graph at all.
+        // A clean chain is still a chain the server owns and can reshape when
+        // the next application starts, so this is reported next to it rather
+        // than only when something is wrong.
+        let r = playing_hires(chain_held_by_the_server(Some(
+            "alsa_card.usb-Studio_DAC-00",
+        )));
+        let text = overlay_text(&r.app);
+        assert!(
+            text.contains("Output device"),
+            "the section is there: {text}"
+        );
+        assert!(
+            text.contains("the sound server (wireplumber)"),
+            "what has it open, named from the dump: {text}"
+        );
+        assert!(text.contains("hw:2,0"), "and which device that is: {text}");
+    }
+
+    #[test]
+    fn a_device_the_server_holds_comes_with_what_it_takes_to_reserve_it() {
+        // Goal: the second half - the change, where it goes, and what is given
+        // up. The trade is not a footnote: reserving the card silences every
+        // other application on the machine, and someone who finds that out
+        // afterwards was misled.
+        let r = playing_hires(chain_held_by_the_server(Some(
+            "alsa_card.usb-Studio_DAC-00",
+        )));
+        let text = overlay_text(&r.app);
+        assert!(text.contains("wireplumber.conf.d"), "where: {text}");
+        assert!(text.contains("device.disabled = true"), "what: {text}");
+        assert!(
+            text.contains("alsa_card.usb-Studio_DAC-00"),
+            "which card: {text}"
+        );
+        assert!(
+            text.contains("Nothing else on this machine"),
+            "what it costs: {text}"
+        );
+        assert!(
+            !text.contains("--exclusive"),
+            "taking a free card already has a flag and a toggle: {text}"
+        );
+    }
+
+    #[test]
+    fn a_card_the_graph_did_not_name_gets_no_rule_on_screen() {
+        // Goal: the honesty rule again. Knowing the server has the device and
+        // knowing which card that is are two facts, and a rule matching a name
+        // priel invented would disable something that was working.
+        let r = playing_hires(chain_held_by_the_server(None));
+        let text = overlay_text(&r.app);
+        assert!(
+            text.contains("the sound server"),
+            "the holder is still named: {text}"
+        );
+        assert!(
+            !text.contains("monitor.alsa.rules"),
+            "and nothing is guessed at: {text}"
+        );
+    }
+
+    #[test]
+    fn a_holder_the_graph_cannot_determine_is_reported_as_unknown() {
+        // Goal: an undeterminable owner is reported as undeterminable. The
+        // nearest card on the machine is a guess, and the reader acts on this
+        // by disabling something.
+        let mut g = chain_clocked(&[44_100], 44_100);
+        g.holder = DeviceHolder::Unknown {
+            sink: "Studio DAC".into(),
+        };
+        let r = playing_hires(g);
+        let text = overlay_text(&r.app);
+        assert!(text.contains("held by  unknown"), "{text}");
+        assert!(
+            !text.contains("wireplumber.conf.d"),
+            "nothing to advise about something unidentified: {text}"
+        );
+    }
+
+    #[test]
+    fn a_chain_that_reaches_no_device_says_that_rather_than_unknown() {
+        // Goal: "nothing is at the end of this chain" is a different finding
+        // from "something is and priel cannot tell what". Reporting the first
+        // as the second puts an unanswerable question where there is no
+        // question.
+        let mut g = chain_clocked(&[44_100], 44_100);
+        g.holder = DeviceHolder::NoDevice;
+        let r = playing_hires(g);
+        let text = overlay_text(&r.app);
+        assert!(
+            text.contains("no output device"),
+            "the chain reaches none: {text}"
+        );
+        assert!(!text.contains("unknown"), "which is not the same: {text}");
+    }
+
+    #[test]
+    fn a_device_priel_holds_itself_is_named_and_advised_about_nothing() {
+        // Goal: on the direct path the device is already priel's alone, so
+        // there is nothing to reserve. Advice printed over the destination
+        // teaches the reader to ignore the section - and the overlay still owes
+        // them which device it is that priel has.
+        let mut r = rig();
+        r.app.status.audio_device = "alsa/hw:CARD=AUDIO,DEV=0".into();
+        r.app.on_key(key('D'));
+        let text = overlay_text(&r.app);
+        assert!(text.contains("Output device"), "{text}");
+        assert!(text.contains("priel"), "who has it: {text}");
+        assert!(
+            text.contains("alsa/hw:CARD=AUDIO,DEV=0"),
+            "and which device that is: {text}"
+        );
+        assert!(
+            !text.contains("wireplumber.conf.d"),
+            "there is nothing left to hand over: {text}"
         );
     }
 

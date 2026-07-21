@@ -6,6 +6,7 @@
     "info": {
       "props": {
         "application.name": "mpv",
+        "application.process.binary": "priel",
         "application.process.id": 4242
       }
     }
@@ -79,6 +80,7 @@
         "api.alsa.path": "hw:3,0",
         "audio.format": "S16LE",
         "device.api": "alsa",
+        "device.id": 106,
         "media.class": "Audio/Sink",
         "node.description": "Example DAC Analog Stereo",
         "node.name": "alsa_output.usb-Example_DAC-00.analog-stereo"
@@ -123,6 +125,23 @@
       "input-node-id": 103,
       "input-port-id": 4,
       "state": "active"
+    }
+  }
+,
+  {
+    "id": 106,
+    "type": "PipeWire:Interface:Device",
+    "version": 3,
+    "info": {
+      "props": {
+        "alsa.card": 3,
+        "alsa.id": "DAC",
+        "api.alsa.path": "hw:3",
+        "device.api": "alsa",
+        "device.description": "Example DAC",
+        "device.name": "alsa_card.usb-Example_DAC-00",
+        "media.class": "Audio/Device"
+      }
     }
   }
 ]

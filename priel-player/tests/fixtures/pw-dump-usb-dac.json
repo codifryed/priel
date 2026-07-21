@@ -637,4 +637,85 @@
       }
     }
   }
+,
+  {
+    "id": 73,
+    "type": "PipeWire:Interface:Client",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "change-mask": [
+        "props"
+      ],
+      "props": {
+        "application.language": "en_US.UTF-8",
+        "application.name": "WirePlumber [export]",
+        "application.process.binary": "wireplumber",
+        "application.process.host": "host",
+        "application.process.id": 1116824,
+        "application.process.session-id": 3,
+        "application.process.user": "user",
+        "application.version": "0.5.14",
+        "core.name": "pipewire-user-1116824",
+        "core.version": "1.6.8",
+        "module.id": 2,
+        "object.id": 73,
+        "object.serial": 336,
+        "pipewire.access": "unrestricted",
+        "pipewire.protocol": "protocol-native",
+        "pipewire.sec.label": "unconfined",
+        "pipewire.sec.socket": "pipewire-0-manager",
+        "wireplumber.daemon": true,
+        "wireplumber.export-core": true,
+        "wireplumber.profile": "main"
+      }
+    }
+  },
+  {
+    "id": 47,
+    "type": "PipeWire:Interface:Device",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "change-mask": [
+        "props"
+      ],
+      "props": {
+        "alsa.card": 2,
+        "alsa.card_name": "SMSL USB AUDIO",
+        "alsa.driver_name": "snd_usb_audio",
+        "alsa.id": "AUDIO",
+        "alsa.long_card_name": "SMSL SMSL USB AUDIO at usb-0000:00:00.0-1, high speed",
+        "api.alsa.card": 2,
+        "api.alsa.path": "hw:2",
+        "api.alsa.use-acp": true,
+        "api.dbus.ReserveDevice1": "Audio2",
+        "client.id": 73,
+        "device.api": "alsa",
+        "device.bus": "usb",
+        "device.bus-id": "usb-SMSL_SMSL_USB_AUDIO-00",
+        "device.description": "SMSL USB AUDIO",
+        "device.enum.api": "udev",
+        "device.name": "alsa_card.usb-SMSL_SMSL_USB_AUDIO-00",
+        "device.nick": "SMSL USB AUDIO",
+        "device.product.name": "SMSL USB AUDIO",
+        "device.subsystem": "sound",
+        "factory.id": 15,
+        "media.class": "Audio/Device",
+        "object.id": 47,
+        "object.path": "alsa:acp:AUDIO",
+        "object.serial": 2918
+      }
+    }
+  }
 ]

@@ -77,9 +77,10 @@ water in and out of the flats twice a day, on the pull of the moon.*
 - **Library-first.** The API and player crates contain no UI code, so a GUI
   frontend can be added later as a second binary sharing both.
 
-Next up, and the reason this list has a gap: **PipeWire setup assistance** —
-the `allowed-rates` half is built, and what is left is naming the application
-holding the device when one is. See the roadmap below.
+The **PipeWire setup assistance** this list used to have a gap for is now
+built: the `allowed-rates` half, and the half that names what has the output
+device open and what it would take to reserve it. See the roadmap below for what
+is next.
 
 ## Install
 
@@ -209,8 +210,9 @@ DAC badge and a bit-perfect indicator; the `?` reference overlay; a diagnostic
 log with an `M` overlay for reading it without leaving the player; a `D` overlay
 listing the PipeWire nodes between priel and the device with the rate and format
 each one negotiated, marking the node where the track's rate or width is first
-lost with a `⚠`, and reporting the rates the sound server is permitted to clock
-at with the change to make when the track's rate is not one of them; a `d`
+lost with a `⚠`, reporting the rates the sound server is permitted to clock
+at with the change to make when the track's rate is not one of them, and naming
+what has the output device open with what it would take to reserve it; a `d`
 picker for moving the output between devices, with an `x` toggle for taking a
 device exclusively.
 
@@ -231,16 +233,20 @@ the path saw a sample. Where the setting cannot be read the overlay says
 `unknown` rather than guessing at one, and a device held directly has no server
 between priel and the DAC to have a setting at all.
 
+The last section of that overlay says who has the output device. A chain that
+alters nothing is still a chain the sound server owns, and it can be reshaped by
+the next application that starts, so the holder is named whether or not anything
+is wrong — read from the same dump: the sink, the process that opened it, the
+PCM behind it, and the card. Where the server has it, the overlay gives the
+WirePlumber rule that stops it claiming that card, the file the rule goes in, and
+the thing that is given up by writing it: nothing else on the machine will be
+able to play through that device. Where the card cannot be named from the dump
+there is no rule to copy, because a rule matching a name priel guessed at would
+disable something that was working. Where priel already holds the device itself
+there is nothing to hand over, and the overlay offers no advice at all.
+
 Roadmap, roughly in order:
 
-- **PipeWire configuration help.** The `D` overlay names the node that altered
-  the samples, and explains the `allowed-rates` setup when the server was not
-  permitted to run at the track's rate. What is left is saying which application
-  is holding the device when one is.
-- **ALSA setup helpers, for true bit-perfect.** The direct path itself is
-  built — `--device alsa/hw:...` with `--exclusive`, or the `x` toggle in the
-  picker. What is left is the guidance around it: detect when a device is
-  already claimed by PipeWire, and explain how to reserve it.
 - **A cleaner sign-in.** The redirect lands on the vendor's own page, which priel
   cannot listen on, so the flow ends with a paste. A client registered with a
   loopback redirect would remove that step; the developer terms do not currently

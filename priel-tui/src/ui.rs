@@ -1473,7 +1473,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use priel_core::{Playlist, Track};
     use priel_player::OutputAccess;
-    use priel_player::graph::{AudioGraph, ClockRates, GraphError, GraphNode, NodeRole};
+    use priel_player::graph::{
+        AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, HeldDevice, NodeRole,
+    };
     use ratatui::layout::Rect;
     use ratatui::style::Style;
     use ratatui::{Terminal, backend::TestBackend};
@@ -1935,6 +1937,7 @@ mod tests {
                     current_hz: Some(48_000),
                     forced_hz: None,
                 },
+                ..AudioGraph::default()
             },
         );
         sc.app.mode = Mode::Graph;
@@ -1950,6 +1953,49 @@ mod tests {
         assert!(out.contains("768000"), "and the tail of the list: {out}");
         assert!(out.contains("pipewire.conf.d"), "where it goes: {out}");
         assert!(out.contains("Restart the sound server"), "{out}");
+    }
+
+    #[test]
+    fn the_reservation_rule_reaches_the_screen_whole() {
+        // Goal: the same hazard the rate advice has. The ownership section is
+        // the last thing in a box sized to its content, so it is the first
+        // thing lost when anything above it grows - and a rule with its tail
+        // clipped still looks like something that can be copied.
+        let mut sc = screen();
+        with_chain(
+            &mut sc,
+            AudioGraph {
+                path: vec![node("Studio DAC", NodeRole::Device, 44_100, "S32LE")],
+                holder: DeviceHolder::Server(HeldDevice {
+                    sink: "Studio DAC".into(),
+                    opened_by: Some("wireplumber".into()),
+                    pcm: Some("hw:2,0".into()),
+                    card_name: Some("alsa_card.usb-Studio_DAC-00".into()),
+                }),
+                ..AudioGraph::default()
+            },
+        );
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 40);
+        assert!(out.contains("Output device"), "{out}");
+        assert!(
+            out.contains("the sound server (wireplumber)"),
+            "what has it open: {out}"
+        );
+        assert!(out.contains("hw:2,0"), "which device: {out}");
+        assert!(
+            out.contains("wireplumber.conf.d"),
+            "where the rule goes: {out}"
+        );
+        assert!(
+            out.contains("alsa_card.usb-Studio_DAC-00"),
+            "the card name survives the box: {out}"
+        );
+        assert!(out.contains("device.disabled = true"), "the change: {out}");
+        assert!(
+            out.contains("Nothing else on this machine"),
+            "and what it costs: {out}"
+        );
     }
 
     #[test]
