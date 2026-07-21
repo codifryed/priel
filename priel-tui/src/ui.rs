@@ -2307,6 +2307,12 @@ fn short_quality(q: &str) -> String {
 }
 
 fn trunc(s: &str, n: usize) -> String {
+    // A field with no room holds nothing. Returning the ellipsis alone made the
+    // result one cell wider than the field it was asked to fit, which on a
+    // narrow picker pushed the column beside it along.
+    if n == 0 {
+        return String::new();
+    }
     if s.chars().count() <= n {
         s.to_string()
     } else {
@@ -4597,5 +4603,17 @@ mod tests {
             !out.contains("HI_RES"),
             "the wire token must not reach a row: {out}"
         );
+    }
+
+    #[test]
+    fn a_field_with_no_room_truncates_to_nothing_rather_than_overflowing() {
+        // Goal: `trunc(s, 0)` returned a lone ellipsis, one cell wider than the
+        // field it was asked to fit. Reachable from the device picker
+        // (`body.width / 2`) and the add-to picker (`body.width - 14`) on a
+        // narrow overlay, where one cell of overflow shifts the column beside
+        // it.
+        assert_eq!(super::trunc("anything", 0), "");
+        assert_eq!(super::trunc("anything", 1), "…");
+        assert_eq!(super::trunc("ab", 2), "ab");
     }
 }
