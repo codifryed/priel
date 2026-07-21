@@ -105,8 +105,8 @@ pub struct Theme {
     pub selection_bg: Color,
     /// The highlighted row of the list the keyboard is **not** driving.
     ///
-    /// Two lists are focusable - the browse list and the queue in the
-    /// now-playing panel - so two cursors are on screen at once and each has to
+    /// Two lists are focusable - the browse list and the queue in its own
+    /// column - so two cursors are on screen at once and each has to
     /// say which it is. This is the quiet one: the selection backing stepped
     /// most of the way back toward the surface, so focusing a list can only
     /// make its cursor louder and never dimmer.

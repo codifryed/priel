@@ -526,8 +526,42 @@ proceeded partly blind before that was noticed.
    silently clipped. Progressive disclosure by width, documented drop order
    (album → artist → tier), duration pinned right.
 
-10. **Now-playing becomes a side panel at 120 columns and up**, freeing two of
-    the three chrome lines. Below that, the three-line bottom block, unchanged.
+10. **The now-playing block is three rows along the bottom at every width, and
+    the right-hand column belongs to the queue alone** (issue #27). Three parts,
+    and the first of them is a correction:
+
+    - **Nothing about now-playing depends on the width any more.** For one
+      release it became a side panel at 120 columns and up, and this entry said
+      that freed two of the three chrome lines. **Those two rows are spent
+      again, deliberately.** What the panel bought in height it cost in
+      steadiness: the four facts a listener glances at without looking for them
+      - what is playing, where it has got to, what it is going into, and the
+      verdict on what arrives there - moved to a different edge of the screen
+      depending on the terminal, and a fact that moves has to be looked for. One
+      place at every width beats two rows.
+
+      The route this arrived by is worth recording, because it is the failure
+      mode and not the layout. Two layouts were offered and a question asked
+      about which was wanted; no answer chose one, and a *follow-up* question
+      about focus carried the panel layout in its mockup and was approved. A
+      mockup inside a question about something else is framing, not a decision.
+
+    - **The column at 120 columns and up is the queue and nothing else**, full
+      height beside the list, 36 cells including its borders. Fixed rather than
+      a share of the width, for the reason the panel's width was fixed: a queue
+      row is a mark and a title, and a column that grew with the terminal would
+      pad short lines with width the list has five columns to spend.
+
+    - **It is shown by default and can be folded away.** `W` hides and restores
+      it - the shifted sibling of the `Ctrl-W` that moves the keyboard between
+      the two regions, so the pair names the window rather than spending a
+      second idiom - and a `▤` in the header does the same through the same
+      method. That control is drawn only at 120 columns and up, because below
+      that it would do nothing where it was clicked. A folded column publishes
+      no `queue_inner`, which is what makes it unfocusable and unclickable by
+      exactly the route a narrowed terminal already used; `Ctrl-W` on one says
+      which key brings it back rather than blaming a width that is not the
+      problem.
 
 11. **Zebra striping is a theme role, and `terminal` opts out** - it inherits a
     palette priel cannot read, so guessing a stripe there is the overstatement
@@ -545,18 +579,19 @@ proceeded partly blind before that was noticed.
 15. **The verdict badge opens the report when clicked**, through the same method
     `[D]` uses.
 
-16. **The queue lives in the now-playing panel, as a second focusable region**
-    (issue #25). Six answers were settled with it, and each is here because the
-    alternative was reachable:
+16. **The queue is a second focusable region** (issue #25). Six answers were
+    settled with it, and each is here because the alternative was reachable.
+    It arrived in the now-playing panel; decision 10 above has since given it
+    the column to itself, which changes where it is drawn and nothing about the
+    six:
 
-    - **No new region and no second breakpoint.** The panel exists at 120
-      columns and the queue appears with it. **Below 120 columns there is no
+    - **No new region and no second breakpoint.** The column exists at 120
+      columns and the queue is what is in it. **Below 120 columns there is no
       queue view at all** - not a narrower one, and not a modal. That is the
-      decision: decision 10 above bought the list two rows by moving the
-      now-playing block off the bottom, and a queue squeezed into a narrow
-      terminal would spend them again on the part of the screen the narrow
-      terminal is least able to afford. `Ctrl-W` there names the width that
-      brings it back rather than doing nothing.
+      decision: a queue squeezed into a narrow terminal would be taking cells
+      from the list, which is the part of the screen a narrow terminal can least
+      afford to shrink and the reason someone is running one. `Ctrl-W` there
+      names the width that brings it back rather than doing nothing.
     - **`Ctrl-W` moves the keyboard between the two.** `Tab` is taken by the
       view cycle. `Ctrl-W` is vim's own window key, so a VIM-first client spends
       no letter on it - and because priel has exactly two regions rather than
