@@ -25,6 +25,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
+use std::io::Read as _;
 use ureq::http::Response;
 use ureq::{Agent, Body};
 
@@ -161,6 +162,38 @@ pub struct Track {
     /// nothing can be continued from, and the caller has something to say about
     /// that rather than something to retry.
     pub mix_id: String,
+    /// The album art identifier, empty when the row named none.
+    ///
+    /// An opaque id, not a URL: [`cover_url`] turns it into one. Empty is a real
+    /// answer - a track whose listing carried no cover - and a frontend that
+    /// cannot draw pictures ignores it at no cost, which is why it is exposed
+    /// here rather than resolved in the library.
+    pub cover: String,
+}
+
+/// The URL of a track's album cover at a given square size, or `None` when the
+/// track named no cover.
+///
+/// **The pattern is the documented public one and is unverified against a live
+/// response in this repository** - there are no captures here to check it, so a
+/// caller must confirm it on real hardware before trusting it, and a cover that
+/// fails to fetch is treated as absent rather than as an error. See
+/// `docs/cover-art.md`.
+///
+/// The service keys its image host by the cover id with its dashes turned into
+/// path separators, and serves a square JPEG at a handful of fixed sizes. `size`
+/// is snapped to the nearest of those the caller is expected to have asked for;
+/// this function does not validate it, because the set is the service's and can
+/// change without this code.
+#[must_use]
+pub fn cover_url(cover_id: &str, size: u32) -> Option<String> {
+    if cover_id.is_empty() {
+        return None;
+    }
+    let path = cover_id.replace('-', "/");
+    Some(format!(
+        "https://resources.tidal.com/images/{path}/{size}x{size}.jpg"
+    ))
 }
 
 /// Derive a short quality label from a track's mediaMetadata tags / audioQuality.
@@ -427,12 +460,14 @@ impl TrackBrief {
             .filter_map(|a| a.name.filter(|n| !n.is_empty()))
             .collect();
         let audio_quality = self.audio_quality.unwrap_or_default();
+        let album = self.album.unwrap_or_default();
         Track {
             id: self.id,
             title: self.title.unwrap_or_default(),
             artist: artists.first().cloned().unwrap_or_default(),
             artists,
-            album: self.album.unwrap_or_default().title.unwrap_or_default(),
+            cover: album.cover.unwrap_or_default(),
+            album: album.title.unwrap_or_default(),
             duration_secs: self.duration.unwrap_or_default(),
             quality: quality_label(&self.media_metadata.tags, &audio_quality),
             version: self.version.unwrap_or_default(),
@@ -568,6 +603,13 @@ struct ArtistBrief {
 struct AlbumBrief {
     #[serde(default)]
     title: Option<String>,
+    /// The album art identifier, the service's own opaque id for the cover.
+    ///
+    /// Left on the wire until now as "art a terminal cannot use"; a half-block
+    /// renderer is what changed that. Still just an id here - turning it into a
+    /// URL is [`cover_url`], and fetching the bytes is the caller's to do.
+    #[serde(default)]
+    cover: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1006,6 +1048,34 @@ impl Client {
             items,
             total: fr.total_number_of_items,
         })
+    }
+
+    /// Fetch the bytes at an absolute URL, unauthenticated, with a size ceiling.
+    ///
+    /// For the album cover, whose host is a public CDN rather than the API: no
+    /// bearer, no session renewal, no `countryCode`. Kept general and dumb - it
+    /// is handed a whole URL by [`cover_url`] rather than building one - so the
+    /// one unverified thing (the URL pattern) lives in one place and this stays
+    /// correct whatever that turns out to be.
+    ///
+    /// `cap` bounds what is read into memory: a redirect to something enormous,
+    /// or a body that is not the picture it claimed, must not be able to fill
+    /// the heap. A cover is tens of kilobytes; the ceiling is set well above
+    /// that and well below anything that would matter.
+    ///
+    /// # Errors
+    /// A transport failure, a non-success status, or a body past `cap`.
+    pub fn fetch_bytes(&self, url: &str, cap: usize) -> Result<Vec<u8>> {
+        let mut resp = self.http.get(url).call()?;
+        if !resp.status().is_success() {
+            bail!("image fetch -> HTTP {}", resp.status());
+        }
+        let mut buf = Vec::new();
+        resp.body_mut()
+            .as_reader()
+            .take(cap as u64)
+            .read_to_end(&mut buf)?;
+        Ok(buf)
     }
 
     /// A page of the user's own playlists.
@@ -1798,7 +1868,8 @@ mod tests {
         // Goal: the wire shape is nested (items[].item) and the paging arguments
         // must actually reach the URL, or every page returns the same rows.
         let body = r#"{"items":[{"item":{"id":1,"title":"T","duration":100,
-            "artists":[{"name":"A"},{"name":"B"}],"album":{"title":"Alb"},
+            "artists":[{"name":"A"},{"name":"B"}],
+            "album":{"title":"Alb","cover":"aaaa-bbbb-cccc"},
             "audioQuality":"LOSSLESS","mediaMetadata":{"tags":["HIRES_LOSSLESS"]}}}]}"#;
         let s = stub(vec![ok(SESSION), ok(body)]);
         let mut c = connected(&s);
@@ -1809,6 +1880,7 @@ mod tests {
         assert_eq!((t.id, t.duration_secs), (1, 100));
         assert_eq!(t.artist, "A", "the first artist represents the track");
         assert_eq!(t.album, "Alb");
+        assert_eq!(t.cover, "aaaa-bbbb-cccc", "the album art id is kept");
         assert_eq!(t.quality, "HI-RES", "the hi-res tag wins over audioQuality");
 
         let _ = s.seen.recv().unwrap();
@@ -3001,5 +3073,37 @@ mod tests {
         let left = c.session_expires_in().expect("a known expiry");
         assert!((1_700..=1_800).contains(&left), "got {left}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn image_bytes_come_back_whole_and_are_capped() {
+        // Goal: `fetch_bytes` reads an absolute URL with no auth and no session,
+        // and the ceiling bounds what a hostile or broken response can put on
+        // the heap. Method: serve a known body from the stub and read it under
+        // caps above and below its length.
+        let body = "\u{ffff}JPEGISH-BYTES";
+        let s = stub(vec![ok(body), ok(body)]);
+        let c = client(&s);
+
+        let whole = c.fetch_bytes(&s.base, 4096).expect("a body");
+        assert_eq!(whole, body.as_bytes(), "the picture comes back whole");
+
+        let clipped = c.fetch_bytes(&s.base, 4).expect("a capped body");
+        assert_eq!(clipped.len(), 4, "the cap is a ceiling on what is read");
+    }
+
+    #[test]
+    fn a_cover_id_becomes_a_square_image_url_and_an_empty_one_becomes_nothing() {
+        // Goal: the one transformation `cover_url` makes - dashes to slashes,
+        // wrapped in the image host and a square size. Absent art is None rather
+        // than a URL that would 404, so the caller draws nothing rather than
+        // chasing a dead link. The pattern itself is unverified against a live
+        // response; this pins its shape, which is what a fix would keep.
+        assert_eq!(
+            cover_url("1234-5678-9abc", 80).as_deref(),
+            Some("https://resources.tidal.com/images/1234/5678/9abc/80x80.jpg"),
+            "dashes become path separators and the size is square"
+        );
+        assert_eq!(cover_url("", 80), None, "no cover, no URL");
     }
 }

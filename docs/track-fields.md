@@ -75,7 +75,8 @@ and `/v1/pages/mix`. Status is one of **read** (reaches `Track`), **discarded**
 | `artists[].id`, `.type`, `.picture`, `.handle` | | discarded | ids for navigation, art a terminal cannot draw |
 | `album.title` | str | read | `Track::album` |
 | `album.id` | int | discarded | wanted the day there is an album view |
-| `album.cover`, `.vibrantColor`, `.videoCover` | | discarded | art and a theme colour |
+| `album.cover` | str | **read (new)** | `Track::cover`; the album art id, drawn as half blocks |
+| `album.vibrantColor`, `.videoCover` | | discarded | a theme colour and a video loop |
 | `audioQuality` | str | read | via `quality_label` |
 | `mediaMetadata.tags` | list | read | via `quality_label`; the hi-res tag wins |
 | `version` | str/null | **read (new)** | `Track::version` |
@@ -226,7 +227,7 @@ Left out on purpose, all of them one line away the day something wants them:
   in.
 - **`album.id`, `artists[].id`** - navigation keys, wanted by the browse work
   and not by this.
-- **art, cover ids, `vibrantColor`, share `url`s** - a terminal cannot use them.
+- **`vibrantColor`, `videoCover`, share `url`s** - a theme colour, a video loop, and links a terminal cannot open. `album.cover` was here too, discarded as "art a terminal cannot use"; a half-block renderer changed that, and it is now `Track::cover`. See `docs/cover-art.md`.
 
 ## A trap worth keeping
 
