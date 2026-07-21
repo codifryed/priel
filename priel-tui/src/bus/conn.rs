@@ -281,7 +281,9 @@ impl<S: Read + Write> Connection<S> {
                     .map_err(|_| refused("the bus sent a handshake line that is not text"));
             }
             if self.inbox.len() > MAX_AUTH_LINE {
-                return Err(refused("the bus sent a handshake line longer than any"));
+                return Err(refused(
+                    "the bus sent a handshake line longer than priel accepts",
+                ));
             }
             if self.fill()? == Fill::Closed {
                 return Err(refused(
@@ -307,7 +309,9 @@ impl<S: Read + Write> Connection<S> {
                 self.unique_name.clone_from(name);
                 Ok(())
             }
-            _ => Err(refused("the bus answered Hello with something but a name")),
+            _ => Err(refused(
+                "the bus answered Hello with something other than a name",
+            )),
         }
     }
 
@@ -327,7 +331,7 @@ impl<S: Read + Write> Connection<S> {
             // anyway - both leave priel without the name.
             Some(Arg::Value(Value::Uint32(2 | 3))) => Ok(NameOutcome::Taken),
             _ => Err(refused(
-                "the bus answered RequestName with something but a code",
+                "the bus answered RequestName with something other than a code",
             )),
         }
     }
@@ -354,9 +358,9 @@ impl<S: Read + Write> Connection<S> {
 
     /// Serve the bus until the connection or the caller ends.
     ///
-    /// One thread does both directions, which the socket's read timeout is what
-    /// makes possible: a read that finds nothing costs [`READ_TIMEOUT`] and
-    /// then the outbound queue gets its turn. The inbox accumulates across
+    /// One thread does both directions, and the socket's read timeout is what
+    /// makes that possible: a read that finds nothing costs [`READ_TIMEOUT`]
+    /// and then the outbound queue gets its turn. The inbox accumulates across
     /// those timeouts and only whole frames are parsed, so a timeout landing
     /// mid-message is not a special case.
     ///
@@ -1710,7 +1714,7 @@ mod tests {
             .authenticate(Some(1000))
             .expect_err("a line with no terminator");
         assert!(
-            error.to_string().contains("longer than any"),
+            error.to_string().contains("longer than priel accepts"),
             "the length is what has to end it, not the peer eventually hanging up: {error}"
         );
     }
