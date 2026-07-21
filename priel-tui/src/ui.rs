@@ -31,38 +31,39 @@ use crate::app::{App, Focus, GraphRow, GraphRowKind, Hit, Mode, Repeat, View};
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
 
-/// The width at which the now-playing block stops being three rows along the
-/// bottom and becomes a column down the right.
+/// The width at which the queue gets a column of its own beside the list.
 ///
 /// **One breakpoint, not a ladder.** A second one would be a third layout to
-/// keep the hit boxes right in, and the row's own drop order
-/// (`track_columns`) already covers the list being narrower once the panel is
-/// there - the two decisions compose rather than fight, which is why the panel
-/// hands the reduced width straight on rather than adding a rule of its own.
+/// keep the hit boxes right in, and the row's own drop order (`track_columns`)
+/// already covers the list being narrower once the column is there - the two
+/// decisions compose rather than fight, which is why the column hands the
+/// reduced width straight on rather than adding a rule of its own.
 ///
 /// 120 because that is where a list still reads comfortably after giving
-/// [`PANEL_COLS`] away: it leaves the box wider than an 80-column terminal
-/// gives it today, so the panel never costs the list more than it was already
+/// [`QUEUE_COLS`] away: it leaves the box wider than an 80-column terminal
+/// gives it today, so the queue never costs the list more than it was already
 /// living with.
+///
+/// The now-playing block is *not* on either side of this line. It is three rows
+/// along the bottom at every width, because the four facts it carries are the
+/// ones a listener glances at without looking for them, and a fact that moves
+/// with the terminal has to be looked for.
 const WIDE_COLS: u16 = 120;
 
-/// The cells the now-playing panel occupies, borders included.
+/// The cells the queue column occupies, borders included.
 ///
-/// Fixed rather than a share of the width: everything in it is a fixed-length
-/// readout - `DAC S32 · 192 kHz`, `≈ near bit-perfect`, `0:00 / 4:05` - so a
-/// panel that grew with the terminal would be padding a column of short lines
-/// while taking the width from the list, which is the one part of the screen
-/// that can always use more.
-const PANEL_COLS: u16 = 36;
+/// Fixed rather than a share of the width: a queue row is a mark and a title,
+/// so a column that grew with the terminal would be padding short lines while
+/// taking the width from the list - which carries a title, an artist, an album,
+/// a tier and a duration, and is the one part of the screen that can always use
+/// more.
+const QUEUE_COLS: u16 = 36;
 
 pub fn render(f: &mut Frame, app: &mut App) {
-    // Two of the three chrome rows move into the panel at [`WIDE_COLS`], which
-    // is two more list rows on a 24-row terminal.
-    let wide = f.area().width >= WIDE_COLS;
     let rows = Layout::vertical([
-        Constraint::Length(1),                        // header / tabs
-        Constraint::Min(1),                           // list, and the panel
-        Constraint::Length(if wide { 1 } else { 3 }), // keys, and the block
+        Constraint::Length(1), // header / tabs
+        Constraint::Min(1),    // the list, and the queue beside it
+        Constraint::Length(3), // the now-playing block, at every width
     ])
     .split(f.area());
 
@@ -74,24 +75,24 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Hit boxes are geometry, so the renderer owns them. Rebuilt every frame.
     app.hits.clear();
     header(f, app, rows[0]);
-    if wide {
+    if f.area().width >= WIDE_COLS {
         let cols =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(PANEL_COLS)]).split(rows[1]);
-        // The panel first, because it is what publishes the queue's rect and
-        // the list draws its own cursor by whether that rect exists. Reading
-        // last frame's would put the focus ring a frame behind the layout on
-        // the one frame a resize crosses the breakpoint.
-        now_panel(f, app, cols[1]);
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(QUEUE_COLS)]).split(rows[1]);
+        // The queue first, because it is what publishes its own rect and both
+        // the list's cursor and the bottom row's focus hint are drawn by
+        // whether that rect exists. Reading last frame's would put them a frame
+        // behind the layout on the one frame a resize crosses the breakpoint.
+        queue_column(f, app, cols[1]);
         list(f, app, cols[0]);
-        key_row(f, app, rows[2]);
     } else {
-        // No panel means no second region: the queue's rect goes away with it,
-        // so nothing below the breakpoint is focusable or clickable, and the
-        // list keeps the single cursor it has always had.
+        // No column means no second region: the queue's rect goes away with it,
+        // so a narrow terminal and a collapsed column are alike in the one way
+        // that matters - nothing there is focusable or clickable, and the list
+        // keeps the single cursor it has always had.
         app.queue_inner = Rect::default();
         list(f, app, rows[1]);
-        now_playing(f, app, rows[2]);
     }
+    now_playing(f, app, rows[2]);
 
     // Drawn last so it sits over everything, and after the hit boxes above have
     // been registered - `App` ignores them while the overlay is up.
@@ -2170,7 +2171,12 @@ fn push_gap(row: &mut String) {
     }
 }
 
-/// The now-playing block as three rows along the bottom, below [`WIDE_COLS`].
+/// The now-playing block: three rows along the bottom, at every width.
+///
+/// What is playing, where it has got to, what it is going into and the verdict
+/// on what arrives there - in one place a listener does not have to find again
+/// after a resize. It was a side panel above [`WIDE_COLS`] for one release; the
+/// two chrome rows that bought the list are spent here again deliberately.
 fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
     // Split rather than offset from `area.y`: on a terminal too short for three
@@ -2227,9 +2233,10 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     }
     bar.label(act_text, Style::default().fg(act_color));
     bar.label("  ", Style::default());
-    // The bottom block only exists below the breakpoint, where the panel that
-    // holds the queue does not, so there is never a second region down here.
-    push_hints(&mut bar, &t, false);
+    // The row is the same row at every width, so whether there is a second
+    // region to name is a question about the queue's rect rather than about the
+    // layout - and that rect is published before this runs.
+    push_hints(&mut bar, &t, two_regions(app));
     app.hits.extend(bar.hits);
     f.render_widget(Paragraph::new(Line::from(bar.spans)), l2);
 }
@@ -2292,32 +2299,13 @@ fn progress_bar(app: &App, t: &Theme) -> Gauge<'static> {
         ))
 }
 
-/// The keyboard reference, and nothing else, on the bottom row.
-///
-/// What the row looks like at [`WIDE_COLS`] and above, once the panel has taken
-/// the readouts off it. One leading space so the row starts where the block's
-/// did, and `push_hints` still reserves for `[?]` and `[q]` - the extra width is
-/// spent on showing more of the reference, never on letting it run off the edge.
-fn key_row(f: &mut Frame, app: &mut App, area: Rect) {
-    let t = app.theme();
-    let mut bar = ControlBar::new(area);
-    bar.label(" ", Style::default());
-    let second_region = two_regions(app);
-    push_hints(&mut bar, &t, second_region);
-    app.hits.extend(bar.hits);
-    f.render_widget(Paragraph::new(Line::from(bar.spans)), area);
-}
-
-/// The state glyph and the heart, so the artist starts under the title rather
-/// than under the two glyphs that lead the line above it.
-const PANEL_NAME_INDENT: u16 = 4;
-
 /// Is there a second region on screen to hand the keyboard to?
 ///
-/// The queue's rect and nothing else, because that rect is the panel: it is
-/// written every frame by the renderer and cleared where there is no panel, so
-/// the breakpoint is asked about once, here, rather than being a width the key
-/// handler has to know as well.
+/// The queue's rect and nothing else, because that rect *is* the column: it is
+/// written every frame by the renderer and cleared wherever there is no column
+/// to click on - too narrow, collapsed, or nothing queued - so the three
+/// reasons are asked about once, here, rather than being three conditions the
+/// key handler has to carry as well.
 fn two_regions(app: &App) -> bool {
     app.queue_inner.height > 0
 }
@@ -2358,23 +2346,27 @@ fn queue_marks(app: &App, index: usize) -> String {
     format!("{playing}{source} ")
 }
 
-/// The line above the entries: where in the queue the music is, and - only
-/// where there is one to explain - what the mark on a row means.
+/// The column's own title: where in the queue the music is, and - only where
+/// there is one to explain - what the mark on a row means.
+///
+/// In the border rather than on a line of its own, which is where the list
+/// beside it says the same two things, and which is a row given back to the
+/// entries.
 fn queue_heading(app: &App) -> Vec<Span<'static>> {
     let t = app.theme();
     let mut spans = vec![Span::styled(
-        format!("Queue {}/{}", app.queue_pos + 1, app.queue.len()),
+        format!(" Queue {}/{} ", app.queue_pos + 1, app.queue.len()),
         Style::default().fg(t.queue),
     )];
     if app.queue_has_suggestions() {
         // The colour the counter in the header already wears for music the
-        // service chose, so the panel and the header say it the same way.
-        spans.push(Span::styled("  ~ radio", Style::default().fg(t.notice)));
+        // service chose, so the column and the header say it the same way.
+        spans.push(Span::styled("~ radio ", Style::default().fg(t.notice)));
     }
     spans
 }
 
-/// The queue, under the readouts in the now-playing panel.
+/// The queue, in a column of its own down the right-hand side.
 ///
 /// **History is above the current track and dimmed**, which is what makes
 /// "backward" real navigation: the tracks already played are on screen and
@@ -2386,37 +2378,49 @@ fn queue_heading(app: &App) -> Vec<Span<'static>> {
 /// later page of the listing lands - showing it makes that visible, which is
 /// the point - so there is no second copy here that could come to disagree with
 /// the one the player is working through.
+///
+/// **`queue_inner` is published here and nowhere else**, and is left empty when
+/// there is nothing to drive: it is what `App::focus` and `App::click_at` are
+/// derived from, so an empty queue is a box with an empty state in it rather
+/// than a region the keyboard can be handed to.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "row index is bounded by the rect height, itself a u16"
 )]
-fn queue_panel(f: &mut Frame, app: &mut App, area: Rect) {
+fn queue_column(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme();
+    // Asked *before* the rect is cleared. `focus()` is derived from that rect,
+    // so clearing it first would answer `List` every frame and the ring would
+    // never be drawn - which is exactly what happened once the queue became the
+    // box that publishes its own geometry.
+    let focused = app.focus() == Focus::Queue && !app.queue.is_empty();
+    let (ring, edge) = focus_ring(app, focused, &t);
     app.queue_inner = Rect::default();
-    // A heading and one entry, plus the blank line that separates the queue
-    // from the readouts above it. Under that there is no queue worth the rows.
-    if area.height < 3 || app.queue.is_empty() {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(t.surface())
+        .border_style(ring)
+        .border_type(edge)
+        .title(Line::from(queue_heading(app)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
         return;
     }
-    let t = app.theme();
-    // The spacer is inside this rect rather than a constraint of the panel's
-    // own: a tenth fixed row up there changed how a short panel is squeezed and
-    // took the verdict badge off it.
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(area);
-    f.render_widget(Paragraph::new(Line::from(queue_heading(app))), rows[1]);
-
-    let inner = rows[2];
+    if app.queue.is_empty() {
+        // An empty state rather than an empty box: a column that says nothing
+        // reads as a column that failed to load.
+        f.render_widget(
+            Paragraph::new(trunc(" Nothing queued yet.", usize::from(inner.width)))
+                .style(Style::default().fg(t.faint)),
+            Rect { height: 1, ..inner },
+        );
+        return;
+    }
     app.queue_inner = inner;
     let h = inner.height as usize;
-    if h == 0 {
-        return;
-    }
     // The same scroll idiom the browse list uses, for the same reason: a window
-    // that recentred on every keystroke would move the whole panel under a
+    // that recentred on every keystroke would move the whole column under a
     // cursor that moved one row.
     if app.queue_selected < app.queue_offset {
         app.queue_offset = app.queue_selected;
@@ -2427,7 +2431,6 @@ fn queue_panel(f: &mut Frame, app: &mut App, area: Rect) {
         app.queue_offset = 0;
     }
 
-    let focused = app.focus() == Focus::Queue;
     let width = inner.width as usize;
     for (i, qi) in (app.queue_offset..(app.queue_offset + h).min(app.queue.len())).enumerate() {
         let Some(entry) = app.queue.get(qi) else {
@@ -2457,126 +2460,6 @@ fn queue_panel(f: &mut Frame, app: &mut App, area: Rect) {
             },
         );
     }
-}
-
-/// The now-playing block as a column down the right-hand side.
-///
-/// Same facts as the three rows along the bottom, in the same words: what is
-/// playing, where it has got to, what it is being played into, and the verdict
-/// on what arrives there. Stacked rather than laid end to end, which is the
-/// whole reason for the panel - the bottom row was spending about 108 cells on
-/// badges before the first key hint, and dropping hints at 80 columns to do it.
-///
-/// **What the two lines at the top do that the one line cannot.** The block
-/// writes `Artist — Title` because it has one line and must join them; the panel
-/// has two and joins nothing, so it leads with the title, which is what the list
-/// column beside it leads with. The block's line is untouched, so the question
-/// of which order a single line should use is still open.
-fn now_panel(f: &mut Frame, app: &mut App, area: Rect) {
-    let t = app.theme();
-    let (ring, edge) = focus_ring(app, app.focus() == Focus::Queue, &t);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .style(t.surface())
-        .border_style(ring)
-        .border_type(edge)
-        .title(" Now playing ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    // One cell in from the border on both sides, so the panel has one left edge
-    // rather than text against the frame and a bar clear of it.
-    let body = Rect {
-        x: inner.x.saturating_add(1),
-        width: inner.width.saturating_sub(2),
-        ..inner
-    };
-    // A layout rather than offsets from `body.y`: on a short terminal a
-    // hand-computed row addresses cells outside the buffer and ratatui panics,
-    // where this yields empty rects that render nothing.
-    let rows = Layout::vertical([
-        Constraint::Length(1), // what is playing
-        Constraint::Length(1), // who by
-        Constraint::Length(1),
-        Constraint::Length(1), // the bar and the two times
-        Constraint::Length(1),
-        Constraint::Length(1), // what the stream is
-        Constraint::Length(1), // what it is going into
-        Constraint::Length(1), // and what arrives there
-        Constraint::Length(1), // the activity slot
-        Constraint::Min(0),    // and the queue takes whatever is left
-    ])
-    .split(body);
-
-    let mut top = ControlBar::new(rows[0]);
-    top.label(
-        format!("{} ", play_state(app)),
-        Style::default().fg(t.accent),
-    );
-    push_heart(&mut top, app, &t);
-    let title = match &app.now_playing {
-        Some(track) => track.title.clone(),
-        None => "Nothing playing".into(),
-    };
-    let room = usize::from(top.remaining());
-    top.label(
-        trunc(&title, room),
-        Style::default().add_modifier(Modifier::BOLD),
-    );
-    app.hits.extend(top.hits);
-    f.render_widget(Paragraph::new(Line::from(top.spans)), rows[0]);
-
-    // Under the title rather than beside it, indented to the width of the state
-    // glyph and the heart so the two names share a left edge.
-    let artist = app
-        .now_playing
-        .as_ref()
-        .map_or_else(String::new, |track| track.artist.clone());
-    let named = Rect {
-        x: rows[1].x.saturating_add(PANEL_NAME_INDENT),
-        width: rows[1].width.saturating_sub(PANEL_NAME_INDENT),
-        ..rows[1]
-    };
-    f.render_widget(
-        Paragraph::new(trunc(&artist, usize::from(named.width)))
-            .style(Style::default().fg(t.faint)),
-        named,
-    );
-
-    f.render_widget(progress_bar(app, &t), rows[3]);
-    app.progress_rect = rows[3];
-
-    let width = usize::from(body.width);
-    let (act_text, act_color) = activity_words(app);
-    let (verdict_text, verdict_color) = verdict_badge(app);
-    for (text, style, row) in [
-        (source_words(app), Style::default().fg(t.faint), rows[5]),
-        (
-            device_readout(&app.status),
-            Style::default().fg(t.active),
-            rows[6],
-        ),
-        (act_text, Style::default().fg(act_color), rows[8]),
-    ] {
-        f.render_widget(Paragraph::new(trunc(&text, width)).style(style), row);
-    }
-
-    // The verdict says *whether*; clicking it says *why*, through the same
-    // method `[D]` runs - as on the bottom row, and registered in the same walk
-    // that paints it so the two cannot drift apart.
-    let mut said = ControlBar::new(rows[7]);
-    if !verdict_text.is_empty() {
-        said.button(
-            trunc(&verdict_text, width),
-            Hit::Graph,
-            Style::default()
-                .fg(verdict_color)
-                .add_modifier(Modifier::BOLD),
-        );
-    }
-    app.hits.extend(said.hits);
-    f.render_widget(Paragraph::new(Line::from(said.spans)), rows[7]);
-
-    queue_panel(f, app, rows[9]);
 }
 
 /// One entry in the bottom keyboard reference.
@@ -3218,7 +3101,7 @@ fn fmt_hms(secs: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlBar, FOCUS_HINT, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, PANEL_COLS,
+        ControlBar, FOCUS_HINT, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, QUEUE_COLS,
         WIDE_COLS, hint_width, push_hints, render,
     };
     use crate::app::{App, Click, Focus, Hit, Mode, View};
@@ -3540,7 +3423,7 @@ mod tests {
                 t.background
             };
             assert_eq!(
-                one_backing(&mut sc.app, 120, 12, r),
+                one_backing(&mut sc.app, 120, 14, r),
                 want,
                 "row {r} is not the backing its place in the list calls for"
             );
@@ -4951,89 +4834,204 @@ mod tests {
         }
     }
 
-    // ---- one breakpoint: the now-playing block becomes a side panel ----
+    // ---- one breakpoint: the queue takes the column beside the list ----
+
+    /// The cells of one rectangle of a rendered frame, row by row and untrimmed.
+    ///
+    /// Untrimmed on purpose: a column is read by slicing rows at a cell offset,
+    /// and trimming the right-hand edge first makes those offsets meaningless.
+    fn rect_text(app: &mut App, w: u16, h: u16, r: Rect) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let buf = term.backend().buffer().clone();
+        (r.y..r.y.saturating_add(r.height))
+            .map(|y| {
+                (r.x..r.x.saturating_add(r.width))
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The cells of the right-hand column, at a width that has one.
+    fn column_text(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        rect_text(
+            app,
+            w,
+            h,
+            Rect {
+                x: w - QUEUE_COLS,
+                y: 0,
+                width: QUEUE_COLS,
+                height: h,
+            },
+        )
+    }
 
     #[test]
-    fn the_breakpoint_and_the_panel_are_the_widths_that_were_written_down() {
+    fn the_now_playing_block_is_three_rows_along_the_bottom_at_every_width() {
+        // Goal: the block is the bottom of the screen whatever the terminal is,
+        // so a listener who resizes finds the same four facts in the same place
+        // rather than a second layout to learn. Method: a real frame at three
+        // widths, read row by row off the bottom.
+        for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30), (200, 40)] {
+            let mut sc = screen();
+            sc.app.now_playing = Some(track(1, "Blue in Green"));
+            sc.app.status.duration = 245.0;
+            let out = draw(&mut sc.app, w, h);
+            let last = usize::from(h) - 1;
+
+            assert!(
+                out[last - 2].contains("Blue in Green"),
+                "what is playing at {w}x{h}: {:?}",
+                out[last - 2]
+            );
+            assert!(
+                out[last - 1].contains("0:00 / 4:05"),
+                "the bar at {w}x{h}: {:?}",
+                out[last - 1]
+            );
+            assert!(
+                out[last].contains("OUT —"),
+                "the readout at {w}x{h}: {:?}",
+                out[last]
+            );
+            assert!(
+                out[last].contains("[q] quit"),
+                "the reference at {w}x{h}: {:?}",
+                out[last]
+            );
+            assert_eq!(
+                usize::from(sc.app.progress_rect.y),
+                last - 1,
+                "the bar is the middle row of the block at {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_right_hand_column_is_the_queue_and_nothing_else() {
+        // Goal: the column beside the list holds the queue alone - the readouts
+        // it used to sit under are back on the bottom row, and a second copy of
+        // them up here would be two places to read one fact. Method: render a
+        // queue at the breakpoint and read only the cells of the column.
+        let mut sc = queued(6, 3);
+        sc.app.status.duration = 245.0;
+        let col = column_text(&mut sc.app, WIDE_COLS, 30).join("\n");
+
+        assert!(col.contains("Track 4"), "the queue is not here: {col}");
+        assert!(col.contains("Queue"), "the column is not named: {col}");
+        assert!(
+            !col.contains("OUT"),
+            "the device readout is still in the column: {col}"
+        );
+        assert!(
+            !col.contains("0:00 /"),
+            "a second progress bar is in the column: {col}"
+        );
+        assert!(
+            !col.contains("Now playing"),
+            "the column is still the now-playing panel: {col}"
+        );
+    }
+
+    #[test]
+    fn the_queue_column_stands_the_full_height_beside_the_list() {
+        // Goal: the column is the list's neighbour rather than a box under some
+        // readouts, so it starts and ends on the same rows the list's box does.
+        // Method: read the corners of both boxes out of a real frame.
+        let mut sc = queued(40, 0);
+        let out = draw(&mut sc.app, WIDE_COLS, 30);
+        let seam = usize::from(WIDE_COLS - QUEUE_COLS);
+        // Either weight of corner: which box holds the keyboard is a separate
+        // question, asked by its own test.
+        let corner = |line: &String, at: usize, of: [char; 2]| {
+            let c = line.chars().nth(at);
+            assert!(
+                c.is_some_and(|c| of.contains(&c)),
+                "no {of:?} corner at cell {at}: {line:?}"
+            );
+        };
+
+        corner(&out[1], 0, ['┌', '┏']);
+        corner(&out[1], seam, ['┌', '┏']);
+        // The middle area ends three rows above the bottom, where the block is.
+        corner(&out[26], 0, ['└', '┗']);
+        corner(&out[26], seam, ['└', '┗']);
+        assert!(
+            sc.app.queue_inner.height >= 20,
+            "the column is not the full height: {:?}",
+            sc.app.queue_inner
+        );
+    }
+
+    #[test]
+    fn the_breakpoint_and_the_column_are_the_widths_that_were_written_down() {
         // Goal: every other test here is written in terms of these two, so they
         // would all move together if one were edited. The numbers are a
-        // decision - 120 is where the list still reads after giving the panel
+        // decision - 120 is where the list still reads after giving the queue
         // its column - so changing one is a decision to take again, not a
         // refactor. Spelled out once, here.
         assert_eq!(WIDE_COLS, 120);
-        assert_eq!(PANEL_COLS, 36);
+        assert_eq!(QUEUE_COLS, 36);
         // Which leaves the list wider than an eighty-column terminal gives it,
-        // so the panel never costs the list more than it already lived with.
+        // so the column never costs the list more than it already lived with.
         let mut sc = screen();
         let _ = draw(&mut sc.app, WIDE_COLS, 24);
-        let panelled = sc.app.list_inner.width;
+        let beside = sc.app.list_inner.width;
         let _ = draw(&mut sc.app, 80, 24);
         assert!(
-            panelled > sc.app.list_inner.width,
-            "the panel took the list under the width it already ran at: \
-             {panelled} against {}",
+            beside > sc.app.list_inner.width,
+            "the column took the list under the width it already ran at: \
+             {beside} against {}",
             sc.app.list_inner.width
         );
     }
 
     #[test]
-    fn below_the_breakpoint_the_now_playing_block_is_three_rows_along_the_bottom() {
-        // Goal: the narrow side of the one breakpoint is exactly what it was, so
-        // nothing changes for the terminal widths most people run. Method: a
-        // real frame one column under it, read row by row.
-        let mut sc = screen();
-        sc.app.now_playing = Some(track(1, "Blue in Green"));
-        sc.app.status.duration = 245.0;
-        let out = draw(&mut sc.app, WIDE_COLS - 1, 30);
+    fn below_the_breakpoint_the_list_has_the_whole_width() {
+        // Goal: under WIDE_COLS there is no column beside the list, so the list
+        // gets everything but its own border - and nothing of the queue is left
+        // on screen from a wider frame. Method: a real frame one column under
+        // the breakpoint.
+        let mut sc = queued(6, 2);
+        let out = draw(&mut sc.app, WIDE_COLS - 1, 30).join("\n");
 
-        assert!(out[27].contains("Blue in Green"), "{:?}", out[27]);
-        assert!(out[28].contains("0:00 / 4:05"), "{:?}", out[28]);
-        assert!(
-            out[29].contains("OUT —"),
-            "the readout is here: {:?}",
-            out[29]
-        );
-        assert!(out[29].contains("[q] quit"), "{:?}", out[29]);
         assert_eq!(
             sc.app.list_inner.width,
             WIDE_COLS - 3,
             "the list has the whole width, less its own border"
         );
-        assert_eq!(sc.app.progress_rect.y, 28, "the bar is the middle row");
+        assert!(!out.contains("Queue "), "the queue is still drawn: {out}");
     }
 
     #[test]
-    fn at_the_breakpoint_the_now_playing_block_becomes_a_column_on_the_right() {
-        // Goal: at WIDE_COLS the block moves into a fixed column and the bottom
-        // row keeps only the key hints. Method: a real frame at exactly the
-        // breakpoint, checking both that the panel carries what the block
-        // carried and that the bottom row no longer does.
-        let mut sc = screen();
-        sc.app.now_playing = Some(track(1, "Blue in Green"));
+    fn at_the_breakpoint_the_list_gives_the_queue_a_fixed_column() {
+        // Goal: at WIDE_COLS the queue takes a column of its own and the list
+        // keeps the rest - and the now-playing block stays where it is, on the
+        // bottom row, so nothing of it is up in the column. Method: a real frame
+        // at exactly the breakpoint, checking the widths and where the heart
+        // that belongs to the block was painted.
+        let mut sc = queued(6, 2);
         sc.app.status.duration = 245.0;
         let out = draw(&mut sc.app, WIDE_COLS, 30);
-        let all = out.join("\n");
 
         assert!(out[29].contains("[q] quit"), "{:?}", out[29]);
         assert!(
-            !out[29].contains("OUT"),
-            "the readout moved off the bottom row: {:?}",
+            out[29].contains("OUT —"),
+            "the readout stayed on the bottom row: {:?}",
             out[29]
         );
-        assert!(all.contains("Blue in Green"), "{all}");
-        assert!(all.contains("Artist"), "{all}");
-        assert!(all.contains("0:00 / 4:05"), "{all}");
-        assert!(all.contains("OUT —"), "the device readout: {all}");
 
-        let left = WIDE_COLS - PANEL_COLS;
+        let seam = WIDE_COLS - QUEUE_COLS;
         assert_eq!(
             sc.app.list_inner.width,
-            left - 2,
-            "the list gives the panel a fixed column and keeps the rest"
+            seam - 2,
+            "the list gives the queue a fixed column and keeps the rest"
         );
         assert!(
-            sc.app.progress_rect.x >= left,
-            "the bar is inside the panel: {:?}",
+            sc.app.progress_rect.x < seam,
+            "the bar is not in the column: {:?}",
             sc.app.progress_rect
         );
         let heart = sc
@@ -5042,14 +5040,15 @@ mod tests {
             .iter()
             .find(|(_, h)| *h == Hit::FavoriteNowPlaying)
             .map_or_else(|| panic!("the heart has no hit box"), |(r, _)| *r);
-        assert!(heart.x >= left, "and so is the heart: {heart:?}");
+        assert!(heart.x < seam, "and neither is the heart: {heart:?}");
     }
 
     #[test]
-    fn the_side_panel_buys_two_more_list_rows() {
-        // Goal: the panel pays for itself in height - the bottom block's three
-        // chrome rows become one. Method: the same terminal height either side
-        // of the breakpoint, comparing the rect the list was given.
+    fn the_bottom_block_costs_the_list_the_same_rows_at_every_width() {
+        // Goal: the block is three rows on both sides of the breakpoint, so a
+        // terminal that crosses it gains a queue and loses nothing. Method: the
+        // same terminal height either side, comparing the rect the list was
+        // given.
         let mut sc = screen();
         sc.app.favorites = (0..40).map(|i| track(i, "T")).collect();
         let _ = draw(&mut sc.app, WIDE_COLS - 1, 24);
@@ -5057,11 +5056,7 @@ mod tests {
         let _ = draw(&mut sc.app, WIDE_COLS, 24);
         let wide = sc.app.list_inner.height;
 
-        assert_eq!(
-            wide,
-            narrow + 2,
-            "two of the three chrome rows go into the panel"
-        );
+        assert_eq!(wide, narrow, "the block changed height with the terminal");
     }
 
     #[test]
@@ -6999,8 +6994,12 @@ mod tests {
         // focus key is no exception - the mouse's path to the other region is
         // the same walk that paints it. Method: render wide enough for the hint
         // and click it where it was drawn.
+        //
+        // Wide enough is wider than it was: the readouts are back on this row,
+        // and this hint is deliberately the first one the row gives up. `?` and
+        // the heavy border are what make it findable at ordinary widths.
         let mut sc = queued(6, 0);
-        assert_eq!(painted(&mut sc.app, 200, 30, Hit::CycleFocus), "Ctrl-W");
+        assert_eq!(painted(&mut sc.app, 210, 30, Hit::CycleFocus), "Ctrl-W");
         click_hit(&mut sc.app, Hit::CycleFocus);
         assert_eq!(sc.app.focus(), Focus::Queue);
     }
@@ -7021,8 +7020,8 @@ mod tests {
             "the browse list has the keys and does not say so: {boxes:?}"
         );
         assert!(
-            boxes.contains("┌ Now playing"),
-            "the panel has no keys and is drawn as though it had: {boxes:?}"
+            boxes.contains("┌ Queue"),
+            "the queue has no keys and is drawn as though it had: {boxes:?}"
         );
         sc.app
             .on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
@@ -7034,8 +7033,8 @@ mod tests {
             "the browse list kept the heavy border it had given up: {boxes:?}"
         );
         assert!(
-            boxes.contains("┏ Now playing"),
-            "the panel took the keyboard and did not say so: {boxes:?}"
+            boxes.contains("┏ Queue"),
+            "the queue took the keyboard and did not say so: {boxes:?}"
         );
     }
 
