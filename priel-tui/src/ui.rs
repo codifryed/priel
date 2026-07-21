@@ -1734,7 +1734,11 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
                 "{mark}{kept} {:<32} {:<20} {:<8}{:>6}",
                 trunc(&t.title, 32),
                 trunc(&t.artist, 20),
-                trunc(&t.quality, 8),
+                // The same spelling the badge beside the playing track uses.
+                // The raw wire token does not fit this column, so a row that
+                // printed it named the track's quality one way while the row
+                // above the progress bar named it another.
+                trunc(&short_quality(&t.quality), 8),
                 fmt_dur(t.duration_secs),
             ),
             is_now,
@@ -4574,6 +4578,24 @@ mod tests {
             indent(&idle_row),
             indent(&open_row),
             "idle: {idle_row}\nopen: {open_row}"
+        );
+    }
+
+    #[test]
+    fn a_row_names_the_quality_the_way_the_badge_does() {
+        // Goal: one fact, one spelling. The wire says `HI_RES_LOSSLESS`; the
+        // badge beside the playing track says `HI-RES`; the list said
+        // `HI_RES_…` because the raw token did not fit its own column, so the
+        // same track was named two ways two lines apart.
+        let mut sc = screen();
+        let mut t = track(1, "T");
+        t.quality = "HI_RES_LOSSLESS".into();
+        favorites_arrive(&mut sc, vec![t]);
+        let out = text(&mut sc.app, 120, 10);
+        assert!(out.contains("HI-RES"), "{out}");
+        assert!(
+            !out.contains("HI_RES"),
+            "the wire token must not reach a row: {out}"
         );
     }
 }
