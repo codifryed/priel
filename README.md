@@ -196,11 +196,11 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 | Choose the output device | `d` | click `◎`, then a row in the picker |
 | Exclusive output on/off | `x` in the picker | click the toggle |
 | Sign in again | `A` | `[?]`, then `A` |
-| Switch view | `Tab` cycles, `1`/`2`/`3` | click a tab |
+| Switch view | `Tab` cycles, `1`/`2`/`3`/`4` | click a tab |
 | Move selection | `j`/`k`, `↑`/`↓` | scroll wheel |
 | First / last | `g` / `G` | click `[g/G]` |
 | Page up/down | `J`/`K` full, `Ctrl-U`/`Ctrl-D` half | `[?]`, then the same keys |
-| Open playlist / back | `Enter` / `Esc` | double-click |
+| Open playlist or mix / back | `Enter` / `Esc` | double-click |
 | Play selected | `Enter` | double-click a row |
 | Play / pause | `Space` | click `▷` / `‖` |
 | Seek ±5s | `h`/`l`, `←`/`→` | click or drag the progress bar |
@@ -233,12 +233,23 @@ reloaded with `r`: removing the row would move every row below it out from under
 the cursor, including the one you just acted on.
 
 `Esc` cancels: it leaves a filter or search box, and steps back out of an opened
-playlist. It never quits.
+playlist or mix — to the list it was opened from, whichever that was. It never
+quits.
+
+The `4` tab holds the mixes the service builds for you, kept apart from the
+playlists you wrote rather than mingled with them: nobody can edit a mix, and it
+is rebuilt under you. That last part is why this is the one list priel fetches
+again every time you open the tab, where the playlists are fetched once — a copy
+of a mix held from your last visit is stale by construction, not by bad luck.
+`r` refreshes it again without leaving. A mix row shows what the mix was built
+from instead of a track count and a running time, because the service sends
+neither for a mix; its length is only knowable once you open it.
 
 ## Status
 
-Working: favorites, playlists and catalogue search, each paged in as the
-selection nears the end of the loaded rows and reloadable with `r`; local
+Working: favorites, playlists, the service's own mixes and catalogue search,
+each paged in as the selection nears the end of the loaded rows and reloadable
+with `r`; local
 filtering; hi-res resolution and playback (24/192 via progressive segment
 streaming); a gapless
 play queue with a preloaded next track; shuffle with auto-advance; play, pause,
