@@ -615,7 +615,7 @@ impl Writer {
     /// not, which is the trap the variant writer below is careful about.
     fn signature(&mut self, value: &str) -> Result<()> {
         let len = u8::try_from(value.len())
-            .map_err(|_| bad("a signature longer than 255 bytes cannot be written"))?;
+            .map_err(|_| bad(format!("a signature longer than {MAX_SIGNATURE_LEN} bytes")))?;
         self.byte(len);
         self.buf.extend_from_slice(value.as_bytes());
         self.buf.push(0);
@@ -812,6 +812,422 @@ pub(crate) fn marshal(message: &Message, endian: Endian) -> Result<Vec<u8>> {
     Ok(writer.buf)
 }
 
+/// Reads a message out of the buffer it arrived in.
+///
+/// `at` is an offset into the whole frame and never into a sub-slice, for the
+/// same reason the writer builds into one buffer: alignment is measured from
+/// byte 0 of the message, so a reader over a slice of it would be padding
+/// against the wrong origin.
+struct Reader<'a> {
+    buf: &'a [u8],
+    at: usize,
+    endian: Endian,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8], at: usize, endian: Endian) -> Self {
+        Self { buf, at, endian }
+    }
+
+    /// Steps over alignment padding, which the specification requires to be
+    /// nul. Enforcing that turns a marshaller that padded wrongly into an error
+    /// here instead of a value read from the wrong offset.
+    fn pad_to(&mut self, alignment: usize) -> Result<()> {
+        while !self.at.is_multiple_of(alignment) {
+            if self.byte()? != 0 {
+                return Err(bad("alignment padding that is not nul"));
+            }
+        }
+        Ok(())
+    }
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(count)
+            .ok_or_else(|| bad("a length that overflows the buffer"))?;
+        let slice = self
+            .buf
+            .get(self.at..end)
+            .ok_or_else(|| bad("a value that runs past the end of the message"))?;
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn byte(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn four(&mut self) -> Result<[u8; 4]> {
+        self.pad_to(4)?;
+        let bytes = self.take(4)?;
+        Ok([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    fn eight(&mut self) -> Result<[u8; 8]> {
+        self.pad_to(8)?;
+        let bytes = self.take(8)?;
+        Ok([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        let bytes = self.four()?;
+        Ok(match self.endian {
+            Endian::Little => u32::from_le_bytes(bytes),
+            Endian::Big => u32::from_be_bytes(bytes),
+        })
+    }
+
+    fn i32(&mut self) -> Result<i32> {
+        let bytes = self.four()?;
+        Ok(match self.endian {
+            Endian::Little => i32::from_le_bytes(bytes),
+            Endian::Big => i32::from_be_bytes(bytes),
+        })
+    }
+
+    fn i64(&mut self) -> Result<i64> {
+        let bytes = self.eight()?;
+        Ok(match self.endian {
+            Endian::Little => i64::from_le_bytes(bytes),
+            Endian::Big => i64::from_be_bytes(bytes),
+        })
+    }
+
+    fn f64(&mut self) -> Result<f64> {
+        let bytes = self.eight()?;
+        Ok(match self.endian {
+            Endian::Little => f64::from_le_bytes(bytes),
+            Endian::Big => f64::from_be_bytes(bytes),
+        })
+    }
+
+    /// Spec 0.43: a boolean is a `u32` that is 0 or 1, and no other value is
+    /// valid. Reading 2 as true would be a guess.
+    fn boolean(&mut self) -> Result<bool> {
+        match self.u32()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(bad(format!("{other} is not a boolean"))),
+        }
+    }
+
+    fn length(&mut self) -> Result<usize> {
+        usize::try_from(self.u32()?).map_err(|_| bad("a length this machine cannot address"))
+    }
+
+    fn string(&mut self) -> Result<String> {
+        let len = self.length()?;
+        let bytes = self.take(len)?;
+        if bytes.contains(&0) {
+            return Err(bad("a string containing a nul"));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| bad("a string that is not utf-8"))?
+            .to_owned();
+        if self.byte()? != 0 {
+            return Err(bad("a string not terminated by a nul"));
+        }
+        Ok(text)
+    }
+
+    fn object_path(&mut self) -> Result<String> {
+        let path = self.string()?;
+        if !is_object_path(&path) {
+            return Err(bad(format!("\"{path}\" is not an object path")));
+        }
+        Ok(path)
+    }
+
+    /// `g`: a one-byte length, so it needs no alignment - but what follows it
+    /// does, which is why nothing here pads and every caller does.
+    fn signature(&mut self) -> Result<String> {
+        let len = usize::from(self.byte()?);
+        let bytes = self.take(len)?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| bad("a signature that is not utf-8"))?
+            .to_owned();
+        if self.byte()? != 0 {
+            return Err(bad("a signature not terminated by a nul"));
+        }
+        Ok(text)
+    }
+
+    /// Any array: the length, the padding out to the element's alignment that
+    /// the length does not count, then elements until the length runs out.
+    ///
+    /// The loop is bounded by that length and additionally by progress: an
+    /// element that consumes nothing would otherwise spin on a crafted message.
+    fn array<T>(
+        &mut self,
+        element_alignment: usize,
+        mut read: impl FnMut(&mut Self) -> Result<T>,
+    ) -> Result<Vec<T>> {
+        let len = self.length()?;
+        if len > MAX_ARRAY_LEN {
+            return Err(bad("an array longer than the specification allows"));
+        }
+        self.pad_to(element_alignment)?;
+        let end = self
+            .at
+            .checked_add(len)
+            .ok_or_else(|| bad("an array length that overflows the buffer"))?;
+        // Bounded twice over: by the declared length, and by every element
+        // consuming at least one byte of a buffer that is already at most one
+        // message long. An array running past the end fails in `take`.
+        let mut items = Vec::new();
+        while self.at < end {
+            let before = self.at;
+            items.push(read(self)?);
+            if self.at <= before {
+                return Err(bad("an array element that consumed no bytes"));
+            }
+        }
+        if self.at != end {
+            return Err(bad("an array element that ran past the array's own length"));
+        }
+        Ok(items)
+    }
+
+    fn value(&mut self, kind: Kind) -> Result<Value> {
+        match kind {
+            Kind::Bool => Ok(Value::Bool(self.boolean()?)),
+            Kind::Int32 => Ok(Value::Int32(self.i32()?)),
+            Kind::Uint32 => Ok(Value::Uint32(self.u32()?)),
+            Kind::Int64 => Ok(Value::Int64(self.i64()?)),
+            Kind::Double => Ok(Value::Double(self.f64()?)),
+            Kind::Str => Ok(Value::Str(self.string()?)),
+            Kind::Path => Ok(Value::Path(self.object_path()?)),
+            Kind::Strings => Ok(Value::Strings(self.array(4, Self::string)?)),
+            Kind::Variant | Kind::Dict => Err(bad("a container where a leaf value was declared")),
+        }
+    }
+
+    fn variant(&mut self) -> Result<Variant> {
+        let signature = self.signature()?;
+        match one_kind(&signature)? {
+            Kind::Dict => Ok(Variant::Dict(self.metadata()?)),
+            Kind::Variant => Err(bad("a variant directly inside a variant")),
+            leaf => Ok(Variant::Value(self.value(leaf)?)),
+        }
+    }
+
+    /// A `v` that has to hold a leaf. `Metadata`'s members are leaves, so a
+    /// dictionary three deep is a shape MPRIS does not define, and refusing it
+    /// is what keeps the nesting bounded without a depth counter.
+    fn leaf_variant(&mut self) -> Result<Value> {
+        let signature = self.signature()?;
+        self.value(one_kind(&signature)?)
+    }
+
+    fn dict(&mut self) -> Result<Vec<(String, Variant)>> {
+        self.array(8, |reader| {
+            reader.pad_to(8)?;
+            let key = reader.string()?;
+            Ok((key, reader.variant()?))
+        })
+    }
+
+    fn metadata(&mut self) -> Result<Vec<(String, Value)>> {
+        self.array(8, |reader| {
+            reader.pad_to(8)?;
+            let key = reader.string()?;
+            Ok((key, reader.leaf_variant()?))
+        })
+    }
+
+    fn arg(&mut self, kind: Kind) -> Result<Arg> {
+        match kind {
+            Kind::Variant => Ok(Arg::Variant(self.variant()?)),
+            Kind::Dict => Ok(Arg::Dict(self.dict()?)),
+            leaf => Ok(Arg::Value(self.value(leaf)?)),
+        }
+    }
+
+    /// One `(yv)`.
+    ///
+    /// `None` is a field code priel does not know, which spec 0.43 says a
+    /// receiver must ignore. That is honoured for the four types the standard
+    /// fields use; a peer that invents a field of some other type costs itself
+    /// one message rather than getting it guessed at. No implementation does.
+    fn header_field(&mut self) -> Result<Option<Field>> {
+        self.pad_to(8)?;
+        let code = self.byte()?;
+        let signature = self.signature()?;
+        let field = match (code, signature.as_str()) {
+            (1, "o") => Field::Path(self.object_path()?),
+            (2, "s") => Field::Interface(self.string()?),
+            (3, "s") => Field::Member(self.string()?),
+            (4, "s") => Field::ErrorName(self.string()?),
+            (5, "u") => Field::ReplySerial(self.u32()?),
+            (6, "s") => Field::Destination(self.string()?),
+            (7, "s") => Field::Sender(self.string()?),
+            (8, "g") => Field::Signature(self.signature()?),
+            (9, "u") => Field::UnixFds(self.u32()?),
+            (1..=9, other) => {
+                return Err(bad(format!(
+                    "header field {code} carries a \"{other}\", not the type it is defined as"
+                )));
+            }
+            (_, "s") => {
+                self.string()?;
+                return Ok(None);
+            }
+            (_, "o") => {
+                self.object_path()?;
+                return Ok(None);
+            }
+            (_, "g") => {
+                self.signature()?;
+                return Ok(None);
+            }
+            (_, "u") => {
+                self.u32()?;
+                return Ok(None);
+            }
+            (_, other) => {
+                return Err(bad(format!(
+                    "header field {code} carries a \"{other}\", which cannot be stepped over"
+                )));
+            }
+        };
+        Ok(Some(field))
+    }
+}
+
+/// A signature that names exactly one type, which is what a variant carries.
+fn one_kind(signature: &str) -> Result<Kind> {
+    match parse_signature(signature)?[..] {
+        [kind] => Ok(kind),
+        _ => Err(bad(format!(
+            "a variant declared \"{signature}\", which is not one type"
+        ))),
+    }
+}
+
+/// Length of the whole message beginning at `buf[0]`.
+///
+/// `None` means the buffer does not hold enough to say yet, which is the answer
+/// the receive loop needs: it accumulates across read timeouts and only parses
+/// complete frames, so a timeout landing mid-message is not a special case.
+///
+/// The errors here are [`WireError::Framing`] and cost the connection, because
+/// a fixed header that is not one leaves no way to find where the next message
+/// starts.
+pub(crate) fn frame_len(buf: &[u8]) -> Result<Option<usize>> {
+    if buf.len() < FIXED_HEADER_LEN {
+        return Ok(None);
+    }
+    let endian = Endian::from_marker(buf[0])?;
+    if buf[3] != PROTOCOL_VERSION {
+        return Err(WireError::Framing("protocol version is not 1"));
+    }
+    let read = |at: usize| {
+        let bytes = [buf[at], buf[at + 1], buf[at + 2], buf[at + 3]];
+        match endian {
+            Endian::Little => u32::from_le_bytes(bytes),
+            Endian::Big => u32::from_be_bytes(bytes),
+        }
+    };
+    let body_len = usize::try_from(read(4))
+        .map_err(|_| WireError::Framing("a body length this machine cannot address"))?;
+    let fields_len = usize::try_from(read(12))
+        .map_err(|_| WireError::Framing("a field length this machine cannot address"))?;
+    if fields_len > MAX_ARRAY_LEN {
+        return Err(WireError::Framing(
+            "header fields longer than an array may be",
+        ));
+    }
+    // The body starts on an 8-byte boundary however long the fields came to.
+    let total = FIXED_HEADER_LEN
+        .checked_add(fields_len)
+        .and_then(|head| head.checked_next_multiple_of(8))
+        .and_then(|head| head.checked_add(body_len))
+        .ok_or(WireError::Framing("a length that overflows"))?;
+    if total > MAX_MESSAGE_LEN {
+        return Err(WireError::Framing(
+            "a message longer than the specification allows",
+        ));
+    }
+    if buf.len() < total {
+        return Ok(None);
+    }
+    Ok(Some(total))
+}
+
+/// Turn one whole frame - exactly what [`frame_len`] measured, no more - into a
+/// message.
+///
+/// Everything outside the closed set of signatures is an error and never a
+/// guess: a body read as the wrong shape is silent, where an error is not.
+pub(crate) fn parse(frame: &[u8]) -> Result<Message> {
+    match frame_len(frame)? {
+        None => return Err(WireError::Framing("less than a whole message")),
+        Some(total) if total != frame.len() => {
+            return Err(WireError::Framing("more than one whole message"));
+        }
+        Some(_) => {}
+    }
+    let endian = Endian::from_marker(frame[0])?;
+    let kind = MessageType::from_code(frame[1])?;
+    let flags = frame[2];
+
+    let mut reader = Reader::new(frame, 8, endian);
+    let serial = reader.u32()?;
+    if serial == 0 {
+        return Err(bad("serial 0 identifies no call"));
+    }
+    let fields: Vec<Field> = reader
+        .array(8, Reader::header_field)?
+        .into_iter()
+        .flatten()
+        .collect();
+    reader.pad_to(8)?;
+
+    let message = Message {
+        kind,
+        flags,
+        serial,
+        fields,
+        body: Vec::new(),
+    };
+    require_fields(&message)?;
+
+    let mut body = Vec::new();
+    for kind in parse_signature(message.signature())? {
+        body.push(reader.arg(kind)?);
+    }
+    if reader.at != frame.len() {
+        return Err(bad("a body that does not fill its own declared length"));
+    }
+    Ok(Message { body, ..message })
+}
+
+/// Spec 0.43 makes some header fields required per message type, and a peer
+/// that leaves one out has sent something priel cannot answer. Checked once
+/// here so that everything above can read them without a second opinion.
+fn require_fields(message: &Message) -> Result<()> {
+    let missing = match message.kind {
+        MessageType::MethodCall => {
+            [message.path().is_none(), message.member().is_none()].contains(&true)
+        }
+        MessageType::MethodReturn => message.reply_serial().is_none(),
+        MessageType::Error => message.reply_serial().is_none() || message.error_name().is_none(),
+        MessageType::Signal => [
+            message.path().is_none(),
+            message.interface().is_none(),
+            message.member().is_none(),
+        ]
+        .contains(&true),
+    };
+    if missing {
+        return Err(bad("a message missing a header field its type requires"));
+    }
+    Ok(())
+}
+
 /// Serial numbers for outbound messages.
 ///
 /// Spec 0.43: a serial identifies a call until its reply arrives and must never
@@ -878,6 +1294,37 @@ mod tests {
                 Arg::Value(strings(&[])),
             ],
         }
+    }
+
+    /// Every full message captured off a real bus, named for the assertion
+    /// failures.
+    fn captures() -> Vec<(&'static str, &'static [u8])> {
+        vec![
+            ("GETALL_ROOT_REPLY", vectors::GETALL_ROOT_REPLY),
+            ("GET_POSITION_REPLY", vectors::GET_POSITION_REPLY),
+            ("PING_REPLY", vectors::PING_REPLY),
+            ("GETALL_CALL", vectors::GETALL_CALL),
+            ("GET_CALL", vectors::GET_CALL),
+            ("PING_CALL", vectors::PING_CALL),
+            ("SET_CALL", vectors::SET_CALL),
+            ("ERROR_REPLY", vectors::ERROR_REPLY),
+            ("SEEK_CALL", vectors::SEEK_CALL),
+            ("SETPOSITION_CALL", vectors::SETPOSITION_CALL),
+            ("SEEKED_SIGNAL", vectors::SEEKED_SIGNAL),
+            ("PROPERTIES_CHANGED", vectors::PROPERTIES_CHANGED),
+            (
+                "PROPERTIES_CHANGED_EMPTY_DICT",
+                vectors::PROPERTIES_CHANGED_EMPTY_DICT,
+            ),
+            (
+                "PROPERTIES_CHANGED_PADDED_DICT",
+                vectors::PROPERTIES_CHANGED_PADDED_DICT,
+            ),
+            (
+                "PROPERTIES_CHANGED_PADDED_ENTRIES",
+                vectors::PROPERTIES_CHANGED_PADDED_ENTRIES,
+            ),
+        ]
     }
 
     /// The body gdbus emitted for the alignment family, behind a leading string
@@ -1172,6 +1619,15 @@ mod tests {
             .clone()
             .with_body(vec![Arg::Value(Value::Path("priel/track/1".into()))]);
         assert!(marshal(&not_a_path, Endian::Little).is_err());
+
+        // A signature field is one byte long, so a body of more arguments than
+        // that can describe has no way onto the wire.
+        let too_many = ok.with_body(
+            (0..=MAX_SIGNATURE_LEN)
+                .map(|_| Arg::Value(str_value("a")))
+                .collect(),
+        );
+        assert!(marshal(&too_many, Endian::Little).is_err());
     }
 
     /// Goal: `mpris:trackid` is checked before it reaches a consumer that type
@@ -1222,6 +1678,325 @@ mod tests {
             Some("org.freedesktop.DBus.Error.Failed")
         );
         assert_eq!(failed.signature(), "s");
+    }
+
+    /// Goal: parsing and marshalling are inverses over every shape that has
+    /// been seen on a real bus. Method: parse each capture and marshal it
+    /// straight back, and require the same bytes. Field order comes back too,
+    /// which is why the fields are a list and not a set of named options.
+    #[test]
+    fn every_captured_message_survives_a_round_trip_unchanged() {
+        for (name, bytes) in captures() {
+            let message = parse(bytes).unwrap_or_else(|error| panic!("{name} parses: {error}"));
+            let again = marshal(&message, Endian::Little)
+                .unwrap_or_else(|error| panic!("{name} marshals back: {error}"));
+            assert_eq!(again, bytes, "{name} did not survive the round trip");
+        }
+    }
+
+    /// Goal: parsing means what it says, not merely something reversible.
+    /// Method: read the header and the body out of three captures and check
+    /// them against what the tools reported at capture time. A round trip alone
+    /// would pass with the whole message read at a constant offset.
+    #[test]
+    fn a_parsed_message_carries_what_the_capture_showed() {
+        let call = parse(vectors::GET_CALL).expect("the Get call parses");
+        assert_eq!(call.kind, MessageType::MethodCall);
+        assert_eq!(call.interface(), Some("org.freedesktop.DBus.Properties"));
+        assert_eq!(call.member(), Some("Get"));
+        assert_eq!(call.path(), Some("/org/mpris/MediaPlayer2"));
+        assert_eq!(call.signature(), "ss");
+        assert_eq!(
+            call.body,
+            vec![
+                Arg::Value(str_value("org.mpris.MediaPlayer2.Player")),
+                Arg::Value(str_value("Position")),
+            ]
+        );
+
+        let position = parse(vectors::GET_POSITION_REPLY).expect("the Position reply parses");
+        assert_eq!(position.kind, MessageType::MethodReturn);
+        assert_eq!(position.reply_serial(), Some(3));
+        assert_eq!(
+            position.body,
+            vec![Arg::Variant(Variant::Value(Value::Int64(31_785_771)))]
+        );
+
+        let changed = parse(vectors::PROPERTIES_CHANGED).expect("the signal parses");
+        assert_eq!(changed, properties_changed());
+
+        let failed = parse(vectors::ERROR_REPLY).expect("the error parses");
+        assert_eq!(failed.kind, MessageType::Error);
+        assert_eq!(
+            failed.error_name(),
+            Some("org.freedesktop.DBus.Error.ServiceUnknown")
+        );
+    }
+
+    /// Goal: a peer's byte order is honoured rather than assumed. Method:
+    /// marshal one message big-endian and parse it back. Both orders are legal
+    /// and a receiver does not get to pick.
+    #[test]
+    fn a_big_endian_message_parses_to_the_same_value() {
+        let message = properties_changed();
+        let bytes = marshal(&message, Endian::Big).expect("big-endian marshals");
+        assert_eq!(bytes[0], b'B');
+        assert_eq!(parse(&bytes), Ok(message));
+    }
+
+    /// Goal: a message that arrives in pieces is only parsed once it is whole.
+    /// Method: offer every prefix of a capture and require `None` until the
+    /// last byte, then the exact length. The receive loop accumulates across
+    /// read timeouts, so a timeout landing mid-message must not be a case.
+    #[test]
+    fn a_partial_message_is_not_a_message_yet() {
+        let whole = vectors::PROPERTIES_CHANGED;
+        for short in 0..whole.len() {
+            assert_eq!(
+                frame_len(&whole[..short]),
+                Ok(None),
+                "{short} bytes is not yet a whole message"
+            );
+        }
+        assert_eq!(frame_len(whole), Ok(Some(whole.len())));
+
+        // A second message behind the first is measured, not swallowed - and
+        // `parse` takes one frame and nothing else, in either direction.
+        let mut two = whole.to_vec();
+        two.extend_from_slice(vectors::SEEKED_SIGNAL);
+        assert_eq!(frame_len(&two), Ok(Some(whole.len())));
+        assert_eq!(
+            frame_len(&two[whole.len()..]),
+            Ok(Some(vectors::SEEKED_SIGNAL.len()))
+        );
+        // Both of these are the caller handing over the wrong slice rather than
+        // a peer sending something wrong, so both are framing errors: they say
+        // the stream is not where it was thought to be, which is what decides
+        // whether the connection can carry on.
+        assert!(
+            matches!(parse(&two), Err(WireError::Framing(_))),
+            "two messages are not one message"
+        );
+        assert!(
+            matches!(parse(&whole[..whole.len() - 1]), Err(WireError::Framing(_))),
+            "most of a message is not a message"
+        );
+    }
+
+    /// Goal: a body that stops short of its own declared length is refused.
+    /// Method: pad a real `s` body out with eight bytes the signature does not
+    /// account for. Left alone, those bytes are whatever the next value would
+    /// have been read as.
+    #[test]
+    fn a_body_shorter_than_its_declared_length_is_refused() {
+        let mut padded = vectors::GETALL_CALL.to_vec();
+        let body_len = u32::from_le_bytes([padded[4], padded[5], padded[6], padded[7]]);
+        padded[4..8].copy_from_slice(&(body_len + 8).to_le_bytes());
+        padded.extend_from_slice(&[0; 8]);
+        assert_eq!(frame_len(&padded), Ok(Some(padded.len())));
+        assert!(parse(&padded).is_err());
+    }
+
+    /// Goal: a variant carries exactly one type, and a signature naming two is
+    /// refused rather than half-read. Method: the tokeniser directly, since a
+    /// variant that read only its first type would leave the rest of the body
+    /// to be read as something else entirely.
+    #[test]
+    fn a_variant_declaring_more_than_one_type_is_refused() {
+        assert_eq!(one_kind("x"), Ok(Kind::Int64));
+        assert_eq!(one_kind("a{sv}"), Ok(Kind::Dict));
+        assert!(one_kind("").is_err(), "a variant with no type");
+        assert!(one_kind("xx").is_err(), "a variant with two types");
+        assert!(one_kind("sa{sv}").is_err(), "a variant with two types");
+        assert!(one_kind("ao").is_err(), "a variant outside the closed set");
+    }
+
+    /// Goal: a header that is not one costs the connection, and a message that
+    /// is merely wrong costs one message. Method: one corruption per rule,
+    /// checking which half of [`WireError`] comes back - the receive loop
+    /// branches on exactly that.
+    #[test]
+    fn a_broken_header_and_a_broken_message_are_told_apart() {
+        let mut wrong_order = vectors::SEEKED_SIGNAL.to_vec();
+        wrong_order[0] = b'x';
+        assert!(matches!(
+            frame_len(&wrong_order),
+            Err(WireError::Framing(_))
+        ));
+
+        let mut wrong_version = vectors::SEEKED_SIGNAL.to_vec();
+        wrong_version[3] = 2;
+        assert!(matches!(
+            frame_len(&wrong_version),
+            Err(WireError::Framing(_))
+        ));
+
+        // A field array claiming more than an array may hold.
+        let mut absurd_fields = vectors::SEEKED_SIGNAL.to_vec();
+        absurd_fields[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            frame_len(&absurd_fields),
+            Err(WireError::Framing(_))
+        ));
+
+        // A body claiming more than a message may hold.
+        let mut absurd_body = vectors::SEEKED_SIGNAL.to_vec();
+        absurd_body[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            frame_len(&absurd_body),
+            Err(WireError::Framing(_))
+        ));
+
+        // The type byte is the message's problem, not the stream's.
+        let mut unknown_type = vectors::SEEKED_SIGNAL.to_vec();
+        unknown_type[1] = 9;
+        assert!(matches!(parse(&unknown_type), Err(WireError::Message(_))));
+    }
+
+    /// Goal: a body that does not match its own signature is refused rather
+    /// than misread. Method: corrupt one rule at a time in a real message and
+    /// require an error each time. Silence is the failure mode being designed
+    /// against here: the specification's answer to a malformed message is to
+    /// hang up without a word, so anything read at the wrong offset would
+    /// simply take the bus away.
+    #[test]
+    fn a_body_that_contradicts_its_signature_is_refused() {
+        // A real `x` body, with the signature relabelled as something wider.
+        let seeked = vectors::SEEKED_SIGNAL;
+        assert!(parse(seeked).is_ok());
+
+        let mut wrong_signature = seeked.to_vec();
+        let signature_at = wrong_signature
+            .windows(4)
+            .position(|window| window == [0x08, 0x01, 0x67, 0x00])
+            .expect("the SIGNATURE field is in the capture")
+            + 5;
+        wrong_signature[signature_at] = b'o';
+        assert!(parse(&wrong_signature).is_err(), "an `x` read as an `o`");
+
+        // A signature naming a container priel deliberately does not implement.
+        let mut out_of_scope = seeked.to_vec();
+        out_of_scope[signature_at - 1] = 2;
+        out_of_scope[signature_at] = b'a';
+        out_of_scope[signature_at + 1] = b'o';
+        assert!(parse(&out_of_scope).is_err(), "an `ao` body");
+
+        // Padding that is not nul: the four bytes an empty `a{sv}` writes after
+        // its length and does not count. A reader that steps over them blindly
+        // reads the same message; one that checks them says so.
+        let mut dirty_padding = vectors::PROPERTIES_CHANGED_PADDED_DICT.to_vec();
+        let body_len = usize::from(dirty_padding[4]);
+        let body_at = dirty_padding.len() - body_len;
+        dirty_padding[body_at + 36] = 0x41;
+        assert!(parse(&dirty_padding).is_err(), "padding that is not nul");
+
+        // A string that is not terminated.
+        let mut unterminated = vectors::PROPERTIES_CHANGED_PADDED_DICT.to_vec();
+        let last = unterminated.len() - 1;
+        unterminated[last] = 0x41;
+        assert!(parse(&unterminated).is_err(), "a string without its nul");
+    }
+
+    /// Goal: the values inside a body are checked, not merely stepped over.
+    /// Method: build each malformed value with the marshaller's own layout and
+    /// require the reader to refuse it. These are the ones a lenient parser
+    /// waves through and hands upwards as a wrong answer.
+    #[test]
+    fn values_that_are_not_their_own_type_are_refused() {
+        let make = |body: Vec<Arg>, edit: fn(&mut Vec<u8>)| {
+            let message = Message::signal(1, "/priel", "org.priel.Wire", "Sample").with_body(body);
+            let mut bytes = marshal(&message, Endian::Little).expect("the sample marshals");
+            edit(&mut bytes);
+            parse(&bytes)
+        };
+
+        // A boolean that is neither 0 nor 1.
+        assert!(
+            make(vec![Arg::Value(Value::Bool(true))], |bytes| {
+                let last = bytes.len() - 4;
+                bytes[last] = 2;
+            })
+            .is_err()
+        );
+
+        // A string whose bytes are not utf-8.
+        assert!(
+            make(vec![Arg::Value(str_value("ok"))], |bytes| {
+                let last = bytes.len() - 3;
+                bytes[last] = 0xff;
+            })
+            .is_err()
+        );
+
+        // An object path that is not one.
+        assert!(
+            make(
+                vec![Arg::Value(Value::Path("/priel/track".into()))],
+                |bytes| {
+                    let last = bytes.len() - 2;
+                    bytes[last] = b'-';
+                }
+            )
+            .is_err()
+        );
+
+        // An array claiming more bytes than the message holds.
+        assert!(
+            make(vec![Arg::Value(strings(&["one"]))], |bytes| {
+                let at = bytes.len() - 12;
+                bytes[at..at + 4].copy_from_slice(&1000u32.to_le_bytes());
+            })
+            .is_err()
+        );
+    }
+
+    /// Goal: a message missing a field its type requires is refused once, here,
+    /// rather than by whatever reads it later. Method: drop the required field
+    /// from a real call and a real reply.
+    #[test]
+    fn a_message_missing_a_required_field_is_refused() {
+        let mut call = parse(vectors::GETALL_CALL).expect("the call parses");
+        call.fields
+            .retain(|field| !matches!(field, Field::Member(_)));
+        let bytes = marshal(&call, Endian::Little).expect("it still marshals");
+        assert!(parse(&bytes).is_err(), "a method call with no member");
+
+        let mut reply = parse(vectors::PING_REPLY).expect("the reply parses");
+        reply
+            .fields
+            .retain(|field| !matches!(field, Field::ReplySerial(_)));
+        let bytes = marshal(&reply, Endian::Little).expect("it still marshals");
+        assert!(parse(&bytes).is_err(), "a reply answering nothing");
+    }
+
+    /// Goal: no corruption of a real message makes the parser panic. Method:
+    /// sweep every byte of every capture, set it to three values that are not
+    /// what was there, and require a verdict rather than an unwind. Anything
+    /// the parser reads is a peer's bytes, so a panic here is a crash any
+    /// process on the bus could cause.
+    #[test]
+    fn no_corruption_of_a_real_message_can_panic() {
+        for (name, bytes) in captures() {
+            for at in 0..bytes.len() {
+                for replacement in [0x00, 0x01, 0xff] {
+                    let mut broken = bytes.to_vec();
+                    if broken[at] == replacement {
+                        continue;
+                    }
+                    broken[at] = replacement;
+                    // Only that it returns. Most of these are still valid
+                    // messages saying something different.
+                    let _ = frame_len(&broken);
+                    let _ = parse(&broken);
+                    assert!(!name.is_empty());
+                }
+            }
+            // And every truncation, which is what a short read looks like.
+            for short in 0..bytes.len() {
+                let _ = frame_len(&bytes[..short]);
+                let _ = parse(&bytes[..short]);
+            }
+        }
     }
 
     /// Goal: the body and the signature that describes it are set together, so
