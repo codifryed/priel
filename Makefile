@@ -80,6 +80,26 @@ fmt-check: ## Fail if anything is unformatted
 
 check: fmt-check lint test-all ## Everything CI runs; the gate before a commit
 
+# A test binary can die on a signal rather than fail a test. cargo then reports
+# no FAILED line and no assertion - just a non-zero exit - so anyone grepping
+# the log for a failing test finds nothing and reads it as "could not
+# reproduce". That is exactly how a use-after-free across the mpv FFI boundary
+# survived for a day. This target names that case and says where the evidence
+# already is.
+check-signals: ## Run the suite and say plainly if a test binary was killed
+	@set -o pipefail; $(CARGO) test $(CARGO_FLAGS) --workspace 2>&1 | tee /tmp/priel-check.log; \
+	status=$$?; \
+	if grep -qE "signal: [0-9]+|SIGSEGV|SIGABRT|SIGILL|SIGBUS" /tmp/priel-check.log; then \
+	  echo ""; \
+	  echo "!! A TEST BINARY DIED ON A SIGNAL. No test failed; the process was killed."; \
+	  echo "!! There is no FAILED line and no assertion to find - do not read this as a"; \
+	  echo "!! flake. The core dump is already captured:"; \
+	  echo "!!     coredumpctl list | grep priel"; \
+	  echo "!!     coredumpctl info <PID>   # the stack trace names the faulting frame"; \
+	  exit 1; \
+	fi; \
+	exit $$status
+
 coverage: ## Line-coverage summary (needs cargo-llvm-cov)
 	@$(CARGO) llvm-cov --version >/dev/null 2>&1 \
 		|| { echo "cargo-llvm-cov is not installed: cargo install cargo-llvm-cov"; exit 1; }
