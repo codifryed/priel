@@ -21,15 +21,21 @@
 //!
 //!   --device <mpv-device>   e.g. pipewire/alsa_output.usb-SMSL...pro-output-0
 //!   --exclusive             take that device for priel alone (never automatic)
+//!   --shared                give it back, whatever the settings file remembers
 //!   --list-devices          print the output devices and exit
 //!   --theme <theme>         colour palette (default: nord; `terminal` defers)
 //!   --log-level <level>     diagnostics detail (default: warn; `$PRIEL_LOG` too)
 //!   --log-file <path>       default: `~/.local/state/priel/priel.log`
+//!
+//! The palette, the device, exclusivity and the log level are remembered in
+//! `~/.config/priel/settings.conf`. A flag wins over the file for that run, and
+//! the file wins over the default.
 
 mod app;
 mod bus;
 mod cli;
 mod logging;
+mod settings;
 mod theme;
 mod ui;
 mod worker;
@@ -57,6 +63,14 @@ fn main() -> Result<()> {
     // clap handles --help and --version itself, exiting before we touch the
     // terminal - important, since setup() puts it in raw mode.
     let args = cli::Cli::parse();
+    // Read before the logger is started, because it is where the log level can
+    // come from. It therefore cannot log its own troubles, and hands them back
+    // as notes to be emitted below instead. The path is resolved here and
+    // nowhere else: `main` is the only place allowed to touch the user's home
+    // directory, which is what keeps every test out of it.
+    let settings_path = settings::default_path();
+    let settings = settings::load(&settings_path);
+    let level = args.log_level(settings.settings.log_level);
     // Started before the terminal is taken, so a problem opening the log lands
     // on a stderr the user can still see. It is never fatal: priel plays music
     // with or without a log.
@@ -66,10 +80,13 @@ fn main() -> Result<()> {
     // The in-memory ring is created here whether or not a file can be opened,
     // so the `M` overlay works even when the log is off or unwritable.
     let recent = logging::Recent::default();
-    if let Err(e) = logging::init(args.log_level(), &args.log_path(), &recent) {
+    if let Err(e) = logging::init(level, &args.log_path(), &recent) {
         eprintln!("priel: no diagnostic log: {e:#}");
     }
     log::info!("priel {} starting", env!("CARGO_PKG_VERSION"));
+    for note in &settings.notes {
+        log::log!(note.level, "{}", note.text);
+    }
     // Installed here, before the terminal exists, so it sits underneath the
     // restoring hook that `setup` adds and covers the run that never gets that
     // far. The hook is global, so it also catches the worker, player and
@@ -86,7 +103,7 @@ fn main() -> Result<()> {
         print_devices();
         Ok(())
     } else {
-        session(args, recent)
+        session(&args, recent, &settings.settings, &settings_path)
     };
     match &outcome {
         Ok(()) => log::info!("priel stopping"),
@@ -141,7 +158,12 @@ fn print_devices() {
 /// Split out so that no exit path can skip the record of why priel stopped: a
 /// terminal that cannot be prepared used to return straight out of `main`,
 /// leaving the one file that would have explained it empty.
-fn session(args: cli::Cli, recent: logging::Recent) -> Result<()> {
+fn session(
+    args: &cli::Cli,
+    recent: logging::Recent,
+    remembered: &settings::Settings,
+    settings_path: &str,
+) -> Result<()> {
     // Both files used to live in the config directory. Move them once rather
     // than silently logging the user out to make a spec point.
     //
@@ -156,12 +178,19 @@ fn session(args: cli::Cli, recent: logging::Recent) -> Result<()> {
     // to the machine, and tests build an `App`.
     let bus = bus::conn::start(bus::mpris::WELL_KNOWN_NAME);
     let mut terminal = setup().context("preparing the terminal")?;
-    let theme = args.theme.unwrap_or_default();
+    let level = args.log_level(remembered.log_level);
+    let theme = args.theme(remembered.theme);
     let player = priel_player::PlayerConfig {
-        mpv_log_level: args.mpv_log_level(),
-        audio_device: args.device,
-        exclusive: args.exclusive,
+        mpv_log_level: cli::Cli::mpv_log_level(level),
+        audio_device: args.device(remembered.device.clone()),
+        exclusive: args.exclusive(remembered.exclusive),
     };
+    // Written once, here, after the loop has ended: a `write(2)` has no business
+    // on the render thread, and `App` deliberately owns no path at all so that
+    // nothing a test constructs can reach a home directory. Only what a picker
+    // chose this session is in there - a flag is for one run, and quietly making
+    // one permanent is the surprise this whole design avoids.
+    let mut not_saved = None;
     let res = App::new(
         player,
         priel_core::Client::default_token_path(),
@@ -169,13 +198,26 @@ fn session(args: cli::Cli, recent: logging::Recent) -> Result<()> {
         theme,
         bus,
     )
-    .and_then(|mut app| run(&mut terminal, &mut app, &mut TerminalEvents));
+    .and_then(|mut app| {
+        let outcome = run(&mut terminal, &mut app, &mut TerminalEvents);
+        if let Err(e) = settings::save(settings_path, app.chosen()) {
+            not_saved = Some(e);
+        }
+        outcome
+    });
     restore(&mut terminal)?;
     // Reported rather than returned: the terminal is back, and printing the
     // error beats anyhow's own rendering of it after an interactive session.
     if let Err(e) = res {
         log::error!("the session ended in an error: {e:?}");
         eprintln!("priel error: {e:?}");
+    }
+    // Said in both places for the reason the style guide gives: the log line is
+    // for whoever reads the file afterwards, and the printed one is for the user
+    // who would otherwise find their choice gone on the next start.
+    if let Some(e) = not_saved {
+        log::warn!("the settings were not saved: {e:#}");
+        eprintln!("priel: your choices were not saved to {settings_path}: {e:#}");
     }
     Ok(())
 }
@@ -326,7 +368,7 @@ mod tests {
             cli.device.is_none(),
             "no --device means the system default sink"
         );
-        assert_eq!(cli.log_level(), log::LevelFilter::Warn);
+        assert_eq!(cli.log_level(None), log::LevelFilter::Warn);
         assert!(cli.log_path().ends_with("/priel/priel.log"));
     }
 
@@ -413,7 +455,7 @@ mod tests {
         // Goal: raising the level and redirecting the file are the two things
         // asked of a user who is reporting a bug.
         let cli = parse(&["--log-level", "debug", "--log-file", "/tmp/p.log"]);
-        assert_eq!(cli.log_level(), log::LevelFilter::Debug);
+        assert_eq!(cli.log_level(None), log::LevelFilter::Debug);
         assert_eq!(cli.log_path(), "/tmp/p.log");
     }
 
@@ -425,15 +467,119 @@ mod tests {
         // and it must not be able to cost someone their music player.
         use crate::cli::LogLevel;
         use log::LevelFilter;
-        assert_eq!(Cli::resolve_level(None, Some("debug")), LevelFilter::Debug);
-        assert_eq!(Cli::resolve_level(None, Some("DEBUG")), LevelFilter::Debug);
         assert_eq!(
-            Cli::resolve_level(Some(LogLevel::Error), Some("trace")),
+            Cli::resolve_level(None, Some("debug"), None),
+            LevelFilter::Debug
+        );
+        assert_eq!(
+            Cli::resolve_level(None, Some("DEBUG"), None),
+            LevelFilter::Debug
+        );
+        assert_eq!(
+            Cli::resolve_level(Some(LogLevel::Error), Some("trace"), None),
             LevelFilter::Error,
             "the flag wins"
         );
-        assert_eq!(Cli::resolve_level(None, Some("verbose")), LevelFilter::Warn);
-        assert_eq!(Cli::resolve_level(None, None), LevelFilter::Warn);
+        assert_eq!(
+            Cli::resolve_level(None, Some("verbose"), None),
+            LevelFilter::Warn
+        );
+        assert_eq!(Cli::resolve_level(None, None, None), LevelFilter::Warn);
+    }
+
+    #[test]
+    fn a_flag_wins_over_the_file_and_the_file_wins_over_the_default() {
+        // Goal: the whole precedence rule, in one table. A flag is for one run,
+        // the file is what this machine is normally set to, and the default is
+        // what priel does when neither has an opinion. Getting the middle rung
+        // wrong in either direction is how a settings file either does nothing
+        // or takes a machine over.
+        use crate::cli::{LogLevel, ThemeName};
+        let file = crate::settings::Settings {
+            theme: Some(ThemeName::Dracula),
+            device: Some("pipewire/from-the-file".into()),
+            exclusive: Some(true),
+            log_level: Some(LogLevel::Info),
+        };
+        let bare = parse(&[]);
+        assert_eq!(bare.theme(file.theme), ThemeName::Dracula);
+        assert_eq!(
+            bare.device(file.device.clone()).as_deref(),
+            Some("pipewire/from-the-file")
+        );
+        assert!(bare.exclusive(file.exclusive));
+        assert_eq!(bare.log_level(file.log_level), log::LevelFilter::Info);
+
+        let flagged = parse(&[
+            "--theme",
+            "nord",
+            "--device",
+            "pipewire/flag",
+            "--log-level",
+            "off",
+        ]);
+        assert_eq!(flagged.theme(file.theme), ThemeName::Nord);
+        assert_eq!(
+            flagged.device(file.device.clone()).as_deref(),
+            Some("pipewire/flag")
+        );
+        assert_eq!(flagged.log_level(file.log_level), log::LevelFilter::Off);
+
+        assert_eq!(bare.theme(None), ThemeName::Nord, "then the default");
+        assert_eq!(bare.device(None), None, "which is the default sink");
+        assert!(!bare.exclusive(None), "and shared output");
+        assert_eq!(bare.log_level(None), log::LevelFilter::Warn);
+    }
+
+    #[test]
+    fn a_remembered_setting_can_always_be_answered_from_the_command_line() {
+        // Goal: a file you cannot get out from under is a file that can break a
+        // start. --theme, --device and --log-level all take a value either way,
+        // but a bare --exclusive cannot say *false* - so --shared exists, and
+        // the two override each other in the order they are given.
+        assert!(
+            !parse(&["--shared"]).exclusive(Some(true)),
+            "the flag has to beat a remembered exclusive = true"
+        );
+        assert!(
+            parse(&["--exclusive"]).exclusive(Some(false)),
+            "and the other way round"
+        );
+        assert!(
+            !parse(&["--exclusive", "--shared"]).exclusive(None),
+            "the last one on the line wins"
+        );
+        assert!(
+            parse(&["--shared", "--exclusive"]).exclusive(None),
+            "in both orders"
+        );
+    }
+
+    #[test]
+    fn the_environment_still_outranks_the_file_but_not_the_flag() {
+        // Goal: $PRIEL_LOG is per-invocation, like a flag - it is how a level is
+        // raised for one run started from a desktop entry. The file is what the
+        // machine is normally set to, so it sits underneath.
+        use crate::cli::LogLevel;
+        use log::LevelFilter;
+        assert_eq!(
+            Cli::resolve_level(None, Some("trace"), Some(LogLevel::Error)),
+            LevelFilter::Trace
+        );
+        assert_eq!(
+            Cli::resolve_level(None, None, Some(LogLevel::Error)),
+            LevelFilter::Error
+        );
+        assert_eq!(
+            Cli::resolve_level(Some(LogLevel::Off), Some("trace"), Some(LogLevel::Error)),
+            LevelFilter::Off,
+            "the flag still wins over both"
+        );
+        assert_eq!(
+            Cli::resolve_level(None, Some("verbose"), Some(LogLevel::Error)),
+            LevelFilter::Error,
+            "an unusable environment value falls through to the file"
+        );
     }
 
     #[test]
@@ -441,18 +587,16 @@ mod tests {
         // Goal: one --log-level controls both halves of the log. Asking mpv for
         // more than priel will record is wasted work; asking for less loses the
         // half that explains a playback failure.
-        assert_eq!(parse(&[]).mpv_log_level().as_deref(), Some("warn"));
+        let mpv = |args: &[&str]| Cli::mpv_log_level(parse(args).log_level(None));
+        assert_eq!(mpv(&[]).as_deref(), Some("warn"));
+        assert_eq!(mpv(&["--log-level", "info"]).as_deref(), Some("info"));
         assert_eq!(
-            parse(&["--log-level", "info"]).mpv_log_level().as_deref(),
-            Some("info")
-        );
-        assert_eq!(
-            parse(&["--log-level", "debug"]).mpv_log_level().as_deref(),
+            mpv(&["--log-level", "debug"]).as_deref(),
             Some("v"),
             "mpv's own `debug` is far noisier than priel's"
         );
         assert!(
-            parse(&["--log-level", "off"]).mpv_log_level().is_none(),
+            mpv(&["--log-level", "off"]).is_none(),
             "off means mpv is not asked at all"
         );
     }
@@ -514,6 +658,21 @@ mod tests {
         assert!(help.contains("--device"), "{help}");
         assert!(help.contains("--log-level"), "{help}");
         assert!(DISCLAIMER.contains("not affiliated"));
+    }
+
+    #[test]
+    fn the_long_help_says_where_the_settings_are_kept() {
+        // Goal: the man page is generated from this definition and nothing
+        // else, so "where does priel keep this" has to be answerable from the
+        // command definition itself. It also has to keep the two directories
+        // apart: settings are a preference, the session is runtime state.
+        let long = Cli::command().render_long_help().to_string();
+        assert!(long.contains("settings.conf"), "{long}");
+        assert!(long.contains("XDG_CONFIG_HOME"), "{long}");
+        assert!(
+            long.contains("XDG_STATE_HOME"),
+            "and says what does not live there: {long}"
+        );
     }
 
     #[test]

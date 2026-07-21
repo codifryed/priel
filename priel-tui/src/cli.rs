@@ -60,10 +60,22 @@ pub struct Cli {
     /// for the same card, which is the same DAC shared, and to the default sink
     /// when there is no such entry. The track restarts from the beginning. The
     /// output badge then reports shared output; it never claims exclusivity it
-    /// did not get. `x` in the device picker toggles the same thing for one
-    /// session.
+    /// did not get. `x` in the device picker toggles the same thing, and what it
+    /// settles on is remembered.
     #[arg(long)]
     pub exclusive: bool,
+
+    /// Share the output device, whatever the settings file remembers
+    ///
+    /// The answer to `--exclusive` in the other direction, and the reason it
+    /// exists: a bare boolean flag cannot say *false*, so a remembered
+    /// `exclusive = true` would otherwise be unanswerable without editing the
+    /// file. Every setting priel remembers has to be overridable from the
+    /// command line in both directions.
+    ///
+    /// Given both, the last one on the line wins.
+    #[arg(long, overrides_with = "exclusive")]
+    pub shared: bool,
 
     /// List the audio output devices and exit
     ///
@@ -86,16 +98,17 @@ pub struct Cli {
     /// rather priel followed it. It is also the one palette that draws no row
     /// stripe: it cannot see the background it would be striping against.
     ///
-    /// `t` opens the same list at runtime, but priel reads no configuration
-    /// file, so a choice made there lasts for that session only. This flag is
-    /// how one is kept.
+    /// `t` opens the same list at runtime, and what is chosen there is
+    /// remembered in `$XDG_CONFIG_HOME/priel/settings.conf`. This flag
+    /// overrides it for one run.
     #[arg(long, value_name = "THEME")]
     pub theme: Option<ThemeName>,
 
     /// Detail recorded in the diagnostic log
     ///
     /// Defaults to `warn`. `$PRIEL_LOG` sets it too, for launching from a
-    /// desktop entry; the flag wins when both are given.
+    /// desktop entry, and `log_level` in the settings file sets it for good.
+    /// The flag wins over the environment, and both win over the file.
     #[arg(long, value_name = "LEVEL")]
     pub log_level: Option<LogLevel>,
 
@@ -176,21 +189,71 @@ impl From<LogLevel> for LevelFilter {
 // never resolves anything, so these are dead code in that binary only.
 #[cfg_attr(not(test), allow(dead_code, reason = "unused by the asset generator"))]
 impl Cli {
-    /// The level to log at, from the flag, the environment or the default.
+    /// The palette to paint with: the flag, then the settings file, then `nord`.
+    ///
+    /// `from_file` is passed in rather than read here for the same reason the
+    /// environment is passed to [`Self::resolve_level`]: precedence is then a
+    /// pure function, and a test needs neither a home directory nor a file.
     #[must_use]
-    pub fn log_level(&self) -> LevelFilter {
-        Self::resolve_level(self.log_level, std::env::var("PRIEL_LOG").ok().as_deref())
+    pub fn theme(&self, from_file: Option<ThemeName>) -> ThemeName {
+        self.theme.or(from_file).unwrap_or_default()
     }
 
-    /// The flag wins over the environment, and an unrecognised `$PRIEL_LOG`
-    /// falls back to the default rather than refusing to start: it is the kind
-    /// of thing that gets set once in a launcher and forgotten, and a typo there
-    /// must not cost the user their music player.
+    /// The output device: the flag, then the settings file, then `None`, which
+    /// is the sound server's default sink.
     ///
-    /// Takes the environment as a parameter so it can be tested without
-    /// mutating the process's own.
-    pub(crate) fn resolve_level(flag: Option<LogLevel>, env: Option<&str>) -> LevelFilter {
+    /// `--device auto` is the way back to the default sink from a remembered
+    /// device, so there is no third flag for it.
+    #[must_use]
+    pub fn device(&self, from_file: Option<String>) -> Option<String> {
+        self.device.clone().or(from_file)
+    }
+
+    /// Whether to ask for the device exclusively: either flag, then the settings
+    /// file, then shared.
+    ///
+    /// Two flags rather than one because a bare boolean cannot say *false*; clap
+    /// makes them override each other, so at most one is ever set.
+    #[must_use]
+    pub fn exclusive(&self, from_file: Option<bool>) -> bool {
+        if self.shared {
+            false
+        } else if self.exclusive {
+            true
+        } else {
+            from_file.unwrap_or(false)
+        }
+    }
+
+    /// The level to log at, from the flag, the environment, the file or the
+    /// default.
+    #[must_use]
+    pub fn log_level(&self, from_file: Option<LogLevel>) -> LevelFilter {
+        Self::resolve_level(
+            self.log_level,
+            std::env::var("PRIEL_LOG").ok().as_deref(),
+            from_file,
+        )
+    }
+
+    /// The flag wins over the environment, the environment over the file, and an
+    /// unrecognised value in either falls through rather than refusing to start:
+    /// they are the kind of thing that gets set once in a launcher and
+    /// forgotten, and a typo there must not cost the user their music player.
+    ///
+    /// `$PRIEL_LOG` sits above the file because it is per-invocation, like a
+    /// flag: it is how a level is raised for one run started from a desktop
+    /// entry. The file is what the machine is normally set to.
+    ///
+    /// Takes both sources as parameters so it can be tested without mutating the
+    /// process's own environment or touching a real home directory.
+    pub(crate) fn resolve_level(
+        flag: Option<LogLevel>,
+        env: Option<&str>,
+        from_file: Option<LogLevel>,
+    ) -> LevelFilter {
         flag.or_else(|| env.and_then(|v| LogLevel::from_str(v, true).ok()))
+            .or(from_file)
             .unwrap_or(LogLevel::Warn)
             .into()
     }
@@ -207,9 +270,13 @@ impl Cli {
     /// The names are not quite priel's. mpv's `v` (verbose) sits between info
     /// and debug and is what priel's `debug` maps onto; mpv's own `debug` and
     /// `trace` go down to individual packets, which would bury everything else.
+    ///
+    /// Takes the level already resolved rather than resolving it again: there is
+    /// one answer to "how much detail was asked for", and two callers deriving
+    /// it separately is how the two halves of the log come to disagree.
     #[must_use]
-    pub fn mpv_log_level(&self) -> Option<String> {
-        let level = match self.log_level() {
+    pub fn mpv_log_level(level: LevelFilter) -> Option<String> {
+        let level = match level {
             LevelFilter::Off => return None,
             LevelFilter::Error => "error",
             LevelFilter::Warn => "warn",

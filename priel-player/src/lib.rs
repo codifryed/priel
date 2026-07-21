@@ -696,8 +696,9 @@ impl Player {
     /// is loaded again, from the start, because the player abandons a file
     /// whose output fails to open.
     ///
-    /// The choice lasts for this session. priel reads no configuration file, so
-    /// `--device` is what makes one permanent.
+    /// The player holds the choice for as long as it runs and no longer: it
+    /// keeps no file of its own. Whether a choice outlives the session is the
+    /// frontend's business, and the terminal frontend remembers it.
     pub fn set_device(&self, device: &str) {
         self.send(Cmd::SetDevice(device.to_string()));
     }
@@ -710,8 +711,8 @@ impl Player {
     /// [`OutputAccess::Refused`] rather than claiming a connection it does not
     /// have.
     ///
-    /// Like the device, the choice lasts for this session; `--exclusive` is
-    /// what makes it permanent.
+    /// Like the device, the choice lasts as long as the player does; keeping it
+    /// beyond that is the frontend's business.
     pub fn set_exclusive(&self, exclusive: bool) {
         self.send(Cmd::SetExclusive(exclusive));
     }

@@ -150,6 +150,28 @@ files, and it moves its own out of the old location once, so an existing session
 is not lost. There is no flag for the session path: pointing priel at a file
 another application owns would rewrite it on every token refresh.
 
+**Settings live in `~/.config/priel/settings.conf`** (or `$XDG_CONFIG_HOME`),
+and hold the four things a flag can also set: the palette, the output device,
+whether that device is taken exclusively, and how much the log records. A flag
+wins over the file for that run, the file wins over the default, and the file is
+plain `key = value` with `#` comments:
+
+```ini
+theme = gruvbox-dark
+device = pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0
+exclusive = false
+log_level = warn
+```
+
+The values are spelled exactly as the flags spell them. Choosing a palette with
+`t`, a device with `d` or exclusivity with `x` writes that one line back when
+priel exits - the rest of the file, comments included, comes back untouched, and
+a run in which no picker was used does not write at all. A missing, unreadable
+or half-written file never stops priel starting: the bad lines are skipped, the
+reason goes in the diagnostic log, and everything else still applies. Nothing
+else is kept there - the session and the client key are state, not settings, and
+stay under `~/.local/state/priel/`.
+
 `~/.local/state/priel/priel.log` is the diagnostic log, started fresh each run
 and holding warnings and errors by default. `--log-level debug` (or
 `PRIEL_LOG=debug`) is what to attach to a bug report; `--log-level off` keeps no
@@ -162,9 +184,8 @@ priel's own account of what it was trying to play.
 `tokyo-night`, `tokyo-night-day`, or `terminal` to defer to your terminal's own
 colours — which is also the one palette that draws no row stripe, since it
 cannot see the background it would be striping against. `t` opens the same list
-while priel is running, but **priel reads no
-configuration file**, so a choice made there lasts for that session only and the
-picker says so; the flag is how one is kept.
+while priel is running, and what is chosen there is remembered in
+`settings.conf`; the flag overrides it for one run.
 
 Set `PRIEL_NO_BROWSER=1` to stop priel launching a browser; the sign-in screen
 always shows the URL as well, so a headless or remote session still works.
@@ -196,8 +217,9 @@ devices — `alsa/hw:CARD=AUDIO,DEV=0` and the like, marked *(direct hardware
 access)* — which ALSA advertises nowhere: it publishes only the plugin spellings
 of a card, so priel builds those entries from the kernel's own card listing.
 They are the outputs where `--exclusive` means something, so they are the last
-ones that should have needed looking up. `--log-level` and `--log-file` control
-the diagnostic log. See `man priel` or `priel --help`.
+ones that should have needed looking up; `--shared` is the way back to a shared
+device when the file remembers an exclusive one. `--log-level` and `--log-file`
+control the diagnostic log. See `man priel` or `priel --help`.
 
 ```bash
 make run ARGS="--device alsa/hw:CARD=AUDIO,DEV=0 --exclusive"
