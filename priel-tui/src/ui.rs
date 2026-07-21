@@ -2204,7 +2204,6 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     ])
     .split(area);
     let (l0, l1, l2) = (rows[0], rows[1], rows[2]);
-    app.progress_rect = l1;
 
     let title = match &app.now_playing {
         Some(t) => format!("{} — {}", t.artist, t.title),
@@ -2225,7 +2224,7 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.extend(top.hits);
     f.render_widget(Paragraph::new(Line::from(top.spans)), l0);
 
-    f.render_widget(progress_bar(app, &t), l1);
+    app.progress_rect = progress_row(f, app, &t, l1);
 
     // DAC badge, the shared activity slot (resolving / buffering / buffered),
     // then the keyboard reference. The clickable controls live in the header.
@@ -2285,17 +2284,27 @@ fn push_heart(bar: &mut ControlBar, app: &App, t: &Theme) {
     );
 }
 
-/// The bar and the two times, as one widget both layouts render.
+/// The bar and the two times: elapsed pinned left, length pinned right, bar
+/// between. **Returns the rect the bar itself went into**, which the caller must
+/// record as `App::progress_rect` - that is what a click and a drag are measured
+/// within, so a bar drawn in one place and hit-tested in another seeks to the
+/// wrong second silently.
 ///
-/// Whoever renders it must record the rect it went into as `App::progress_rect`:
-/// that is what a click and a drag are measured within, so a bar drawn in one
-/// place and hit-tested in another seeks to the wrong second silently.
+/// The times are laid out beside the bar rather than left to `Gauge`, which
+/// centres its label: the elapsed figure is the one number a listener glances at
+/// repeatedly, and centred it sat near column 34 in an 80-cell terminal and near
+/// column 94 in a 200-cell one, sliding across the screen during a resize.
+///
+/// Both time columns are sized by the **length**, never by the elapsed figure,
+/// so the bar's rect cannot narrow under the pointer as `9:59` turns into
+/// `10:00` mid-track. That would be the same drift again, in time instead of in
+/// width, and it would move what a click means while the listener is aiming.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "display-only: elapsed and total seconds are non-negative and rendered whole"
 )]
-fn progress_bar(app: &App, t: &Theme) -> Gauge<'static> {
+fn progress_row(f: &mut Frame, app: &App, t: &Theme, area: Rect) -> Rect {
     let s = &app.status;
     // The listing's length, never mpv's estimate; see `App::duration`.
     let total = app.duration();
@@ -2304,14 +2313,36 @@ fn progress_bar(app: &App, t: &Theme) -> Gauge<'static> {
     } else {
         0.0
     };
-    Gauge::default()
-        .gauge_style(t.on(t.accent))
-        .ratio(ratio)
-        .label(format!(
-            "{} / {}",
-            fmt_dur(s.position as u32),
-            fmt_dur(total as u32)
-        ))
+    let length = fmt_dur(total as u32);
+    let elapsed = fmt_dur(s.position as u32);
+    let figure = u16::try_from(length.width()).unwrap_or(u16::MAX);
+    // One cell of air each side of each figure, so neither touches the edge of
+    // the terminal or the end of the bar.
+    let gutter = figure.saturating_add(2);
+    let cols = Layout::horizontal([
+        Constraint::Length(gutter),
+        Constraint::Min(0),
+        Constraint::Length(gutter),
+    ])
+    .split(area);
+
+    let width = usize::from(figure);
+    f.render_widget(Paragraph::new(format!(" {elapsed:>width$} ")), cols[0]);
+    f.render_widget(
+        Gauge::default()
+            .gauge_style(t.on(t.accent))
+            .ratio(ratio)
+            .label(""),
+        cols[1],
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {length} "),
+            Style::default().fg(t.faint),
+        )),
+        cols[2],
+    );
+    cols[1]
 }
 
 /// Is there a second region on screen to hand the keyboard to?
@@ -4847,12 +4878,22 @@ mod tests {
             // is the ordinary state of a stream whose size is not advertised.
             sc.app.now_playing.as_mut().expect("just set").duration_secs = 200;
             sc.app.status.duration = 70.0;
+            // A quarter of the way in, so the rect has both a filled end and an
+            // empty one and covering the wrong cells shows up as either.
+            sc.app.status.position = 50.0;
 
             let bar = painted_bar(&mut sc.app, w, h);
             assert!(
-                bar.contains("0:00 / 3:20"),
-                "the rect must cover the bar that was painted, not a row beside \
-                 it: {bar:?} at {w}x{h}, collapsed={collapsed}"
+                bar.starts_with('█') && bar.ends_with(' '),
+                "the rect must cover the bar that was painted, from its filled \
+                 end to its empty one: {bar:?} at {w}x{h}, collapsed={collapsed}"
+            );
+            // No figure of any kind: the times are laid out beside the bar now,
+            // and `Gauge` prints its own percentage unless the label is cleared.
+            assert!(
+                !bar.chars().any(|c| c.is_ascii_digit()),
+                "the rect a seek is measured within must cover the bar alone: \
+                 {bar:?} at {w}x{h}"
             );
 
             let pr = sc.app.progress_rect;
@@ -4870,6 +4911,67 @@ mod tests {
                  at {w}x{h}"
             );
         }
+    }
+
+    #[test]
+    fn the_two_times_sit_at_the_edges_however_wide_the_terminal_is() {
+        // Goal: audit item 8. `Gauge` centres its label, so the elapsed time -
+        // the one number a listener glances at over and over - sat near column
+        // 34 in an 80-cell terminal and near column 94 in a 200-cell one, and
+        // slid across the screen while the window was being resized. Method:
+        // render the same second of the same track at two widths and measure
+        // each figure from its own edge.
+        let mut elapsed_at = Vec::new();
+        for w in [80u16, 200] {
+            let mut sc = screen();
+            sc.app.now_playing = Some(track(1, "Blue in Green"));
+            sc.app.now_playing.as_mut().expect("just set").duration_secs = 245;
+            sc.app.status.position = 61.0;
+
+            let out = draw(&mut sc.app, w, 24);
+            let bar_row = out.get(22).map_or(String::new(), Clone::clone);
+            elapsed_at.push(
+                bar_row
+                    .find("1:01")
+                    .unwrap_or_else(|| panic!("no elapsed time at {w}: {bar_row:?}")),
+            );
+            assert!(
+                bar_row.ends_with("4:05"),
+                "the length is not against the right edge at {w}: {bar_row:?}"
+            );
+        }
+        assert_eq!(
+            elapsed_at[0], elapsed_at[1],
+            "the elapsed time moved when the terminal got wider"
+        );
+        assert!(
+            elapsed_at[0] <= 2,
+            "and it belongs against the left edge, not at column {}",
+            elapsed_at[0]
+        );
+    }
+
+    #[test]
+    fn the_bar_does_not_move_when_the_elapsed_time_grows_a_digit() {
+        // Goal: the same drift again, in time rather than in width. Sizing the
+        // time columns by the elapsed figure looks equivalent and is not: on a
+        // track past ten minutes the left column widens as `9:59` becomes
+        // `10:00`, the bar shifts a cell under a pointer that is already aiming,
+        // and every seek after that is measured within a different rect. Method:
+        // render one long track at two moments either side of that carry.
+        let mut rects = Vec::new();
+        for pos in [61.0, 605.0] {
+            let mut sc = screen();
+            sc.app.now_playing = Some(track(1, "Shine On You Crazy Diamond"));
+            sc.app.now_playing.as_mut().expect("just set").duration_secs = 1103;
+            sc.app.status.position = pos;
+            let _ = draw(&mut sc.app, 80, 24);
+            rects.push(sc.app.progress_rect);
+        }
+        assert_eq!(
+            rects[0], rects[1],
+            "the bar moved between 1:01 and 10:05 of the same track"
+        );
     }
 
     // ---- one breakpoint: the queue takes the column beside the list ----
@@ -4925,7 +5027,7 @@ mod tests {
                 out[last - 2]
             );
             assert!(
-                out[last - 1].contains("0:00 / 4:05"),
+                out[last - 1].starts_with(" 0:00") && out[last - 1].ends_with("4:05"),
                 "the bar at {w}x{h}: {:?}",
                 out[last - 1]
             );
@@ -4964,7 +5066,7 @@ mod tests {
             "the device readout is still in the column: {col}"
         );
         assert!(
-            !col.contains("0:00 /"),
+            !col.contains('█'),
             "a second progress bar is in the column: {col}"
         );
         assert!(
@@ -7319,10 +7421,11 @@ mod tests {
         // What mpv believes so far, a fraction of the truth.
         sc.app.status.duration = 70.0;
 
-        let out = text(&mut sc.app, 130, 12);
+        let out = draw(&mut sc.app, 130, 12);
+        let bar_row = out.get(10).map_or(String::new(), Clone::clone);
         assert!(
-            out.contains("1:01 / 4:05"),
-            "the track is 4:05 however little of it has arrived: {out}"
+            bar_row.starts_with(" 1:01") && bar_row.ends_with("4:05"),
+            "the track is 4:05 however little of it has arrived: {bar_row:?}"
         );
     }
 

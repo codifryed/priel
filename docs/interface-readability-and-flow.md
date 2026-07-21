@@ -57,7 +57,7 @@ and web typography and does not transfer; I have not cited it where it does not.
 | 5 | Truncation counts characters, not cells | medium | low | guidance | propose |
 | 6 | No breadcrumb when a playlist or mix is open | medium | low | guidance | propose |
 | 7 | Now-playing says "Artist — Title"; rows say the reverse | medium | low | taste | propose |
-| 8 | The elapsed time is centred and drifts | medium | medium | guidance | propose |
+| 8 | The elapsed time is centred and drifts | medium | medium | guidance | **done** |
 | 9 | Overlay body text hugs the border, footers do not | low | none | guidance | **done** |
 | 10 | Overlay widths are an arbitrary ladder | low | low | taste | propose |
 | 11 | The report and the device picker are both "Output" | low | low | taste | propose |
@@ -333,7 +333,7 @@ reason for borrowing its shapes. My preference is title-first in both, because
 one pair of facts in one interface should have one order and the list is the
 place the order matters more.
 
-## 8. The elapsed time is centred and drifts with the terminal width
+## 8. The elapsed time is centred and drifts with the terminal width — **done**
 
 **Guidance**: `number-tabular` again, and `visual-hierarchy`. ratatui's `Gauge`
 centres its label, so the one number a listener glances at repeatedly sits at
@@ -347,19 +347,36 @@ before, 200 columns
                                                           0:00 / 0:00
 ```
 
-**Proposed after**: elapsed at the left edge, remaining at the right, bar
-between - the shape every player uses, and the shape that keeps both figures in
-a fixed place.
+**After**: elapsed at the left edge, the length at the right, bar between - the
+shape every player uses, and the shape that keeps both figures in a fixed place.
 
 ```
 after
- 1:01 ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ -3:04
+ 1:01 ████████████                                                      4:05
 ```
 
-Proposed rather than done because it means hand-rendering the bar instead of
-using `Gauge`, and because `progress_rect` is what click-to-seek hit-tests
-against, so the geometry has to stay exactly in step. That is a change with a
-real chance of breaking seeking, which is not a change to make unasked.
+**Done**, with two departures from the proposal above.
+
+*Not hand-rendered.* The row is a three-way `Layout::horizontal` - a fixed
+column for each figure, the rest to a label-less `Gauge` - so the bar is still
+drawn by the widget that was already drawing it, and only its rect changed.
+`progress_rect` becomes the middle chunk rather than the whole row, which is
+what keeps click-to-seek honest: the bar a click is measured within is now
+exactly the bar that was painted, where before the rect also covered the cells
+the centred label sat on. A click on either figure no longer seeks, which is the
+cost, and it is the right one - those cells are not part of the bar.
+
+*Length, not remaining.* The right-hand figure stays the track's length. The
+defect was where the numbers sat, not which numbers they were, and swapping a
+fact out while moving it would have hidden one change inside another. Remaining
+is still available as a later taste question.
+
+Both time columns are sized by the **length**, never by the elapsed figure. That
+is load-bearing rather than tidy: sized by the elapsed, the left column widens
+as `9:59` becomes `10:00`, the bar shifts a cell under a pointer already aiming
+at it, and every seek after that is measured within a different rect. It is the
+same drift the item is about, in time instead of in width, and it has its own
+test.
 
 ## 9. Overlay body text hugs the border while footers are indented — **done**
 
