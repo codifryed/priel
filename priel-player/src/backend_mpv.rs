@@ -3684,4 +3684,208 @@ mod tests {
             }
         }
     }
+
+    // ---- feasibility harness: driving a display from the decoded audio ----
+    //
+    // Outside the normal suite for the same reasons as the block above: these
+    // play in real time, write PCM to a temporary file, and read the process's
+    // own CPU counters. Run them deliberately, with the rest:
+    //   cargo test -p priel-player -- --ignored --nocapture measure_
+    //
+    // What they settled is written up in
+    // `docs/adr/0002-a-display-of-the-audio-costs-the-gapless-transition.md`.
+
+    /// A deterministic hi-res signal, synthesised by the ffmpeg already inside
+    /// libmpv. No media file, no network and no audio device, so the comparison
+    /// below reproduces anywhere libmpv does.
+    const ANALYSIS_SIGNAL: &str = "av://lavfi:anoisesrc=r=96000:d=25:c=pink:a=0.9:seed=42";
+
+    /// The same signal, short enough to hear the join between two of them.
+    const ANALYSIS_SIGNAL_SHORT: &str = "av://lavfi:anoisesrc=r=96000:d=2:c=pink:a=0.9:seed=42";
+
+    /// The only graph shape that feeds a display without standing in the audio
+    /// path: the decoded stream is split, one copy goes to the output untouched
+    /// and the other into an analysis filter, whose result is a *video* stream.
+    const ANALYSIS_GRAPH: &str = "[aid1] asplit [ao] [t]; [t] showcqt=s=120x32 [vo]";
+
+    /// A player configured as priel's is, optionally with the analysis branch
+    /// attached. Nothing is loaded yet.
+    fn analysing_mpv(with_branch: bool) -> Option<Mpv> {
+        let mpv = Mpv::new().ok()?;
+        init_mpv(&mpv, &silent_config());
+        if with_branch {
+            // The analysis filter's output is video, which priel otherwise
+            // switches off outright, and it needs somewhere to go.
+            set_prop(&mpv, "vid", "auto");
+            set_prop(&mpv, "vo", "null");
+            set_prop(&mpv, "lavfi-complex", ANALYSIS_GRAPH);
+        }
+        Some(mpv)
+    }
+
+    /// Wait for `count` files to finish, or give up.
+    ///
+    /// Also counts the times mpv says it is opening the audio output, which is
+    /// only visible in mpv's own log: a second one across a playlist transition
+    /// means the output was torn down and rebuilt, which is the gap that
+    /// `gapless-audio` exists to remove.
+    fn play_until_ended(mpv: &Mpv, count: u32, limit: Duration) -> Option<u32> {
+        let deadline = Instant::now() + limit;
+        let mut ended = 0;
+        let mut opens = 0;
+        while ended < count && Instant::now() < deadline {
+            match mpv.wait_event(0.2) {
+                Some(Ok(Event::EndFile(_))) => ended += 1,
+                Some(Ok(Event::LogMessage { text, .. })) => {
+                    if text.contains("Trying audio driver") {
+                        opens += 1;
+                    }
+                }
+                Some(Err(_)) => return None,
+                _ => {}
+            }
+        }
+        (ended == count).then_some(opens)
+    }
+
+    /// Capture exactly what would reach the audio API, with the analysis branch
+    /// attached or not.
+    ///
+    /// mpv's PCM writer stands where the device would, so this opens nothing and
+    /// runs far faster than real time.
+    fn output_bytes(with_branch: bool, path: &std::path::Path) -> Option<Vec<u8>> {
+        let _ = std::fs::remove_file(path);
+        {
+            let mpv = analysing_mpv(with_branch)?;
+            set_prop(&mpv, "ao", "pcm");
+            set_prop(&mpv, "ao-pcm-file", path.to_str()?);
+            mpv.command("loadfile", &[ANALYSIS_SIGNAL, "replace"])
+                .ok()?;
+            play_until_ended(&mpv, 1, Duration::from_secs(120))?;
+        }
+        std::fs::read(path).ok()
+    }
+
+    /// Process CPU time, user plus system, in seconds.
+    ///
+    /// The 14th and 15th fields of `/proc/self/stat`, in clock ticks. The `comm`
+    /// field can hold spaces and brackets, so the split is on the last `") "`
+    /// rather than on whitespace from the front.
+    fn cpu_secs() -> Option<f64> {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+        let utime: f64 = fields.nth(11)?.parse().ok()?;
+        let stime: f64 = fields.next()?.parse().ok()?;
+        // USER_HZ, fixed at 100 on Linux.
+        Some((utime + stime) / 100.0)
+    }
+
+    /// CPU seconds spent over `window` of real-time playback.
+    ///
+    /// Whole-process, so the two runs have to be sequential - which they are,
+    /// each owning its player for the length of the call.
+    fn cpu_while_playing(with_branch: bool, window: Duration) -> Option<f64> {
+        let mpv = analysing_mpv(with_branch)?;
+        mpv.command("loadfile", &[ANALYSIS_SIGNAL, "replace"])
+            .ok()?;
+        // The decoder and the filter graph both settle before the clock starts.
+        thread::sleep(Duration::from_secs(2));
+        let before = cpu_secs()?;
+        thread::sleep(window);
+        let after = cpu_secs()?;
+        Some(after - before)
+    }
+
+    #[test]
+    #[ignore = "writes PCM to a temporary file and decodes a whole signal"]
+    fn measure_what_an_analysis_branch_does_to_the_output() {
+        // Goal: the acceptance test for a spectrum display. Splitting the
+        // decoded stream and analysing one copy must leave the other copy - the
+        // one the device receives - byte for byte what it would have been. The
+        // third capture is the control: without it, two identical hashes could
+        // just mean the signal is the same both times, and two different ones
+        // could just mean the source is not reproducible.
+        let dir = std::env::temp_dir();
+        let (plain, split, again) = (
+            dir.join("priel-analysis-plain.wav"),
+            dir.join("priel-analysis-split.wav"),
+            dir.join("priel-analysis-again.wav"),
+        );
+        let (Some(a), Some(b), Some(c)) = (
+            output_bytes(false, &plain),
+            output_bytes(true, &split),
+            output_bytes(false, &again),
+        ) else {
+            println!("MEASURE no capture: libmpv would not write PCM here");
+            return;
+        };
+        println!(
+            "MEASURE plain={} bytes  split={} bytes  repeat={} bytes",
+            a.len(),
+            b.len(),
+            c.len()
+        );
+        assert_eq!(a, c, "the capture must be reproducible to mean anything");
+        assert_eq!(
+            a, b,
+            "an analysis branch must not alter the samples reaching the output"
+        );
+        for p in [plain, split, again] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    #[ignore = "plays in real time to measure CPU"]
+    fn measure_the_cpu_an_analysis_branch_costs() {
+        // Goal: put a number on what a display costs while it runs, against the
+        // decode it is added to. priel redraws only when something changed and
+        // backs the player thread off when idle, so this is the part of that
+        // saving a continuously updating display would hand back.
+        let window = Duration::from_secs(10);
+        let (Some(plain), Some(split)) = (
+            cpu_while_playing(false, window),
+            cpu_while_playing(true, window),
+        ) else {
+            println!("MEASURE no CPU reading available on this platform");
+            return;
+        };
+        let pct = |s: f64| s / window.as_secs_f64() * 100.0;
+        println!(
+            "MEASURE decode only {:.2}s CPU ({:.1}% of one core); with analysis {:.2}s ({:.1}%); \
+             the branch costs {:.2}s ({:.1} points)",
+            plain,
+            pct(plain),
+            split,
+            pct(split),
+            split - plain,
+            pct(split - plain)
+        );
+    }
+
+    #[test]
+    #[ignore = "plays two files in real time to reach the transition"]
+    fn measure_whether_an_analysis_branch_keeps_the_transition_gapless() {
+        // Goal: gapless works by keeping the audio output open across a playlist
+        // transition. A complex filter graph is rebuilt per file, and the
+        // question is whether the output survives that. One open across two
+        // files is gapless; two is the gap back.
+        for with_branch in [false, true] {
+            let Some(mpv) = analysing_mpv(with_branch) else {
+                println!("MEASURE mpv would not start");
+                return;
+            };
+            // The output being reopened is only visible in mpv's own log.
+            request_log_messages(&mpv, "v");
+            let _ = mpv.command("loadfile", &[ANALYSIS_SIGNAL_SHORT, "replace"]);
+            let _ = mpv.command("loadfile", &[ANALYSIS_SIGNAL_SHORT, "append"]);
+            match play_until_ended(&mpv, 2, Duration::from_secs(60)) {
+                Some(opens) => println!(
+                    "MEASURE analysis branch={with_branch:<5} audio output opened {opens}x across \
+                     two files"
+                ),
+                None => println!("MEASURE analysis branch={with_branch:<5} did not finish"),
+            }
+        }
+    }
 }
