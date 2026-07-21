@@ -315,6 +315,21 @@ fn add_to_rows(f: &mut Frame, app: &mut App, body: Rect) {
     app.add_rows = rows;
 }
 
+/// How far an overlay's content sits from its own border.
+///
+/// Two cells, everywhere. Every footer already used it and most bodies did; the
+/// two that did not gave their box a left edge of its own.
+const OVERLAY_INDENT: u16 = 2;
+
+/// `area` moved in from the left by [`OVERLAY_INDENT`], never past its own end.
+fn indented(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(OVERLAY_INDENT),
+        width: area.width.saturating_sub(OVERLAY_INDENT),
+        ..area
+    }
+}
+
 /// A box of the given size in the middle of `area`.
 ///
 /// Extracted because five overlays did the same arithmetic, and one of them
@@ -904,10 +919,14 @@ fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
 
     // One row goes to the way out, as in the help overlay: an overlay that does
     // not say how to close it is a trap.
-    let body = Rect {
+    //
+    // Indented two cells to the same left edge the footer below and every other
+    // overlay's body already use. Without it this box had two left edges of its
+    // own, the lines against the border and the footer clear of it.
+    let body = indented(Rect {
         height: inner.height.saturating_sub(1),
         ..inner
-    };
+    });
     let all = app.log_lines();
     let lines: Vec<Line> = if all.is_empty() {
         vec![Line::from(Span::styled(
@@ -1095,12 +1114,14 @@ fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         ..inner
     };
     match app.device_notice() {
+        // Indented to where a device row's own two-cell mark starts, and to
+        // where the footer starts, rather than against the border.
         Some(notice) => f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 notice,
                 Style::default().fg(t.faint),
             ))),
-            body,
+            indented(body),
         ),
         None => device_rows(f, app, body),
     }
@@ -1441,9 +1462,9 @@ fn help_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         // more below: a reference that silently ended would be a reference that
         // silently lost bindings.
         let footer = if furthest > 0 {
-            "  j k scroll · g G ends · press ?, Esc or q to close"
+            "  j k scroll · g G ends · ?, Esc or q to close"
         } else {
-            "  press ?, Esc or q to close"
+            "  ?, Esc or q to close"
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1734,7 +1755,11 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
                 "{mark}{kept} {:<32} {:<20} {:<8}{:>6}",
                 trunc(&t.title, 32),
                 trunc(&t.artist, 20),
-                trunc(&t.quality, 8),
+                // The same spelling the badge beside the playing track uses.
+                // The raw wire token does not fit this column, so a row that
+                // printed it named the track's quality one way while the row
+                // above the progress bar named it another.
+                trunc(&short_quality(&t.quality), 8),
                 fmt_dur(t.duration_secs),
             ),
             is_now,
@@ -2063,7 +2088,10 @@ fn source_badge(app: &App) -> String {
     if parts.is_empty() {
         String::new()
     } else {
-        format!("   ·  {}", parts.join(" · "))
+        // Two cells either side of the separator that joins the title to the
+        // badge, against one either side of the separators inside it: enough of
+        // a gap to read as a group, and even, which three-then-two was not.
+        format!("  ·  {}", parts.join(" · "))
     }
 }
 
@@ -2255,7 +2283,11 @@ pub(crate) fn device_readout(s: &priel_player::PlaybackStatus) -> String {
     } else {
         "?".to_string()
     };
-    format!(" {label} {fmt} · {rate}")
+    // No leading space, exactly as the `OUT —` case above returns none: the
+    // callers add their own. One branch that padded itself and one that did not
+    // moved the whole bottom row - and every hit box on it - one cell right the
+    // moment an output opened.
+    format!("{label} {fmt} · {rate}")
 }
 
 /// How the output device is being held.
@@ -2299,6 +2331,12 @@ fn short_quality(q: &str) -> String {
 }
 
 fn trunc(s: &str, n: usize) -> String {
+    // A field with no room holds nothing. Returning the ellipsis alone made the
+    // result one cell wider than the field it was asked to fit, which on a
+    // narrow picker pushed the column beside it along.
+    if n == 0 {
+        return String::new();
+    }
     if s.chars().count() <= n {
         s.to_string()
     } else {
@@ -4541,6 +4579,160 @@ mod tests {
                 !sc.app.hits.iter().any(|(_, h)| *h == Hit::Quit),
                 "and nothing behind the {name} is clickable"
             );
+        }
+    }
+
+    // ---- readability: alignment, truncation and one spelling per fact ----
+
+    /// The leading blanks on a line, which is where its content starts.
+    fn indent(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    #[test]
+    fn the_output_badge_starts_in_the_same_column_whether_or_not_one_is_open() {
+        // Goal: the bottom row must not move when an output opens.
+        // `device_readout` returned a leading space in one case and not in the
+        // other, so the verdict, the activity slot and every key hint - and
+        // every one of their hit boxes - stepped one cell right the moment
+        // playback started.
+        // Method: render both states and compare where the row's content
+        // begins.
+        let mut sc = screen();
+        let idle = draw(&mut sc.app, 130, 12);
+        let idle_row = idle.last().cloned().unwrap_or_default();
+        chain(&mut sc, 24, 96_000, 96_000, "s32");
+        let open = draw(&mut sc.app, 130, 12);
+        let open_row = open.last().cloned().unwrap_or_default();
+        assert_eq!(
+            indent(&idle_row),
+            indent(&open_row),
+            "idle: {idle_row}\nopen: {open_row}"
+        );
+    }
+
+    #[test]
+    fn a_row_names_the_quality_the_way_the_badge_does() {
+        // Goal: one fact, one spelling. The wire says `HI_RES_LOSSLESS`; the
+        // badge beside the playing track says `HI-RES`; the list said
+        // `HI_RES_…` because the raw token did not fit its own column, so the
+        // same track was named two ways two lines apart.
+        let mut sc = screen();
+        let mut t = track(1, "T");
+        t.quality = "HI_RES_LOSSLESS".into();
+        favorites_arrive(&mut sc, vec![t]);
+        let out = text(&mut sc.app, 120, 10);
+        assert!(out.contains("HI-RES"), "{out}");
+        assert!(
+            !out.contains("HI_RES"),
+            "the wire token must not reach a row: {out}"
+        );
+    }
+
+    #[test]
+    fn the_source_badge_is_joined_on_with_an_even_separator() {
+        // Goal: the separator between the title and the badge carried three
+        // spaces on its left and two on its right, where every separator inside
+        // the badge carries one of each. An uneven gap around one glyph reads
+        // as a misalignment rather than as a grouping.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "So What"));
+        sc.app.now_meta = crate::app::StreamMeta {
+            bit_depth: 24,
+            sample_rate: 192_000,
+            codec: "flac".into(),
+            quality: "HI_RES_LOSSLESS".into(),
+        };
+        let out = text(&mut sc.app, 130, 12);
+        assert!(out.contains("  ·  24-bit · 192 kHz"), "{out}");
+        assert!(
+            !out.contains("   ·  24-bit"),
+            "and no third space on the left: {out}"
+        );
+    }
+
+    #[test]
+    fn a_field_with_no_room_truncates_to_nothing_rather_than_overflowing() {
+        // Goal: `trunc(s, 0)` returned a lone ellipsis, one cell wider than the
+        // field it was asked to fit. Reachable from the device picker
+        // (`body.width / 2`) and the add-to picker (`body.width - 14`) on a
+        // narrow overlay, where one cell of overflow shifts the column beside
+        // it.
+        assert_eq!(super::trunc("anything", 0), "");
+        assert_eq!(super::trunc("anything", 1), "…");
+        assert_eq!(super::trunc("ab", 2), "ab");
+    }
+
+    /// Where a line's content starts, counted from the overlay's own left
+    /// border rather than from the edge of the frame - the list behind an
+    /// overlay paints the columns to its left, so a raw indent measures that
+    /// instead.
+    fn inside(line: &str, border: usize) -> usize {
+        let after: String = line.chars().skip(border + 1).collect();
+        after.len() - after.trim_start().len()
+    }
+
+    #[test]
+    fn an_overlay_body_starts_where_its_own_footer_does() {
+        // Goal: one left edge per box. The recent log and the device picker's
+        // empty state sat against the border while their own footers were
+        // indented two cells, so each of those boxes had a ragged left edge
+        // that no other overlay has.
+        // Method: find the box's own left border from its title row, then
+        // measure the body and the footer from there.
+        for (mode, title) in [(Mode::Log, "Recent log"), (Mode::Devices, "Output device")] {
+            let name = format!("{mode:?}");
+            let mut sc = screen();
+            sc.app.set_mode_for_test(mode);
+            let frame = draw(&mut sc.app, 100, 30);
+            let border = frame
+                .iter()
+                .find(|l| l.contains(title))
+                // The last corner on the row, not the first: the list behind
+                // the overlay draws its own border further left.
+                .and_then(|l| {
+                    l.char_indices()
+                        .rfind(|(_, c)| *c == '\u{250c}')
+                        .map(|(b, _)| l[..b].chars().count())
+                })
+                .unwrap_or_default();
+            let body = frame
+                .iter()
+                .find(|l| l.contains("Nothing recorded yet") || l.contains("No output devices"))
+                .cloned()
+                .unwrap_or_default();
+            let footer = frame
+                .iter()
+                .find(|l| l.contains("Esc or q to close"))
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                inside(&body, border),
+                inside(&footer, border),
+                "{name}\nbody:   {body}\nfooter: {footer}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_overlay_says_the_way_out_the_same_way() {
+        // Goal: five overlays print one closing instruction and one of them
+        // used to say `press ?, Esc or q to close` where the rest said
+        // `M, Esc or q to close`. A single stray verb is the kind of drift the
+        // reader reads as a difference in meaning.
+        for mode in [
+            Mode::Help,
+            Mode::Log,
+            Mode::Graph,
+            Mode::Devices,
+            Mode::Themes,
+        ] {
+            let name = format!("{mode:?}");
+            let mut sc = screen();
+            sc.app.set_mode_for_test(mode);
+            let out = text(&mut sc.app, 100, 40);
+            assert!(out.contains(", Esc or q to close"), "{name}: {out}");
+            assert!(!out.contains("press "), "{name} says it its own way: {out}");
         }
     }
 }
