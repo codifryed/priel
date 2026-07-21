@@ -265,10 +265,12 @@ how the rarely-used actions stay off a bottom row narrow terminals would clip.
 | Sign in again | `A` | `[?]`, then `A` |
 | Switch view | `Tab` cycles, `1`/`2`/`3`/`4` | click a tab |
 | Move selection | `j`/`k`, `↑`/`↓` | scroll wheel |
+| Browse list / queue | `Ctrl-W` | click into either box |
 | First / last | `g` / `G` | click `[g/G]` |
 | Page up/down | `J`/`K` full, `Ctrl-U`/`Ctrl-D` half | `[?]`, then the same keys |
 | Open playlist or mix / back | `Enter` / `Esc` | double-click |
 | Play selected | `Enter` | double-click a row |
+| Play a queue entry | `Ctrl-W`, then `Enter` on it | double-click it in the panel |
 | Play / pause | `Space` | click `▷` / `‖` |
 | Seek ±5s | `h`/`l`, `←`/`→` | click or drag the progress bar |
 | Previous / next track | `H`/`L`, or `p`/`n` | click `|◁` / `▷|` |
@@ -316,6 +318,39 @@ still click-and-drag to seek, in its new place. Below 120 columns the three rows
 along the bottom are exactly as they were. That one width is the only
 breakpoint; the list simply has less room once the panel is there, and the row
 gives its columns up in the order above.
+
+Under those readouts the panel carries **the play queue**, with the tracks
+already played above the current one and dimmed, and what is still to come below
+it. It is a second focusable region: `Ctrl-W` moves the keyboard between the
+browse list and the queue — vim's own window key — and clicking into either box
+does the same thing with the pointer. Whichever box holds the keyboard is drawn
+with a heavier border, so which one `j`/`k`, `g`/`G` and `Enter` will act on is
+readable with no colour at all; the box that does not hold it still shows where
+its cursor is, in a quieter backing of its own. `Enter` on a queue entry plays
+it, forwards or back, which is what makes the history above the current track
+navigation rather than a picture of it.
+
+`F` still favorites the playing track and the `♥` beside the title is still
+clickable, whichever box has the keyboard.
+
+Entries the radio added when the queue ran out are marked `~`, and the heading
+above the queue says so — `Queue 4/9  ~ radio` — for as long as there is a mark
+to explain. Music you chose and music the service suggested are never blurred
+together: the mark is a column of its own, so an entry can be a suggestion and
+be in the history at the same time and say both.
+
+The queue is the snapshot taken when you pressed `Enter`, and showing it makes
+that visible: a page of the listing that lands later does not join it, and
+pressing `Enter` again in the list is how you take the larger set. The panel
+draws straight from that one queue every frame, so what is on screen and what
+plays next cannot disagree.
+
+**Below 120 columns there is no panel and so no queue view.** That is the
+decision rather than an omission: it is one breakpoint for the whole interface,
+and a queue squeezed into a narrow terminal would be taking rows from the list
+that is the reason for the narrow terminal. `Ctrl-W` there says which width
+brings the queue back, and the queue itself is still driven by `H`/`L`, `s` and
+`c` exactly as before.
 
 A `♥` on a row means the track is in your favorites and a `♡` means it is not,
 as far as priel has been told. The service reports no favorite flag on a track,

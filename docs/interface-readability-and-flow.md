@@ -544,3 +544,41 @@ proceeded partly blind before that was noticed.
 
 15. **The verdict badge opens the report when clicked**, through the same method
     `[D]` uses.
+
+16. **The queue lives in the now-playing panel, as a second focusable region**
+    (issue #25). Six answers were settled with it, and each is here because the
+    alternative was reachable:
+
+    - **No new region and no second breakpoint.** The panel exists at 120
+      columns and the queue appears with it. **Below 120 columns there is no
+      queue view at all** - not a narrower one, and not a modal. That is the
+      decision: decision 10 above bought the list two rows by moving the
+      now-playing block off the bottom, and a queue squeezed into a narrow
+      terminal would spend them again on the part of the screen the narrow
+      terminal is least able to afford. `Ctrl-W` there names the width that
+      brings it back rather than doing nothing.
+    - **`Ctrl-W` moves the keyboard between the two.** `Tab` is taken by the
+      view cycle. `Ctrl-W` is vim's own window key, so a VIM-first client spends
+      no letter on it - and because priel has exactly two regions rather than
+      vim's arbitrarily many, the *prefix* is the whole move and no direction
+      follows it. A third region would have to grow one.
+    - **A click into either box does the same thing**, which is the gesture
+      nobody has to be taught, and the wheel follows the pointer for the same
+      reason. Both go through one method, so the key and the pointer cannot
+      leave the focus in two places.
+    - **Which box has the keyboard is said twice, and one of the two carries no
+      colour.** The cursors differ by a backing - `selection_idle_bg`, a new
+      theme role measured in all eleven palettes - and the focused box is drawn
+      in the heavy box-drawing set. A backing is the one thing a monochrome
+      terminal cannot show, so the border is what makes the answer survive one.
+      The unfocused box keeps its cursor and its ordinary text: it is not being
+      driven, which is not the same thing as being disabled.
+    - **History above, dimmed, and `Enter` on it plays it.** That is what makes
+      "backward" navigation rather than a second spelling of the
+      previous-track key.
+    - **Provenance is a column, not a shade.** An entry the radio added is
+      marked `~` whatever else is true of it, because it can be a suggestion and
+      be in the history at once. The rule is the positional one
+      `playing_from_radio` already used, moved into `App::suggested` so the mark
+      on a row and the word beside the playing track are one rule with two
+      callers.
