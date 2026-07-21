@@ -2229,7 +2229,11 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     let (l0, l1, l2) = (rows[0], rows[1], rows[2]);
 
     let title = match &app.now_playing {
-        Some(t) => format!("{} — {}", t.artist, t.title),
+        // Title first, the same way round as a track row. One pair of facts in
+        // one interface gets one order, and the list is where the order matters
+        // more: a title column is scanned repeatedly, an announcement is read
+        // once. See finding 7 of the interface audit.
+        Some(t) => format!("{} — {}", t.title, t.artist),
         None => "Nothing playing".into(),
     };
     // Built through a `ControlBar` rather than as raw spans so the heart's hit
@@ -4211,7 +4215,7 @@ mod tests {
         favorites_arrive(&mut sc, vec![track(1, "Playing")]);
         sc.app.now_playing = Some(track(1, "Playing"));
         let out = text(&mut sc.app, 100, 20);
-        assert!(out.contains("\u{2665} Artist"), "{out}");
+        assert!(out.contains("\u{2665} Playing"), "{out}");
     }
 
     #[test]
@@ -4231,7 +4235,7 @@ mod tests {
         click_hit(&mut sc.app, Hit::FavoriteNowPlaying);
         assert!(!sc.app.is_favorite(1), "the click ran the action");
         assert!(
-            text(&mut sc.app, 100, 20).contains("\u{2661} Artist"),
+            text(&mut sc.app, 100, 20).contains("\u{2661} Playing"),
             "and the glyph followed it"
         );
     }
@@ -5144,6 +5148,40 @@ mod tests {
                 "the bar is the middle row of the box at {w}x{h}"
             );
         }
+    }
+
+    #[test]
+    fn the_now_playing_line_and_a_track_row_name_the_pair_in_the_same_order() {
+        // Goal: audit finding 7. The list led with the title and the now-playing
+        // line led with the artist, so one pair of facts had two orders eight
+        // rows apart. Method: render a track that is both playing and visible in
+        // the list, and ask each line which name it reached first. Measured in
+        // one frame rather than asserted as two literals, so the two lines
+        // cannot be changed apart.
+        let mut sc = screen();
+        sc.app.favorites = vec![track(1, "Everything In Its Right Place")];
+        sc.app.now_playing = Some(track(1, "Everything In Its Right Place"));
+        let out = draw(&mut sc.app, 120, 24);
+
+        let order = |line: &str| {
+            let title = line.find("Everything In Its Right Place");
+            let artist = line.find("Artist");
+            match (title, artist) {
+                (Some(t), Some(a)) => t < a,
+                _ => panic!("both names must be on the line: {line:?}"),
+            }
+        };
+        let row = out
+            .iter()
+            .find(|l| l.contains("Everything In Its Right Place") && l.contains('│'))
+            .map_or_else(|| panic!("no track row: {out:?}"), Clone::clone);
+        let now = out[block::title(24)].clone();
+        assert_eq!(
+            order(&row),
+            order(&now),
+            "the row {row:?} and the now-playing line {now:?} disagree"
+        );
+        assert!(order(&now), "and both lead with the title");
     }
 
     #[test]

@@ -56,7 +56,7 @@ and web typography and does not transfer; I have not cited it where it does not.
 | 4 | The bottom row shifts one cell when output opens | medium | none | guidance | **done** |
 | 5 | Truncation counts characters, not cells | medium | low | guidance | **done** |
 | 6 | No breadcrumb when a playlist or mix is open | medium | low | guidance | **done** |
-| 7 | Now-playing says "Artist — Title"; rows say the reverse | medium | low | taste | propose |
+| 7 | Now-playing says "Artist — Title"; rows say the reverse | medium | low | taste | **done** |
 | 8 | The elapsed time is centred and drifts | medium | medium | guidance | **done** |
 | 9 | Overlay body text hugs the border, footers do not | low | none | guidance | **done** |
 | 10 | Overlay widths are an arbitrary ladder | low | low | taste | propose |
@@ -315,7 +315,7 @@ control at 80 columns. I recommend A, and would make `Esc` visible as part of
 the trail rather than as a hint. Either way this is a decision about where
 something lives, so it is proposed.
 
-## 7. The now-playing line and the track rows order the same pair differently
+## 7. The now-playing line and the track rows order the same pair differently — **done**
 
 **Taste.** I could not find a rule for this, and the argument cuts both ways.
 
@@ -332,6 +332,11 @@ web client puts the title first in both places, which is the issue's stated
 reason for borrowing its shapes. My preference is title-first in both, because
 one pair of facts in one interface should have one order and the list is the
 place the order matters more.
+
+**Settled: title first in both.** The now-playing line now reads
+`Everything In Its Right Place — Radiohead`. Its test asserts the two lines agree
+by reading both out of one frame rather than by comparing two literals, so they
+cannot be changed apart.
 
 ## 8. The elapsed time is centred and drifts with the terminal width — **done**
 
