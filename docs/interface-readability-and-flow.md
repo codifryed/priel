@@ -544,9 +544,9 @@ proceeded partly blind before that was noticed.
    silently clipped. Progressive disclosure by width, documented drop order
    (album → artist → tier), duration pinned right.
 
-10. **The now-playing block is three rows along the bottom at every width, and
-    the right-hand column belongs to the queue alone** (issue #27). Three parts,
-    and the first of them is a correction:
+10. **The now-playing block is three rows in a box of its own along the bottom
+    at every width, and the right-hand column belongs to the queue alone**
+    (issue #27). Three parts, and the first of them is a correction:
 
     - **Nothing about now-playing depends on the width any more.** For one
       release it became a side panel at 120 columns and up, and this entry said

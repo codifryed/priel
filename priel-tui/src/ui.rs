@@ -44,7 +44,7 @@ use crate::theme::{self, Theme};
 /// gives it today, so the queue never costs the list more than it was already
 /// living with.
 ///
-/// The now-playing block is *not* on either side of this line. It is three rows
+/// The now-playing block is *not* on either side of this line. It is a box
 /// along the bottom at every width, because the four facts it carries are the
 /// ones a listener glances at without looking for them, and a fact that moves
 /// with the terminal has to be looked for.
@@ -63,7 +63,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([
         Constraint::Length(1), // header / tabs
         Constraint::Min(1),    // the list, and the queue beside it
-        Constraint::Length(3), // the now-playing block, at every width
+        Constraint::Length(5), // the now-playing box, at every width
+        Constraint::Length(1), // the keyboard reference, outside the box
     ])
     .split(f.area());
 
@@ -93,6 +94,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         list(f, app, rows[1]);
     }
     now_playing(f, app, rows[2]);
+    key_row(f, app, rows[3]);
 
     // Drawn last so it sits over everything, and after the hit boxes above have
     // been registered - `App` ignores them while the overlay is up.
@@ -2186,15 +2188,36 @@ fn push_gap(row: &mut String) {
     }
 }
 
-/// The now-playing block: three rows along the bottom, at every width.
+/// The now-playing block: three rows in a box of their own along the bottom, at
+/// every width.
 ///
 /// What is playing, where it has got to, what it is going into and the verdict
 /// on what arrives there - in one place a listener does not have to find again
 /// after a resize. It was a side panel above [`WIDE_COLS`] for one release; the
-/// two chrome rows that bought the list are spent here again deliberately.
+/// two chrome rows that bought the list are spent here again deliberately, and
+/// the box's own two are spent on top of them.
+///
+/// The border is what says where the section starts and stops. Without it the
+/// three rows were whatever happened to be left at the bottom of the screen,
+/// running into the list above them with nothing between. The keyboard
+/// reference sits *below* the box rather than inside it - see [`key_row`].
 fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
-    // Split rather than offset from `area.y`: on a terminal too short for three
+    // A box of its own, so the three rows read as one section rather than as
+    // whatever happened to be left at the bottom of the screen. Plain borders
+    // and never the heavy set: the focus ring means "this is the region the
+    // keyboard is driving", and nothing here is focusable, so wearing it would
+    // say something untrue.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(t.surface())
+        .border_style(t.surface())
+        .border_type(BorderType::Plain)
+        .title(" Now playing ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Split rather than offset from `inner.y`: on a terminal too short for three
     // rows, hand-computed offsets address cells outside the buffer and ratatui
     // panics. A layout clamps to what exists, yielding empty rects instead.
     let rows = Layout::vertical([
@@ -2202,7 +2225,7 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .split(area);
+    .split(inner);
     let (l0, l1, l2) = (rows[0], rows[1], rows[2]);
 
     let title = match &app.now_playing {
@@ -2226,8 +2249,10 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
 
     app.progress_rect = progress_row(f, app, &t, l1);
 
-    // DAC badge, the shared activity slot (resolving / buffering / buffered),
-    // then the keyboard reference. The clickable controls live in the header.
+    // DAC badge and the shared activity slot (resolving / buffering /
+    // buffered). The keyboard reference is no longer on the end of this row: it
+    // is not a fact about what is playing, so it sits below the box rather than
+    // inside it. The clickable controls live in the header.
     let (act_text, act_color) = activity(app);
     let (verdict_text, verdict_color) = verdict_badge(app);
     let mut bar = ControlBar::new(l2);
@@ -2246,13 +2271,30 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
         );
     }
     bar.label(act_text, Style::default().fg(act_color));
-    bar.label("  ", Style::default());
-    // The row is the same row at every width, so whether there is a second
-    // region to name is a question about the queue's rect rather than about the
-    // layout - and that rect is published before this runs.
-    push_hints(&mut bar, &t, two_regions(app));
     app.hits.extend(bar.hits);
     f.render_widget(Paragraph::new(Line::from(bar.spans)), l2);
+}
+
+/// The keyboard reference, on its own row below the now-playing box.
+///
+/// Outside the box on purpose: everything inside it is a fact about what is
+/// playing, and a list of keys is not. It also gets the whole terminal width
+/// now that it no longer shares a row with the readout, so the optional hints
+/// survive to a narrower terminal than they used to.
+///
+/// Every key printed here is itself the button - `push_hints` registers a hit
+/// box for each in the same walk that lays it out - which is why there is no
+/// separate quit control anywhere: `[q] quit` is it.
+fn key_row(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme();
+    let mut bar = ControlBar::new(area);
+    bar.label(" ", Style::default());
+    // Whether there is a second region to name is a question about the queue's
+    // rect rather than about the layout - and that rect is published before
+    // this runs.
+    push_hints(&mut bar, &t, two_regions(app));
+    app.hits.extend(bar.hits);
+    f.render_widget(Paragraph::new(Line::from(bar.spans)), area);
 }
 
 /// Playing, paused, or neither, as one glyph. Shared by both layouts so they
@@ -3213,6 +3255,52 @@ mod tests {
         }
     }
 
+    /// Which row of a frame `h` rows tall each part of the bottom block is on.
+    ///
+    /// Counted from the bottom, because that is what the block is anchored to.
+    /// Named here rather than spelled `h - 2` at each call site: the block has
+    /// moved twice now, and both times every hard-coded offset in these tests
+    /// had to be hunted down and re-derived. One place to change.
+    ///
+    /// ```text
+    ///   h-6  ┌ Now playing ──────────┐
+    ///   h-5  │ ▶ ♡ Title — Artist    │
+    ///   h-4  │ 1:01 ███░░░░░░░  4:05 │
+    ///   h-3  │ OUT — ✓ bit-perfect   │
+    ///   h-2  └───────────────────────┘
+    ///   h-1   [space] play  …  [q] quit
+    /// ```
+    mod block {
+        pub const fn title(h: u16) -> usize {
+            (h as usize).saturating_sub(5)
+        }
+        pub const fn bar(h: u16) -> usize {
+            (h as usize).saturating_sub(4)
+        }
+        pub const fn readout(h: u16) -> usize {
+            (h as usize).saturating_sub(3)
+        }
+        pub const fn keys(h: u16) -> usize {
+            (h as usize).saturating_sub(1)
+        }
+        /// The box's own top border, and so the row after the list's bottom one.
+        pub const fn top(h: u16) -> usize {
+            (h as usize).saturating_sub(6)
+        }
+    }
+
+    /// Which screen column a substring was painted at, counting cells.
+    ///
+    /// `str::find` answers in bytes, and every box border on the way to the
+    /// thing being measured is three of them - so a byte offset is not a column
+    /// and comparing two of them across widths silently compares nothing.
+    fn col_of(line: &str, needle: &str) -> usize {
+        line.find(needle).map_or_else(
+            || panic!("{needle:?} is not on the line: {line:?}"),
+            |b| line[..b].chars().count(),
+        )
+    }
+
     /// Render one frame and return it as plain text lines.
     fn draw(app: &mut App, w: u16, h: u16) -> Vec<String> {
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
@@ -3483,7 +3571,7 @@ mod tests {
                 t.background
             };
             assert_eq!(
-                one_backing(&mut sc.app, 120, 14, r),
+                one_backing(&mut sc.app, 120, 17, r),
                 want,
                 "row {r} is not the backing its place in the list calls for"
             );
@@ -3540,7 +3628,7 @@ mod tests {
         let mut sc = listing(6);
         sc.app.selected = 3;
         let t = sc.app.theme();
-        assert_eq!(one_backing(&mut sc.app, 120, 12, 3), t.selection_bg);
+        assert_eq!(one_backing(&mut sc.app, 120, 15, 3), t.selection_bg);
     }
 
     #[test]
@@ -3554,9 +3642,9 @@ mod tests {
         sc.app.now_playing = Some(track(4, "Track 4"));
         sc.app.selected = 0;
         let t = sc.app.theme();
-        assert_eq!(one_backing(&mut sc.app, 120, 12, 3), t.stripe_bg);
-        assert_eq!(one_backing(&mut sc.app, 120, 12, 2), t.background);
-        let out = text(&mut sc.app, 120, 12);
+        assert_eq!(one_backing(&mut sc.app, 120, 15, 3), t.stripe_bg);
+        assert_eq!(one_backing(&mut sc.app, 120, 15, 2), t.background);
+        let out = text(&mut sc.app, 120, 15);
         assert!(out.contains("♪ ♡ Track 4"), "{out}");
     }
 
@@ -3571,7 +3659,7 @@ mod tests {
         sc.app.now_playing = Some(track(4, "Track 4"));
         sc.app.selected = 3;
         let t = sc.app.theme();
-        assert_eq!(one_backing(&mut sc.app, 120, 12, 3), t.selection_bg);
+        assert_eq!(one_backing(&mut sc.app, 120, 15, 3), t.selection_bg);
     }
 
     #[test]
@@ -3583,10 +3671,10 @@ mod tests {
         // it. Method: scroll one row and follow the same track.
         let mut sc = listing(40);
         let t = sc.app.theme();
-        assert_eq!(one_backing(&mut sc.app, 120, 12, 1), t.stripe_bg);
+        assert_eq!(one_backing(&mut sc.app, 120, 15, 1), t.stripe_bg);
         // One row past the last one on screen, which moves the window by one.
         sc.app.selected = sc.app.list_inner.height as usize;
-        let mut term = Terminal::new(TestBackend::new(120, 12)).expect("backend");
+        let mut term = Terminal::new(TestBackend::new(120, 15)).expect("backend");
         term.draw(|f| render(f, &mut sc.app)).expect("render");
         assert_eq!(
             sc.app.list_offset, 1,
@@ -3594,7 +3682,7 @@ mod tests {
         );
         // The second track was the striped row above; it is the topmost one
         // now, and it keeps the stripe it had.
-        assert_eq!(one_backing(&mut sc.app, 120, 12, 0), t.stripe_bg);
+        assert_eq!(one_backing(&mut sc.app, 120, 15, 0), t.stripe_bg);
     }
 
     #[test]
@@ -3623,7 +3711,7 @@ mod tests {
         assert_eq!(sc.app.theme_name(), ThemeName::Terminal);
         for r in 0..4 {
             assert_eq!(
-                one_backing(&mut sc.app, 120, 12, r + 1),
+                one_backing(&mut sc.app, 120, 15, r + 1),
                 Color::Reset,
                 "row {r} under the terminal palette carries a backing of its own"
             );
@@ -4929,14 +5017,10 @@ mod tests {
             sc.app.status.position = 61.0;
 
             let out = draw(&mut sc.app, w, 24);
-            let bar_row = out.get(22).map_or(String::new(), Clone::clone);
-            elapsed_at.push(
-                bar_row
-                    .find("1:01")
-                    .unwrap_or_else(|| panic!("no elapsed time at {w}: {bar_row:?}")),
-            );
+            let bar_row = out.get(block::bar(24)).map_or(String::new(), Clone::clone);
+            elapsed_at.push(col_of(&bar_row, "1:01"));
             assert!(
-                bar_row.ends_with("4:05"),
+                bar_row.ends_with("4:05 \u{2502}"),
                 "the length is not against the right edge at {w}: {bar_row:?}"
             );
         }
@@ -4945,7 +5029,7 @@ mod tests {
             "the elapsed time moved when the terminal got wider"
         );
         assert!(
-            elapsed_at[0] <= 2,
+            elapsed_at[0] <= 3,
             "and it belongs against the left edge, not at column {}",
             elapsed_at[0]
         );
@@ -5009,42 +5093,55 @@ mod tests {
     }
 
     #[test]
-    fn the_now_playing_block_is_three_rows_along_the_bottom_at_every_width() {
+    fn the_now_playing_block_is_a_box_along_the_bottom_at_every_width() {
         // Goal: the block is the bottom of the screen whatever the terminal is,
         // so a listener who resizes finds the same four facts in the same place
-        // rather than a second layout to learn. Method: a real frame at three
-        // widths, read row by row off the bottom.
+        // rather than a second layout to learn - and the box around them is
+        // what says where the section starts and stops. Method: a real frame at
+        // three widths, read row by row off the bottom.
         for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30), (200, 40)] {
             let mut sc = screen();
             sc.app.now_playing = Some(track(1, "Blue in Green"));
             sc.app.status.duration = 245.0;
             let out = draw(&mut sc.app, w, h);
-            let last = usize::from(h) - 1;
 
             assert!(
-                out[last - 2].contains("Blue in Green"),
+                out[block::top(h)].starts_with("\u{250c} Now playing "),
+                "the box is not named at {w}x{h}: {:?}",
+                out[block::top(h)]
+            );
+            assert!(
+                out[block::title(h)].contains("Blue in Green"),
                 "what is playing at {w}x{h}: {:?}",
-                out[last - 2]
+                out[block::title(h)]
             );
             assert!(
-                out[last - 1].starts_with(" 0:00") && out[last - 1].ends_with("4:05"),
+                out[block::bar(h)].starts_with("\u{2502} 0:00")
+                    && out[block::bar(h)].ends_with("4:05 \u{2502}"),
                 "the bar at {w}x{h}: {:?}",
-                out[last - 1]
+                out[block::bar(h)]
             );
             assert!(
-                out[last].contains("OUT —"),
+                out[block::readout(h)].contains("OUT \u{2014}"),
                 "the readout at {w}x{h}: {:?}",
-                out[last]
+                out[block::readout(h)]
+            );
+            // Below the box, not inside it: the keys are not a fact about what
+            // is playing.
+            assert!(
+                out[block::keys(h)].contains("[q] quit"),
+                "the reference at {w}x{h}: {:?}",
+                out[block::keys(h)]
             );
             assert!(
-                out[last].contains("[q] quit"),
-                "the reference at {w}x{h}: {:?}",
-                out[last]
+                !out[block::keys(h)].contains('\u{2502}'),
+                "the reference is inside the box at {w}x{h}: {:?}",
+                out[block::keys(h)]
             );
             assert_eq!(
                 usize::from(sc.app.progress_rect.y),
-                last - 1,
-                "the bar is the middle row of the block at {w}x{h}"
+                block::bar(h),
+                "the bar is the middle row of the box at {w}x{h}"
             );
         }
     }
@@ -5095,9 +5192,10 @@ mod tests {
 
         corner(&out[1], 0, ['┌', '┏']);
         corner(&out[1], seam, ['┌', '┏']);
-        // The middle area ends three rows above the bottom, where the block is.
-        corner(&out[26], 0, ['└', '┗']);
-        corner(&out[26], seam, ['└', '┗']);
+        // The middle area ends where the now-playing box begins.
+        let bottom = block::top(30) - 1;
+        corner(&out[bottom], 0, ['└', '┗']);
+        corner(&out[bottom], seam, ['└', '┗']);
         assert!(
             sc.app.queue_inner.height >= 20,
             "the column is not the full height: {:?}",
@@ -5156,11 +5254,15 @@ mod tests {
         sc.app.status.duration = 245.0;
         let out = draw(&mut sc.app, WIDE_COLS, 30);
 
-        assert!(out[29].contains("[q] quit"), "{:?}", out[29]);
         assert!(
-            out[29].contains("OUT —"),
-            "the readout stayed on the bottom row: {:?}",
-            out[29]
+            out[block::keys(30)].contains("[q] quit"),
+            "{:?}",
+            out[block::keys(30)]
+        );
+        assert!(
+            out[block::readout(30)].contains("OUT —"),
+            "the readout stayed in the box along the bottom: {:?}",
+            out[block::readout(30)]
         );
 
         let seam = WIDE_COLS - QUEUE_COLS;
@@ -5185,10 +5287,10 @@ mod tests {
 
     #[test]
     fn the_bottom_block_costs_the_list_the_same_rows_at_every_width() {
-        // Goal: the block is three rows on both sides of the breakpoint, so a
-        // terminal that crosses it gains a queue and loses nothing. Method: the
-        // same terminal height either side, comparing the rect the list was
-        // given.
+        // Goal: the block is the same height on both sides of the breakpoint,
+        // so a terminal that crosses it gains a queue and loses nothing.
+        // Method: the same terminal height either side, comparing the rect the
+        // list was given.
         let mut sc = screen();
         sc.app.favorites = (0..40).map(|i| track(i, "T")).collect();
         let _ = draw(&mut sc.app, WIDE_COLS - 1, 24);
@@ -6956,9 +7058,10 @@ mod tests {
         // is only worth taking while there are rows left to explain.
         let mut sc = screen();
         sc.app.favorites = (1..=6).map(|i| track(i, "Nude")).collect();
-        // One row of tabs, three of the block below, and the box's own two
-        // borders: two lines are left inside it.
-        let out = text(&mut sc.app, 80, 8);
+        // One row of tabs, five for the now-playing box, one for the keys
+        // below it, and the list box's own two borders: two lines are left
+        // inside it.
+        let out = text(&mut sc.app, 80, 11);
         assert!(
             !out.contains("Title"),
             "the last lines went to a header: {out}"
@@ -7422,9 +7525,9 @@ mod tests {
         sc.app.status.duration = 70.0;
 
         let out = draw(&mut sc.app, 130, 12);
-        let bar_row = out.get(10).map_or(String::new(), Clone::clone);
+        let bar_row = out.get(block::bar(12)).map_or(String::new(), Clone::clone);
         assert!(
-            bar_row.starts_with(" 1:01") && bar_row.ends_with("4:05"),
+            bar_row.starts_with("\u{2502} 1:01") && bar_row.ends_with("4:05 \u{2502}"),
             "the track is 4:05 however little of it has arrived: {bar_row:?}"
         );
     }
