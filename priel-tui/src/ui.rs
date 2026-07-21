@@ -768,6 +768,10 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
                 "next / previous track",
             ),
             row(&[("s", Some(Hit::Shuffle))], "shuffle this view"),
+            row(&[("c", Some(Hit::Continue))], "keep playing at the end"),
+            // The vocabulary, not an action: this is the word the queue counter
+            // wears once the music stopped being something anybody picked.
+            row(&[("radio", None)], "suggested, not chosen"),
             row(
                 &[("f", Some(Hit::FavoriteSelected))],
                 "favorite selected track",
@@ -1596,7 +1600,9 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     let playing = app.status.playing;
     let shuffle = app.shuffle;
     let volume = app.status.volume as u32;
+    let carrying_on = app.continue_radio;
     let queue = app.queue_indicator();
+    let from_radio = app.playing_from_radio();
     let filtering = app.mode == Mode::Filter;
     let filter = app.filter.clone();
     let notice = app.notice.clone();
@@ -1623,6 +1629,11 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     bar.button(" ▷| ", Hit::Next, t.control());
     bar.label(" ", Style::default());
     bar.button(" ⇄ ", Hit::Shuffle, t.toggle(shuffle));
+    // Beside the shuffle because both answer "and then?", and drawn the same
+    // way so the pair reads as a pair. A lemniscate rather than any of the
+    // broadcast or repeat codepoints: those are emoji, and an emoji font paints
+    // them two cells wide while unicode-width calls them one.
+    bar.button(" ∞ ", Hit::Continue, t.toggle(carrying_on));
     bar.label(" ", Style::default());
     bar.button(" - ", Hit::VolDown, t.control());
     // Unity gain is the desirable state, so say so rather than leaving the
@@ -1657,7 +1668,16 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     bar.label("  ", Style::default());
 
     if let Some(q) = queue {
-        bar.label(format!("queue {q}  "), Style::default().fg(t.queue));
+        // The same slot and the same numbers, and the word changes to name what
+        // is playing. A listener who has stopped watching the clock cannot
+        // otherwise tell music they chose from music the service suggested, and
+        // saying so once as a notice is saying so only to whoever was looking.
+        let (word, colour) = if from_radio {
+            ("radio", t.notice)
+        } else {
+            ("queue", t.queue)
+        };
+        bar.label(format!("{word} {q}  "), Style::default().fg(colour));
     }
     if filtering {
         bar.label(format!("/{filter}"), Style::default().fg(t.notice));
@@ -2392,6 +2412,10 @@ const HINTS: &[Hint] = &[
     Hint {
         keys: &[("s", Hit::Shuffle)],
         label: "shuffle",
+    },
+    Hint {
+        keys: &[("c", Hit::Continue)],
+        label: "radio",
     },
     Hint {
         keys: &[("-", Hit::VolDown), ("+", Hit::VolUp)],
@@ -3797,6 +3821,39 @@ mod tests {
         sc.app.queue_pos = 1;
         let out = text(&mut sc.app, 130, 12);
         assert!(out.contains("queue 2/2"), "{out}");
+    }
+
+    #[test]
+    fn the_queue_says_when_what_is_playing_was_the_services_idea() {
+        // Goal: the listener has to be able to tell suggested music from chosen
+        // music without remembering how long ago they pressed Enter. The word
+        // in the counter's own slot is what says it, for as long as it is true.
+        let mut sc = screen();
+        sc.app.queue = vec![track(1, "Chosen"), track(2, "Suggested")];
+        sc.app.queue_pos = 0;
+        sc.app.set_radio_from_for_test(Some(1));
+        assert!(text(&mut sc.app, 130, 12).contains("queue 1/2"));
+
+        sc.app.queue_pos = 1;
+        let out = text(&mut sc.app, 130, 12);
+        assert!(out.contains("radio 2/2"), "{out}");
+        assert!(!out.contains("queue 2/2"), "one word, not two: {out}");
+    }
+
+    #[test]
+    fn carrying_on_has_a_control_and_a_key_that_say_which_way_it_is_set() {
+        // Goal: a toggle nobody can see the state of is a toggle nobody trusts,
+        // and this one decides whether the machine plays music unasked. The
+        // control is clickable, the key is in the reference, and both are the
+        // same action.
+        let mut sc = screen();
+        assert_eq!(painted(&mut sc.app, 130, 12, Hit::Continue), " ∞ ");
+        assert!(text(&mut sc.app, 200, 12).contains("] radio"), "on the row");
+
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 130, 30);
+        assert!(out.contains("keep playing at the end"), "{out}");
+        assert!(out.contains("suggested, not chosen"), "the word too: {out}");
     }
 
     // ---- favorites ----

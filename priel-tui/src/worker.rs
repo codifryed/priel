@@ -54,6 +54,15 @@ pub const MIXES_PAGE: u32 = 100;
 /// is read from the top and played straight through.
 pub const MIX_TRACKS_PAGE: u32 = 200;
 
+/// Rows one radio request adds to the queue.
+///
+/// Much the smallest of these, and deliberately: this is the one listing nobody
+/// asked for by name, so it takes what a listener might reasonably sit through
+/// before deciding, rather than a library's worth of it. Running out asks again
+/// from whatever was playing by then, which is a better mix than one seeded an
+/// hour earlier.
+pub const RADIO_PAGE: u32 = 25;
+
 /// A request for one page of a listing.
 ///
 /// Every one carries an explicit offset and limit, and the reply carries the
@@ -85,6 +94,20 @@ pub enum ToWorker {
     Search {
         query: String,
         offset: u32,
+        limit: u32,
+    },
+    /// The first page of a track's own radio mix, to carry a queue on past its
+    /// end.
+    ///
+    /// Deliberately not a [`ToWorker::LoadMixTracks`] with a different caller:
+    /// the two go to the same endpoint and mean different things, one filling a
+    /// listing on screen and the other extending the queue behind it. They can
+    /// be in flight for the same mix at once, and a reply that stood for either
+    /// would land in whichever the app guessed. No offset, because there is
+    /// only ever a first page of one - what follows it is the radio for
+    /// whatever is playing by then.
+    LoadRadio {
+        mix_id: String,
         limit: u32,
     },
     Resolve(u64),
@@ -174,6 +197,11 @@ pub enum Task {
         mix_id: String,
         offset: u32,
     },
+    /// A radio that could not be fetched. Named by the mix so a second one for
+    /// a different track is a different failure.
+    Radio {
+        mix_id: String,
+    },
     Search {
         query: String,
         offset: u32,
@@ -218,6 +246,7 @@ impl std::fmt::Display for Task {
             Self::PlaylistTracks { .. } => "playlist tracks",
             Self::Mixes { .. } => "mixes",
             Self::MixTracks { .. } => "mix tracks",
+            Self::Radio { .. } => "the radio",
             Self::Search { .. } => "search",
             Self::Resolve => "resolve",
             // Named by what did not happen rather than by the endpoint: this is
@@ -259,6 +288,15 @@ pub enum FromWorker {
     MixTracks {
         mix_id: String,
         offset: u32,
+        page: Page<Track>,
+    },
+    /// A track's radio mix, to be appended to the play queue.
+    ///
+    /// Names the mix it answers for the reason every listing reply here does:
+    /// a radio and an open mix listing can be in flight for the same id at the
+    /// same time, and only the request that asked knows which of them this is.
+    Radio {
+        mix_id: String,
         page: Page<Track>,
     },
     SearchResults {
@@ -481,6 +519,12 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
                 page,
             },
             Err(e) => failed(Task::MixTracks { mix_id, offset }, &e),
+        },
+        // Always the first page: there is only ever one of a radio, and what
+        // follows it is the radio for whatever is playing by then.
+        ToWorker::LoadRadio { mix_id, limit } => match client.mix_tracks(&mix_id, 0, limit) {
+            Ok(page) => FromWorker::Radio { mix_id, page },
+            Err(e) => failed(Task::Radio { mix_id }, &e),
         },
         ToWorker::Search {
             query,
@@ -824,9 +868,44 @@ mod tests {
             other => panic!("wrong reply variant: {}", variant(&other)),
         }
 
+        w.tx.send(ToWorker::LoadRadio {
+            mix_id: "m1".into(),
+            limit: 10,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::Radio { mix_id, .. } => {
+                assert_eq!(mix_id, "m1", "the reply must name which mix it is for");
+            }
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+
         w.tx.send(ToWorker::Resolve(7)).unwrap();
         match next(&w) {
             FromWorker::Resolved(id, _) => assert_eq!(id, 7, "resolves are matched by id"),
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_radio_is_a_request_of_its_own_and_not_a_page_of_the_open_mix() {
+        // Goal: the two go to the same endpoint and mean different things. One
+        // fills the listing on screen; the other extends the play queue behind
+        // it, and they can be in flight for the same mix at the same time - so
+        // a reply that could stand for either would put a mix's tracks into the
+        // view nobody opened, or into the queue nobody asked to extend.
+        let w = worker_on(origin());
+
+        w.tx.send(ToWorker::LoadRadio {
+            mix_id: "m1".into(),
+            limit: 1,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::Radio { mix_id, page } => {
+                assert_eq!(mix_id, "m1");
+                assert_eq!(page.items[0].id, 1, "past the header module");
+            }
             other => panic!("wrong reply variant: {}", variant(&other)),
         }
     }
@@ -1075,6 +1154,7 @@ mod tests {
             FromWorker::PlaylistTracks { .. } => "PlaylistTracks",
             FromWorker::Mixes { .. } => "Mixes",
             FromWorker::MixTracks { .. } => "MixTracks",
+            FromWorker::Radio { .. } => "Radio",
             FromWorker::SearchResults { .. } => "SearchResults",
             FromWorker::Resolved(..) => "Resolved",
             FromWorker::AudioGraph(_) => "AudioGraph",
