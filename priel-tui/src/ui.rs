@@ -315,6 +315,21 @@ fn add_to_rows(f: &mut Frame, app: &mut App, body: Rect) {
     app.add_rows = rows;
 }
 
+/// How far an overlay's content sits from its own border.
+///
+/// Two cells, everywhere. Every footer already used it and most bodies did; the
+/// two that did not gave their box a left edge of its own.
+const OVERLAY_INDENT: u16 = 2;
+
+/// `area` moved in from the left by [`OVERLAY_INDENT`], never past its own end.
+fn indented(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(OVERLAY_INDENT),
+        width: area.width.saturating_sub(OVERLAY_INDENT),
+        ..area
+    }
+}
+
 /// A box of the given size in the middle of `area`.
 ///
 /// Extracted because five overlays did the same arithmetic, and one of them
@@ -904,10 +919,14 @@ fn log_overlay(f: &mut Frame, area: Rect, app: &App) {
 
     // One row goes to the way out, as in the help overlay: an overlay that does
     // not say how to close it is a trap.
-    let body = Rect {
+    //
+    // Indented two cells to the same left edge the footer below and every other
+    // overlay's body already use. Without it this box had two left edges of its
+    // own, the lines against the border and the footer clear of it.
+    let body = indented(Rect {
         height: inner.height.saturating_sub(1),
         ..inner
-    };
+    });
     let all = app.log_lines();
     let lines: Vec<Line> = if all.is_empty() {
         vec![Line::from(Span::styled(
@@ -1095,12 +1114,14 @@ fn device_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         ..inner
     };
     match app.device_notice() {
+        // Indented to where a device row's own two-cell mark starts, and to
+        // where the footer starts, rather than against the border.
         Some(notice) => f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 notice,
                 Style::default().fg(t.faint),
             ))),
-            body,
+            indented(body),
         ),
         None => device_rows(f, app, body),
     }
@@ -4615,5 +4636,56 @@ mod tests {
         assert_eq!(super::trunc("anything", 0), "");
         assert_eq!(super::trunc("anything", 1), "…");
         assert_eq!(super::trunc("ab", 2), "ab");
+    }
+
+    /// Where a line's content starts, counted from the overlay's own left
+    /// border rather than from the edge of the frame - the list behind an
+    /// overlay paints the columns to its left, so a raw indent measures that
+    /// instead.
+    fn inside(line: &str, border: usize) -> usize {
+        let after: String = line.chars().skip(border + 1).collect();
+        after.len() - after.trim_start().len()
+    }
+
+    #[test]
+    fn an_overlay_body_starts_where_its_own_footer_does() {
+        // Goal: one left edge per box. The recent log and the device picker's
+        // empty state sat against the border while their own footers were
+        // indented two cells, so each of those boxes had a ragged left edge
+        // that no other overlay has.
+        // Method: find the box's own left border from its title row, then
+        // measure the body and the footer from there.
+        for (mode, title) in [(Mode::Log, "Recent log"), (Mode::Devices, "Output device")] {
+            let name = format!("{mode:?}");
+            let mut sc = screen();
+            sc.app.set_mode_for_test(mode);
+            let frame = draw(&mut sc.app, 100, 30);
+            let border = frame
+                .iter()
+                .find(|l| l.contains(title))
+                // The last corner on the row, not the first: the list behind
+                // the overlay draws its own border further left.
+                .and_then(|l| {
+                    l.char_indices()
+                        .rfind(|(_, c)| *c == '\u{250c}')
+                        .map(|(b, _)| l[..b].chars().count())
+                })
+                .unwrap_or_default();
+            let body = frame
+                .iter()
+                .find(|l| l.contains("Nothing recorded yet") || l.contains("No output devices"))
+                .cloned()
+                .unwrap_or_default();
+            let footer = frame
+                .iter()
+                .find(|l| l.contains("Esc or q to close"))
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                inside(&body, border),
+                inside(&footer, border),
+                "{name}\nbody:   {body}\nfooter: {footer}"
+            );
+        }
     }
 }
