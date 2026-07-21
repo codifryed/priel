@@ -451,6 +451,18 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
             ),
             row(&[("s", Some(Hit::Shuffle))], "shuffle this view"),
             row(
+                &[("f", Some(Hit::FavoriteSelected))],
+                "favorite selected track",
+            ),
+            row(
+                &[("F", Some(Hit::FavoriteNowPlaying))],
+                "favorite playing track",
+            ),
+            // The vocabulary, not an action: the glyphs are what the two keys
+            // above put on a row, and hollow means "not, as far as priel has
+            // been told" - it loads the favorites a page at a time.
+            row(&[("♥ ♡", None)], "kept / not kept"),
+            row(
                 &[("+", Some(Hit::VolUp)), ("-", Some(Hit::VolDown))],
                 "volume up / down",
             ),
@@ -984,6 +996,26 @@ fn help_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// The favorite state of a track, as one glyph.
+///
+/// Filled means priel has been told the track is in the user's favorites;
+/// hollow covers both "it is not" and "priel has not been told", which is the
+/// only pair of answers there is - see `App::favorite_ids` for why nothing on
+/// the wire offers a third. Suit glyphs rather than the emoji hearts: an emoji
+/// font paints those two cells wide while unicode-width calls them one, and
+/// every hit box after one would sit a cell off what was painted.
+fn heart(favorite: bool) -> &'static str {
+    if favorite { "\u{2665}" } else { "\u{2661}" }
+}
+
+fn heart_style(favorite: bool) -> Style {
+    if favorite {
+        Style::default().fg(Color::Magenta)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
 fn tab_style(active: bool) -> Style {
     if active {
         Style::default()
@@ -1209,9 +1241,14 @@ fn row_text(app: &App, visible: &[usize], vi: usize) -> (String, bool) {
     if let Some(t) = tracks.get(idx) {
         let is_now = app.now_playing.as_ref().is_some_and(|n| n.id == t.id);
         let mark = if is_now { "♪ " } else { "  " };
+        // The heart is text here rather than a control: a row is selected by
+        // clicking it, and a second clickable target inside the same row would
+        // make a click mean two different things a cell apart. The keyboard row
+        // carries the control, and it acts on whatever the click selected.
+        let kept = heart(app.is_favorite(t.id));
         (
             format!(
-                "{mark}{:<32} {:<20} {:<8}{:>6}",
+                "{mark}{kept} {:<32} {:<20} {:<8}{:>6}",
                 trunc(&t.title, 32),
                 trunc(&t.artist, 20),
                 trunc(&t.quality, 8),
@@ -1254,14 +1291,27 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         "·"
     };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {state} "), Style::default().fg(Color::Cyan)),
-            Span::raw(title),
-            Span::styled(source_badge(app), Style::default().fg(Color::DarkGray)),
-        ])),
-        l0,
-    );
+    // Built through a `ControlBar` rather than as raw spans so the heart's hit
+    // box comes out of the same left-to-right walk that paints it. The state and
+    // the button are one glyph on purpose: a separate control elsewhere would be
+    // a second thing to keep in step with what this row already says.
+    let kept = app
+        .now_playing
+        .as_ref()
+        .is_some_and(|t| app.is_favorite(t.id));
+    let mut top = ControlBar::new(l0);
+    top.label(format!(" {state} "), Style::default().fg(Color::Cyan));
+    if app.now_playing.is_some() {
+        top.button(
+            format!("{} ", heart(kept)),
+            Hit::FavoriteNowPlaying,
+            heart_style(kept),
+        );
+    }
+    top.label(title, Style::default());
+    top.label(source_badge(app), Style::default().fg(Color::DarkGray));
+    app.hits.extend(top.hits);
+    f.render_widget(Paragraph::new(Line::from(top.spans)), l0);
 
     let ratio = if s.duration > 0.0 {
         (s.position / s.duration).clamp(0.0, 1.0)
@@ -1341,6 +1391,12 @@ const HINTS: &[Hint] = &[
     Hint {
         keys: &[("/", Hit::Filter)],
         label: "filter",
+    },
+    // The control for the *selected* row. The playing track has its own heart,
+    // up beside the title where its state already is.
+    Hint {
+        keys: &[("f", Hit::FavoriteSelected)],
+        label: "fav",
     },
     Hint {
         keys: &[("j", Hit::MoveDown), ("k", Hit::MoveUp)],
@@ -2220,6 +2276,105 @@ mod tests {
         sc.app.queue_pos = 1;
         let out = text(&mut sc.app, 130, 12);
         assert!(out.contains("queue 2/2"), "{out}");
+    }
+
+    // ---- favorites ----
+
+    /// Put a page of favorites on screen the way the worker would. Every row of
+    /// that listing is a favorite, which is the only thing that ever says so.
+    fn favorites_arrive(sc: &mut Screen, tracks: Vec<Track>) {
+        // Asked for first: a page nobody is waiting on is dropped, which is the
+        // guard that stops one listing's reply landing in another's rows.
+        sc.app.start();
+        let total = u32::try_from(tracks.len()).unwrap_or(u32::MAX);
+        sc.to_app
+            .send(FromWorker::Favorites {
+                offset: 0,
+                page: priel_core::Page {
+                    items: tracks,
+                    total,
+                },
+            })
+            .expect("the rigged worker channel is open");
+        sc.app.drain_worker();
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn a_row_says_whether_the_track_is_kept() {
+        // Goal: the state has to be readable without acting on it, on the row
+        // itself. Both glyphs are asserted from one frame: a renderer that drew
+        // the same heart either way would satisfy half of this.
+        let mut sc = screen();
+        favorites_arrive(&mut sc, vec![track(1, "Kept One"), track(2, "Dropped One")]);
+        sc.app.selected = 1;
+        press(&mut sc.app, 'f');
+
+        let out = draw(&mut sc.app, 100, 20);
+        let kept = out
+            .iter()
+            .find(|l| l.contains("Kept One"))
+            .expect("the first row");
+        let dropped = out
+            .iter()
+            .find(|l| l.contains("Dropped One"))
+            .expect("the second row");
+        assert!(kept.contains('\u{2665}'), "a kept track is filled: {kept}");
+        assert!(
+            dropped.contains('\u{2661}'),
+            "and one taken off is hollow: {dropped}"
+        );
+    }
+
+    #[test]
+    fn the_playing_track_wears_its_state_beside_its_title() {
+        // Goal: the track in the speakers is routinely not the row under the
+        // cursor, so its own state has to be on its own row.
+        let mut sc = screen();
+        favorites_arrive(&mut sc, vec![track(1, "Playing")]);
+        sc.app.now_playing = Some(track(1, "Playing"));
+        let out = text(&mut sc.app, 100, 20);
+        assert!(out.contains("\u{2665} Artist"), "{out}");
+    }
+
+    #[test]
+    fn the_heart_beside_the_playing_track_is_the_button_for_it() {
+        // Goal: the state and the control are one glyph, so what is painted and
+        // what answers a click cannot come apart - and clicking it has to run
+        // the same thing the key does.
+        let mut sc = screen();
+        favorites_arrive(&mut sc, vec![track(1, "Playing")]);
+        sc.app.now_playing = Some(track(1, "Playing"));
+        assert_eq!(
+            painted(&mut sc.app, 100, 20, Hit::FavoriteNowPlaying),
+            "\u{2665} ",
+            "the hit box covers the heart that was drawn"
+        );
+
+        click_hit(&mut sc.app, Hit::FavoriteNowPlaying);
+        assert!(!sc.app.is_favorite(1), "the click ran the action");
+        assert!(
+            text(&mut sc.app, 100, 20).contains("\u{2661} Artist"),
+            "and the glyph followed it"
+        );
+    }
+
+    #[test]
+    fn nothing_playing_offers_no_heart_to_click() {
+        // Goal: a control that could not act on anything must not be on screen.
+        // Registering its hit box anyway is how a click lands on a no-op that
+        // looks like a bug.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 100, 20);
+        assert!(
+            !sc.app
+                .hits
+                .iter()
+                .any(|(_, h)| *h == Hit::FavoriteNowPlaying)
+        );
     }
 
     // ---- the overlay ----

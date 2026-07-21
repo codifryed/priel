@@ -465,14 +465,26 @@ impl Client {
         Ok(())
     }
 
-    /// A GET that renews the session when it has to.
+    /// A request that renews the session when it has to.
     ///
     /// Proactive refresh handles the common case; the retry covers a token the
     /// service rejected earlier than its stated expiry, which happens when a
     /// session is revoked elsewhere.
-    fn get_authed(&mut self, url: &str, query: &[(&str, &str)]) -> Result<Response<Body>> {
+    ///
+    /// The request arrives as a closure rather than as a built request, and it
+    /// is handed the token afresh each time it is called. ureq's builder is a
+    /// different type per verb, so there is no one request object the retry
+    /// could re-send; and a request built once would carry the header of the
+    /// token that had just been rejected. Writing this once matters more than it
+    /// looks: the retry lived in the GET path alone, and a write bolted on
+    /// beside it would have been the one request that could not survive an
+    /// expired session.
+    fn send_authed<F>(&mut self, send: F) -> Result<Response<Body>>
+    where
+        F: Fn(&Agent, &str) -> Result<Response<Body>>,
+    {
         self.ensure_fresh()?;
-        let resp = self.get(url, query)?;
+        let resp = send(&self.http, &self.token)?;
         if resp.status() != 401 || self.auth.is_none() {
             return Ok(resp);
         }
@@ -480,22 +492,55 @@ impl Client {
         self.refresh_session()
             .map_err(|e| e.context(Fault::SignedOut))
             .context("the session was rejected and could not be renewed; log in again")?;
-        self.get(url, query)
+        send(&self.http, &self.token)
+    }
+
+    fn get_authed(&mut self, url: &str, query: &[(&str, &str)]) -> Result<Response<Body>> {
+        self.send_authed(|http, token| {
+            let mut req = http
+                .get(url)
+                .header("Authorization", format!("Bearer {token}"));
+            for (k, v) in query {
+                req = req.query(*k, *v);
+            }
+            Ok(req.call()?)
+        })
+    }
+
+    /// A form POST that renews the session the way a GET does.
+    fn post_form_authed(
+        &mut self,
+        url: &str,
+        query: &[(&str, &str)],
+        form: &str,
+    ) -> Result<Response<Body>> {
+        self.send_authed(|http, token| {
+            let mut req = http
+                .post(url)
+                .header("Authorization", format!("Bearer {token}"))
+                .content_type("application/x-www-form-urlencoded");
+            for (k, v) in query {
+                req = req.query(*k, *v);
+            }
+            Ok(req.send(form)?)
+        })
+    }
+
+    /// A DELETE that renews the session the way a GET does.
+    fn delete_authed(&mut self, url: &str, query: &[(&str, &str)]) -> Result<Response<Body>> {
+        self.send_authed(|http, token| {
+            let mut req = http
+                .delete(url)
+                .header("Authorization", format!("Bearer {token}"));
+            for (k, v) in query {
+                req = req.query(*k, *v);
+            }
+            Ok(req.call()?)
+        })
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
-    }
-
-    fn get(&self, url: &str, query: &[(&str, &str)]) -> Result<Response<Body>> {
-        let mut req = self
-            .http
-            .get(url)
-            .header("Authorization", format!("Bearer {}", self.token));
-        for (k, v) in query {
-            req = req.query(*k, *v);
-        }
-        Ok(req.call()?)
     }
 
     /// Validate the token and cache `userId`/`countryCode`.
@@ -712,6 +757,49 @@ impl Client {
         })
     }
 
+    /// Put a track in the user's favorites, or take it back off them.
+    ///
+    /// The first call in this crate that *changes* anything, so its shape is
+    /// worth stating. It takes the state the caller wants rather than the verb
+    /// that achieves it: a favorite is one bit, a caller always knows which way
+    /// it should end up, and POST-to-add versus DELETE-to-remove is the
+    /// service's spelling of that bit and belongs behind this boundary. Two
+    /// methods would make every frontend write the same `if` before choosing
+    /// between them.
+    ///
+    /// It answers with `()` for the same reason: there is no page to hand back,
+    /// and the caller already holds the state it asked for. Only the failure
+    /// carries information.
+    ///
+    /// # Errors
+    /// If [`Self::connect`] has not run, on a transport failure, or on a
+    /// non-success status - the body is included, since it carries the reason.
+    pub fn set_favorite_track(&mut self, track_id: u64, favorite: bool) -> Result<()> {
+        let sess = self.session()?.clone();
+        let listing = self.url(&format!("/v1/users/{}/favorites/tracks", sess.user_id));
+        let country = sess.country_code.clone();
+        let mut resp = if favorite {
+            // The id goes in a form body rather than the path: this endpoint
+            // takes a comma-separated list, and one track is a list of one.
+            self.post_form_authed(
+                &listing,
+                &[("countryCode", country.as_str())],
+                &format!("trackId={track_id}"),
+            )?
+        } else {
+            let one = format!("{listing}/{track_id}");
+            self.delete_authed(&one, &[("countryCode", country.as_str())])?
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            bail!(
+                "favorites/tracks -> HTTP {status}: {}",
+                resp.body_mut().read_to_string().unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
     /// Resolve a track to a playable source at the requested quality.
     ///
     /// # Errors
@@ -776,7 +864,7 @@ fn decode_manifest(s: &Stream) -> Result<ResolvedStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
@@ -786,7 +874,19 @@ mod tests {
     /// server is not worth a dependency in a crate this small.
     struct Stub {
         base: String,
-        seen: Receiver<String>,
+        seen: Receiver<Req>,
+    }
+
+    /// One request the stub saw: the request line, and the body that followed.
+    ///
+    /// The body is read rather than skipped for two reasons. A write is only
+    /// verifiable if what it carried can be asserted - the id of the track being
+    /// favorited travels in the body, not the URL - and closing a socket that
+    /// still has unread bytes in it resets the connection, which can lose the
+    /// answer the client is in the middle of reading.
+    struct Req {
+        line: String,
+        body: String,
     }
 
     fn stub(responses: Vec<(u16, String)>) -> Stub {
@@ -801,15 +901,28 @@ mod tests {
                 let mut reader = BufReader::new(sock.try_clone().expect("clone"));
                 let mut line = String::new();
                 let _ = reader.read_line(&mut line);
+                let mut length = 0usize;
                 loop {
                     let mut header = String::new();
                     match reader.read_line(&mut header) {
                         Ok(0) | Err(_) => break,
                         Ok(_) if header == "\r\n" => break,
-                        Ok(_) => {}
+                        Ok(_) => {
+                            let lower = header.to_ascii_lowercase();
+                            if let Some(v) = lower.strip_prefix("content-length:") {
+                                length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
                     }
                 }
-                let _ = tx.send(line.trim().to_string());
+                let mut sent = vec![0u8; length];
+                if length > 0 {
+                    let _ = reader.read_exact(&mut sent);
+                }
+                let _ = tx.send(Req {
+                    line: line.trim().to_string(),
+                    body: String::from_utf8_lossy(&sent).to_string(),
+                });
                 let resp = format!(
                     "HTTP/1.1 {code} S\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -853,7 +966,7 @@ mod tests {
         let sess = c.connect().unwrap();
         assert_eq!(sess.user_id, 7);
         assert_eq!(sess.country_code, "DE");
-        assert!(s.seen.recv().unwrap().starts_with("GET /v1/sessions"));
+        assert!(s.seen.recv().unwrap().line.starts_with("GET /v1/sessions"));
     }
 
     #[test]
@@ -945,7 +1058,7 @@ mod tests {
         assert_eq!(t.quality, "HI-RES", "the hi-res tag wins over audioQuality");
 
         let _ = s.seen.recv().unwrap();
-        let req = s.seen.recv().unwrap();
+        let req = s.seen.recv().unwrap().line;
         assert!(req.contains("offset=20"), "{req}");
         assert!(req.contains("limit=5"), "{req}");
         assert!(req.contains("countryCode=DE"), "{req}");
@@ -1005,7 +1118,13 @@ mod tests {
 
         let _ = s.seen.recv().unwrap();
         let _ = s.seen.recv().unwrap();
-        assert!(s.seen.recv().unwrap().contains("/v1/playlists/abc/tracks"));
+        assert!(
+            s.seen
+                .recv()
+                .unwrap()
+                .line
+                .contains("/v1/playlists/abc/tracks")
+        );
     }
 
     #[test]
@@ -1058,7 +1177,7 @@ mod tests {
         assert_eq!(page.items[0].id, 2);
 
         let _ = s.seen.recv().unwrap();
-        let req = s.seen.recv().unwrap();
+        let req = s.seen.recv().unwrap().line;
         assert!(req.contains("offset=60"), "{req}");
         assert!(req.contains("limit=30"), "{req}");
         assert!(
@@ -1088,6 +1207,79 @@ mod tests {
         let s = stub(vec![ok(SESSION), (500, "boom".into())]);
         let err = connected(&s).user_playlists(0, 1).unwrap_err().to_string();
         assert!(err.contains("playlists") && err.contains("500"), "{err}");
+    }
+
+    // ---- writes ----
+
+    #[test]
+    fn adding_a_favorite_posts_the_track_to_the_favorites_listing() {
+        // Goal: the first request in this crate that changes something. A write
+        // is only verifiable if the verb, the path and what it carried can all
+        // be read back, and the id of the track travels in the body rather than
+        // the URL - so a test that looked only at the path would pass whichever
+        // track was sent.
+        let s = stub(vec![ok(SESSION), ok("{}")]);
+        connected(&s)
+            .set_favorite_track(42, true)
+            .expect("the add should succeed");
+
+        let _ = s.seen.recv().unwrap();
+        let req = s.seen.recv().unwrap();
+        assert!(
+            req.line.starts_with("POST /v1/users/7/favorites/tracks"),
+            "{}",
+            req.line
+        );
+        assert!(req.line.contains("countryCode=DE"), "{}", req.line);
+        assert!(
+            req.body.contains("42"),
+            "the track has to be in the body: {:?}",
+            req.body
+        );
+    }
+
+    #[test]
+    fn removing_a_favorite_deletes_that_track_from_the_listing() {
+        // Goal: taking a track off is a different verb *and* a different path -
+        // the id moves out of the body and into the URL - so the two directions
+        // cannot share an assertion.
+        let s = stub(vec![ok(SESSION), ok("{}")]);
+        connected(&s)
+            .set_favorite_track(42, false)
+            .expect("the removal should succeed");
+
+        let _ = s.seen.recv().unwrap();
+        let req = s.seen.recv().unwrap();
+        assert!(
+            req.line
+                .starts_with("DELETE /v1/users/7/favorites/tracks/42"),
+            "{}",
+            req.line
+        );
+    }
+
+    #[test]
+    fn a_refused_favorite_change_comes_back_as_an_error() {
+        // Goal: the interface fills the heart before this returns and puts it
+        // back when the service says no, so a refusal that read as success would
+        // leave the user believing something happened that did not.
+        let s = stub(vec![ok(SESSION), (403, "not yours".into())]);
+        let err = connected(&s).set_favorite_track(42, true).unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+        assert!(err.to_string().contains("not yours"), "{err}");
+        assert_eq!(Fault::of(&err), Fault::Refused);
+    }
+
+    #[test]
+    fn a_favorite_change_refuses_to_run_before_connect() {
+        // Goal: the path interpolates the user id, so without a session this
+        // would write to /v1/users//favorites/tracks and get a puzzling 404.
+        let s = stub(vec![]);
+        let err = client(&s)
+            .set_favorite_track(1, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("connect"), "{err}");
     }
 
     // ---- stream resolution ----
@@ -1211,7 +1403,7 @@ mod tests {
         ]);
         let _ = connected(&s).resolve_stream(42, Quality::HiRes);
         let _ = s.seen.recv().unwrap();
-        let req = s.seen.recv().unwrap();
+        let req = s.seen.recv().unwrap().line;
         assert!(
             req.contains("/v1/tracks/42/playbackinfopostpaywall"),
             "{req}"
@@ -1350,10 +1542,11 @@ mod tests {
 
         let first = s.seen.recv().expect("a request should have been made");
         assert!(
-            first.starts_with("POST /token"),
-            "refresh comes first: {first}"
+            first.line.starts_with("POST /token"),
+            "refresh comes first: {}",
+            first.line
         );
-        assert!(s.seen.recv().unwrap().starts_with("GET /v1/sessions"));
+        assert!(s.seen.recv().unwrap().line.starts_with("GET /v1/sessions"));
 
         let saved = auth::StoredToken::load(&path).expect("reload");
         assert_eq!(
@@ -1376,7 +1569,7 @@ mod tests {
 
         c.connect().expect("connect");
         assert!(
-            s.seen.recv().unwrap().starts_with("GET /v1/sessions"),
+            s.seen.recv().unwrap().line.starts_with("GET /v1/sessions"),
             "no refresh should have preceded it"
         );
         let _ = std::fs::remove_file(&path);
@@ -1398,16 +1591,61 @@ mod tests {
         assert_eq!(sess.user_id, 7);
 
         assert!(
-            s.seen.recv().unwrap().starts_with("GET /v1/sessions"),
+            s.seen.recv().unwrap().line.starts_with("GET /v1/sessions"),
             "first attempt"
         );
         assert!(
-            s.seen.recv().unwrap().starts_with("POST /token"),
+            s.seen.recv().unwrap().line.starts_with("POST /token"),
             "then a refresh"
         );
         assert!(
-            s.seen.recv().unwrap().starts_with("GET /v1/sessions"),
+            s.seen.recv().unwrap().line.starts_with("GET /v1/sessions"),
             "then a retry"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_write_survives_a_session_rejected_mid_flight_just_as_a_read_does() {
+        // Goal: the refresh-and-retry used to be written into the GET path
+        // itself. A write bolted on beside it would be the one request that
+        // died on a revoked session - and it is the request that changes the
+        // user's library, so failing it silently is the worst place for it.
+        let s = stub(vec![
+            ok(SESSION),
+            (401, "expired".into()),
+            ok(r#"{"access_token":"fresh","expires_in":3600}"#),
+            ok("{}"),
+        ]);
+        let (mut c, path) = authed(&s.base, auth::now_epoch() + 3_600);
+        c.connect().expect("connect");
+
+        c.set_favorite_track(9, true)
+            .expect("the retry should have succeeded");
+
+        assert!(
+            s.seen.recv().unwrap().line.starts_with("GET /v1/sessions"),
+            "the handshake"
+        );
+        assert!(
+            s.seen
+                .recv()
+                .unwrap()
+                .line
+                .starts_with("POST /v1/users/7/favorites/tracks"),
+            "then the write, on the token that was about to be refused"
+        );
+        assert!(
+            s.seen.recv().unwrap().line.starts_with("POST /token"),
+            "then a refresh"
+        );
+        assert!(
+            s.seen
+                .recv()
+                .unwrap()
+                .line
+                .starts_with("POST /v1/users/7/favorites/tracks"),
+            "then the write again"
         );
         let _ = std::fs::remove_file(&path);
     }

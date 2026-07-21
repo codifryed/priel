@@ -70,6 +70,16 @@ pub enum ToWorker {
         limit: u32,
     },
     Resolve(u64),
+    /// Put a track in the user's favorites, or take it back off them.
+    ///
+    /// The one request here that *changes* remote state. It carries the state
+    /// the interface has already shown rather than "toggle", because a toggle
+    /// would be interpreted against whatever the service held by the time it
+    /// arrived, which is not what the user saw when they pressed the key.
+    SetFavorite {
+        track_id: u64,
+        favorite: bool,
+    },
     /// Read the chain to the output device. Runs `pw-dump` and waits for it,
     /// which is why it is here and not on the UI thread.
     ReadAudioGraph,
@@ -91,11 +101,29 @@ pub enum ToWorker {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Task {
     Startup,
-    Favorites { offset: u32 },
-    Playlists { offset: u32 },
-    PlaylistTracks { uuid: String, offset: u32 },
-    Search { query: String, offset: u32 },
+    Favorites {
+        offset: u32,
+    },
+    Playlists {
+        offset: u32,
+    },
+    PlaylistTracks {
+        uuid: String,
+        offset: u32,
+    },
+    Search {
+        query: String,
+        offset: u32,
+    },
     Resolve,
+    /// A favorite that could not be changed. The track names it, and `wanted`
+    /// is the state that was asked for: "add track 7" and "remove track 7" are
+    /// two different requests, and the interface has to know which of them it
+    /// is putting back.
+    SetFavorite {
+        track_id: u64,
+        wanted: bool,
+    },
 }
 
 impl std::fmt::Display for Task {
@@ -107,6 +135,11 @@ impl std::fmt::Display for Task {
             Self::PlaylistTracks { .. } => "playlist tracks",
             Self::Search { .. } => "search",
             Self::Resolve => "resolve",
+            // Named by what did not happen rather than by the endpoint: this is
+            // the only failure here the user asked for directly, so the notice
+            // should read back the action they took.
+            Self::SetFavorite { wanted: true, .. } => "adding to favorites",
+            Self::SetFavorite { wanted: false, .. } => "removing from favorites",
         })
     }
 }
@@ -264,6 +297,28 @@ where
                     Ok(r) => FromWorker::Resolved(id, r),
                     Err(e) => failed(Task::Resolve, &e),
                 },
+                ToWorker::SetFavorite { track_id, favorite } => {
+                    match client.set_favorite_track(track_id, favorite) {
+                        // Silence is success, and it is the only reply in this
+                        // loop that is. The interface changed the heart before
+                        // this went out, so a confirmation would tell it only
+                        // what it already believes; the reply worth the channel
+                        // is the one that says it was wrong. Recorded in the log
+                        // all the same, because a library that changed under the
+                        // user is worth a line.
+                        Ok(()) => {
+                            log::info!("favorite {track_id} -> {favorite}");
+                            continue;
+                        }
+                        Err(e) => failed(
+                            Task::SetFavorite {
+                                track_id,
+                                wanted: favorite,
+                            },
+                            &e,
+                        ),
+                    }
+                }
                 // The only request here that touches no network. It is still on
                 // this thread because it waits on a subprocess, and the render
                 // loop may not wait on anything.
@@ -298,7 +353,7 @@ where
 mod tests {
     use super::{Fault, FromWorker, Task, ToWorker, Worker, spawn_with};
     use priel_core::Client;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
@@ -314,13 +369,26 @@ mod tests {
                 let mut reader = BufReader::new(sock.try_clone().expect("clone"));
                 let mut line = String::new();
                 let _ = reader.read_line(&mut line);
+                // The body is drained rather than ignored: closing a socket that
+                // still holds unread bytes resets the connection, and a write
+                // would lose the answer it is in the middle of reading.
+                let mut length = 0usize;
                 loop {
                     let mut h = String::new();
                     match reader.read_line(&mut h) {
                         Ok(0) | Err(_) => break,
                         Ok(_) if h == "\r\n" => break,
-                        Ok(_) => {}
+                        Ok(_) => {
+                            let lower = h.to_ascii_lowercase();
+                            if let Some(v) = lower.strip_prefix("content-length:") {
+                                length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
                     }
+                }
+                if length > 0 {
+                    let mut sent = vec![0u8; length];
+                    let _ = reader.read_exact(&mut sent);
                 }
                 let body = if line.contains("/v1/sessions") {
                     r#"{"userId":1,"countryCode":"DE"}"#.to_string()
@@ -585,6 +653,93 @@ mod tests {
                 other => panic!("expected an error, got {}", variant(&other)),
             }
         }
+    }
+
+    #[test]
+    fn a_favorite_that_was_accepted_is_answered_with_silence() {
+        // Goal: the one request here that changes remote state, and the one that
+        // replies only when it goes wrong. Asserted against the *next* reply
+        // rather than against a timeout: the worker handles commands in order,
+        // so a page asked for afterwards arriving first proves nothing was sent
+        // for the write.
+        let w = worker_on(origin());
+
+        w.tx.send(ToWorker::SetFavorite {
+            track_id: 7,
+            favorite: true,
+        })
+        .unwrap();
+        w.tx.send(ToWorker::LoadFavorites {
+            offset: 0,
+            limit: 1,
+        })
+        .unwrap();
+
+        match next(&w) {
+            FromWorker::Favorites { .. } => {}
+            other => panic!(
+                "a successful favorite should say nothing, got {}",
+                variant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn a_favorite_that_failed_names_the_track_and_what_was_attempted() {
+        // Goal: the interface filled the heart before this went out and has to
+        // put exactly that one back. Correlating by identity rather than by
+        // arrival order is what lets it: two tracks toggled in quick succession
+        // must not undo each other.
+        let base = origin();
+        let w = spawn_with(move || {
+            let mut c = Client::new("tok".into())?.with_base_url(base);
+            c.connect()?;
+            Ok(c.with_base_url("http://127.0.0.1:1"))
+        });
+
+        for wanted in [true, false] {
+            w.tx.send(ToWorker::SetFavorite {
+                track_id: 7,
+                favorite: wanted,
+            })
+            .unwrap();
+            match next(&w) {
+                FromWorker::Failed { task, detail, .. } => {
+                    assert_eq!(
+                        task,
+                        Task::SetFavorite {
+                            track_id: 7,
+                            wanted
+                        }
+                    );
+                    assert!(detail.contains("favorites"), "{detail}");
+                }
+                other => panic!("expected an error, got {}", variant(&other)),
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_favorite_says_which_direction_it_was_going() {
+        // Goal: the notice is one line and it is the only thing the user is
+        // told. "adding to favorites" and "removing from favorites" fail for
+        // the same reasons and mean opposite things.
+        assert_eq!(
+            Task::SetFavorite {
+                track_id: 1,
+                wanted: true
+            }
+            .to_string(),
+            "adding to favorites"
+        );
+        assert_eq!(
+            Task::SetFavorite {
+                track_id: 1,
+                wanted: false
+            }
+            .to_string(),
+            "removing from favorites"
+        );
     }
 
     fn variant(m: &FromWorker) -> &'static str {

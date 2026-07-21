@@ -20,7 +20,7 @@
 //! views (favorites / playlists / playlist tracks / search) and the gapless
 //! play-queue orchestration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -97,6 +97,12 @@ pub enum Hit {
     Filter,
     EditSearch,
     Reload,
+    /// Add the highlighted track to the favorites, or take it back off.
+    FavoriteSelected,
+    /// The same, for the track that is playing. Two controls rather than one
+    /// because the row under the cursor and the track in the speakers are
+    /// routinely different tracks, and the heart beside each one has to mean it.
+    FavoriteNowPlaying,
     CycleView,
     Help,
     Log,
@@ -383,6 +389,21 @@ pub struct App {
     metas: HashMap<u64, StreamMeta>,
     advanced: bool,
 
+    /// Tracks priel knows are in the user's favorites.
+    ///
+    /// **The service reports no favorite flag on a track.** A track carries its
+    /// title, its artists and its quality tags and nothing that says whether the
+    /// listener kept it, so the only thing that ever says so is membership of
+    /// the favorites listing itself. That makes this set priel's own record, and
+    /// it knows exactly as much as it has been told: the favorites pages that
+    /// have been fetched, plus whatever has been changed here since.
+    ///
+    /// The consequence is worth naming rather than hiding. A favorited track met
+    /// in the search results, on a page of the favorites that has not been
+    /// scrolled to, reads as not favorited. Pressing the key on it adds it
+    /// again, which the service accepts, and the heart then tells the truth.
+    favorite_ids: HashSet<u64>,
+
     pub mode: Mode,
     pub filter: String,
     pub shuffle: bool,
@@ -558,6 +579,7 @@ impl App {
             next_intended: None,
             metas: HashMap::new(),
             advanced: false,
+            favorite_ids: HashSet::new(),
             mode: Mode::Normal,
             filter: String::new(),
             shuffle: false,
@@ -1053,7 +1075,9 @@ impl App {
             Task::Search { query, offset } => {
                 (*query == self.search_asked).then_some((&mut self.search_paging, *offset))
             }
-            Task::Startup | Task::Resolve => None,
+            // A favorite belongs to no listing: it changes one row's state, not
+            // how much of a list has been fetched.
+            Task::Startup | Task::Resolve | Task::SetFavorite { .. } => None,
         }
     }
 
@@ -1147,6 +1171,19 @@ impl App {
             log::debug!("dropping a favorites page at offset {offset}: nothing is waiting for it");
             return;
         }
+        // The listing *is* the favorite state, since nothing on a track says
+        // so, and the set follows the rows the way `absorb` does. Taken from the
+        // arriving page rather than from the rows afterwards: the rows are the
+        // whole listing loaded so far, and rebuilding from them would also throw
+        // away a change made from another view - a track favorited out of the
+        // search results, whose own page of the listing has not been reached.
+        if offset == 0 {
+            // The service's answer replaces what priel believed, this included.
+            // Without it a track taken off the favorites on another device
+            // would keep its heart until priel was restarted.
+            self.favorite_ids.clear();
+        }
+        self.favorite_ids.extend(page.items.iter().map(|t| t.id));
         let mut rows = std::mem::take(&mut self.favorites);
         self.favorites_paging.absorb(&mut rows, offset, page);
         self.favorites = rows;
@@ -1366,6 +1403,19 @@ impl App {
     /// arrive is a page missing from the end, not a reason to empty the list.
     fn on_failed(&mut self, task: &Task, fault: Fault, detail: &str) {
         self.loading = false;
+        // A change the interface has already shown. Putting it back is what
+        // makes showing it early safe.
+        //
+        // Unguarded, deliberately. A refusal that lands after the user has
+        // pressed the key again looks like it should need a "only if nothing
+        // has moved since" check, and does not: the state is one bit, so a
+        // belief that has moved on is already `!wanted` and writing `!wanted`
+        // over it changes nothing. A guard here would be a branch no input
+        // could take, which is worse than none - it reads as protection that is
+        // not there.
+        if let Task::SetFavorite { track_id, wanted } = task {
+            self.remember_favorite(*track_id, !*wanted);
+        }
         if let Some((paging, offset)) = self.paging_for(task)
             && paging.wanted == Some(offset)
         {
@@ -1769,6 +1819,75 @@ impl App {
         self.mode = Mode::Filter;
         self.filter.clear();
         self.selected = 0;
+    }
+
+    // ---- favorites ----
+
+    /// Is this track one priel knows the user has kept?
+    ///
+    /// The renderer's only question. `false` covers both "not a favorite" and
+    /// "priel has not been told", which the doc on `favorite_ids` explains: with
+    /// no favorite flag on a track there is no third answer to give, and a
+    /// glyph that meant "unknown" would still have to be clickable and would
+    /// still do the same thing when clicked.
+    #[must_use]
+    pub fn is_favorite(&self, track_id: u64) -> bool {
+        self.favorite_ids.contains(&track_id)
+    }
+
+    /// Add the track to the user's favorites, or take it back off.
+    ///
+    /// **The one way in.** The `f` and `F` keys, the `[f]` control on the
+    /// keyboard row, the reference overlay and the heart beside the playing
+    /// track all arrive here, so no two of them can come to disagree about what
+    /// the action is.
+    ///
+    /// **Optimistic on purpose.** The heart changes now and is put back by
+    /// [`Self::on_failed`] if the service refuses. A control that waited for a
+    /// round trip before answering would read as broken - this is the only
+    /// keystroke in priel whose whole effect is one bit - and one bit is the
+    /// cheapest thing there is to undo. The failure is not swallowed: it reaches
+    /// the notice line the way every other refusal does.
+    fn toggle_favorite(&mut self, track_id: u64) {
+        let wanted = !self.is_favorite(track_id);
+        self.remember_favorite(track_id, wanted);
+        self.ask(ToWorker::SetFavorite {
+            track_id,
+            favorite: wanted,
+        });
+    }
+
+    /// Record what priel believes about a track, without asking anything.
+    fn remember_favorite(&mut self, track_id: u64, favorite: bool) {
+        if favorite {
+            self.favorite_ids.insert(track_id);
+        } else {
+            self.favorite_ids.remove(&track_id);
+        }
+    }
+
+    /// The track under the cursor, if this view has tracks at all.
+    ///
+    /// Through `visible()` rather than straight into the backing vec: selection
+    /// is an index into the filtered rows, and reading the backing vec with it
+    /// would favorite a different track than the highlighted one whenever a
+    /// filter was on.
+    fn selected_track_id(&self) -> Option<u64> {
+        let visible = self.visible();
+        let index = *visible.get(self.selected)?;
+        self.current_tracks().get(index).map(|t| t.id)
+    }
+
+    fn favorite_selected(&mut self) {
+        if let Some(id) = self.selected_track_id() {
+            self.toggle_favorite(id);
+        }
+    }
+
+    fn favorite_now_playing(&mut self) {
+        if let Some(id) = self.now_playing.as_ref().map(|t| t.id) {
+            self.toggle_favorite(id);
+        }
     }
 
     fn play_selected(&mut self) {
@@ -2460,6 +2579,8 @@ impl App {
             KeyCode::Char('-') => self.volume_step(-5.0),
             KeyCode::Char('0') => self.volume_unity(),
             KeyCode::Char('/') => self.start_filter(),
+            KeyCode::Char('f') => self.favorite_selected(),
+            KeyCode::Char('F') => self.favorite_now_playing(),
             KeyCode::Char('r') => self.reload_view(),
             _ => {}
         }
@@ -2582,6 +2703,8 @@ impl App {
             Hit::VolDown => self.volume_step(-5.0),
             Hit::VolUnity => self.volume_unity(),
             Hit::Filter => self.start_filter(),
+            Hit::FavoriteSelected => self.favorite_selected(),
+            Hit::FavoriteNowPlaying => self.favorite_now_playing(),
             Hit::EditSearch => self.edit_search(),
             Hit::Reload => self.reload_view(),
             Hit::CycleView => self.cycle_view(),
@@ -3947,6 +4070,276 @@ mod tests {
         r.to_app.send(favorites_page(5, 5..10, 500)).unwrap();
         r.app.drain_worker();
         assert_eq!(r.app.queue.len(), 5, "the queue is a snapshot, not a view");
+    }
+
+    // ---- favorites ----
+
+    /// Favorites loaded and drawn, with the cursor on the first row. Every row
+    /// in that listing is a favorite by definition, which is the only thing that
+    /// ever says so.
+    fn favorites_loaded(r: &mut Rig, ids: std::ops::Range<u64>) {
+        r.app.start();
+        r.to_app.send(favorites_page(0, ids, 3)).unwrap();
+        r.app.drain_worker();
+        r.app.list_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+        let _ = requests(r);
+    }
+
+    fn favorite_requests(reqs: &[ToWorker]) -> Vec<(u64, bool)> {
+        reqs.iter()
+            .filter_map(|c| match c {
+                ToWorker::SetFavorite { track_id, favorite } => Some((*track_id, *favorite)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_favorites_listing_is_the_only_thing_that_says_a_track_is_kept() {
+        // Goal: no track on the wire carries a favorite flag, so the rows of
+        // that one listing are the whole source of truth. Results from anywhere
+        // else say nothing about it, and must not be read as saying "no".
+        let mut r = rig();
+        favorites_loaded(&mut r, 1..4);
+        assert!(r.app.is_favorite(2), "a row of the favorites listing");
+
+        searched(&mut r, "blue", 40..42, 2);
+        assert!(
+            !r.app.is_favorite(40),
+            "a search hit priel has been told nothing about"
+        );
+    }
+
+    #[test]
+    fn the_heart_changes_before_the_service_has_answered() {
+        // Goal: the deliberate optimism. One bit, changed now and put back if it
+        // is refused - a control that waited for a round trip would read as
+        // broken for the length of one.
+        let mut r = rig();
+        favorites_loaded(&mut r, 1..4);
+        r.app.on_key(key('f'));
+
+        assert!(!r.app.is_favorite(1), "the heart empties on the keystroke");
+        assert_eq!(
+            favorite_requests(&requests(&r)),
+            vec![(1, false)],
+            "and the request goes out carrying the state that is on screen"
+        );
+    }
+
+    #[test]
+    fn a_track_the_listing_never_mentioned_is_added_rather_than_removed() {
+        // Goal: the other direction. The key is one action whose meaning comes
+        // from what priel currently believes, so a search hit is added.
+        let mut r = rig();
+        searched(&mut r, "blue", 40..42, 2);
+        r.app.selected = 0;
+        r.app.on_key(key('f'));
+
+        assert!(r.app.is_favorite(40));
+        assert_eq!(favorite_requests(&requests(&r)), vec![(40, true)]);
+    }
+
+    #[test]
+    fn the_key_and_the_control_run_the_same_thing() {
+        // Goal: parity is enforced by there being one method, not by two paths
+        // being kept in step. Asserting it here is what stops a later edit
+        // giving the control its own copy.
+        let mut by_key = rig();
+        favorites_loaded(&mut by_key, 1..4);
+        by_key.app.on_key(key('f'));
+
+        let mut by_click = rig();
+        favorites_loaded(&mut by_click, 1..4);
+        by_click.app.dispatch(Hit::FavoriteSelected);
+
+        assert_eq!(
+            favorite_requests(&requests(&by_key)),
+            favorite_requests(&requests(&by_click))
+        );
+        assert_eq!(by_key.app.is_favorite(1), by_click.app.is_favorite(1));
+    }
+
+    #[test]
+    fn the_playing_track_has_a_control_of_its_own() {
+        // Goal: the row under the cursor and the track in the speakers are
+        // routinely different tracks. A single action would leave whichever one
+        // the user was not looking at unreachable.
+        let mut r = rig();
+        favorites_loaded(&mut r, 1..4);
+        r.app.on_key(code(KeyCode::Enter)); // play row 1
+        r.app.selected = 2; // and move the cursor off it
+        let _ = requests(&r);
+
+        r.app.dispatch(Hit::FavoriteNowPlaying);
+        assert_eq!(
+            favorite_requests(&requests(&r)),
+            vec![(1, false)],
+            "the playing track, not the highlighted one"
+        );
+    }
+
+    #[test]
+    fn a_refused_change_puts_the_heart_back() {
+        // Goal: what makes the optimism honest. Without this the user is left
+        // believing something happened that did not, which is worse than a
+        // stale listing - a listing at least corrects itself on reload.
+        let mut r = rig();
+        favorites_loaded(&mut r, 1..4);
+        r.app.on_key(key('f'));
+        assert!(!r.app.is_favorite(1));
+
+        r.to_app
+            .send(unreachable(Task::SetFavorite {
+                track_id: 1,
+                wanted: false,
+            }))
+            .unwrap();
+        r.app.drain_worker();
+
+        assert!(r.app.is_favorite(1), "the heart comes back");
+        assert!(
+            r.app.notice.as_deref().unwrap_or_default().contains("⚠"),
+            "and the user is told: {:?}",
+            r.app.notice
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_arrives_late_does_not_undo_a_newer_change() {
+        // Goal: two presses in quick succession send two requests, and the
+        // failure for the first can land after the second has been shown. The
+        // newer state has to stand. It does so without a guard, because the
+        // state is one bit: the belief has already moved to `!wanted`, and
+        // putting `!wanted` back over it is a no-op.
+        let mut r = rig();
+        favorites_loaded(&mut r, 1..4);
+        r.app.on_key(key('f')); // off
+        r.app.on_key(key('f')); // and on again
+        assert!(r.app.is_favorite(1));
+
+        r.to_app
+            .send(unreachable(Task::SetFavorite {
+                track_id: 1,
+                wanted: false,
+            }))
+            .unwrap();
+        r.app.drain_worker();
+
+        assert!(
+            r.app.is_favorite(1),
+            "the newer state stands; only the change that failed is undone"
+        );
+    }
+
+    #[test]
+    fn a_track_taken_off_the_favorites_keeps_its_row_until_the_list_is_reloaded() {
+        // Goal: the deliberate answer to what happens to a loaded page. The row
+        // stays and only its heart changes, for two reasons that both bite.
+        // Dropping it would move every row below it out from under the cursor -
+        // including the one just acted on, which makes the undo unreachable -
+        // and `Paging::absorb` requires the next page to continue where the
+        // loaded rows end, so a hole in the middle would silently skip a row.
+        let mut r = rig();
+        favorites_loaded(&mut r, 1..4);
+        r.app.selected = 1;
+        r.app.on_key(key('f'));
+
+        assert_eq!(ids(&r.app.favorites), vec![1, 2, 3], "the row stays put");
+        assert_eq!(r.app.selected, 1, "and so does the cursor");
+        assert!(!r.app.is_favorite(2), "only the heart changed");
+    }
+
+    #[test]
+    fn reloading_the_favorites_takes_the_state_from_the_service_again() {
+        // Goal: the set mirrors the rows, so the first page *replaces* it rather
+        // than adding to it. An id kept across a reload is a track taken off the
+        // favorites somewhere else that would wear a heart until priel was
+        // restarted - and a listing shorter than the one before it is the only
+        // way that shows up.
+        let mut r = rig();
+        favorites_loaded(&mut r, 1..4);
+        r.app.on_key(key('f')); // priel now believes 1 is not a favorite
+        assert!(!r.app.is_favorite(1));
+
+        r.app.on_key(key('r'));
+        r.to_app.send(favorites_page(0, 1..3, 2)).unwrap();
+        r.app.drain_worker();
+
+        assert!(r.app.is_favorite(1), "the service is believed over priel");
+        assert!(
+            !r.app.is_favorite(3),
+            "and a row the listing no longer has loses its heart"
+        );
+    }
+
+    #[test]
+    fn a_later_page_of_favorites_adds_to_what_is_known_rather_than_replacing_it() {
+        // Goal: the set mirrors the rows both ways round. Only the first page
+        // replaces; a second page that also cleared would empty every heart
+        // above it the moment the user scrolled past the first hundred.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 1..3, 4)).unwrap();
+        r.app.drain_worker();
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh();
+
+        r.to_app.send(favorites_page(2, 3..5, 4)).unwrap();
+        r.app.drain_worker();
+
+        assert!(r.app.is_favorite(1), "the first page keeps its hearts");
+        assert!(r.app.is_favorite(4), "and the second page brings its own");
+    }
+
+    #[test]
+    fn a_view_with_no_track_under_the_cursor_asks_for_nothing() {
+        // Goal: the playlists list holds playlists, and the key has nothing to
+        // act on there. Sending a request for whatever id happened to be at that
+        // index in another view's rows is the bug this guards.
+        let mut r = rig();
+        playlists_loaded(&mut r, &["mix"], 1);
+        r.app.on_key(key('f'));
+        assert!(favorite_requests(&requests(&r)).is_empty());
+    }
+
+    #[test]
+    fn the_filter_decides_which_track_the_key_acts_on() {
+        // Goal: selection is an index into the *filtered* rows. Reading the
+        // backing vec with it would favorite a different track than the
+        // highlighted one whenever a filter was on.
+        let mut r = rig();
+        r.app.start();
+        r.to_app
+            .send(FromWorker::Favorites {
+                offset: 0,
+                page: priel_core::Page {
+                    items: vec![track(1, "Blue", "A"), track(2, "Red", "B")],
+                    total: 2,
+                },
+            })
+            .unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+
+        r.app.on_key(key('/'));
+        for c in "Red".chars() {
+            r.app.on_key(key(c));
+        }
+        // Accepted first: while the box is open every key is text, `f` included.
+        r.app.on_key(code(KeyCode::Enter));
+        r.app.on_key(key('f'));
+
+        assert_eq!(
+            favorite_requests(&requests(&r)),
+            vec![(2, false)],
+            "the one row the filter left on screen"
+        );
     }
 
     /// A tick where nothing is happening: no track, no audio, nothing queued.
