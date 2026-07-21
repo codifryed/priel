@@ -44,8 +44,10 @@ use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use super::mpris::{self, Answer, BusCommand, Snapshot};
 use super::wire::{
     Arg, Endian, Message, MessageType, NO_REPLY_EXPECTED, Serials, Value, WireError, frame_len,
     marshal, parse,
@@ -189,6 +191,20 @@ pub(crate) enum NameOutcome {
     Taken,
 }
 
+/// The app's end of the bus, as the connection sees it.
+///
+/// Two halves and not one: state flows down and commands flow up, and neither
+/// waits on the other. The same arrangement `Player` already is - a command
+/// channel beside an `Arc<Mutex<..>>` snapshot - and for the same reason,
+/// which is that the UI thread may not block on anything.
+pub(crate) struct Link {
+    /// What a call is answered from, replaced by the UI thread each tick.
+    pub(crate) snapshot: Arc<Mutex<Snapshot>>,
+    /// Where a transport method goes. The app drains this and runs the very
+    /// method the key binding runs.
+    pub(crate) commands: mpsc::Sender<BusCommand>,
+}
+
 /// A connection to the session bus.
 ///
 /// Generic over the stream and never over a socket, so a scripted in-memory
@@ -204,20 +220,37 @@ pub(crate) struct Connection<S> {
     /// What the bus called priel when it answered `Hello`. Empty until then.
     unique_name: String,
     machine_id: Option<String>,
+    link: Link,
 }
 
 impl<S: Read + Write> Connection<S> {
     /// Wraps a stream that is already open. `machine_id` is what
     /// `org.freedesktop.DBus.Peer.GetMachineId` answers with; `None` answers
     /// that call with an error rather than inventing one.
-    pub(crate) fn new(stream: S, machine_id: Option<String>) -> Self {
+    pub(crate) fn new(stream: S, machine_id: Option<String>, link: Link) -> Self {
         Self {
             stream,
             inbox: Vec::new(),
             serials: Serials::default(),
             unique_name: String::new(),
             machine_id,
+            link,
         }
+    }
+
+    /// The state a call is answered from, taken while the lock is held for no
+    /// longer than the clone.
+    ///
+    /// Poison-tolerant for the reason `Player::status` is: this is a plain
+    /// snapshot with no cross-field invariant, so a producer that panicked
+    /// mid-update leaves nothing to corrupt, and a bus thread that panicked in
+    /// turn would take priel off the desktop for the rest of the session.
+    fn snapshot(&self) -> Snapshot {
+        self.link
+            .snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The SASL EXTERNAL handshake: a leading nul, the identity, then `BEGIN`.
@@ -391,7 +424,16 @@ impl<S: Read + Write> Connection<S> {
                 // still land. Answering either is a protocol error.
                 continue;
             }
-            if let Some(reply) = answer(&message, self.machine_id.as_deref()) {
+            let answered = answer(&message, self.machine_id.as_deref(), &self.snapshot());
+            // The command goes first. A reply is an acknowledgement, and a
+            // consumer that got one before the action ran would be told the
+            // track had changed while it had not.
+            if let Some(command) = answered.command
+                && self.link.commands.send(command).is_err()
+            {
+                log::debug!("priel is no longer listening, so a command from the bus was dropped");
+            }
+            if let Some(reply) = answered.reply {
                 self.send(reply)?;
             }
         }
@@ -551,11 +593,32 @@ fn is_idle(error: &io::Error) -> bool {
 /// one [`READ_TIMEOUT`], which is how the bus thread joins on the way out.
 pub(crate) struct Bus {
     signals: mpsc::Sender<Message>,
+    /// What consumers have asked for since the last tick.
+    commands: Receiver<BusCommand>,
+    /// What the bus thread answers a call from.
+    snapshot: Arc<Mutex<Snapshot>>,
     name: String,
     unique_name: String,
 }
 
 impl Bus {
+    /// Hand the bus thread the state it answers from.
+    ///
+    /// Never blocks for longer than one move: the bus thread holds the same
+    /// lock only long enough to clone, and it takes no other lock at all - the
+    /// UI thread may not wait on anything.
+    pub(crate) fn publish(&self, snapshot: Snapshot) {
+        *self.snapshot.lock().unwrap_or_else(PoisonError::into_inner) = snapshot;
+    }
+
+    /// The next thing a consumer asked for, or `None`.
+    ///
+    /// A bus thread that has gone reads the same as one with nothing to say,
+    /// which is right: either way there is no command, and the player carries
+    /// on.
+    pub(crate) fn next_command(&self) -> Option<BusCommand> {
+        self.commands.try_recv().ok()
+    }
     /// The well-known name priel is published under. Either the one asked for
     /// or its per-instance spelling.
     pub(crate) fn name(&self) -> &str {
@@ -577,6 +640,35 @@ impl Bus {
         if self.signals.send(signal).is_err() {
             log::debug!("the session bus connection is gone, so a signal was dropped");
         }
+    }
+
+    /// A bus with both ends in the test's hands and no socket anywhere.
+    ///
+    /// The app drives the same methods against this that it drives against a
+    /// real one, so the publishing and the commands are testable with no bus
+    /// present - which they have to be, since the suite runs on machines that
+    /// have none.
+    #[cfg(test)]
+    pub(crate) fn rigged() -> (Self, Receiver<Message>, mpsc::Sender<BusCommand>) {
+        let (signals, emitted) = mpsc::channel();
+        let (sender, commands) = mpsc::channel();
+        let bus = Self {
+            signals,
+            commands,
+            snapshot: Arc::new(Mutex::new(Snapshot::default())),
+            name: mpris::WELL_KNOWN_NAME.to_owned(),
+            unique_name: ":1.42".to_owned(),
+        };
+        (bus, emitted, sender)
+    }
+
+    /// What was last published to the bus thread. The tests' only reader.
+    #[cfg(test)]
+    pub(crate) fn published(&self) -> Snapshot {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -617,7 +709,16 @@ fn connect(address: &Address, well_known: &str) -> Result<Bus> {
     // The one thing that makes one thread enough for both directions.
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
 
-    let mut connection = Connection::new(stream, machine_id());
+    let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+    let (sender, commands) = mpsc::channel();
+    let mut connection = Connection::new(
+        stream,
+        machine_id(),
+        Link {
+            snapshot: Arc::clone(&snapshot),
+            commands: sender,
+        },
+    );
     connection.authenticate(current_uid())?;
     connection.hello()?;
     let unique_name = connection.unique_name().to_owned();
@@ -638,6 +739,8 @@ fn connect(address: &Address, well_known: &str) -> Result<Bus> {
         .map_err(BusError::Io)?;
     Ok(Bus {
         signals,
+        commands,
+        snapshot,
         name,
         unique_name,
     })
@@ -714,25 +817,39 @@ fn valid_machine_id(text: &str) -> Option<String> {
     shaped.then(|| id.to_owned())
 }
 
-/// The answer to one method call, or `None` where the caller asked for none.
+/// The answer to one method call.
 ///
 /// Pure, in the shape `App::decide` already established: the loop mints the
 /// serial and writes it. Every reply leaves here with serial 0, which
 /// [`marshal`] refuses, so a path that forgot to mint one fails loudly rather
 /// than sending a message no reply can be matched to.
 ///
-/// priel answers only what the bus requires of every peer. Everything else gets
-/// the error a real service gives an unknown member - and that fallback is what
-/// the interfaces above will slot in ahead of.
-fn answer(call: &Message, machine_id: Option<&str>) -> Option<Message> {
+/// The interfaces come first and what the bus requires of every peer comes
+/// second, because `Peer` lives at every object path while MPRIS lives at
+/// exactly one.
+fn answer(call: &Message, machine_id: Option<&str>, snapshot: &Snapshot) -> Answer {
+    let mut answered = mpris::answer(call, snapshot).unwrap_or_else(|| Answer {
+        reply: Some(peer(call, machine_id)),
+        command: None,
+    });
+    // Spec 0.43: a caller that said it wants no reply gets none. **The action
+    // it asked for still happens** - the flag suppresses the acknowledgement
+    // and not the command, and a media key sent this way must still skip the
+    // track.
     if call.flags & NO_REPLY_EXPECTED != 0 {
-        return None;
+        answered.reply = None;
     }
+    answered
+}
+
+/// What the bus requires of every peer, and the error a real service gives an
+/// unknown member.
+fn peer(call: &Message, machine_id: Option<&str>) -> Message {
     let member = call.member().unwrap_or_default();
     // The object path is deliberately not matched on: spec 0.43 puts `Peer` on
     // every path a connection exposes, and a `Ping` answered only at one is a
     // peer that looks hung to whatever probed it elsewhere.
-    let reply = match (call.interface(), member) {
+    match (call.interface(), member) {
         (Some(PEER_INTERFACE), "Ping") => Message::method_return(0, call),
         (Some(PEER_INTERFACE), "GetMachineId") => match machine_id {
             Some(id) => Message::method_return(0, call)
@@ -756,8 +873,7 @@ fn answer(call: &Message, machine_id: Option<&str>) -> Option<Message> {
                 interface.unwrap_or("")
             ),
         ),
-    };
-    Some(reply)
+    }
 }
 
 /// An error reply, spelled for the log.
@@ -865,7 +981,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::bus::wire::{Field, NO_REPLY_EXPECTED, frame_len};
+    use crate::bus::wire::{Field, NO_REPLY_EXPECTED, Variant, frame_len};
 
     /// What the far end does next.
     #[derive(Debug, Clone)]
@@ -970,10 +1086,49 @@ mod tests {
         marshal(&error, Endian::NATIVE).expect("an error the tests built")
     }
 
+    /// The app's end of a [`Link`], held so a test can read what the loop sent
+    /// it and set what it answers from.
+    struct AppEnd {
+        snapshot: Arc<Mutex<Snapshot>>,
+        commands: Receiver<BusCommand>,
+    }
+
+    impl AppEnd {
+        fn publish(&self, snapshot: Snapshot) {
+            *self.snapshot.lock().unwrap_or_else(PoisonError::into_inner) = snapshot;
+        }
+
+        fn drain(&self) -> Vec<BusCommand> {
+            std::iter::from_fn(|| self.commands.try_recv().ok()).collect()
+        }
+    }
+
+    fn linked() -> (Link, AppEnd) {
+        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        let (commands, received) = mpsc::channel();
+        (
+            Link {
+                snapshot: Arc::clone(&snapshot),
+                commands,
+            },
+            AppEnd {
+                snapshot,
+                commands: received,
+            },
+        )
+    }
+
+    /// A connection whose app end is dropped, for the tests that script the bus
+    /// rather than the app. A command with nobody listening is logged and
+    /// forgotten, which is what happens on the way out of a real session too.
+    fn connection(duplex: &mut Duplex, machine_id: Option<String>) -> Connection<&mut Duplex> {
+        Connection::new(duplex, machine_id, linked().0)
+    }
+
     /// A connection that has already authenticated, so a test scripts what
     /// comes after the handshake and nothing else.
     fn greeted(duplex: &mut Duplex) -> Connection<&mut Duplex> {
-        let mut conn = Connection::new(duplex, None);
+        let mut conn = connection(duplex, None);
         conn.authenticate(Some(1000))
             .expect("the scripted handshake");
         conn
@@ -1228,11 +1383,25 @@ mod tests {
         incoming(serial, Some(PEER_INTERFACE), "Ping", 0)
     }
 
+    /// Just the reply half of an answer, for the calls that ask for nothing to
+    /// be done - which is every one the bus itself requires of a peer.
+    fn answered(call: &Message, machine_id: Option<&str>) -> Option<Message> {
+        let answer = answer(call, machine_id, &Snapshot::default());
+        assert_eq!(answer.command, None, "the peer interface runs no action");
+        answer.reply
+    }
+
     /// Run the dispatch loop over a scripted session with nothing to send.
     fn served(duplex: &mut Duplex, machine_id: Option<String>) -> Result<()> {
+        served_for(duplex, machine_id, linked().0)
+    }
+
+    /// The same, against an app end the test holds - which is what lets a test
+    /// set the state a call is answered from and read the commands back.
+    fn served_for(duplex: &mut Duplex, machine_id: Option<String>, link: Link) -> Result<()> {
         // The sender is held for the whole loop, so the script is what ends it.
         let (signals, outbox) = mpsc::channel();
-        let mut conn = Connection::new(duplex, machine_id);
+        let mut conn = Connection::new(duplex, machine_id, link);
         conn.authenticate(Some(1000))
             .expect("the scripted handshake");
         let result = conn.serve(&outbox);
@@ -1256,7 +1425,7 @@ mod tests {
         ]);
         let (name, unique) = {
             let (signals, outbox) = mpsc::channel();
-            let mut conn = Connection::new(&mut duplex, None);
+            let mut conn = connection(&mut duplex, None);
             conn.authenticate(Some(1000)).expect("the handshake");
             conn.hello().expect("Hello");
             let name = conn
@@ -1366,7 +1535,7 @@ mod tests {
     /// nothing at.
     #[test]
     fn ping_is_answered_at_any_object_path() {
-        let reply = answer(&parsed(&ping(7)), None).expect("a reply to Ping");
+        let reply = answered(&parsed(&ping(7)), None).expect("a reply to Ping");
         assert_eq!(reply.kind, MessageType::MethodReturn);
         assert_eq!(reply.reply_serial(), Some(7));
         assert!(reply.body.is_empty());
@@ -1378,7 +1547,7 @@ mod tests {
     #[test]
     fn get_machine_id_answers_with_the_id_or_says_it_has_none() {
         let call = parsed(&incoming(7, Some(PEER_INTERFACE), "GetMachineId", 0));
-        let reply = answer(&call, Some("5aa16f5d981140ac87052e109dd35eaf")).expect("a reply");
+        let reply = answered(&call, Some("5aa16f5d981140ac87052e109dd35eaf")).expect("a reply");
         assert_eq!(reply.kind, MessageType::MethodReturn);
         assert_eq!(reply.signature(), "s");
         assert_eq!(
@@ -1388,7 +1557,7 @@ mod tests {
             ))]
         );
 
-        let reply = answer(&call, None).expect("a reply");
+        let reply = answered(&call, None).expect("a reply");
         assert_eq!(reply.kind, MessageType::Error);
         assert_eq!(reply.error_name(), Some(ERROR_FAILED));
     }
@@ -1406,7 +1575,7 @@ mod tests {
             None,
         ] {
             let call = parsed(&incoming(7, interface, "Wobble", 0));
-            let reply = answer(&call, None).expect("a reply to every call");
+            let reply = answered(&call, None).expect("a reply to every call");
             assert_eq!(reply.kind, MessageType::Error, "{interface:?}");
             assert_eq!(reply.error_name(), Some(ERROR_UNKNOWN_METHOD));
             assert_eq!(reply.reply_serial(), Some(7));
@@ -1426,7 +1595,7 @@ mod tests {
             "Ping",
             NO_REPLY_EXPECTED,
         ));
-        assert!(answer(&call, None).is_none());
+        assert!(answered(&call, None).is_none());
 
         let mut duplex = after_handshake(vec![Turn::Bytes(incoming(
             7,
@@ -1436,6 +1605,161 @@ mod tests {
         ))]);
         served(&mut duplex, None).expect("a session that ends cleanly");
         assert!(sent(&duplex).is_empty());
+    }
+
+    /// The bytes of a call to one of priel's own interfaces, body and all.
+    fn to_priel(serial: u32, interface: &str, member: &str, flags: u8, body: Vec<Arg>) -> Vec<u8> {
+        let call = Message {
+            kind: MessageType::MethodCall,
+            flags,
+            serial,
+            fields: vec![
+                Field::Path(mpris::OBJECT_PATH.to_owned()),
+                Field::Interface(interface.to_owned()),
+                Field::Member(member.to_owned()),
+                Field::Sender(":1.99".to_owned()),
+            ],
+            body: Vec::new(),
+        }
+        .with_body(body);
+        marshal(&call, Endian::NATIVE).expect("a call the tests built")
+    }
+
+    /// A snapshot with something playing, so a `GetAll` has something to say.
+    fn something_playing() -> Snapshot {
+        Snapshot {
+            now: mpris::Now {
+                track: Some(mpris::Entry {
+                    path: mpris::track_path(1),
+                    title: "A Title".to_owned(),
+                    artist: "An Artist".to_owned(),
+                    album: "An Album".to_owned(),
+                    length_us: 300_000_000,
+                }),
+                volume: 1.0,
+                can_go_next: true,
+                ..mpris::Now::default()
+            },
+            position_us: 42_000_000,
+        }
+    }
+
+    /// Goal: a `GetAll` off the socket is answered from the state the app last
+    /// published, which is the whole point of the shared snapshot - the bus
+    /// thread holds no player state of its own and asks nothing for it.
+    /// Method: publish a track, then read one back through the wire.
+    #[test]
+    fn a_call_is_answered_from_the_state_the_app_published() {
+        let (link, end) = linked();
+        end.publish(something_playing());
+        let mut duplex = after_handshake(vec![Turn::Bytes(to_priel(
+            7,
+            mpris::PROPERTIES_INTERFACE,
+            "GetAll",
+            0,
+            vec![Arg::Value(Value::Str(mpris::PLAYER_INTERFACE.into()))],
+        ))]);
+        served_for(&mut duplex, None, link).expect("a session that ends cleanly");
+
+        let written = sent(&duplex);
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].kind, MessageType::MethodReturn);
+        assert_eq!(written[0].reply_serial(), Some(7));
+        let Some(Arg::Dict(properties)) = written[0].body.first() else {
+            panic!("GetAll answers with a{{sv}}");
+        };
+        let value = |name: &str| {
+            properties
+                .iter()
+                .find(|(known, _)| known == name)
+                .map(|(_, value)| value.clone())
+        };
+        // The values and not just the names: a bus thread answering from its own
+        // default would publish exactly the same key set.
+        assert_eq!(
+            value("PlaybackStatus"),
+            Some(Variant::Value(Value::Str("Playing".into()))),
+            "a default snapshot would say Stopped"
+        );
+        assert_eq!(
+            value(mpris::POSITION),
+            Some(Variant::Value(Value::Int64(42_000_000)))
+        );
+        let Some(Variant::Dict(metadata)) = value("Metadata") else {
+            panic!("Metadata is a dict");
+        };
+        assert!(
+            metadata
+                .iter()
+                .any(|(_, field)| *field == Value::Str("A Title".into())),
+            "the track the app published reached the answer: {metadata:?}"
+        );
+        assert!(end.drain().is_empty(), "reading state does nothing");
+    }
+
+    /// Goal: a transport method reaches the app as a command, which is what
+    /// makes MPRIS a third caller of an action rather than a second
+    /// implementation of one. Method: `Next` off the socket, read off the
+    /// channel the app drains.
+    #[test]
+    fn a_transport_method_reaches_the_app_and_is_acknowledged() {
+        let (link, end) = linked();
+        end.publish(something_playing());
+        let mut duplex = after_handshake(vec![Turn::Bytes(to_priel(
+            7,
+            mpris::PLAYER_INTERFACE,
+            "Next",
+            0,
+            Vec::new(),
+        ))]);
+        served_for(&mut duplex, None, link).expect("a session that ends cleanly");
+
+        assert_eq!(end.drain(), vec![BusCommand::Next]);
+        let written = sent(&duplex);
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].kind, MessageType::MethodReturn);
+        assert_eq!(written[0].reply_serial(), Some(7));
+    }
+
+    /// Goal: **a caller that wants no reply still gets the action.** The flag
+    /// suppresses the acknowledgement, not the command, and a media key sent
+    /// that way must still skip the track - answering it with silence *and*
+    /// inaction is a skip button that does nothing. Method: `Next` with the
+    /// flag set.
+    #[test]
+    fn a_command_that_expects_no_reply_still_runs() {
+        let (link, end) = linked();
+        end.publish(something_playing());
+        let mut duplex = after_handshake(vec![Turn::Bytes(to_priel(
+            7,
+            mpris::PLAYER_INTERFACE,
+            "Next",
+            NO_REPLY_EXPECTED,
+            Vec::new(),
+        ))]);
+        served_for(&mut duplex, None, link).expect("a session that ends cleanly");
+
+        assert_eq!(end.drain(), vec![BusCommand::Next]);
+        assert!(sent(&duplex).is_empty(), "and nothing was written back");
+    }
+
+    /// Goal: an app that has gone leaves the bus thread able to answer rather
+    /// than able to crash - the two ends outlive each other in both orders on
+    /// the way out of a session. Method: drop the app end and call a transport
+    /// method.
+    #[test]
+    fn a_command_with_nobody_listening_costs_only_itself() {
+        let mut duplex = after_handshake(vec![Turn::Bytes(to_priel(
+            7,
+            mpris::PLAYER_INTERFACE,
+            "Next",
+            0,
+            Vec::new(),
+        ))]);
+        served(&mut duplex, None).expect("a session that ends cleanly");
+        let written = sent(&duplex);
+        assert_eq!(written.len(), 1, "the call is still acknowledged");
+        assert_eq!(written[0].kind, MessageType::MethodReturn);
     }
 
     /// Goal: what is not a method call is not answered. The bus sends
@@ -1481,7 +1805,7 @@ mod tests {
         let mut duplex = after_handshake(vec![Turn::Idle]);
         {
             let (signals, outbox) = mpsc::channel();
-            let mut conn = Connection::new(&mut duplex, None);
+            let mut conn = connection(&mut duplex, None);
             conn.authenticate(Some(1000)).expect("the handshake");
             let queued = Message::signal(
                 0,
@@ -1509,7 +1833,7 @@ mod tests {
         let mut duplex = after_handshake(vec![Turn::Idle, Turn::Idle, Turn::Idle]);
         {
             let (signals, outbox) = mpsc::channel();
-            let mut conn = Connection::new(&mut duplex, None);
+            let mut conn = connection(&mut duplex, None);
             conn.authenticate(Some(1000)).expect("the handshake");
             for _ in 0..queued {
                 signals
@@ -1558,7 +1882,7 @@ mod tests {
         {
             let (signals, outbox) = mpsc::channel::<Message>();
             drop(signals);
-            let mut conn = Connection::new(&mut duplex, None);
+            let mut conn = connection(&mut duplex, None);
             conn.authenticate(Some(1000)).expect("the handshake");
             conn.serve(&outbox).expect("a loop that stops cleanly");
         }
@@ -1630,7 +1954,7 @@ mod tests {
     fn the_handshake_is_a_nul_an_identity_and_begin() {
         let mut duplex = Duplex::text(OK_LINE);
         {
-            let mut conn = Connection::new(&mut duplex, None);
+            let mut conn = connection(&mut duplex, None);
             assert!(conn.authenticate(Some(1000)).is_ok());
         }
         assert_eq!(duplex.written, b"\0AUTH EXTERNAL 31303030\r\nBEGIN\r\n");
@@ -1653,7 +1977,7 @@ mod tests {
     fn a_bus_that_rejects_external_is_declined_not_retried() {
         let mut duplex = Duplex::text(b"REJECTED DBUS_COOKIE_SHA1 ANONYMOUS\r\n");
         {
-            let mut conn = Connection::new(&mut duplex, None);
+            let mut conn = connection(&mut duplex, None);
             let error = conn.authenticate(Some(1000)).expect_err("EXTERNAL refused");
             assert!(
                 error.to_string().contains("DBUS_COOKIE_SHA1"),
@@ -1673,7 +1997,7 @@ mod tests {
             Turn::Bytes(OK_LINE.to_vec()),
         ]);
         {
-            let mut conn = Connection::new(&mut duplex, None);
+            let mut conn = connection(&mut duplex, None);
             assert!(conn.authenticate(None).is_ok());
         }
         assert_eq!(duplex.written, b"\0AUTH EXTERNAL\r\nDATA\r\nBEGIN\r\n");
@@ -1684,7 +2008,7 @@ mod tests {
     #[test]
     fn an_error_from_the_bus_ends_the_handshake() {
         let mut duplex = Duplex::text(b"ERROR Not enough\r\n");
-        let mut conn = Connection::new(&mut duplex, None);
+        let mut conn = connection(&mut duplex, None);
         assert!(conn.authenticate(Some(1000)).is_err());
     }
 
@@ -1694,7 +2018,7 @@ mod tests {
     #[test]
     fn a_peer_that_hangs_up_mid_handshake_is_declined() {
         let mut duplex = Duplex::text(b"OK cc77a0b3");
-        let mut conn = Connection::new(&mut duplex, None);
+        let mut conn = connection(&mut duplex, None);
         let error = conn
             .authenticate(Some(1000))
             .expect_err("a truncated handshake");
@@ -1709,7 +2033,7 @@ mod tests {
     #[test]
     fn an_auth_line_that_never_ends_is_declined() {
         let mut duplex = Duplex::text(&b"O".repeat(MAX_AUTH_LINE * 4));
-        let mut conn = Connection::new(&mut duplex, None);
+        let mut conn = connection(&mut duplex, None);
         let error = conn
             .authenticate(Some(1000))
             .expect_err("a line with no terminator");
@@ -1725,7 +2049,7 @@ mod tests {
     #[test]
     fn a_timeout_during_the_handshake_is_waited_through() {
         let mut duplex = Duplex::new(vec![Turn::Idle, Turn::Idle, Turn::Bytes(OK_LINE.to_vec())]);
-        let mut conn = Connection::new(&mut duplex, None);
+        let mut conn = connection(&mut duplex, None);
         assert!(conn.authenticate(Some(1000)).is_ok());
     }
 
@@ -1734,7 +2058,7 @@ mod tests {
     #[test]
     fn a_bus_that_never_answers_is_given_up_on() {
         let mut duplex = Duplex::new(vec![Turn::Idle; MAX_AUTH_READS * 2]);
-        let mut conn = Connection::new(&mut duplex, None);
+        let mut conn = connection(&mut duplex, None);
         assert!(conn.authenticate(Some(1000)).is_err());
     }
 
