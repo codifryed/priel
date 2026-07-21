@@ -42,7 +42,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Drawn last so it sits over everything, and after the hit boxes above have
     // been registered - `App` ignores them while the overlay is up.
     if app.mode == Mode::Help {
-        help_overlay(f, f.area());
+        let area = f.area();
+        help_overlay(f, app, area);
     }
     if app.mode == Mode::Log {
         log_overlay(f, f.area(), app);
@@ -54,12 +55,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
         device_overlay(f, f.area(), app);
     }
     if app.mode == Mode::Credentials {
-        credentials_overlay(f, f.area(), app.credential_status());
+        let area = f.area();
+        credentials_overlay(f, app, area);
     }
-    if app.mode == Mode::Login
-        && let Some(flow) = app.login()
-    {
-        login_overlay(f, f.area(), flow);
+    if app.mode == Mode::Login {
+        let area = f.area();
+        login_overlay(f, app, area);
     }
 }
 
@@ -69,7 +70,19 @@ pub fn render(f: &mut Frame, app: &mut App) {
 /// so the last step is unavoidably a paste. Everything around it is made as
 /// short as possible: the browser is already open, the box is already focused,
 /// and one paste plus Enter finishes the job.
-fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
+fn login_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    // Read before the mutable borrow the hit boxes need, as the header does.
+    let flow = app
+        .login()
+        .map(|f| (f.is_busy(), f.pasted.clone(), f.status.clone()));
+    // Modal: whatever the header and the bottom row registered this frame is
+    // behind this screen and must not be reachable through it. Cleared before
+    // the guard below, so a mode with no flow to draw is not a mode in which the
+    // header underneath quietly answers to clicks.
+    app.hits.clear();
+    let Some((busy, pasted, status)) = flow else {
+        return;
+    };
     let width = area.width.min(76);
     let height = 16u16.min(area.height);
     let rect = Rect {
@@ -106,7 +119,7 @@ fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
         Line::raw(""),
     ];
 
-    if flow.is_busy() {
+    if busy {
         lines.push(Line::from(Span::styled(
             "    signing in…",
             Style::default().fg(Color::Yellow),
@@ -114,7 +127,7 @@ fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
     } else {
         // A pasted URL is far wider than the box; show the tail, which is where
         // the code sits, so the user can see something arrived.
-        let shown = tail(&flow.pasted, inner.width.saturating_sub(6) as usize);
+        let shown = tail(&pasted, inner.width.saturating_sub(6) as usize);
         lines.push(Line::from(vec![
             Span::styled("    ", dim),
             Span::styled(
@@ -123,7 +136,7 @@ fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
                 } else {
                     shown
                 },
-                if flow.pasted.is_empty() {
+                if pasted.is_empty() {
                     Style::default().fg(Color::DarkGray)
                 } else {
                     Style::default().fg(Color::White)
@@ -134,27 +147,58 @@ fn login_overlay(f: &mut Frame, area: Rect, flow: &crate::app::LoginFlow) {
     }
 
     lines.push(Line::raw(""));
-    if let Some(status) = &flow.status {
+    if let Some(status) = &status {
         lines.push(Line::from(Span::styled(
             format!("    {status}"),
             Style::default().fg(Color::Yellow),
         )));
         lines.push(Line::raw(""));
     }
-    lines.push(Line::from(vec![
-        Span::styled("    [Enter]", key),
-        Span::styled(" sign in   ", dim),
-        Span::styled("[Ctrl-O]", key),
-        Span::styled(" reopen browser   ", dim),
-        Span::styled("[Ctrl-U]", key),
-        Span::styled(" clear", dim),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("    [Esc]", key),
-        Span::styled(" cancel", dim),
-    ]));
-
+    // The rows of actions are placed by hand rather than pushed onto the
+    // paragraph, because a control needs a rect of its own to register the hit
+    // box that makes it one. Everything above is prose.
+    let used = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     f.render_widget(Paragraph::new(lines), inner);
+    login_controls(f, app, inner, used);
+}
+
+/// The sign-in screen's four actions, as controls.
+///
+/// Laid out and hit-boxed in the same left-to-right walk the header's are, from
+/// the row `used` lines down. A row the box was too short to draw registers
+/// nothing: a control that was never painted must not answer to a click.
+fn login_controls(f: &mut Frame, app: &mut App, inner: Rect, used: u16) {
+    let dim = Style::default().fg(Color::Gray);
+    let key = Style::default().fg(Color::Cyan);
+    let mut row = |y: u16, build: &dyn Fn(&mut ControlBar)| {
+        if y >= inner.height {
+            return;
+        }
+        let line = Rect {
+            y: inner.y.saturating_add(y),
+            height: 1,
+            ..inner
+        };
+        let mut bar = ControlBar::new(line);
+        build(&mut bar);
+        app.hits.extend(bar.hits.iter().copied());
+        f.render_widget(Paragraph::new(Line::from(bar.spans)), line);
+    };
+
+    row(used, &|bar: &mut ControlBar| {
+        bar.label("    [", dim);
+        bar.button("Enter", Hit::SubmitLogin, key);
+        bar.label("] sign in   [", dim);
+        bar.button("Ctrl-O", Hit::ReopenBrowser, key);
+        bar.label("] reopen browser   [", dim);
+        bar.button("Ctrl-U", Hit::ClearPaste, key);
+        bar.label("] clear", dim);
+    });
+    row(used.saturating_add(1), &|bar: &mut ControlBar| {
+        bar.label("    [", dim);
+        bar.button("Esc", Hit::CancelLogin, key);
+        bar.label("] cancel", dim);
+    });
 }
 
 /// The last `width` characters, so a long URL shows its tail.
@@ -166,9 +210,16 @@ fn tail(s: &str, width: usize) -> String {
     s.chars().skip(count - width).collect()
 }
 
-/// Draw the consent screen. `status` is the line under the buttons: idle,
-/// in flight, or the reason a previous attempt failed.
-fn credentials_overlay(f: &mut Frame, area: Rect, status: Option<&str>) {
+/// Draw the consent screen.
+///
+/// Its three answers - download it, not now, quit - are controls, laid out and
+/// hit-boxed in the same walk the header's are. A stray click is still not
+/// consent: the app answers a click here only where it lands on one of these.
+fn credentials_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    let status = app.credential_status().map(ToString::to_string);
+    // Modal: whatever the header and the bottom row registered this frame is
+    // behind this screen and must not be reachable through it.
+    app.hits.clear();
     let rows = u16::try_from(CREDENTIALS_PROMPT.len()).unwrap_or(u16::MAX);
     let width = area.width.min(78);
     let height = rows.saturating_add(6).min(area.height);
@@ -187,7 +238,7 @@ fn credentials_overlay(f: &mut Frame, area: Rect, status: Option<&str>) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let mut lines: Vec<Line<'static>> = CREDENTIALS_PROMPT
+    let lines: Vec<Line<'static>> = CREDENTIALS_PROMPT
         .iter()
         .map(|l| {
             // The address and the destination path are the two facts a reader
@@ -201,22 +252,48 @@ fn credentials_overlay(f: &mut Frame, area: Rect, status: Option<&str>) {
             Line::from(Span::styled((*l).to_string(), style))
         })
         .collect();
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("    [f]", Style::default().fg(Color::Cyan)),
-        Span::styled(" download it   ", Style::default().fg(Color::Gray)),
-        Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
-        Span::styled(" not now   ", Style::default().fg(Color::Gray)),
-        Span::styled("[q]", Style::default().fg(Color::Cyan)),
-        Span::styled(" quit", Style::default().fg(Color::Gray)),
-    ]));
-    if let Some(status) = status {
-        lines.push(Line::from(Span::styled(
-            format!("    {status}"),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
     f.render_widget(Paragraph::new(lines), inner);
+
+    // A blank line after the prose, then the choices, then whatever the last
+    // attempt had to say. Placed by hand rather than pushed onto the paragraph
+    // because the controls need a rect of their own to register hit boxes in.
+    let dim = Style::default().fg(Color::Gray);
+    let key = Style::default().fg(Color::Cyan);
+    let choices = rows.saturating_add(1);
+    if choices >= inner.height {
+        return; // too short to draw them, so nothing to click either
+    }
+    let line = Rect {
+        y: inner.y.saturating_add(choices),
+        height: 1,
+        ..inner
+    };
+    let mut bar = ControlBar::new(line);
+    bar.label("    [", dim);
+    bar.button("f", Hit::FetchCredentials, key);
+    bar.label("] download it   [", dim);
+    bar.button("Esc", Hit::DeclineCredentials, key);
+    bar.label("] not now   [", dim);
+    bar.button("q", Hit::Quit, key);
+    bar.label("] quit", dim);
+    app.hits.extend(bar.hits.iter().copied());
+    f.render_widget(Paragraph::new(Line::from(bar.spans)), line);
+
+    if let Some(status) = status
+        && choices.saturating_add(1) < inner.height
+    {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("    {status}"),
+                Style::default().fg(Color::Yellow),
+            ))),
+            Rect {
+                y: line.y.saturating_add(1),
+                height: 1,
+                ..inner
+            },
+        );
+    }
 }
 
 /// The first-run consent screen for obtaining a client identity.
@@ -246,104 +323,241 @@ const CREDENTIALS_PROMPT: &[&str] = &[
     "~/.config/priel/credentials.json and restart priel.",
 ];
 
-/// The complete reference, in two columns. The bottom row carries only what is
-/// used constantly; everything else is discoverable from here, which is what
-/// keeps that row short enough to survive a narrow terminal.
-const HELP_LEFT: &[(&str, &[(&str, &str)])] = &[
+/// One line of the reference: the keys it names, and what they do.
+///
+/// A key carries the action it runs, so the reference is not a description of
+/// the interface but the interface itself - clicking `M` here opens the log the
+/// same way pressing `M` does. `None` marks a line that names no action: the
+/// vocabulary of the fidelity badges, and the mouse gestures that have no key.
+struct HelpRow {
+    keys: &'static [(&'static str, Option<Hit>)],
+    what: &'static str,
+}
+
+const fn row(keys: &'static [(&'static str, Option<Hit>)], what: &'static str) -> HelpRow {
+    HelpRow { keys, what }
+}
+
+/// The complete reference, in two columns.
+///
+/// **This is where the mouse reaches everything.** The bottom row carries only
+/// what is used constantly and drops hints as the terminal narrows, and the
+/// header runs out of width too; this overlay is sized to the terminal and is
+/// opened by a `[?]` that is never dropped, so a key that is listed here can be
+/// clicked at any width. That is what lets rarely-used actions stay out of the
+/// competition for space down there without becoming keyboard-only.
+const HELP_LEFT: &[(&str, &[HelpRow])] = &[
     (
         "Views",
         &[
-            ("Tab", "cycle views"),
-            ("1 2 3", "jump to a view"),
-            ("Enter", "open playlist"),
-            ("Esc", "back to playlists"),
-            ("r", "reload this list"),
-            ("M", "recent log messages"),
+            row(&[("Tab", Some(Hit::CycleView))], "cycle views"),
+            row(
+                &[
+                    ("1", Some(Hit::View(View::Favorites))),
+                    ("2", Some(Hit::View(View::Playlists))),
+                    ("3", Some(Hit::View(View::Search))),
+                ],
+                "jump to a view",
+            ),
+            row(&[("Enter", Some(Hit::Enter))], "open playlist"),
+            row(
+                &[("Esc", Some(Hit::View(View::Playlists)))],
+                "back to playlists",
+            ),
+            row(&[("r", Some(Hit::Reload))], "reload this list"),
+            row(&[("M", Some(Hit::Log))], "recent log messages"),
         ],
     ),
     (
         "Move",
         &[
-            ("j k", "move the selection"),
-            ("Down Up", "move the selection"),
-            ("J K", "page down / up"),
-            ("Ctrl-D Ctrl-U", "half page down / up"),
-            ("g G", "first / last row"),
+            row(
+                &[("j", Some(Hit::MoveDown)), ("k", Some(Hit::MoveUp))],
+                "move the selection",
+            ),
+            row(
+                &[("Down", Some(Hit::MoveDown)), ("Up", Some(Hit::MoveUp))],
+                "move the selection",
+            ),
+            row(
+                &[("J", Some(Hit::PageDown)), ("K", Some(Hit::PageUp))],
+                "page down / up",
+            ),
+            row(
+                &[
+                    ("Ctrl-D", Some(Hit::HalfPageDown)),
+                    ("Ctrl-U", Some(Hit::HalfPageUp)),
+                ],
+                "half page down / up",
+            ),
+            row(
+                &[("g", Some(Hit::Top)), ("G", Some(Hit::Bottom))],
+                "first / last row",
+            ),
         ],
     ),
     (
         "Output",
         &[
-            ("D", "the chain to the device"),
-            ("d", "choose the device"),
-            ("x", "exclusive, in the picker"),
-            ("exclusive", "the device is priel's"),
-            ("direct", "the card itself, no mixer"),
-            ("DAC", "live from the device"),
-            ("OUT", "what the server took"),
-            ("bit-perfect", "nothing altered"),
-            ("near", "level changed only"),
-            ("resampled", "rate changed"),
-            ("truncated", "format too narrow"),
-            ("⚠ in D", "the node that did it"),
-            ("permitted", "rates the server may use"),
-            ("0", "restore unity gain"),
+            row(&[("D", Some(Hit::Graph))], "the chain to the device"),
+            row(&[("d", Some(Hit::Devices))], "choose the device"),
+            // The picker carries its own toggle, and `x` outside the picker is
+            // not an action at all, so this line names a key rather than
+            // offering a control that would do nothing where it was clicked.
+            row(&[("x", None)], "exclusive, in the picker"),
+            row(&[("exclusive", None)], "the device is priel's"),
+            row(&[("direct", None)], "the card itself, no mixer"),
+            row(&[("DAC", None)], "live from the device"),
+            row(&[("OUT", None)], "what the server took"),
+            row(&[("bit-perfect", None)], "nothing altered"),
+            row(&[("near", None)], "level changed only"),
+            row(&[("resampled", None)], "rate changed"),
+            row(&[("truncated", None)], "format too narrow"),
+            row(&[("⚠ in D", None)], "the node that did it"),
+            row(&[("permitted", None)], "rates the server may use"),
+            row(&[("0", Some(Hit::VolUnity))], "restore unity gain"),
         ],
     ),
 ];
 
-const HELP_RIGHT: &[(&str, &[(&str, &str)])] = &[
+const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
     (
         "Play",
         &[
-            ("Enter", "play selected track"),
-            ("space", "play / pause"),
-            ("h l", "seek -5s / +5s"),
-            ("L H", "next / previous track"),
-            ("n p", "next / previous track"),
-            ("s", "shuffle this view"),
-            ("+ -", "volume up / down"),
+            row(&[("Enter", Some(Hit::Enter))], "play selected track"),
+            row(&[("space", Some(Hit::PlayPause))], "play / pause"),
+            row(
+                &[("h", Some(Hit::SeekBack)), ("l", Some(Hit::SeekFwd))],
+                "seek -5s / +5s",
+            ),
+            row(
+                &[("L", Some(Hit::Next)), ("H", Some(Hit::Prev))],
+                "next / previous track",
+            ),
+            row(
+                &[("n", Some(Hit::Next)), ("p", Some(Hit::Prev))],
+                "next / previous track",
+            ),
+            row(&[("s", Some(Hit::Shuffle))], "shuffle this view"),
+            row(
+                &[("+", Some(Hit::VolUp)), ("-", Some(Hit::VolDown))],
+                "volume up / down",
+            ),
         ],
     ),
     (
         "Find",
         &[
-            ("/", "filter this list"),
-            ("i", "edit search query"),
-            ("Enter Esc", "accept / cancel"),
+            row(&[("/", Some(Hit::Filter))], "filter this list"),
+            row(&[("i", Some(Hit::EditSearch))], "edit search query"),
+            // Accepting or cancelling what has been typed belongs to the box
+            // being typed in. There is nothing to point at here, and no control
+            // that could stand for a keystroke aimed at a text field.
+            row(&[("Enter", None), ("Esc", None)], "accept / cancel"),
+        ],
+    ),
+    (
+        "Session",
+        &[
+            row(&[("A", Some(Hit::SignIn))], "sign in again"),
+            row(&[("q", Some(Hit::Quit))], "quit priel"),
         ],
     ),
     (
         "Mouse",
         &[
-            ("wheel", "move the selection"),
-            ("double-click", "play a row"),
-            ("click drag", "seek on progress bar"),
-            ("click", "header and hint keys"),
+            // The gestures themselves: these have no key and need none, because
+            // every action they reach is bound above.
+            row(&[("wheel", None)], "move the selection"),
+            row(&[("double-click", None)], "play a row"),
+            row(&[("click drag", None)], "seek on progress bar"),
+            row(&[("click", None)], "any key printed here"),
         ],
     ),
 ];
 
-fn help_lines(sections: &[(&str, &[(&str, &str)])]) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for (title, rows) in sections {
-        if !lines.is_empty() {
-            lines.push(Line::raw(""));
+/// How many lines a column of the reference occupies, blank separators included.
+fn help_height(sections: &[(&str, &[HelpRow])]) -> usize {
+    sections
+        .iter()
+        .map(|(_, rows)| rows.len() + 1)
+        .sum::<usize>()
+        + sections.len().saturating_sub(1)
+}
+
+/// Where the description column starts, in cells from the left of the overlay.
+const HELP_KEY_FIELD: u16 = 16;
+
+/// Draw one column of the reference, registering a hit box for every key that
+/// names an action.
+///
+/// The hit boxes are built in the same left-to-right walk that lays the spans
+/// out, through the same `ControlBar` the header uses, so what was painted and
+/// what is clickable are the same cells. Rows past the bottom of `area` are
+/// neither drawn nor registered: a control clipped off the overlay must not
+/// still answer to a click at the place it would have been.
+fn help_column(
+    f: &mut Frame,
+    area: Rect,
+    sections: &[(&str, &[HelpRow])],
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let end = area.y.saturating_add(area.height);
+    let mut y = area.y;
+    for (i, (title, rows)) in sections.iter().enumerate() {
+        if i > 0 {
+            y = y.saturating_add(1); // a blank line between sections
         }
-        lines.push(Line::from(Span::styled(
-            (*title).to_string(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for (keys, what) in *rows {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {keys:<14}"), Style::default().fg(Color::White)),
-                Span::styled((*what).to_string(), Style::default().fg(Color::DarkGray)),
-            ]));
+        if y >= end {
+            return;
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                (*title).to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Rect {
+                y,
+                height: 1,
+                ..area
+            },
+        );
+        y = y.saturating_add(1);
+        for r in *rows {
+            if y >= end {
+                return;
+            }
+            let line = Rect {
+                y,
+                height: 1,
+                ..area
+            };
+            let mut bar = ControlBar::new(line);
+            bar.label("  ", Style::default());
+            for (n, (key, hit)) in r.keys.iter().enumerate() {
+                if n > 0 {
+                    bar.label(" ", Style::default());
+                }
+                let style = Style::default().fg(Color::White);
+                match hit {
+                    Some(h) => bar.button(*key, *h, style),
+                    None => bar.label(*key, style),
+                }
+            }
+            // Pad to the description column, and never to nothing: a key field
+            // wider than the column must not run into the description.
+            let used = bar.x.saturating_sub(area.x);
+            let pad = usize::from(HELP_KEY_FIELD.saturating_sub(used)).max(1);
+            bar.label(" ".repeat(pad), Style::default());
+            bar.label(r.what, dim);
+            hits.extend(bar.hits.iter().copied());
+            f.render_widget(Paragraph::new(Line::from(bar.spans)), line);
+            y = y.saturating_add(1);
         }
     }
-    lines
 }
 
 /// The recent diagnostics, newest last.
@@ -693,17 +907,22 @@ fn log_line(raw: &str) -> Line<'_> {
     Line::from(Span::styled(text, Style::default().fg(colour)))
 }
 
-fn help_overlay(f: &mut Frame, area: Rect) {
-    let left = help_lines(HELP_LEFT);
-    let right = help_lines(HELP_RIGHT);
+/// The full reference, and the mouse's way to everything in it.
+///
+/// Modal, and the hit boxes it publishes replace the ones the header and the
+/// bottom row registered for this frame - so a click cannot reach a control
+/// underneath it, and every key it prints can be clicked instead of pressed.
+fn help_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    let left = help_height(HELP_LEFT);
+    let right = help_height(HELP_RIGHT);
     let width = area.width.min(84);
     // Two columns need a 14-cell key field plus a description, twice over.
     // Below that, stacking beats clipping every description in half.
     let stacked = width.saturating_sub(2) < 76;
     let rows = if stacked {
-        u16::try_from(left.len() + right.len() + 1).unwrap_or(u16::MAX)
+        u16::try_from(left + right + 1).unwrap_or(u16::MAX)
     } else {
-        u16::try_from(left.len().max(right.len())).unwrap_or(u16::MAX)
+        u16::try_from(left.max(right)).unwrap_or(u16::MAX)
     };
 
     // Fit the terminal rather than assume it: a short window clips the overlay
@@ -724,13 +943,20 @@ fn help_overlay(f: &mut Frame, area: Rect) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
+    // The overlay owns the frame's hit boxes while it is up: the header and the
+    // bottom row registered theirs before this ran, and a click reaching one of
+    // them through a modal overlay is exactly the bug modality prevents.
+    app.hits.clear();
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
     let cols =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(Rect {
-            height: inner.height.saturating_sub(1),
-            ..inner
-        });
-    f.render_widget(Paragraph::new(left), cols[0]);
-    f.render_widget(Paragraph::new(right), cols[1]);
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(body);
+    let mut found = Vec::new();
+    help_column(f, cols[0], HELP_LEFT, &mut found);
+    help_column(f, cols[1], HELP_RIGHT, &mut found);
+    app.hits = found;
 
     if inner.height > 0 {
         f.render_widget(
@@ -841,6 +1067,13 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     };
     bar.button(vol_text, Hit::VolUnity, vol_style);
     bar.button(" + ", Hit::VolUp, button_style());
+    bar.label(" ", Style::default());
+    // Last in the output cluster, because that is what it belongs to: it opens
+    // the picker that decides where these samples go. A bullseye rather than a
+    // speaker: every speaker codepoint is emoji, and an emoji font would paint
+    // it two cells wide while unicode-width calls it one, moving every hit box
+    // after it one cell off what was painted.
+    bar.button(" ◎ ", Hit::Devices, button_style());
     bar.label("  ", Style::default());
 
     if let Some(q) = queue {
@@ -1467,7 +1700,10 @@ fn fmt_hms(secs: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlBar, HINTS, HINTS_ESSENTIAL, button_style, hint_width, push_hints, render};
+    use super::{
+        ControlBar, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, button_style, hint_width,
+        push_hints, render,
+    };
     use crate::app::{App, Hit, Mode, View};
     use crate::worker::{FromWorker, ToWorker};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1540,6 +1776,40 @@ mod tests {
             width,
             height: 1,
         }
+    }
+
+    /// Render a frame and return the cells the control's hit box covers.
+    ///
+    /// The one assertion every clickable control owes: what was painted and what
+    /// is clickable are the same cells. Comparing the two by eye in a frame dump
+    /// is exactly the check that has been missed before.
+    fn painted(app: &mut App, w: u16, h: u16, wanted: Hit) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| render(f, app)).expect("render");
+        let rect = app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == wanted)
+            .map_or_else(|| panic!("{wanted:?} has no hit box"), |(r, _)| *r);
+        let buf = term.backend().buffer().clone();
+        (rect.x..rect.x.saturating_add(rect.width))
+            .map(|x| buf[(x, rect.y)].symbol().to_string())
+            .collect()
+    }
+
+    /// Press a control the way a user would: on its own hit box.
+    fn click_hit(app: &mut App, wanted: Hit) {
+        let rect = app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == wanted)
+            .map_or_else(|| panic!("{wanted:?} has no hit box"), |(r, _)| *r);
+        app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
     }
 
     #[test]
@@ -1866,6 +2136,141 @@ mod tests {
             !out.contains("Hidden Title"),
             "the list should be covered: {out}"
         );
+    }
+
+    #[test]
+    fn every_action_the_reference_names_is_clickable_where_it_was_printed() {
+        // Goal: this overlay is where the mouse reaches what the bottom row has
+        // no width for, so every key that names an action owes a hit box on the
+        // cells it was painted on. Counted rather than sampled: a row added
+        // without a `Hit` would otherwise be a keyboard-only action again.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let wanted: usize = HELP_LEFT
+            .iter()
+            .chain(HELP_RIGHT)
+            .flat_map(|(_, rows)| rows.iter())
+            .flat_map(|r| r.keys.iter())
+            .filter(|(_, h)| h.is_some())
+            .count();
+        let _ = draw(&mut sc.app, 120, 40);
+        assert_eq!(
+            sc.app.hits.len(),
+            wanted,
+            "every action in the reference has to publish a hit box"
+        );
+
+        for (hit, glyph) in [
+            (Hit::Log, "M"),
+            (Hit::Devices, "d"),
+            (Hit::SignIn, "A"),
+            (Hit::EditSearch, "i"),
+            (Hit::PageDown, "J"),
+            (Hit::HalfPageUp, "Ctrl-U"),
+        ] {
+            assert_eq!(
+                painted(&mut sc.app, 120, 40, hit),
+                glyph,
+                "{hit:?} must be clickable on the key it printed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_too_narrow_for_a_control_still_leaves_the_reference() {
+        // Goal: the header runs out of width like any row, and the rule does not
+        // stop being true at 60 columns. What survives every width is the `[?]`
+        // hint, which `push_hints` reserves space for, and the overlay it opens -
+        // where the same action is clickable whatever the header had room for.
+        // That is the whole reason the reference carries hit boxes.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 60, 30);
+        assert!(
+            !sc.app.hits.iter().any(|(_, h)| *h == Hit::Devices),
+            "a control the header could not paint must not answer to a click"
+        );
+        assert!(
+            sc.app.hits.iter().any(|(_, h)| *h == Hit::Help),
+            "but the way to the reference is reserved and cannot be dropped"
+        );
+
+        sc.app.mode = Mode::Help;
+        assert_eq!(
+            painted(&mut sc.app, 60, 30, Hit::Devices),
+            "d",
+            "and the reference still offers the picker at that width"
+        );
+    }
+
+    #[test]
+    fn a_word_the_reference_only_explains_offers_nothing_to_click() {
+        // Goal: half of the Output section is the vocabulary of the badges, not
+        // actions. Making those clickable would promise a control that could not
+        // do anything, so they stay plain - which is also the record of the
+        // judgement that they are not actions.
+        let glossary = HELP_LEFT
+            .iter()
+            .chain(HELP_RIGHT)
+            .flat_map(|(_, rows)| rows.iter())
+            .filter(|r| r.keys.iter().all(|(_, h)| h.is_none()))
+            .count();
+        assert!(
+            glossary >= 12,
+            "the badge vocabulary and the mouse gestures are not actions"
+        );
+    }
+
+    #[test]
+    fn the_reference_takes_the_hit_boxes_over_from_the_row_behind_it() {
+        // Goal: modal means a click cannot reach a control underneath. The header
+        // registers its controls before the overlay draws, so the overlay has to
+        // replace them - otherwise clicking to dismiss would also reload the list
+        // or skip a track.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 120, 40);
+        let under = sc
+            .app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == Hit::Reload)
+            .map_or_else(|| panic!("the header should publish reload"), |(r, _)| *r);
+
+        sc.app.mode = Mode::Help;
+        let _ = draw(&mut sc.app, 120, 40);
+        assert!(
+            !sc.app.hits.iter().any(|(r, _)| r.y == under.y),
+            "nothing on the header's row may still be clickable"
+        );
+
+        sc.app.on_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: under.x,
+            row: under.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(sc.app.mode, Mode::Normal, "the click dismissed instead");
+        assert!(
+            sc.from_app.try_recv().is_err(),
+            "and asked the worker for nothing"
+        );
+    }
+
+    #[test]
+    fn clicking_a_key_in_the_reference_runs_it() {
+        // Goal: the round trip that makes this the mouse's route to everything -
+        // the renderer publishes the key's geometry and the click runs the same
+        // shared method the key press does.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let _ = draw(&mut sc.app, 120, 40);
+        click_hit(&mut sc.app, Hit::Log);
+        assert_eq!(sc.app.mode, Mode::Log, "`M` opens the recent log");
+
+        sc.app.mode = Mode::Help;
+        let _ = draw(&mut sc.app, 120, 40);
+        click_hit(&mut sc.app, Hit::EditSearch);
+        assert_eq!(sc.app.view, View::Search);
+        assert_eq!(sc.app.mode, Mode::Search, "`i` opens the query box");
     }
 
     #[test]
@@ -2565,6 +2970,25 @@ mod tests {
     }
 
     #[test]
+    fn the_output_picker_is_opened_by_a_control_painted_in_the_header() {
+        // Goal: the picker answered to `d` and to nothing at all on screen, which
+        // is the asymmetry the parity rule exists to catch. The control has to be
+        // painted, and its hit box has to be the cells it was painted on.
+        let mut sc = screen();
+        assert_eq!(
+            painted(&mut sc.app, 120, 12, Hit::Devices),
+            " ◎ ",
+            "the hit box must cover the glyph that was drawn"
+        );
+        click_hit(&mut sc.app, Hit::Devices);
+        assert_eq!(
+            sc.app.mode,
+            Mode::Devices,
+            "and clicking it must open the same picker `d` opens"
+        );
+    }
+
+    #[test]
     fn the_reference_lists_the_key_that_takes_the_device() {
         // Goal: the bottom row stays short by keeping everything not used
         // constantly in the `?` overlay, which makes the overlay the only place
@@ -2703,6 +3127,46 @@ mod tests {
     }
 
     #[test]
+    fn the_consent_screens_choices_are_painted_where_a_click_lands() {
+        // Goal: this screen appears before anything else priel does, and it had
+        // three actions and no way to point at any of them. Each key is a
+        // control on the cells it printed, and declining runs the same shared
+        // method `Esc` does.
+        let mut sc = screen();
+        sc.app.set_mode_for_test(Mode::Credentials);
+        for (hit, key) in [
+            (Hit::FetchCredentials, "f"),
+            (Hit::DeclineCredentials, "Esc"),
+            (Hit::Quit, "q"),
+        ] {
+            assert_eq!(painted(&mut sc.app, 100, 30, hit), key);
+        }
+        click_hit(&mut sc.app, Hit::DeclineCredentials);
+        assert_eq!(sc.app.mode, Mode::Normal, "declining continues without it");
+    }
+
+    #[test]
+    fn the_consent_screen_takes_the_hit_boxes_over_from_the_row_behind_it() {
+        // Goal: modal means a click cannot reach a control underneath. The header
+        // is drawn first, so its controls have to be replaced by this screen's.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 100, 30);
+        let header_row = sc
+            .app
+            .hits
+            .iter()
+            .map(|(r, _)| r.y)
+            .min()
+            .expect("the header should publish controls");
+        sc.app.set_mode_for_test(Mode::Credentials);
+        let _ = draw(&mut sc.app, 100, 30);
+        assert!(
+            !sc.app.hits.iter().any(|(r, _)| r.y == header_row),
+            "nothing behind the consent screen may still be clickable"
+        );
+    }
+
+    #[test]
     fn the_consent_screen_fits_a_modest_terminal() {
         // Goal: a wall of text that overflows is a wall of text nobody reads.
         for (w, h) in [(80u16, 30u16), (96, 34), (120, 40)] {
@@ -2734,6 +3198,47 @@ mod tests {
         let path = dir.join("credentials.json");
         std::fs::write(&path, r#"{"client_id":"cid","client_secret":"sec"}"#).expect("write");
         path.to_str().expect("path").to_string()
+    }
+
+    #[test]
+    fn the_sign_in_screens_actions_are_painted_where_a_click_lands() {
+        // Goal: four actions, none of which could be pointed at. Each is a
+        // control on the cells its key printed, and cancelling runs the same
+        // shared method `Esc` does.
+        let mut sc = screen();
+        signing_in(&mut sc);
+        for (hit, key) in [
+            (Hit::SubmitLogin, "Enter"),
+            (Hit::ReopenBrowser, "Ctrl-O"),
+            (Hit::ClearPaste, "Ctrl-U"),
+            (Hit::CancelLogin, "Esc"),
+        ] {
+            assert_eq!(painted(&mut sc.app, 88, 24, hit), key);
+        }
+        click_hit(&mut sc.app, Hit::CancelLogin);
+        assert_eq!(sc.app.mode, Mode::Normal);
+        assert!(sc.app.login().is_none(), "and drops the flow with it");
+    }
+
+    #[test]
+    fn the_sign_in_screen_takes_the_hit_boxes_over_from_the_row_behind_it() {
+        // Goal: modal means a click cannot reach a control underneath, and this
+        // screen covers a header whose controls were registered before it drew.
+        let mut sc = screen();
+        let _ = draw(&mut sc.app, 88, 24);
+        let header_row = sc
+            .app
+            .hits
+            .iter()
+            .map(|(r, _)| r.y)
+            .min()
+            .expect("the header should publish controls");
+        signing_in(&mut sc);
+        let _ = draw(&mut sc.app, 88, 24);
+        assert!(
+            !sc.app.hits.iter().any(|(r, _)| r.y == header_row),
+            "nothing behind the sign-in screen may still be clickable"
+        );
     }
 
     #[test]

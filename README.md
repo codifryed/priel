@@ -167,21 +167,23 @@ interface with playback stubbed out.
 
 ## Keys & mouse
 
-Press `?` in the app for the complete reference. Every key listed in the bottom
-row of the interface is also clickable.
+Every action has a key binding and something to point at; parity runs both ways.
+Every key listed in the bottom row of the interface is clickable, and so is
+every key listed in the `?` reference — that overlay is priel's menu, which is
+how the rarely-used actions stay off a bottom row narrow terminals would clip.
 
 | Action | Keyboard | Mouse |
 |---|---|---|
 | Full key reference | `?` | click `[?]` |
-| Recent log messages | `M` | scroll to page back |
-| Audio graph to the device | `D` | click `[D]` |
-| Choose the output device | `d` | click a row in the picker |
+| Recent log messages | `M` | `[?]`, then `M` |
+| Audio graph to the device | `D` | click `[D]`, or `[?]` then `D` |
+| Choose the output device | `d` | click `◎`, then a row in the picker |
 | Exclusive output on/off | `x` in the picker | click the toggle |
-| Sign in again | `A` | — |
+| Sign in again | `A` | `[?]`, then `A` |
 | Switch view | `Tab` cycles, `1`/`2`/`3` | click a tab |
 | Move selection | `j`/`k`, `↑`/`↓` | scroll wheel |
 | First / last | `g` / `G` | click `[g/G]` |
-| Page up/down | `J`/`K` full, `Ctrl-U`/`Ctrl-D` half | — |
+| Page up/down | `J`/`K` full, `Ctrl-U`/`Ctrl-D` half | `[?]`, then the same keys |
 | Open playlist / back | `Enter` / `Esc` | double-click |
 | Play selected | `Enter` | double-click a row |
 | Play / pause | `Space` | click `▷` / `‖` |
@@ -189,11 +191,15 @@ row of the interface is also clickable.
 | Previous / next track | `H`/`L`, or `p`/`n` | click `|◁` / `▷|` |
 | Filter the current list | `/`, type, `Enter`/`Esc` | click `[/]` |
 | Reload the current list | `r` | click `↻` |
-| Search the catalogue | `3`, type, `Enter`; `i` to re-edit | — |
+| Search the catalogue | `3`, type, `Enter`; `i` to re-edit | click the `3` tab; `[?]` then `i` |
 | Shuffle the current view | `s` | click `⇄` |
 | Volume | `+` / `-` | click `-` / `+` |
 | Restore unity gain | `0` | click the percentage |
 | Quit | `q` | click `[q]` |
+
+Typing is the one thing the mouse is not asked to do: the filter box, the search
+query and the pasted sign-in address are text, so the keys that accept or cancel
+them belong to the box being typed in and have no control of their own.
 
 `Esc` cancels: it leaves a filter or search box, and steps back out of an opened
 playlist. It never quits.

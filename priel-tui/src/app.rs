@@ -52,9 +52,27 @@ pub enum View {
     Search,
 }
 
-/// A clickable region recorded by the renderer. Mouse support is a headline
-/// feature, so every control that has a key binding also has a hit box: the
+/// A clickable region recorded by the renderer.
+///
+/// Parity runs both ways: every action has a VIM-style key binding *and* a hit
+/// box, so this enum is the list of everything priel can be asked to do. The
 /// renderer knows the geometry, and only the renderer should have to.
+///
+/// Three things deliberately have no variant here, and saying so is the point -
+/// an admitted gap beats a silent one:
+///
+/// - **Typing.** The filter box, the search query and the pasted sign-in address
+///   are text, and the keys that edit, accept or cancel them belong to the box
+///   being typed in. A button standing for a keystroke aimed at a text field
+///   would be a control that could not do what it named.
+/// - **Scroll positions.** `g`, `G`, `J`, `K` and the half-page pair name
+///   *distances*, not destinations the mouse cannot otherwise reach: the wheel
+///   moves the same selection and a click lands on any row directly. They are
+///   listed in the reference all the same, and clickable there, so the keyboard
+///   idiom is never the only route.
+/// - **`x` outside the output picker.** Exclusivity is a property of the picker
+///   and the picker draws its own toggle. A control for it anywhere else would
+///   do nothing where it was clicked.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
     View(View),
@@ -65,17 +83,38 @@ pub enum Hit {
     SeekFwd,
     MoveUp,
     MoveDown,
+    HalfPageUp,
+    HalfPageDown,
+    PageUp,
+    PageDown,
     Top,
     Bottom,
+    Enter,
     Shuffle,
     VolUp,
     VolDown,
     VolUnity,
     Filter,
+    EditSearch,
     Reload,
     CycleView,
     Help,
+    Log,
     Graph,
+    Devices,
+    SignIn,
+    /// Download a client identity, from the first-run consent screen.
+    FetchCredentials,
+    /// Carry on without one, from the same screen.
+    DeclineCredentials,
+    /// Hand the pasted redirect back for a session, from the sign-in screen.
+    SubmitLogin,
+    /// Open the authorization page again, from the same screen.
+    ReopenBrowser,
+    /// Empty the paste box, from the same screen.
+    ClearPaste,
+    /// Abandon the sign-in.
+    CancelLogin,
     Quit,
 }
 
@@ -714,31 +753,45 @@ impl App {
         }
     }
 
+    /// Open the authorization page again.
+    ///
+    /// The one way in: `Ctrl-O` and the screen's own control both come through
+    /// here, as with the three below. A browser that was closed, or never
+    /// opened because there is no desktop session, is the whole reason this is
+    /// an action rather than something that only happens once.
+    fn reopen_browser(&self) {
+        if let Some(flow) = &self.login {
+            open_in_browser(&flow.url);
+        }
+    }
+
+    /// Empty the paste box and forget what the last attempt said about it.
+    fn clear_paste(&mut self) {
+        if let Some(flow) = self.login.as_mut() {
+            flow.pasted.clear();
+            flow.status = None;
+        }
+    }
+
+    /// Abandon the sign-in, dropping the flow with it.
+    fn cancel_login(&mut self) {
+        self.login = None;
+        self.mode = Mode::Normal;
+    }
+
     fn on_key_login(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 // Letters go into the pasted text, so the actions take a
                 // modifier rather than stealing characters from a URL.
-                KeyCode::Char('o') => {
-                    if let Some(flow) = &self.login {
-                        open_in_browser(&flow.url);
-                    }
-                }
-                KeyCode::Char('u') => {
-                    if let Some(flow) = self.login.as_mut() {
-                        flow.pasted.clear();
-                        flow.status = None;
-                    }
-                }
+                KeyCode::Char('o') => self.reopen_browser(),
+                KeyCode::Char('u') => self.clear_paste(),
                 _ => {}
             }
             return;
         }
         match key.code {
-            KeyCode::Esc => {
-                self.login = None;
-                self.mode = Mode::Normal;
-            }
+            KeyCode::Esc => self.cancel_login(),
             KeyCode::Enter => self.submit_login(),
             KeyCode::Backspace => {
                 if let Some(flow) = self.login.as_mut() {
@@ -844,12 +897,20 @@ impl App {
         }
     }
 
+    /// Carry on without downloading a client identity.
+    ///
+    /// The one way out that is not quitting: `Esc`, `Enter` and the screen's own
+    /// "not now" control all come through here.
+    fn decline_credentials(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
     /// The consent screen is modal: nothing reaches the list behind it.
     fn on_key_credentials(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('f') => self.fetch_credentials(),
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
+            KeyCode::Esc | KeyCode::Enter => self.decline_credentials(),
             _ => {}
         }
     }
@@ -1522,6 +1583,21 @@ impl App {
         }
     }
 
+    /// Put the cursor in the search box, going to that view first if need be.
+    ///
+    /// The one way in: `i` and the `i` control in the reference overlay both
+    /// come through here. Not guarded by the current view, because a control the
+    /// mouse could reach only from one screen would be an action the keyboard
+    /// had a shorter route to than the mouse - the asymmetry, backwards. Already
+    /// on the search view it only reopens the box, leaving the results and the
+    /// selection where they were.
+    fn edit_search(&mut self) {
+        if self.view != View::Search {
+            self.switch_view(View::Search);
+        }
+        self.mode = Mode::Search;
+    }
+
     fn cycle_view(&mut self) {
         let next = match self.view {
             View::Favorites => View::Playlists,
@@ -1774,6 +1850,17 @@ impl App {
         }
     }
 
+    /// Open the recent diagnostics.
+    ///
+    /// The one way in: `M` and the `M` control in the reference overlay both
+    /// come through here, so the two cannot drift apart. Always opens on the
+    /// newest line - the reason for opening this is almost always something that
+    /// just happened.
+    fn open_log(&mut self) {
+        self.mode = Mode::Log;
+        self.log_scroll = 0;
+    }
+
     /// The log overlay: modal like the help one, and scrolled like every list.
     ///
     /// A second scrolling idiom would be its own bug, so j/k and g/G mean here
@@ -1912,8 +1999,8 @@ impl App {
 
     /// Open the output picker, asking for a fresh list as it opens.
     ///
-    /// The one way in: the key and the hint click both come through here, so the
-    /// two cannot drift apart.
+    /// The one way in: `d` and the header's `◎` control both come through here,
+    /// so the two cannot drift apart.
     fn open_devices(&mut self) {
         self.mode = Mode::Devices;
         self.device_offset = 0;
@@ -2205,8 +2292,7 @@ impl App {
             KeyCode::Char('1') => self.switch_view(View::Favorites),
             KeyCode::Char('2') => self.switch_view(View::Playlists),
             KeyCode::Char('3') => self.switch_view(View::Search),
-            // Re-edit the search query while in the Search view.
-            KeyCode::Char('i') if self.view == View::Search => self.mode = Mode::Search,
+            KeyCode::Char('i') => self.edit_search(),
             KeyCode::Char('j') | KeyCode::Down => self.move_down(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(1),
             KeyCode::Char('J') => self.move_down(self.full_page()),
@@ -2214,12 +2300,7 @@ impl App {
             KeyCode::Char('g') => self.goto_top(),
             KeyCode::Char('G') => self.goto_bottom(),
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('M') => {
-                self.mode = Mode::Log;
-                // Always open on the newest line: the reason for opening this is
-                // almost always something that just happened.
-                self.log_scroll = 0;
-            }
+            KeyCode::Char('M') => self.open_log(),
             KeyCode::Char('D') => self.open_graph(),
             KeyCode::Char('d') => self.open_devices(),
             KeyCode::Char('A') => self.start_login(),
@@ -2241,7 +2322,18 @@ impl App {
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
         if matches!(self.mode, Mode::Credentials | Mode::Login) {
-            return; // these screens take no mouse input
+            // These two offer controls rather than a way out, and are the one
+            // place a click off a control means nothing at all: a stray click is
+            // not consent to download a credential, and not an abandoned
+            // sign-in. Both screens replace the frame's hit boxes with their
+            // own, so nothing behind them can be reached from here either.
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(h) = self.hit_at(m.column, m.row)
+            {
+                self.dispatch(h);
+                self.dirty = true;
+            }
+            return;
         }
         if self.mode == Mode::Log {
             match m.kind {
@@ -2290,9 +2382,20 @@ impl App {
             return;
         }
         if self.mode == Mode::Help {
-            // Any click dismisses; scrolling the list behind it would be odd.
+            // The reference is priel's menu: every key it lists is a control, so
+            // a click that lands on one runs it and anything else just
+            // dismisses. Either way the overlay closes, and the mode is put back
+            // *before* dispatching so an action that opens another overlay is
+            // not closed again by its own click. The renderer replaces the hit
+            // boxes with the overlay's own while it is up, so nothing behind it
+            // can be reached from here. Scrolling the list behind it would be
+            // odd, so only a click is answered.
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let landed = self.hit_at(m.column, m.row);
                 self.mode = Mode::Normal;
+                if let Some(h) = landed {
+                    self.dispatch(h);
+                }
                 self.dirty = true;
             }
             return;
@@ -2322,28 +2425,47 @@ impl App {
             Hit::SeekFwd => self.player.seek_relative(5.0),
             Hit::MoveUp => self.move_up(1),
             Hit::MoveDown => self.move_down(1),
+            Hit::HalfPageUp => self.move_up(self.half_page()),
+            Hit::HalfPageDown => self.move_down(self.half_page()),
+            Hit::PageUp => self.move_up(self.full_page()),
+            Hit::PageDown => self.move_down(self.full_page()),
             Hit::Top => self.goto_top(),
             Hit::Bottom => self.goto_bottom(),
+            Hit::Enter => self.on_enter(),
             Hit::Shuffle => self.toggle_shuffle(),
             Hit::VolUp => self.volume_step(5.0),
             Hit::VolDown => self.volume_step(-5.0),
             Hit::VolUnity => self.volume_unity(),
             Hit::Filter => self.start_filter(),
+            Hit::EditSearch => self.edit_search(),
             Hit::Reload => self.reload_view(),
             Hit::CycleView => self.cycle_view(),
             Hit::Help => self.mode = Mode::Help,
+            Hit::Log => self.open_log(),
             Hit::Graph => self.open_graph(),
+            Hit::Devices => self.open_devices(),
+            Hit::SignIn => self.start_login(),
+            Hit::FetchCredentials => self.fetch_credentials(),
+            Hit::DeclineCredentials => self.decline_credentials(),
+            Hit::SubmitLogin => self.submit_login(),
+            Hit::ReopenBrowser => self.reopen_browser(),
+            Hit::ClearPaste => self.clear_paste(),
+            Hit::CancelLogin => self.cancel_login(),
             Hit::Quit => self.should_quit = true,
         }
     }
 
-    fn on_click(&mut self, col: u16, row: u16) {
-        if let Some(h) = self
-            .hits
+    /// The control under the pointer, if any. The renderer rebuilds `hits` every
+    /// frame, so this only ever answers with something currently on screen.
+    fn hit_at(&self, col: u16, row: u16) -> Option<Hit> {
+        self.hits
             .iter()
             .find(|(r, _)| hit(*r, col, row))
             .map(|(_, h)| *h)
-        {
+    }
+
+    fn on_click(&mut self, col: u16, row: u16) {
+        if let Some(h) = self.hit_at(col, row) {
             self.dispatch(h);
             return;
         }
@@ -5656,9 +5778,13 @@ mod tests {
     }
 
     #[test]
-    fn a_click_dismisses_the_reference_without_activating_anything() {
-        // Goal: clicking to dismiss must not also press whatever control sits
-        // under the pointer.
+    fn a_click_on_the_reference_runs_the_key_it_landed_on_and_closes() {
+        // Goal: the reference is priel's menu, so a click on one of its keys must
+        // run that key rather than merely dismiss - that is the mouse's route to
+        // everything the bottom row has no width for. A click on nothing still
+        // just dismisses. That the keys under the pointer belong to the overlay
+        // and never to the header behind it is the renderer's half of this, and
+        // is asserted in `ui`.
         let mut r = rig();
         r.app.hits = vec![(
             Rect {
@@ -5671,8 +5797,13 @@ mod tests {
         )];
         r.app.on_key(key('?'));
         r.app.on_mouse(click(1, 0));
+        assert_eq!(r.app.mode, Mode::Normal, "the overlay closes either way");
+        assert!(r.app.shuffle, "and the key it landed on ran");
+
+        r.app.on_key(key('?'));
+        r.app.on_mouse(click(40, 20));
         assert_eq!(r.app.mode, Mode::Normal);
-        assert!(!r.app.shuffle, "the click was consumed by the overlay");
+        assert!(r.app.shuffle, "a click on nothing changes nothing else");
     }
 
     // ---- redraw gating ----
@@ -5768,6 +5899,14 @@ mod tests {
             app.on_mouse(click(1, 0));
         };
 
+        // A page is measured from the list rect the renderer published.
+        r.app.list_inner = Rect {
+            x: 0,
+            y: 1,
+            width: 40,
+            height: 2,
+        };
+
         fire(&mut r.app, Hit::MoveDown);
         assert_eq!(r.app.selected, 1);
         fire(&mut r.app, Hit::Bottom);
@@ -5775,6 +5914,15 @@ mod tests {
         fire(&mut r.app, Hit::MoveUp);
         assert_eq!(r.app.selected, 3);
         fire(&mut r.app, Hit::Top);
+        assert_eq!(r.app.selected, 0);
+
+        fire(&mut r.app, Hit::PageDown);
+        assert_eq!(r.app.selected, 2, "a full page is the list's height");
+        fire(&mut r.app, Hit::HalfPageDown);
+        assert_eq!(r.app.selected, 3, "and half of it is rounded up to one");
+        fire(&mut r.app, Hit::HalfPageUp);
+        assert_eq!(r.app.selected, 2);
+        fire(&mut r.app, Hit::PageUp);
         assert_eq!(r.app.selected, 0);
 
         fire(&mut r.app, Hit::Shuffle);
@@ -5787,6 +5935,23 @@ mod tests {
         assert_eq!(r.app.mode, Mode::Filter);
         fire(&mut r.app, Hit::Help);
         assert_eq!(r.app.mode, Mode::Help);
+        fire(&mut r.app, Hit::Devices);
+        assert_eq!(r.app.mode, Mode::Devices);
+        fire(&mut r.app, Hit::Graph);
+        assert_eq!(r.app.mode, Mode::Graph);
+        fire(&mut r.app, Hit::Log);
+        assert_eq!(r.app.mode, Mode::Log);
+        fire(&mut r.app, Hit::EditSearch);
+        assert_eq!(r.app.view, View::Search);
+        assert_eq!(r.app.mode, Mode::Search);
+        r.app.view = View::Favorites;
+        r.app.selected = 2;
+        fire(&mut r.app, Hit::Enter);
+        assert_eq!(
+            r.app.now_playing.as_ref().map(|t| t.id),
+            Some(3),
+            "Enter plays the row the selection is on"
+        );
 
         // These reach the player rather than app state; with a silent player the
         // observable part is that they are accepted without panicking.
@@ -5802,8 +5967,50 @@ mod tests {
             fire(&mut r.app, h);
         }
 
+        fire(&mut r.app, Hit::SignIn);
+        assert_eq!(
+            r.app.mode,
+            Mode::Normal,
+            "no client identity, so nowhere to sign in to - but it is wired"
+        );
+
         fire(&mut r.app, Hit::Quit);
         assert!(r.app.should_quit);
+    }
+
+    #[test]
+    fn every_control_on_the_two_modal_screens_dispatches_to_a_real_action() {
+        // Goal: the consent and sign-in screens took no mouse input at all, so
+        // their controls are the newest and the least exercised. A rigged app has
+        // no client identity and no flow in progress, so what this asserts is
+        // that each is wired to a method rather than to nothing - and that the
+        // two that leave a screen do leave it.
+        let mut r = rig();
+        let press = |app: &mut App, mode: Mode, h: Hit| {
+            app.set_mode_for_test(mode);
+            app.hits = vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                },
+                h,
+            )];
+            app.on_mouse(click(1, 0));
+        };
+
+        press(&mut r.app, Mode::Credentials, Hit::FetchCredentials);
+        assert!(r.app.credential_status().is_none(), "nowhere to save it to");
+        press(&mut r.app, Mode::Credentials, Hit::DeclineCredentials);
+        assert_eq!(r.app.mode, Mode::Normal, "not now continues without it");
+
+        for h in [Hit::SubmitLogin, Hit::ReopenBrowser, Hit::ClearPaste] {
+            press(&mut r.app, Mode::Login, h);
+            assert_eq!(r.app.mode, Mode::Login, "these all stay on the screen");
+        }
+        press(&mut r.app, Mode::Login, Hit::CancelLogin);
+        assert_eq!(r.app.mode, Mode::Normal, "cancelling leaves it");
     }
 
     #[test]
@@ -5992,13 +6199,27 @@ mod tests {
     }
 
     #[test]
-    fn the_consent_screen_ignores_the_mouse() {
+    fn only_a_click_on_one_of_the_consent_screens_choices_answers_it() {
         // Goal: every other overlay is dismissed by a click. This one is not:
-        // a stray click must not be read as consent to download a credential.
+        // a stray click must not be read as consent to download a credential,
+        // nor as declining. Only a click that lands on one of its own controls
+        // answers, and it runs the same shared method the key does.
         let mut r = rig();
         r.app.set_mode_for_test(Mode::Credentials);
         r.app.on_mouse(click(1, 1));
         assert_eq!(r.app.mode, Mode::Credentials, "a click is not consent");
+
+        r.app.hits = vec![(
+            Rect {
+                x: 0,
+                y: 1,
+                width: 3,
+                height: 1,
+            },
+            Hit::DeclineCredentials,
+        )];
+        r.app.on_mouse(click(1, 1));
+        assert_eq!(r.app.mode, Mode::Normal, "but pointing at `not now` does");
     }
 
     #[test]
