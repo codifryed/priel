@@ -402,12 +402,16 @@ const HELP_LEFT: &[(&str, &[HelpRow])] = &[
     (
         "Output",
         &[
-            row(&[("D", Some(Hit::Graph))], "the chain to the device"),
+            row(&[("D", Some(Hit::Graph))], "the output report"),
             row(&[("d", Some(Hit::Devices))], "choose the device"),
             // The picker carries its own toggle, and `x` outside the picker is
             // not an action at all, so this line names a key rather than
             // offering a control that would do nothing where it was clicked.
             row(&[("x", None)], "exclusive, in the picker"),
+            // Last of the actions, and deliberately above the glossary below
+            // it: a short terminal clips this column from the bottom, and what
+            // it may take is a word being explained, never a control.
+            row(&[("0", Some(Hit::VolUnity))], "restore unity gain"),
             row(&[("exclusive", None)], "the device is priel's"),
             row(&[("direct", None)], "the card itself, no mixer"),
             row(&[("DAC", None)], "live from the device"),
@@ -416,9 +420,13 @@ const HELP_LEFT: &[(&str, &[HelpRow])] = &[
             row(&[("near", None)], "level changed only"),
             row(&[("resampled", None)], "rate changed"),
             row(&[("truncated", None)], "format too narrow"),
+            // The mark decision nine turns on: a stage that cannot exist is
+            // fully evidenced, so this appears only where one that could exist
+            // went unread.
+            row(&[("✓?", None)], "a stage went unread"),
+            row(&[("sink", None)], "the shared output level"),
             row(&[("⚠ in D", None)], "the node that did it"),
             row(&[("permitted", None)], "rates the server may use"),
-            row(&[("0", Some(Hit::VolUnity))], "restore unity gain"),
         ],
     ),
 ];
@@ -2601,7 +2609,7 @@ mod tests {
         let mut sc = screen();
         sc.app.mode = Mode::Help;
         let out = text(&mut sc.app, 100, 30);
-        assert!(out.contains("the chain to the device"), "{out}");
+        assert!(out.contains("the output report"), "{out}");
     }
 
     #[test]
