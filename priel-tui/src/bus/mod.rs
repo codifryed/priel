@@ -28,4 +28,5 @@
 //! decides no policy: what to publish, and which actions the bus may reach, is
 //! decided above it.
 
+pub(crate) mod conn;
 pub(crate) mod wire;
