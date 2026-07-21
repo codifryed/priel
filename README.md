@@ -337,11 +337,17 @@ clickable, whichever box has the keyboard.
 **A repeating queue has no end, so the radio never fires while `e` is on**, and
 the `∞` control goes dark to say so rather than claiming something that will not
 happen. Neither toggle changes the other: turn the repeat off and the radio is
-exactly as you left it. With the shuffle on, repeat-all *is* the shuffle — a
-random walk already never runs out, so there is no end to start again from, and
-forcing an ordered wrap would turn the shuffle off at one place in the queue.
-Repeat-one outranks the shuffle instead, because there is no next track to pick
-at random when the answer is this one again. In a queue of one track the two
+exactly as you left it.
+
+**The shuffle says what the play order is; the repeat says whether that order
+ends.** Repeat-one outranks the shuffle, because there is no next track to pick
+when the answer is this one again. Repeat-all defers to it: today the shuffle
+picks afresh on every advance rather than laying out an order, so it never runs
+out and there is no end for repeat-all to start again from — with the shuffle on,
+repeat-all changes nothing. That is a consequence of the shuffle having no order
+yet, not a rule of its own. Once it has one, the end of that order is exactly
+where repeat-all starts it again instead of stopping, and nothing about the
+repeat has to change to mean that. In a queue of one track the two
 repeat states are the same thing, deliberately. A repeat is answered at the next
 preload, so pressing `e` while a track plays takes effect at the end of it: the
 entry after this one is already in mpv's playlist, and a second path into that

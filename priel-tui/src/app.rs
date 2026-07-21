@@ -2900,29 +2900,40 @@ impl App {
     /// else had already gone wrong. `repeat` is an argument rather than read
     /// from `self` because a skip asks a different question: see
     /// [`Repeat::skipped`].
+    ///
+    /// **The shuffle says what the play order is; the repeat says whether that
+    /// order ends.** The two are answers to different questions, which is what
+    /// keeps this readable as the shuffle changes shape underneath it.
     fn next_pos(&self, repeat: Repeat) -> Option<usize> {
         if self.queue.is_empty() {
             return None;
         }
-        // Repeat-one is about *this* track, so it outranks the shuffle: there is
-        // no next track to pick at random when the answer is "this one again".
+        // Repeat-one is about *this* track, so it outranks the shuffle under
+        // either shape: there is no next track to pick when the answer is "this
+        // one again".
         if repeat == Repeat::One {
             return Some(self.queue_pos);
         }
-        // A random walk already never runs out, so there is no end for
-        // repeat-all to start again from: with the shuffle on, the two agree
-        // here deliberately. Forcing an ordered wrap instead would turn the
-        // shuffle off in all but name at exactly one place in the queue.
+        // The shuffle's own answer to "what next?".
+        //
+        // Today it is a fresh pick on every advance rather than an order, so it
+        // never runs out and there is no end for repeat-all to start again from:
+        // with the shuffle on, repeat-all changes nothing, and that is the
+        // consequence of the shuffle having no order rather than a rule of its
+        // own. When the shuffle gains a real order, an exhausted order returns
+        // `None` from here and falls through to the same repeat question the
+        // ordered end below asks. Nothing about repeat-all changes then - only
+        // whether that branch is ever reached.
         if self.shuffle {
             return Some(self.rand_other());
         }
         if self.queue_pos + 1 < self.queue.len() {
             return Some(self.queue_pos + 1);
         }
-        // The ordered end of the queue. Repeat-all starts it again - and in a
-        // queue of one that lands on the track already playing, which is what
-        // makes repeat-all and repeat-one the same thing there on purpose
-        // rather than by accident.
+        // The end of the order. Repeat-all starts it again - and in a queue of
+        // one that lands on the track already playing, which is what makes
+        // repeat-all and repeat-one the same thing there on purpose rather than
+        // by accident.
         (repeat == Repeat::All).then_some(0)
     }
 
@@ -9366,11 +9377,15 @@ mod tests {
 
     #[test]
     fn repeat_one_outranks_the_shuffle_and_repeat_all_defers_to_it() {
-        // Goal: the two interactions worth writing down. Repeat-one is about
-        // *this* track, so there is no next track for the shuffle to pick.
-        // Repeat-all with the shuffle on is the shuffle: a random walk already
-        // never runs out, so there is no end to start again from, and forcing an
-        // ordered wrap would turn the shuffle off in all but name.
+        // Goal: the two interactions worth writing down. The shuffle says what
+        // the play order is and the repeat says whether it ends, so repeat-one
+        // outranks the shuffle - there is no next track to pick when the answer
+        // is this one again - and repeat-all defers to it, because a shuffle
+        // that picks afresh on every advance has no end to start again from.
+        // That second half is a consequence of today's shuffle having no order
+        // at all, not a rule of its own: give the shuffle a real order and its
+        // exhausted case falls through to the same repeat question the ordered
+        // end asks. This test asserts the shape that holds either way.
         let mut r = rig();
         r.app.queue = (1..=4).map(|i| track(i, "T", "A")).collect();
         r.app.queue_pos = 2;
