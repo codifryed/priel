@@ -2259,8 +2259,10 @@ fn push_heart(bar: &mut ControlBar, app: &App, t: &Theme) {
 )]
 fn progress_bar(app: &App, t: &Theme) -> Gauge<'static> {
     let s = &app.status;
-    let ratio = if s.duration > 0.0 {
-        (s.position / s.duration).clamp(0.0, 1.0)
+    // The listing's length, never mpv's estimate; see `App::duration`.
+    let total = app.duration();
+    let ratio = if total > 0.0 {
+        (s.position / total).clamp(0.0, 1.0)
     } else {
         0.0
     };
@@ -2270,7 +2272,7 @@ fn progress_bar(app: &App, t: &Theme) -> Gauge<'static> {
         .label(format!(
             "{} / {}",
             fmt_dur(s.position as u32),
-            fmt_dur(s.duration as u32)
+            fmt_dur(total as u32)
         ))
 }
 
@@ -4845,7 +4847,11 @@ mod tests {
         for (w, h) in [(80u16, 24u16), (WIDE_COLS, 30)] {
             let mut sc = screen();
             sc.app.now_playing = Some(track(1, "Blue in Green"));
-            sc.app.status.duration = 200.0;
+            // The listing's length is what a seek is a fraction of, so the
+            // track says 200s and mpv is left believing something else - which
+            // is the ordinary state of a stream whose size is not advertised.
+            sc.app.now_playing.as_mut().expect("just set").duration_secs = 200;
+            sc.app.status.duration = 70.0;
 
             let bar = painted_bar(&mut sc.app, w, h);
             assert!(
@@ -6969,6 +6975,29 @@ mod tests {
         let boxes = out.get(1).map_or(String::new(), Clone::clone);
         assert!(boxes.starts_with('┌'), "{boxes:?}");
         assert!(!boxes.contains('┏'), "{boxes:?}");
+    }
+
+    #[test]
+    fn the_total_time_is_the_track_length_not_what_mpv_has_demuxed_so_far() {
+        // Goal: the segment protocol advertises no size until the whole track
+        // has downloaded - `size` answers -1 while `total` is None - so mpv has
+        // an unknown-length stream and estimates the duration from what it has
+        // demuxed. That estimate grows as bytes arrive, so the total time was
+        // counting up beside the position. The listing already carries the real
+        // length, and the bus has been reporting it correctly all along.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "Something"));
+        sc.app.now_playing.as_mut().expect("just set").duration_secs = 245;
+        sc.app.status.playing = true;
+        sc.app.status.position = 61.0;
+        // What mpv believes so far, a fraction of the truth.
+        sc.app.status.duration = 70.0;
+
+        let out = text(&mut sc.app, 130, 12);
+        assert!(
+            out.contains("1:01 / 4:05"),
+            "the track is 4:05 however little of it has arrived: {out}"
+        );
     }
 
     #[test]

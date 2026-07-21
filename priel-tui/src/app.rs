@@ -4385,15 +4385,35 @@ impl App {
         }
     }
 
+    /// How long the playing track is, in seconds.
+    ///
+    /// **The listing's figure, not mpv's.** The segment protocol advertises no
+    /// size until the download finishes - `size` answers -1 while `total` is
+    /// `None` - so mpv has an unknown-length stream and estimates the duration
+    /// from what it has demuxed. That estimate *grows*, which had the total time
+    /// counting up beside the position and, worse, had a click near the end of
+    /// the bar seeking to a fraction of a length that was not the track's.
+    ///
+    /// mpv's figure is the fallback, for a source whose length it does know and
+    /// for a track the listing never described.
+    #[must_use]
+    pub fn duration(&self) -> f64 {
+        match &self.now_playing {
+            Some(t) if t.duration_secs > 0 => f64::from(t.duration_secs),
+            _ => self.status.duration,
+        }
+    }
+
     /// The position a pointer at column `col` names, or `None` when there is no
     /// bar on screen or no track to seek within.
     fn seek_target(&self, col: u16) -> Option<f64> {
         let pr = self.progress_rect;
-        if pr.width == 0 || self.status.duration <= 0.0 {
+        let total = self.duration();
+        if pr.width == 0 || total <= 0.0 {
             return None;
         }
         let rel = f64::from(col.saturating_sub(pr.x)) / f64::from(pr.width);
-        Some(rel.clamp(0.0, 1.0) * self.status.duration)
+        Some(rel.clamp(0.0, 1.0) * total)
     }
 
     fn seek_to_x(&self, col: u16) {
