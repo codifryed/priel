@@ -87,9 +87,11 @@ check: fmt-check lint test-all ## Everything CI runs; the gate before a commit
 # survived for a day. This target names that case and says where the evidence
 # already is.
 check-signals: ## Run the suite and say plainly if a test binary was killed
-	@set -o pipefail; $(CARGO) test $(CARGO_FLAGS) --workspace 2>&1 | tee /tmp/priel-check.log; \
+	@set -o pipefail; log=$$(mktemp -t priel-check.XXXXXXXXXX) || exit 1; \
+	trap 'rm -f "$$log"' EXIT INT TERM; \
+	$(CARGO) test $(CARGO_FLAGS) --workspace 2>&1 | tee "$$log"; \
 	status=$$?; \
-	if grep -qE "signal: [0-9]+|SIGSEGV|SIGABRT|SIGILL|SIGBUS" /tmp/priel-check.log; then \
+	if grep -qE "signal: [0-9]+|SIGSEGV|SIGABRT|SIGILL|SIGBUS" "$$log"; then \
 	  echo ""; \
 	  echo "!! A TEST BINARY DIED ON A SIGNAL. No test failed; the process was killed."; \
 	  echo "!! There is no FAILED line and no assertion to find - do not read this as a"; \
