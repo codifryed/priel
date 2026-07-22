@@ -53,10 +53,11 @@ const HEADER: &str = "\
 # priel settings. One `key = value` per line; a line starting with `#` is a
 # comment. A flag on the command line overrides anything here for that run.
 #
-#   theme      a palette --theme accepts, e.g. nord or gruvbox-dark
-#   device     an output device --device accepts (`priel --list-devices`)
-#   exclusive  true or false; --exclusive and --shared override it
-#   log_level  off, error, warn, info, debug or trace
+#   theme         a palette --theme accepts, e.g. nord or gruvbox-dark
+#   device        an output device --device accepts (`priel --list-devices`)
+#   exclusive     true or false; --exclusive and --shared override it
+#   log_level     off, error, warn, info, debug or trace
+#   update_check  true or false; whether to check the forge for a newer release
 ";
 
 /// `$XDG_CONFIG_HOME/priel/settings.conf`, falling back to `~/.config`.
@@ -82,6 +83,10 @@ pub struct Settings {
     pub device: Option<String>,
     pub exclusive: Option<bool>,
     pub log_level: Option<LogLevel>,
+    /// Whether to check the forge for a newer release at startup. Unset means
+    /// the default (on). Only ever read from the file - no picker sets it, so it
+    /// is never written back automatically; a user turns it off by hand.
+    pub update_check: Option<bool>,
 }
 
 /// Something worth saying about the file, held until there is a log to say it to.
@@ -126,6 +131,9 @@ impl Settings {
         }
         if let Some(level) = self.log_level {
             out.push(("log_level", value_name(&level)));
+        }
+        if let Some(check) = self.update_check {
+            out.push(("update_check", check.to_string()));
         }
         out
     }
@@ -227,6 +235,14 @@ pub fn parse(text: &str) -> Loaded {
             "log_level" => set_once(
                 &mut settings.log_level,
                 LogLevel::from_str(value, true).ok(),
+                key,
+                value,
+                line_no,
+                &mut notes,
+            ),
+            "update_check" => set_once(
+                &mut settings.update_check,
+                parse_bool(value),
                 key,
                 value,
                 line_no,
@@ -499,6 +515,28 @@ mod tests {
     }
 
     #[test]
+    fn the_update_check_key_reads_a_boolean_and_rejects_anything_else() {
+        // Goal: the one setting priel reads that no picker writes - a user turns
+        // the update check off by hand. It parses like `exclusive`, and a value
+        // that is not a boolean is dropped with a warning rather than guessed.
+        assert_eq!(
+            parse("update_check = false\n").settings.update_check,
+            Some(false)
+        );
+        assert_eq!(
+            parse("update_check = true\n").settings.update_check,
+            Some(true)
+        );
+        let loaded = parse("update_check = sometimes\n");
+        assert_eq!(loaded.settings.update_check, None);
+        assert!(
+            warnings(&loaded)[0].contains("sometimes"),
+            "{:?}",
+            loaded.notes
+        );
+    }
+
+    #[test]
     fn a_key_set_twice_keeps_the_first_and_says_so() {
         // Goal: first-wins is also what `merge` edits, so a read and a write
         // agree about which of the two lines is the live one. Silently taking
@@ -623,6 +661,7 @@ oversampling = 4
             device: Some("alsa/hw:CARD=AUDIO,DEV=0".into()),
             exclusive: Some(true),
             log_level: None,
+            update_check: None,
         };
         save(&path, &chosen).expect("the directory is created on the way");
         let back = load(&path);

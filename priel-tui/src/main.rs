@@ -103,6 +103,8 @@ fn main() -> Result<()> {
     let outcome = if args.list_devices {
         print_devices();
         Ok(())
+    } else if args.update {
+        run_installer()
     } else {
         session(&args, recent, &settings.settings, &settings_path)
     };
@@ -114,6 +116,37 @@ fn main() -> Result<()> {
     // log has to be asked for.
     log::logger().flush();
     outcome
+}
+
+/// The install script that `--update` re-runs.
+///
+/// The single source of truth for how priel is installed and updated: `--update`
+/// does not reimplement the download and placement, it runs the same script a
+/// first install runs, which fetches the newest release and replaces this
+/// binary. Kept as a raw-file URL on the default branch so an old binary always
+/// fetches the current installer.
+const INSTALL_URL: &str = "https://codeberg.org/codifryed/priel/raw/branch/main/install.sh";
+
+/// Update priel by running the installer, and report how it went.
+///
+/// Runs `sh -c 'curl … | sh'` with the child's output inherited, so the install
+/// is as visible as running it by hand - and the command is printed first, so
+/// nothing about what is being executed is hidden. `curl` is required; if it is
+/// absent the message says so rather than failing obscurely.
+fn run_installer() -> Result<()> {
+    let command = format!("curl -fsSL {INSTALL_URL} | sh");
+    println!("Updating priel by running the installer:\n    {command}\n");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .status()
+        .context("could not run the installer (is `sh` on PATH?)")?;
+    if !status.success() {
+        anyhow::bail!(
+            "the installer did not finish cleanly; nothing was changed if it failed early"
+        );
+    }
+    Ok(())
 }
 
 /// The widest identifier column `--list-devices` will pad to.
@@ -200,6 +233,12 @@ fn session(
         bus,
     )
     .and_then(|mut app| {
+        // One unauthenticated read of the forge's latest version, before the
+        // loop. Off by a flag, the environment or the file; the reply, if any,
+        // lands on the notice line a few frames in.
+        if args.update_check(remembered.update_check) {
+            app.check_for_updates();
+        }
         let outcome = run(&mut terminal, &mut app, &mut TerminalEvents);
         if let Err(e) = settings::save(settings_path, app.chosen()) {
             not_saved = Some(e);
@@ -489,6 +528,47 @@ mod tests {
     }
 
     #[test]
+    fn the_update_check_is_on_by_default_and_only_ever_turned_off() {
+        // Goal: the check runs unless something says not to, and the only things
+        // that say so - the flag, the environment, the file - can each turn it
+        // off but none can be required to turn it back on. A per-run switch is
+        // for saying "not this time", not for overriding a machine that opted
+        // out for good.
+        assert!(
+            Cli::resolve_update_check(false, false, None),
+            "on by default"
+        );
+        assert!(
+            !Cli::resolve_update_check(true, false, None),
+            "--no-update-check turns it off"
+        );
+        assert!(
+            !Cli::resolve_update_check(false, true, None),
+            "$PRIEL_NO_UPDATE_CHECK turns it off"
+        );
+        assert!(
+            !Cli::resolve_update_check(false, false, Some(false)),
+            "the file can turn it off"
+        );
+        assert!(
+            Cli::resolve_update_check(false, false, Some(true)),
+            "and on"
+        );
+        assert!(
+            !Cli::resolve_update_check(true, false, Some(true)),
+            "a per-run switch off beats a file that had it on"
+        );
+    }
+
+    #[test]
+    fn the_update_flags_parse() {
+        assert!(!parse(&[]).update, "no --update by default");
+        assert!(parse(&["--update"]).update);
+        assert!(!parse(&[]).no_update_check);
+        assert!(parse(&["--no-update-check"]).no_update_check);
+    }
+
+    #[test]
     fn a_flag_wins_over_the_file_and_the_file_wins_over_the_default() {
         // Goal: the whole precedence rule, in one table. A flag is for one run,
         // the file is what this machine is normally set to, and the default is
@@ -501,6 +581,7 @@ mod tests {
             device: Some("pipewire/from-the-file".into()),
             exclusive: Some(true),
             log_level: Some(LogLevel::Info),
+            update_check: None,
         };
         let bare = parse(&[]);
         assert_eq!(bare.theme(file.theme), ThemeName::Dracula);

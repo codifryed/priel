@@ -892,6 +892,11 @@ pub struct App {
     /// would be wrong. This is "asked", the cover map is "arrived", and a track
     /// with no cover id is never asked at all.
     cover_asked: Option<u64>,
+    /// The tag of a newer release, once the forge has been asked and answered
+    /// with one. `None` means "not checked, or already current" - the two are
+    /// the same to the interface, which only ever has something to say when
+    /// there is a newer version.
+    update_available: Option<String>,
     /// How far down the audio-graph overlay is scrolled, from the top.
     graph_scroll: usize,
     /// The output devices the player last published. Kept only while the picker
@@ -1134,6 +1139,7 @@ impl App {
             sink_volume: SinkVolume::Unread,
             sink_volume_asked: None,
             cover_asked: None,
+            update_available: None,
             graph_scroll: 0,
             devices: Vec::new(),
             device_selected: 0,
@@ -1622,6 +1628,31 @@ impl App {
 
     pub fn start(&mut self) {
         self.load_favorites_from_the_top();
+    }
+
+    /// Ask the worker whether a newer release exists.
+    ///
+    /// Not folded into [`App::start`], which every test calls: the check is a
+    /// network call `main` makes once, when it is wanted, and a test that built
+    /// an `App` should not have an update request queued behind its back. Sent
+    /// at most the once - `main` calls this a single time - so there is no guard
+    /// against repeats to keep here.
+    pub fn check_for_updates(&mut self) {
+        self.ask(ToWorker::CheckUpdate);
+    }
+
+    /// A newer release turned up; say so on the notice line and remember it.
+    ///
+    /// A notice rather than anything louder: it is worth telling, not worth
+    /// interrupting, and it names the one command that acts on it. The tag is
+    /// kept as well so a later screen could show it, but the notice is the whole
+    /// of the feature for now.
+    fn on_update_available(&mut self, tag: String) {
+        self.notice = Some(format!(
+            "priel {tag} is available. Update with: priel --update"
+        ));
+        self.update_available = Some(tag);
+        self.dirty = true;
     }
 
     /// Ask for the first page of favorites, discarding whatever was loaded.
@@ -2283,6 +2314,7 @@ impl App {
                     self.graph_scroll = 0;
                 }
                 FromWorker::Cover { track_id, image } => self.on_cover(track_id, image),
+                FromWorker::UpdateAvailable(tag) => self.on_update_available(tag),
                 FromWorker::Failed {
                     task,
                     fault,
@@ -12359,6 +12391,33 @@ mod tests {
             seen,
             (0..6).collect::<Vec<_>>(),
             "every entry of the grown queue is in the order exactly once"
+        );
+    }
+
+    #[test]
+    fn a_newer_release_lands_on_the_notice_line_with_how_to_update() {
+        // Goal: the update check is worth a word, not an interruption, and the
+        // word names the one command that acts on it. Method: hand the app an
+        // UpdateAvailable reply the way the worker would, and read the notice.
+        let mut r = rig();
+        r.app.check_for_updates();
+        assert!(
+            matches!(requests(&r)[..], [ToWorker::CheckUpdate]),
+            "the check is one request and no more"
+        );
+
+        r.to_app
+            .send(FromWorker::UpdateAvailable("v0.2.0".into()))
+            .unwrap();
+        r.app.drain_worker();
+        let notice = r.app.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("v0.2.0"),
+            "the notice names the version: {notice}"
+        );
+        assert!(
+            notice.contains("priel --update"),
+            "and how to get it: {notice}"
         );
     }
 

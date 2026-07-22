@@ -38,6 +38,10 @@ is required; priel neither circumvents access controls nor exports content for o
     after_help = DISCLAIMER,
     after_long_help = DISCLAIMER
 )]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "these are command-line switches, which clap models as bools; they are flags, not state"
+)]
 pub struct Cli {
     /// Audio output device, passed through to mpv
     ///
@@ -89,6 +93,24 @@ pub struct Cli {
     /// for, and the picker (`d`) offers exactly the same set.
     #[arg(long)]
     pub list_devices: bool,
+
+    /// Update priel to the latest release and exit
+    ///
+    /// Runs the install script, which fetches the newest release and replaces
+    /// this binary. Nothing else happens: like `--list-devices`, priel does the
+    /// one thing and stops rather than going on to play.
+    #[arg(long)]
+    pub update: bool,
+
+    /// Do not check the forge for a newer release this run
+    ///
+    /// priel checks once at startup and, if a newer release exists, says so on
+    /// the notice line - a single unauthenticated read of a public version
+    /// number, never an automatic download. This turns that check off for the
+    /// run; `update_check = false` in the settings file turns it off for good,
+    /// and `$PRIEL_NO_UPDATE_CHECK` turns it off from a launcher.
+    #[arg(long)]
+    pub no_update_check: bool,
 
     /// Colour theme
     ///
@@ -223,6 +245,36 @@ impl Cli {
         } else {
             from_file.unwrap_or(false)
         }
+    }
+
+    /// Whether to check the forge for a newer release at startup.
+    ///
+    /// Off if `--no-update-check` is given or `$PRIEL_NO_UPDATE_CHECK` is set to
+    /// anything, off if the file says `update_check = false`, on otherwise. The
+    /// flag and the environment can only turn it *off* - both are per-invocation
+    /// ways to say "not this time" - so there is nothing that forces it back on
+    /// over a file that disabled it.
+    #[must_use]
+    pub fn update_check(&self, from_file: Option<bool>) -> bool {
+        Self::resolve_update_check(
+            self.no_update_check,
+            std::env::var_os("PRIEL_NO_UPDATE_CHECK").is_some(),
+            from_file,
+        )
+    }
+
+    /// Pure so it is testable without the process environment or a home
+    /// directory. Either per-run switch being set wins and disables the check;
+    /// otherwise the file decides, defaulting to on.
+    pub(crate) fn resolve_update_check(
+        flag_off: bool,
+        env_off: bool,
+        from_file: Option<bool>,
+    ) -> bool {
+        if flag_off || env_off {
+            return false;
+        }
+        from_file.unwrap_or(true)
     }
 
     /// The level to log at, from the flag, the environment, the file or the

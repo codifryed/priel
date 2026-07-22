@@ -191,6 +191,12 @@ pub enum ToWorker {
         offset: u32,
         limit: u32,
     },
+    /// Ask the forge whether a newer release than this build exists.
+    ///
+    /// One unauthenticated read of a public version number, on the worker like
+    /// every other network call. It never downloads anything - the reply only
+    /// says whether there is something to tell the listener about.
+    CheckUpdate,
     /// Fetch and decode a track's album cover.
     ///
     /// Both the fetch and the decode happen here, off the render thread: the
@@ -387,6 +393,12 @@ pub enum FromWorker {
         offset: u32,
         page: Page<Track>,
     },
+    /// A newer release exists on the forge; the string is its tag.
+    ///
+    /// Only ever sent when there *is* one - like [`FromWorker::Cover`], a check
+    /// that finds nothing sends nothing, because the interface has nothing to
+    /// say when priel is already current or the forge could not be reached.
+    UpdateAvailable(String),
     /// A decoded album cover, and the track it belongs to.
     ///
     /// Only ever sent on success: a cover that would not fetch or decode is
@@ -654,6 +666,10 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
             offset,
             limit,
         } => fill_queue(client, source, offset, limit)?,
+        // A newer release than this build, if the forge has one. Silent
+        // otherwise, for the reason the cover is: nothing to say when priel is
+        // current or the check did not land.
+        ToWorker::CheckUpdate => check_update(client)?,
         // Fetch the bytes and decode them here, on the worker: a cover is tens
         // of kilobytes, and the cap keeps a broken or hostile response off the
         // heap. Silence on every failure - no URL, a fetch that did not land, a
@@ -667,6 +683,19 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
             FromWorker::Cover { track_id, image }
         }
     })
+}
+
+/// Ask the forge whether there is a newer release than this build.
+///
+/// `None` when there is nothing to tell the listener - already current, or the
+/// check did not land - so the caller sends no reply, the same as the cover.
+fn check_update(client: &Client) -> Option<FromWorker> {
+    let tag = priel_core::update::newer_release(
+        client,
+        priel_core::update::LATEST_RELEASE_URL,
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    Some(FromWorker::UpdateAvailable(tag))
 }
 
 /// Page a queue's source for the background fill.
@@ -1363,6 +1392,7 @@ mod tests {
             FromWorker::PlaylistTrackRemoved { .. } => "PlaylistTrackRemoved",
             FromWorker::PlaylistTrackAdded { .. } => "PlaylistTrackAdded",
             FromWorker::Cover { .. } => "Cover",
+            FromWorker::UpdateAvailable(_) => "UpdateAvailable",
             FromWorker::QueueFilled { .. } => "QueueFilled",
             FromWorker::Failed { .. } => "Failed",
         }
