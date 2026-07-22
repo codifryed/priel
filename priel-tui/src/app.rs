@@ -535,6 +535,17 @@ const QUEUE_MAX_U32: u32 = QUEUE_MAX as u32;
 /// in a column: a name longer than this is a name nobody can read back.
 const PLAYLIST_NAME_MAX: usize = 100;
 
+/// The visual rows one queue entry occupies: a title and the artist beneath it.
+///
+/// **The one number the renderer and the click handler must share.** The panel
+/// paints an entry as two rows (`queue_column`), so a screen row is not a queue
+/// row any more: the offset a click is measured against, the window the cursor
+/// scrolls, and how many entries a page turns are all this factor away from the
+/// visual height. Keeping it here rather than as a `2` in each place is what
+/// stops a click landing on the artist of the row above - the defect the pure
+/// `click_at` seam exists to make untestable-by-accident.
+pub(crate) const QUEUE_ROWS_PER_ENTRY: usize = 2;
+
 /// State of a sign-in in progress.
 ///
 /// The verifier has to survive from building the authorize URL until the code
@@ -2857,10 +2868,14 @@ impl App {
     }
     /// The height of whichever region the keys are moving through, because a
     /// page is a screenful of the list being paged and not of the other one.
+    ///
+    /// Counted in *entries*, not screen rows: the browse list spends one row per
+    /// entry, but the queue spends [`QUEUE_ROWS_PER_ENTRY`], so a page there is
+    /// that many fewer entries than the column is tall.
     fn page_rows(&self) -> usize {
         match self.focus() {
             Focus::List => self.list_inner.height as usize,
-            Focus::Queue => self.queue_inner.height as usize,
+            Focus::Queue => self.queue_inner.height as usize / QUEUE_ROWS_PER_ENTRY,
         }
     }
     fn half_page(&self) -> usize {
@@ -5109,7 +5124,10 @@ impl App {
             }
         }
         if hit(self.queue_inner, col, row) {
-            let qi = self.queue_offset + (row - self.queue_inner.y) as usize;
+            // The entry, not the screen row: an entry is `QUEUE_ROWS_PER_ENTRY`
+            // rows tall, so a click on its title or on the artist beneath it
+            // lands on the same entry.
+            let qi = self.queue_offset + (row - self.queue_inner.y) as usize / QUEUE_ROWS_PER_ENTRY;
             if qi < self.queue.len() {
                 return Click::QueueRow(qi);
             }
@@ -12042,7 +12060,7 @@ mod tests {
         with_column(&mut r.app);
         r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "X")];
         queued(&mut r, 4);
-        r.app.on_mouse(click(86, 11));
+        r.app.on_mouse(click(86, 12));
         assert_eq!(r.app.focus(), Focus::Queue);
         assert_eq!(r.app.queue_selected, 1, "the entry that was clicked");
         r.app.on_mouse(click(3, 3));
@@ -12053,13 +12071,25 @@ mod tests {
     #[test]
     fn a_queue_entry_is_read_off_the_rect_the_renderer_published() {
         // Goal: a click on the queue is answered by the same pure seam a click
-        // on the list is, so there is one place where a cell becomes an intent.
-        // Method: ask what a cell inside and a cell past the entries mean.
+        // on the list is, so there is one place where a cell becomes an intent -
+        // and an entry is two rows now, its title and the artist beneath it, so
+        // a click on either belongs to the one entry. Method: ask what the title
+        // cell, the artist cell, and a cell past the entries each mean.
         let mut r = rig();
         with_column(&mut r.app);
-        queued(&mut r, 3);
-        assert_eq!(r.app.click_at(86, 10), Click::QueueRow(0));
-        assert_eq!(r.app.click_at(86, 12), Click::QueueRow(2));
+        queued(&mut r, 2);
+        assert_eq!(r.app.click_at(86, 10), Click::QueueRow(0), "the title row");
+        assert_eq!(
+            r.app.click_at(86, 11),
+            Click::QueueRow(0),
+            "the artist beneath it is the same entry"
+        );
+        assert_eq!(r.app.click_at(86, 12), Click::QueueRow(1));
+        assert_eq!(
+            r.app.click_at(86, 13),
+            Click::QueueRow(1),
+            "and its artist too"
+        );
         assert_eq!(
             r.app.click_at(86, 14),
             Click::Nothing,
@@ -12076,12 +12106,14 @@ mod tests {
         with_column(&mut r.app);
         queued(&mut r, 4);
         let _ = requests(&r);
-        r.app.on_mouse(click(86, 12));
+        // Row 14 is the title row of the third entry, its two-row entries being
+        // rows 10-11, 12-13, 14-15 down the column.
+        r.app.on_mouse(click(86, 14));
         assert!(
             r.app.now_playing.is_none(),
             "one click only moves the cursor"
         );
-        r.app.on_mouse(click(86, 12));
+        r.app.on_mouse(click(86, 14));
         assert_eq!(r.app.now_playing.as_ref().map(|t| t.id), Some(3));
     }
 

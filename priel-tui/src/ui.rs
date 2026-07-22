@@ -28,7 +28,9 @@ use std::fmt::Write as _;
 use priel_player::graph::{SinkStage, SinkVolume};
 use priel_player::{Alteration, Fidelity, OutputAccess, StreamVolume, Verdict};
 
-use crate::app::{App, Focus, GraphRow, GraphRowKind, Hit, Mode, Repeat, View};
+use crate::app::{
+    App, Focus, GraphRow, GraphRowKind, Hit, Mode, QUEUE_ROWS_PER_ENTRY, Repeat, View,
+};
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
 
@@ -53,10 +55,11 @@ const WIDE_COLS: u16 = 120;
 
 /// The cells the queue column occupies, borders included.
 ///
-/// Fixed rather than a share of the width: a queue row is a mark and a title,
-/// so a column that grew with the terminal would be padding short lines while
-/// taking the width from the list - which carries a title, an artist, an album,
-/// a tier and a duration, and is the one part of the screen that can always use
+/// Fixed rather than a share of the width: a queue entry is a mark, a title, and
+/// the artist on the row beneath it - all short - so a column that grew with the
+/// terminal would be padding those lines while taking the width from the list -
+/// which carries a title, an artist, an album, a tier and a duration, and is the
+/// one part of the screen that can always use
 /// more.
 const QUEUE_COLS: u16 = 36;
 
@@ -2807,14 +2810,20 @@ fn queue_column(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     app.queue_inner = inner;
-    let h = inner.height as usize;
+    let rows = inner.height as usize;
+    // An entry is two rows now - a title and the artist beneath it - so the
+    // window is counted in entries, not screen rows, or the cursor would jump
+    // half a column per keystroke. A column an odd number of rows tall shows the
+    // last entry's title with no room for its artist; that partial row is drawn
+    // but does not count towards a full page.
+    let per_screen = (rows / QUEUE_ROWS_PER_ENTRY).max(1);
     // The same scroll idiom the browse list uses, for the same reason: a window
     // that recentred on every keystroke would move the whole column under a
     // cursor that moved one row.
     if app.queue_selected < app.queue_offset {
         app.queue_offset = app.queue_selected;
-    } else if app.queue_selected >= app.queue_offset + h {
-        app.queue_offset = app.queue_selected + 1 - h;
+    } else if app.queue_selected >= app.queue_offset + per_screen {
+        app.queue_offset = app.queue_selected + 1 - per_screen;
     }
     if app.queue_offset >= app.queue.len() {
         app.queue_offset = 0;
@@ -2822,7 +2831,11 @@ fn queue_column(f: &mut Frame, app: &mut App, area: Rect) {
 
     let width = inner.width as usize;
     let playing_row = app.playing_row();
-    for (i, row) in (app.queue_offset..(app.queue_offset + h).min(app.queue.len())).enumerate() {
+    for (i, row) in (app.queue_offset..app.queue.len()).enumerate() {
+        let title_y = i * QUEUE_ROWS_PER_ENTRY;
+        if title_y >= rows {
+            break;
+        }
         let Some(entry) = app.queue_at(row).and_then(|index| app.queue.get(index)) else {
             break;
         };
@@ -2844,7 +2857,41 @@ fn queue_column(f: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(line).style(style),
             Rect {
                 x: inner.x,
-                y: inner.y + i as u16,
+                y: inner.y + title_y as u16,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        // The artist, one row down and one cell in past the title, so the pair
+        // reads as one entry by its shape and not by its colour alone - the same
+        // rule that keeps the focus ring legible without hue. Dropped where the
+        // column has run out of rows for it.
+        let artist_y = title_y + 1;
+        if artist_y >= rows {
+            continue;
+        }
+        let artist_style = if row == app.queue_selected {
+            // The whole entry stays on the cursor's backing so it reads as one
+            // selected block; the artist is dimmed within it rather than lifted
+            // onto the plain surface, which would split the highlight in two.
+            t.cursor(focused).add_modifier(Modifier::DIM)
+        } else {
+            t.on(t.faint)
+        };
+        let names = if entry.artists.is_empty() {
+            entry.artist.clone()
+        } else {
+            entry.artists.join(", ")
+        };
+        // Aligned one cell past the title's first character: the two lead cells
+        // are the title's alone, and the extra space nests the artist under it.
+        let indent = " ".repeat(lead.chars().count() + 1);
+        let artist_line = trunc(&format!("{indent}{names}"), width);
+        f.render_widget(
+            Paragraph::new(artist_line).style(artist_style),
+            Rect {
+                x: inner.x,
+                y: inner.y + artist_y as u16,
                 width: inner.width,
                 height: 1,
             },
@@ -3493,8 +3540,8 @@ fn fmt_hms(secs: u32) -> String {
 mod tests {
     use super::{
         ControlBar, FOCUS_HINT, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, OVERLAY_MARGIN,
-        OVERLAY_MEDIUM, OVERLAY_NARROW, OVERLAY_WIDE, QUEUE_COLS, WIDE_COLS, hint_width,
-        push_hints, render,
+        OVERLAY_MEDIUM, OVERLAY_NARROW, OVERLAY_WIDE, QUEUE_COLS, QUEUE_ROWS_PER_ENTRY, WIDE_COLS,
+        hint_width, push_hints, render,
     };
     use crate::app::{App, Click, Focus, Hit, Mode, View};
     use crate::cli::ThemeName;
@@ -7900,12 +7947,14 @@ mod tests {
             .collect()
     }
 
-    /// The backing of one queue row.
+    /// The backing of one queue entry's title row. An entry is two rows tall, so
+    /// the title sits `QUEUE_ROWS_PER_ENTRY` rows down per entry above the offset.
     fn queue_backing(app: &mut App, w: u16, h: u16, entry: usize) -> Color {
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("backend");
         term.draw(|f| render(f, app)).expect("render");
         let inner = app.queue_inner;
-        let offset = u16::try_from(entry.saturating_sub(app.queue_offset)).unwrap_or(0);
+        let offset = u16::try_from(entry.saturating_sub(app.queue_offset) * QUEUE_ROWS_PER_ENTRY)
+            .unwrap_or(0);
         let buf = term.backend().buffer().clone();
         buf[(inner.x, inner.y + offset)].bg
     }
@@ -7917,24 +7966,28 @@ mod tests {
         // the current one rather than only reachable by a key. Method: render a
         // queue mid-way through and read the rows out of the column in order.
         let mut sc = queued(6, 3);
-        let rows = queue_rows(&mut sc.app, WIDE_COLS, 30);
-        let played: Vec<&String> = rows.iter().take(3).collect();
+        let titles = queue_titles(&mut sc.app, WIDE_COLS, 30);
         assert!(
-            played.iter().any(|r| r.contains("Track 1")),
-            "what has played is not above the current track: {rows:?}"
+            titles.iter().take(3).any(|r| r.contains("Track 1")),
+            "what has played is not above the current track: {titles:?}"
         );
-        let current = rows
+        let current = titles
             .iter()
             .position(|r| r.contains("Track 4"))
             .expect("the current track is in the queue");
         assert_eq!(
             current, 3,
-            "the current track is under its history: {rows:?}"
+            "the current track is under its history: {titles:?}"
         );
-        assert!(rows[current].contains('♪'), "{rows:?}");
         assert!(
-            rows.iter().any(|r| r.contains("Track 5")),
-            "what is still to come is below it: {rows:?}"
+            titles.iter().any(|r| r.contains("Track 5")),
+            "what is still to come is below it: {titles:?}"
+        );
+        // The ♪ is on the playing entry's title row, two rows down per entry.
+        let rows = queue_rows(&mut sc.app, WIDE_COLS, 30);
+        assert!(
+            rows[current * QUEUE_ROWS_PER_ENTRY].contains('♪'),
+            "the mark is not on the current track's title row: {rows:?}"
         );
     }
 
@@ -7951,11 +8004,26 @@ mod tests {
         sc
     }
 
-    /// What the panel painted, with the two lead cells taken off each row.
+    /// The titles the panel painted, one per entry, with the lead cells taken
+    /// off. Every entry is a title row followed by an artist row, so the titles
+    /// are the rows the entry stride starts on.
     fn queue_titles(app: &mut App, w: u16, h: u16) -> Vec<String> {
         queue_rows(app, w, h)
             .into_iter()
+            .step_by(QUEUE_ROWS_PER_ENTRY)
             .map(|r| r.trim_start_matches(['♪', '~', ' ']).to_string())
+            .filter(|r| !r.is_empty())
+            .collect()
+    }
+
+    /// The artist rows the panel painted, one per entry: the rows between the
+    /// titles, trimmed of the indent that nests them under the title above.
+    fn queue_artists(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        queue_rows(app, w, h)
+            .into_iter()
+            .skip(1)
+            .step_by(QUEUE_ROWS_PER_ENTRY)
+            .map(|r| r.trim().to_string())
             .filter(|r| !r.is_empty())
             .collect()
     }
@@ -8001,19 +8069,22 @@ mod tests {
 
             let inner = sc.app.queue_inner;
             let buf = term.backend().buffer().clone();
-            let drawn = usize::from(inner.height).min(9);
-            for row in (0..drawn).filter(|row| *row != playing_row) {
-                let y = inner.y + u16::try_from(row).unwrap_or(0);
-                let want = if row < playing_row { t.faint } else { t.text };
+            // Each entry is two rows, so an entry's title is that stride down.
+            let drawn = (usize::from(inner.height) / QUEUE_ROWS_PER_ENTRY).min(9);
+            for entry in (0..drawn).filter(|entry| *entry != playing_row) {
+                let y = inner.y + u16::try_from(entry * QUEUE_ROWS_PER_ENTRY).unwrap_or(0);
+                let want = if entry < playing_row { t.faint } else { t.text };
                 assert_eq!(
                     buf[(inner.x + 3, y)].fg,
                     want,
-                    "row {row} of deal {deal} is on the wrong side of the music"
+                    "entry {entry} of deal {deal} is on the wrong side of the music"
                 );
                 assert_ne!(buf[(inner.x, y)].symbol(), "♪", "one mark, on one row");
             }
+            let playing_y =
+                inner.y + u16::try_from(playing_row * QUEUE_ROWS_PER_ENTRY).unwrap_or(0);
             assert_eq!(
-                buf[(inner.x, inner.y + 2)].symbol(),
+                buf[(inner.x, playing_y)].symbol(),
                 "♪",
                 "and it is on the row the music is on"
             );
@@ -8040,10 +8111,60 @@ mod tests {
             t.faint,
             "history is not dim"
         );
+        // Entry 4 is still to come - four entries down, two rows each.
+        let upcoming = inner.y + u16::try_from(4 * QUEUE_ROWS_PER_ENTRY).unwrap_or(0);
         assert_eq!(
-            buf[(inner.x + 3, inner.y + 4)].fg,
+            buf[(inner.x + 3, upcoming)].fg,
             t.text,
             "what is still to come is not ordinary text"
+        );
+        // The artist beneath that upcoming title is drawn dimmer than it, so the
+        // two lines of one entry read as title-then-subtitle and not two tracks.
+        assert_eq!(
+            buf[(inner.x + 3, upcoming + 1)].fg,
+            t.faint,
+            "the artist row is not dimmed beneath its title"
+        );
+    }
+
+    #[test]
+    fn the_queue_shows_the_artist_beneath_each_title() {
+        // Goal: an upcoming track is told apart by more than its title, which a
+        // narrow column truncates hard - so the artist is drawn on its own row
+        // under it. Method: render a queue and read the artist rows out beside
+        // the titles.
+        let mut sc = queued(6, 0);
+        let titles = queue_titles(&mut sc.app, WIDE_COLS, 30);
+        let artists = queue_artists(&mut sc.app, WIDE_COLS, 30);
+        assert_eq!(
+            artists.len(),
+            titles.len(),
+            "every title has an artist beneath it: {titles:?} / {artists:?}"
+        );
+        assert!(
+            artists.iter().all(|a| a == "Artist"),
+            "the artist row is not the track's artist: {artists:?}"
+        );
+    }
+
+    #[test]
+    fn the_queue_names_every_credited_artist_on_the_row() {
+        // Goal: a collaboration is named in full and in the order the service
+        // credits it, not by its first artist alone. Method: queue a track
+        // crediting two and read its artist row back off a real frame.
+        let mut sc = queued(1, 0);
+        sc.app.queue = vec![Track {
+            id: 1,
+            title: "Under Pressure".into(),
+            artist: "Queen".into(),
+            artists: vec!["Queen".into(), "David Bowie".into()],
+            ..Track::default()
+        }];
+        let artists = queue_artists(&mut sc.app, WIDE_COLS, 30);
+        assert_eq!(
+            artists.first().map(String::as_str),
+            Some("Queen, David Bowie"),
+            "the row does not name every credited artist: {artists:?}"
         );
     }
 
@@ -8127,11 +8248,19 @@ mod tests {
             .iter()
             .position(|r| r.contains("Track 3"))
             .expect("the entry is on screen");
+        // `which` is a screen row; the entry is that many two-row strides down.
+        let entry = which / QUEUE_ROWS_PER_ENTRY;
         let inner = sc.app.queue_inner;
         let y = inner.y + u16::try_from(which).expect("a row inside a u16 frame");
         assert_eq!(
             sc.app.click_at(inner.x + 2, y),
-            Click::QueueRow(sc.app.queue_offset + which)
+            Click::QueueRow(sc.app.queue_offset + entry),
+            "the title row clicks through to its entry"
+        );
+        assert_eq!(
+            sc.app.click_at(inner.x + 2, y + 1),
+            Click::QueueRow(sc.app.queue_offset + entry),
+            "and the artist row beneath it is the same entry"
         );
     }
 
