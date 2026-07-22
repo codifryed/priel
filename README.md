@@ -49,8 +49,9 @@ The design decisions behind these live in [`docs/adr/`](docs/adr/).
 
 ## Install
 
-Linux only. Requires Rust ≥ 1.88, `libmpv` (`mpv-devel` / `libmpv-dev` to
-build), a working PipeWire or ALSA setup, and a subscription.
+Linux only. Needs `libmpv` at runtime, a working PipeWire or ALSA setup, and a
+subscription. Building from source additionally needs Rust ≥ 1.88 and the mpv
+headers (`mpv-devel` / `libmpv-dev`).
 
 ### Quick install
 
@@ -58,13 +59,13 @@ build), a working PipeWire or ALSA setup, and a subscription.
 curl -fsSL https://codeberg.org/codifryed/priel/raw/branch/main/install.sh | sh
 ```
 
-Builds priel from source and installs it under `~/.local` (no root needed). If
-Rust or the mpv library is missing, the script names the package for your distro
-and stops rather than half-installing. **Re-run it to update.** Override the
-location with `PRIEL_PREFIX` or the branch/tag with `PRIEL_REF`. There are no
-prebuilt binaries — the script fetches the source and compiles it, so a release
-build takes a few minutes. Read [`install.sh`](install.sh) before piping it to a
-shell; it is short on purpose.
+Downloads the latest release binary and installs it under `~/.local` (no root
+needed). Where there is no binary for the platform — a non-x86_64 machine, or
+before the first release — it builds from source instead, naming the package for
+your distro if Rust or the mpv library is missing. **Re-run it to update, or run
+`priel --update`.** Override the location with `PRIEL_PREFIX`, force a source
+build with `PRIEL_FROM_SOURCE=1`. Read [`install.sh`](install.sh) before piping
+it to a shell; it is short on purpose.
 
 ### From a clone
 
@@ -110,6 +111,7 @@ theme = gruvbox-dark
 device = pipewire/alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0
 exclusive = false
 log_level = warn
+update_check = true
 ```
 
 `priel --list-devices` prints every device with the identifier `--device` takes,
@@ -120,6 +122,15 @@ back to the same card shared if the device will not open exclusively. See
 [ADR-0001](docs/adr/0001-exclusive-output-is-asked-for-never-assumed.md).
 
 Run `man priel` or `priel --help` for the full flag list.
+
+## Updates
+
+At startup priel makes one unauthenticated read of its forge for the latest
+release version, and if a newer one exists it says so on the notice line — never
+an automatic download. `priel --update` then runs the installer to fetch and
+replace the binary. Turn the check off for a run with `--no-update-check`, from a
+launcher with `$PRIEL_NO_UPDATE_CHECK`, or for good with `update_check = false`
+in the settings file.
 
 ## Keys & mouse
 
