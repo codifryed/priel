@@ -24,11 +24,6 @@ jobs:
   release:
     runs-on: self-hosted
     container: rust:1.97.1-bookworm
-    # Injected at the job level rather than on the publish step: a container job
-    # picks a job-level secret up more reliably, and it keeps the value in one
-    # place. The publish step checks it is actually present before using it.
-    env:
-      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
     steps:
       - name: Checkout
         run: |
@@ -82,7 +77,13 @@ jobs:
       # and this image has no Node. Find or create the release for the tag, clear
       # its old assets so a re-run replaces rather than duplicates, then upload
       # the fresh set.
+      # The token is scoped to this one step - never the build steps, whose
+      # `cargo build` compiles third-party crates whose build scripts could read
+      # it out of the environment. It is a repository write token; nothing else
+      # in the job needs it.
       - name: Publish release
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           set -e
           # `-u` is off deliberately: an absent secret should give the clear
