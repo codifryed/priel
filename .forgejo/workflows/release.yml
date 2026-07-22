@@ -77,35 +77,41 @@ jobs:
       # and this image has no Node. Find or create the release for the tag, clear
       # its old assets so a re-run replaces rather than duplicates, then upload
       # the fresh set.
-      # The token is scoped to this one step - never the build steps, whose
+      # The token is referenced inline here rather than through a step `env:`
+      # block: on this runner a secret in a step `env:` fails the step at setup
+      # before the script runs, while inline substitution works and is masked in
+      # the log. It stays scoped to this one step - never the build steps, whose
       # `cargo build` compiles third-party crates whose build scripts could read
-      # it out of the environment. It is a repository write token; nothing else
-      # in the job needs it.
+      # it out of the environment.
       - name: Publish release
-        env:
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           set -e
-          # `-u` is off deliberately: an absent secret should give the clear
-          # message below, not an "unbound variable" abort at the first use.
-          if [ -z "${RELEASE_TOKEN:-}" ]; then
-            echo "error: RELEASE_TOKEN is empty. Add a Forgejo application token"
-            echo "with write:repository as the repo secret RELEASE_TOKEN, and make"
-            echo "sure the runner is allowed to receive secrets."
+          token='${{ secrets.RELEASE_TOKEN }}'
+          if [ -z "$token" ]; then
+            echo "error: RELEASE_TOKEN is empty or was not delivered to the runner."
+            echo "Set a Forgejo application token with write:repository as the repo"
+            echo "secret RELEASE_TOKEN, and confirm the runner may receive secrets."
             exit 1
           fi
+          echo "token present (length ${#token})"
+          auth="Authorization: token ${token}"
           tag='${{ github.ref_name }}'
           api="https://codeberg.org/api/v1/repos/${GITHUB_REPOSITORY}"
-          auth="Authorization: token ${RELEASE_TOKEN}"
+          echo "publishing $tag to $api"
 
           rid="$(curl -fsSL -H "$auth" "$api/releases/tags/$tag" 2>/dev/null \
             | grep -o '"id":[0-9]*' | head -1 | sed 's/.*://')"
+          echo "existing release id: ${rid:-none}"
           if [ -z "${rid:-}" ]; then
-            rid="$(curl -fsS -H "$auth" -H 'Content-Type: application/json' -X POST \
-              -d "{\"tag_name\":\"$tag\",\"name\":\"$tag\"}" "$api/releases" \
-              | grep -o '"id":[0-9]*' | head -1 | sed 's/.*://')"
+            # -sS not -f, so a non-2xx body (e.g. a permission message) is shown
+            # rather than swallowed.
+            resp="$(curl -sS -H "$auth" -H 'Content-Type: application/json' -X POST \
+              -d "{\"tag_name\":\"$tag\",\"name\":\"$tag\"}" "$api/releases")"
+            echo "create response: $(printf '%s' "$resp" | head -c 300)"
+            rid="$(printf '%s' "$resp" | grep -o '"id":[0-9]*' | head -1 | sed 's/.*://')"
           fi
           [ -n "${rid:-}" ] || { echo 'could not find or create the release'; exit 1; }
+          echo "release id: $rid"
 
           for aid in $(curl -fsSL -H "$auth" "$api/releases/$rid/assets" \
               | grep -o '"id":[0-9]*' | sed 's/.*://'); do
