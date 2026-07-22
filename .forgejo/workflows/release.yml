@@ -22,7 +22,7 @@ on:
 
 jobs:
   release:
-    runs-on: codeberg-medium
+    runs-on: self-hosted
     container: rust:1.97.1-bookworm
     steps:
       - name: Checkout
