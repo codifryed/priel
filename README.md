@@ -49,19 +49,37 @@ The design decisions behind these live in [`docs/adr/`](docs/adr/).
 
 ## Install
 
-Requires Rust ≥ 1.88, `libmpv` (`mpv-devel` / `libmpv-dev` to build), a working
-PipeWire or ALSA setup, and a subscription.
+Linux only. Requires Rust ≥ 1.88, `libmpv` (`mpv-devel` / `libmpv-dev` to
+build), a working PipeWire or ALSA setup, and a subscription.
+
+### Quick install
+
+```bash
+curl -fsSL https://codeberg.org/codifryed/priel/raw/branch/main/install.sh | sh
+```
+
+Builds priel from source and installs it under `~/.local` (no root needed). If
+Rust or the mpv library is missing, the script names the package for your distro
+and stops rather than half-installing. **Re-run it to update.** Override the
+location with `PRIEL_PREFIX` or the branch/tag with `PRIEL_REF`. There are no
+prebuilt binaries — the script fetches the source and compiles it, so a release
+build takes a few minutes. Read [`install.sh`](install.sh) before piping it to a
+shell; it is short on purpose.
+
+### From a clone
 
 ```bash
 make check-deps        # verify cargo and libmpv are present
 make                   # release build
-sudo make install      # binary, man page, completions, licence
+sudo make install      # system-wide: binary, man page, completions, licence
 make run ARGS="--device pipewire/alsa_output.usb-..."
 ```
 
 `make help` lists every target. Install paths follow the GNU conventions
-(`DESTDIR`, `PREFIX`, `BINDIR`, `MANDIR`). For UI work without mpv headers,
-`make build-nolibmpv` compiles the interface with playback stubbed out.
+(`DESTDIR`, `PREFIX`, `BINDIR`, `MANDIR`), so `sudo make install PREFIX=/usr/local`
+places it system-wide and `make install PREFIX=~/.local` matches the quick
+installer. For UI work without mpv headers, `make build-nolibmpv` compiles the
+interface with playback stubbed out.
 
 **Signing in.** On first run priel opens your browser; you sign in and land on a
 page that looks like an error. Copy its address, paste it back into priel, and
