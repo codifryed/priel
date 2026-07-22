@@ -99,22 +99,25 @@ jobs:
           api="https://codeberg.org/api/v1/repos/${GITHUB_REPOSITORY}"
           echo "publishing $tag to $api"
 
-          rid="$(curl -fsSL -H "$auth" "$api/releases/tags/$tag" 2>/dev/null \
-            | grep -o '"id":[0-9]*' | head -1 | sed 's/.*://')"
+          # Pull the release id out of a JSON blob. `|| true` because the runner's
+          # shell is `bash -e -o pipefail`, and a `grep` that finds nothing (an
+          # expected miss - e.g. no release for the tag yet, or no assets) exits
+          # non-zero, which pipefail + set -e would otherwise treat as fatal.
+          id_of() { grep -o '"id":[0-9]*' | head -1 | sed 's/.*://' || true; }
+
+          rid="$(curl -sSL -H "$auth" "$api/releases/tags/$tag" 2>/dev/null | id_of)"
           echo "existing release id: ${rid:-none}"
-          if [ -z "${rid:-}" ]; then
-            # -sS not -f, so a non-2xx body (e.g. a permission message) is shown
-            # rather than swallowed.
+          if [ -z "$rid" ]; then
+            # -sS not -f, so a non-2xx body (e.g. a permission message) is shown.
             resp="$(curl -sS -H "$auth" -H 'Content-Type: application/json' -X POST \
               -d "{\"tag_name\":\"$tag\",\"name\":\"$tag\"}" "$api/releases")"
             echo "create response: $(printf '%s' "$resp" | head -c 300)"
-            rid="$(printf '%s' "$resp" | grep -o '"id":[0-9]*' | head -1 | sed 's/.*://')"
+            rid="$(printf '%s' "$resp" | id_of)"
           fi
-          [ -n "${rid:-}" ] || { echo 'could not find or create the release'; exit 1; }
+          [ -n "$rid" ] || { echo 'could not find or create the release'; exit 1; }
           echo "release id: $rid"
 
-          for aid in $(curl -fsSL -H "$auth" "$api/releases/$rid/assets" \
-              | grep -o '"id":[0-9]*' | sed 's/.*://'); do
+          for aid in $(curl -sSL -H "$auth" "$api/releases/$rid/assets" | grep -o '"id":[0-9]*' | sed 's/.*://' || true); do
             curl -fsS -H "$auth" -X DELETE "$api/releases/$rid/assets/$aid" >/dev/null || true
           done
           for f in dist/release/*; do
