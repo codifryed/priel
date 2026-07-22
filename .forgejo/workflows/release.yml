@@ -7,11 +7,12 @@
 # script unpacks it straight into a prefix with a copy, and the layout is the
 # one a distro package uses too.
 #
-# Runs in the official Rust image, so no toolchain is installed per run. Needs
-# one secret: RELEASE_TOKEN, a Forgejo application token with `write:repository`,
-# under Repo Settings → Actions → Secrets - the automatic job token's release
-# permissions vary by version. `override: true` makes re-running a tag replace
-# its assets rather than fail on the release that already exists.
+# Runs in the official Rust image (no toolchain install per run); the checkout is
+# done by hand with git because the Rust image has no Node for a JavaScript
+# action. Needs one secret: RELEASE_TOKEN, a Forgejo application token with
+# `write:repository`, under Repo Settings → Actions → Secrets - the automatic job
+# token's release permissions vary by version. `override: true` makes re-running
+# a tag replace its assets rather than fail on the release that already exists.
 name: release
 
 on:
@@ -23,24 +24,19 @@ jobs:
   release:
     runs-on: codeberg-medium
     container: rust:1-bookworm
-    env:
-      CARGO_HOME: ${{ github.workspace }}/.cargo
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v4
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory '*'
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
 
       - name: mpv headers
         run: |
           apt-get update
           apt-get install -y --no-install-recommends pkg-config libmpv-dev
-
-      - uses: https://data.forgejo.org/actions/cache@v4
-        continue-on-error: true
-        with:
-          path: |
-            .cargo
-            target
-          key: release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: release-
 
       - name: Build and stage the release tarball
         run: |
@@ -70,13 +66,36 @@ jobs:
           tar -czf "dist/release/${name}.tar.gz" -C dist "${name}"
           ( cd dist/release && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
+      # Published with the API directly rather than the forgejo-release action,
+      # for the same reason the checkout is by hand: that action is JavaScript
+      # and this image has no Node. Find or create the release for the tag, clear
+      # its old assets so a re-run replaces rather than duplicates, then upload
+      # the fresh set.
       - name: Publish release
-        uses: https://code.forgejo.org/actions/forgejo-release@v2
-        with:
-          direction: upload
-          url: https://codeberg.org
-          repo: ${{ github.repository }}
-          tag: ${{ github.ref_name }}
-          release-dir: dist/release
-          token: ${{ secrets.RELEASE_TOKEN }}
-          override: true
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -eu
+          tag='${{ github.ref_name }}'
+          api="https://codeberg.org/api/v1/repos/${GITHUB_REPOSITORY}"
+          auth="Authorization: token ${RELEASE_TOKEN}"
+
+          rid="$(curl -fsSL -H "$auth" "$api/releases/tags/$tag" 2>/dev/null \
+            | grep -o '"id":[0-9]*' | head -1 | sed 's/.*://')"
+          if [ -z "${rid:-}" ]; then
+            rid="$(curl -fsS -H "$auth" -H 'Content-Type: application/json' -X POST \
+              -d "{\"tag_name\":\"$tag\",\"name\":\"$tag\"}" "$api/releases" \
+              | grep -o '"id":[0-9]*' | head -1 | sed 's/.*://')"
+          fi
+          [ -n "${rid:-}" ] || { echo 'could not find or create the release'; exit 1; }
+
+          for aid in $(curl -fsSL -H "$auth" "$api/releases/$rid/assets" \
+              | grep -o '"id":[0-9]*' | sed 's/.*://'); do
+            curl -fsS -H "$auth" -X DELETE "$api/releases/$rid/assets/$aid" >/dev/null || true
+          done
+          for f in dist/release/*; do
+            fn="$(basename "$f")"
+            curl -fsS -H "$auth" -X POST -F "attachment=@$f" \
+              "$api/releases/$rid/assets?name=$fn" >/dev/null
+            echo "uploaded $fn"
+          done

@@ -1,11 +1,12 @@
 # Test and lint on every push and pull request.
 #
 # Runs in the official Rust image, so cargo, rustfmt and clippy are already there
-# and no toolchain is installed per run. Split into parallel jobs so no single
-# one has to fit formatting, clippy over both feature configurations and the
-# whole test suite inside the runner's time cap. Each caches CARGO_HOME and
-# target/ - relocated under the workspace so the paths are the image's business,
-# not ours - and the cache is best-effort so a missing backend cannot fail a job.
+# and no toolchain is installed per run. The checkout is done by hand with git
+# rather than the `actions/checkout` action, because that action is JavaScript
+# and the Rust image ships no Node for it to run on - the same reason there is no
+# `actions/cache` step here. Split into parallel jobs so no single one has to fit
+# formatting, clippy over both feature configurations and the whole test suite
+# inside the runner's time cap.
 #
 # Mirrors `make check`, the local gate.
 name: ci
@@ -20,28 +21,30 @@ jobs:
     runs-on: codeberg-small
     container: rust:1-bookworm
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v4
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory '*'
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
       - run: cargo fmt --check
 
   clippy:
     runs-on: codeberg-medium
     container: rust:1-bookworm
-    env:
-      CARGO_HOME: ${{ github.workspace }}/.cargo
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v4
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory '*'
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
       - name: mpv headers
         run: |
           apt-get update
           apt-get install -y --no-install-recommends pkg-config libmpv-dev
-      - uses: https://data.forgejo.org/actions/cache@v4
-        continue-on-error: true
-        with:
-          path: |
-            .cargo
-            target
-          key: clippy-${{ hashFiles('Cargo.lock') }}
-          restore-keys: clippy-
       - name: Clippy, both feature configurations
         run: |
           cargo clippy --all-targets -- -D warnings
@@ -50,22 +53,18 @@ jobs:
   test:
     runs-on: codeberg-medium
     container: rust:1-bookworm
-    env:
-      CARGO_HOME: ${{ github.workspace }}/.cargo
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v4
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory '*'
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
       - name: mpv headers
         run: |
           apt-get update
           apt-get install -y --no-install-recommends pkg-config libmpv-dev
-      - uses: https://data.forgejo.org/actions/cache@v4
-        continue-on-error: true
-        with:
-          path: |
-            .cargo
-            target
-          key: test-${{ hashFiles('Cargo.lock') }}
-          restore-keys: test-
       - name: Tests, both feature configurations
         run: |
           cargo test --locked
