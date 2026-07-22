@@ -26,7 +26,11 @@ name: ci
 on:
   push:
     branches: [main]
-  pull_request:
+# No `pull_request` trigger on purpose. These jobs run on a self-hosted runner,
+# and running the code from an arbitrary fork's pull request there is arbitrary
+# code execution on the maintainer's own machine. priel does not take external
+# pull requests (see .claude/CLAUDE.md); the maintainer's own commits are covered
+# by the push trigger above, since work reaches main by a fast-forward merge.
 
 jobs:
   fmt:
