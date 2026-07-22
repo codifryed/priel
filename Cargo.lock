@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "priel-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "priel-player"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "libmpv2",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "priel-tui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
