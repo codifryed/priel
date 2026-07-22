@@ -31,6 +31,7 @@ use ureq::{Agent, Body};
 
 pub mod auth;
 pub mod mpd;
+pub mod update;
 
 const API: &str = "https://api.tidal.com";
 const UA: &str = concat!("priel/", env!("CARGO_PKG_VERSION"));
@@ -3090,6 +3091,38 @@ mod tests {
 
         let clipped = c.fetch_bytes(&s.base, 4).expect("a capped body");
         assert_eq!(clipped.len(), 4, "the cap is a ceiling on what is read");
+    }
+
+    #[test]
+    fn the_update_check_reports_a_newer_release_and_stays_quiet_otherwise() {
+        // Goal: the whole update check end to end - fetch the release JSON, read
+        // its tag, and report it only when it is newer than what is running.
+        // Method: serve a release document from the stub and ask against a lower
+        // and a higher current version.
+        let body = r#"{"tag_name":"v0.2.0","name":"0.2.0"}"#;
+        let s = stub(vec![ok(body), ok(body)]);
+        let c = client(&s);
+
+        assert_eq!(
+            update::newer_release(&c, &s.base, "0.1.0"),
+            Some("v0.2.0".to_string()),
+            "a newer release on the forge is reported with its tag"
+        );
+        assert_eq!(
+            update::newer_release(&c, &s.base, "0.2.0"),
+            None,
+            "the same version is nothing to report"
+        );
+    }
+
+    #[test]
+    fn no_releases_yet_is_nothing_to_report_rather_than_an_error() {
+        // Goal: before the first release is cut, `/releases/latest` answers 404
+        // with a message body. That is "nothing to update to", not a failure the
+        // listener has to see.
+        let s = stub(vec![(404, r#"{"message":"Not Found"}"#.to_string())]);
+        let c = client(&s);
+        assert_eq!(update::newer_release(&c, &s.base, "0.1.0"), None);
     }
 
     #[test]
