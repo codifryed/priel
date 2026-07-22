@@ -756,10 +756,11 @@ pub struct App {
 
     /// Whether the queue running out should be followed by the radio.
     ///
-    /// **Off unless it is turned on**, which is the whole design: a player that
-    /// carries on by itself past the last track the listener chose is a player
-    /// playing music nobody asked for, unattended, for hours. Silence is the
-    /// honest end of a snapshot somebody took on purpose.
+    /// **On unless it is turned off**: a player that stops dead at the end of a
+    /// chosen queue is a surprising silence, so the service's own suggestions
+    /// carry it on. The `c` key and the header control turn it off for the
+    /// listener who wants the queue to end where it ends, and a repeat outranks
+    /// it either way.
     ///
     /// Session state rather than a setting, in the sense
     /// `docs/adr/0004-a-settings-file-that-is-edited-never-rewritten.md` means
@@ -1106,7 +1107,7 @@ impl App {
             next_intended: None,
             metas: HashMap::new(),
             advanced: false,
-            continue_radio: false,
+            continue_radio: true,
             queue_fill: None,
             repeat: Repeat::Off,
             radio_asked: None,
@@ -9549,14 +9550,25 @@ mod tests {
     }
 
     #[test]
-    fn nothing_follows_the_last_track_until_the_listener_asks_for_it() {
-        // Goal: the whole reason this is a toggle. A player that carries on by
-        // itself after the last track the listener chose is a player playing
-        // music nobody asked for, and it does that unattended, for hours. So
-        // off is the default and silence is the honest end of a queue.
+    fn the_queue_carries_on_with_the_radio_by_default() {
+        // Goal: the default keeps the music going. A player that stops dead at
+        // the end of a chosen queue is a surprising silence; the service's own
+        // suggestions carry it on without the listener asking.
         let mut r = rig();
         on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
-        assert!(!r.app.continue_radio, "off until it is turned on");
+        assert!(r.app.continue_radio, "on until it is turned off");
+        r.app.refresh_for_test();
+        assert_eq!(radios_asked(&r), vec!["0016d".to_string()]);
+    }
+
+    #[test]
+    fn turning_it_off_ends_the_queue_where_it_ends() {
+        // Goal: the toggle's other direction. Off, the last track the listener
+        // chose is the end and nothing is asked for.
+        let mut r = rig();
+        on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
+        r.app.on_key(key('c')); // on by default, so this turns it off
+        assert!(!r.app.continue_radio);
         r.app.refresh_for_test();
         assert!(radios_asked(&r).is_empty());
     }
@@ -9571,7 +9583,6 @@ mod tests {
             &mut r,
             vec![track(1, "T", "A"), track_with_radio(2, "0016d")],
         );
-        r.app.on_key(key('c'));
         r.app.refresh_for_test();
         assert_eq!(radios_asked(&r), vec!["0016d".to_string()]);
     }
@@ -9754,14 +9765,13 @@ mod tests {
         // skipping a track or restarting priel.
         let mut r = rig();
         on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
-        r.app.on_key(key('c'));
-        r.app.refresh_for_test();
+        r.app.refresh_for_test(); // on by default: asked once
         assert_eq!(radios_asked(&r).len(), 1);
         r.app.refresh_for_test();
         assert!(radios_asked(&r).is_empty(), "not while it stays on");
 
-        r.app.on_key(key('c'));
-        r.app.on_key(key('c'));
+        r.app.on_key(key('c')); // off
+        r.app.on_key(key('c')); // on again
         r.app.refresh_for_test();
         assert_eq!(radios_asked(&r).len(), 1, "asked for again");
     }
@@ -9839,9 +9849,9 @@ mod tests {
         // from drifting is for both to run the same method.
         let mut r = rig();
         r.app.on_key(key('c'));
-        assert!(r.app.continue_radio, "the key turns it on");
+        assert!(!r.app.continue_radio, "the key turns it off");
         r.app.dispatch(Hit::Continue);
-        assert!(!r.app.continue_radio, "and the control turns it back off");
+        assert!(r.app.continue_radio, "and the control turns it back on");
         assert!(
             r.app.notice.clone().unwrap_or_default().contains("adio"),
             "each says which way it went: {:?}",
