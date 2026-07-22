@@ -41,7 +41,13 @@ jobs:
       - name: Build and stage the release tarball
         run: |
           cargo build --release --locked -p priel-tui
-          make assets
+          # Generate the man page and completions from the *release* build rather
+          # than `make assets`, which does `cargo run` in debug and so compiles a
+          # whole second `target/debug` tree. On Codeberg's free runners the
+          # filesystem counts against RAM, and that extra tree tips it over - the
+          # release build alone fits. This reuses the release deps and adds no
+          # debug tree.
+          cargo run --release --locked --features gen-assets --bin priel-gen-assets -- target/assets
           strip target/release/priel
 
           tag='${{ github.ref_name }}'
