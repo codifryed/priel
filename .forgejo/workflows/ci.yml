@@ -8,6 +8,11 @@
 # formatting, clippy over both feature configurations and the whole test suite
 # inside the runner's time cap.
 #
+# The Rust image is pinned to an exact version rather than `rust:1-bookworm`:
+# clippy's lint set moves between releases, so a floating image would fail the
+# gate on a lint the maintainer's toolchain does not have yet. Bump this in step
+# with the local toolchain, fixing any new lints deliberately when you do.
+#
 # Mirrors `make check`, the local gate.
 name: ci
 
@@ -19,7 +24,7 @@ on:
 jobs:
   fmt:
     runs-on: codeberg-small
-    container: rust:1-bookworm
+    container: rust:1.97.1-bookworm
     steps:
       - name: Checkout
         run: |
@@ -32,7 +37,7 @@ jobs:
 
   clippy:
     runs-on: codeberg-medium
-    container: rust:1-bookworm
+    container: rust:1.97.1-bookworm
     steps:
       - name: Checkout
         run: |
@@ -52,7 +57,7 @@ jobs:
 
   test:
     runs-on: codeberg-medium
-    container: rust:1-bookworm
+    container: rust:1.97.1-bookworm
     steps:
       - name: Checkout
         run: |

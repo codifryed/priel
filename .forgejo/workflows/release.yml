@@ -23,7 +23,7 @@ on:
 jobs:
   release:
     runs-on: codeberg-medium
-    container: rust:1-bookworm
+    container: rust:1.97.1-bookworm
     steps:
       - name: Checkout
         run: |
