@@ -24,16 +24,31 @@
 name: ci
 
 on:
+  # Every branch push and every pull request targeting main.
+  #
+  # Branch pushes are all trusted: pushing here needs write access, so only the
+  # maintainer makes branches in this repo. Pull requests are the untrusted
+  # surface - a fork's author cannot push here but can still open a PR, and on a
+  # self-hosted runner that PR's code (and its dependencies' build scripts) would
+  # run on the maintainer's own machine. Forgejo gates that: a new or untrusted
+  # author's PR workflow is blocked until a maintainer approves it on the PR page
+  # ("Approve once" for the run, "Approve always" to trust the author from then
+  # on). Only approve a fork PR after reading its workflow and dependency changes.
+  #
+  # ci.yml carries no secrets (unlike release.yml), so an approved fork run can
+  # build and test but has nothing to exfiltrate.
   push:
+  pull_request:
     branches: [main]
-# No `pull_request` trigger on purpose. These jobs run on a self-hosted runner,
-# and running the code from an arbitrary fork's pull request there is arbitrary
-# code execution on the maintainer's own machine. priel does not take external
-# pull requests (see .claude/CLAUDE.md); the maintainer's own commits are covered
-# by the push trigger above, since work reaches main by a fast-forward merge.
 
+# The `if` on each job skips the pull-request event for a PR whose branch lives
+# in this same repo: that branch was already built by its push above, so building
+# it again for the PR would only double the work on the one runner. A fork PR
+# (its head in another repo) has no push event here, so it still runs - once,
+# after approval.
 jobs:
   fmt:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: self-hosted
     container: rust:1.97.1-bookworm
     steps:
@@ -49,6 +64,7 @@ jobs:
           cargo fmt --check
 
   clippy:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: self-hosted
     container: rust:1.97.1-bookworm
     steps:
@@ -70,6 +86,7 @@ jobs:
           cargo clippy -p priel-tui --no-default-features --all-targets -- -D warnings
 
   test:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: self-hosted
     container: rust:1.97.1-bookworm
     steps:
