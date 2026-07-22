@@ -47,7 +47,7 @@ use crate::bus::mpris::{self, BusCommand, Entry, Now, Snapshot};
 use crate::cli::ThemeName;
 use crate::settings::Settings;
 use crate::theme::{self, Theme};
-use crate::worker::{self, FromWorker, Task, ToWorker, Worker};
+use crate::worker::{self, FromWorker, QueueSource, Task, ToWorker, Worker};
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum View {
@@ -500,13 +500,33 @@ fn seconds(micros: i64) -> f64 {
     micros as f64 / 1_000_000.0
 }
 
-/// The most tracks a queue may hold.
+/// The most tracks the **radio** may grow a queue to.
 ///
 /// A queue built from a listing is bounded by the listing, but one the radio
 /// keeps extending is bounded by nothing at all: it runs out, asks again, and
-/// grows every time. This is the bound that makes it finite - about a day of
-/// music, after which the queue ends and says so, like any other queue.
-const QUEUE_MAX: usize = 500;
+/// grows every time. This is the bound that makes *that* finite - about a day of
+/// music, after which the radio adds no more and the queue ends, like any other.
+/// It is not a limit on a queue you filled from a listing you already hold: see
+/// [`QUEUE_MAX`].
+const RADIO_MAX: usize = 500;
+
+/// The absolute ceiling on a queue, however it was filled.
+///
+/// A queue is a handful of small strings per track, drawn a screenful at a time,
+/// and mpv only ever holds the current track plus one preloaded next - so a long
+/// queue costs almost nothing, and this is a sanity backstop rather than a real
+/// limit. It is set far above any real library so that filling a queue from a
+/// listing reads as "all of them"; the one operation that is linear in the queue
+/// length, `playing_row`, runs once a frame and is trivial at this size. The
+/// radio stops well below it, at [`RADIO_MAX`].
+const QUEUE_MAX: usize = 10_000;
+
+/// [`QUEUE_MAX`] as a `u32`, for comparing against a listing's row count.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a fixed 10_000 is far inside u32"
+)]
+const QUEUE_MAX_U32: u32 = QUEUE_MAX as u32;
 
 /// How long a playlist name may be typed.
 ///
@@ -564,6 +584,26 @@ pub struct Paging {
     /// second for as long as priel stayed open. Cleared by a deliberate user
     /// action - reloading, or coming back to the view.
     stalled: bool,
+}
+
+/// The state of filling a queue up to the whole of its listing.
+///
+/// Held while a queue built from a listing still has rows of that listing left
+/// to fetch. One page is in flight at a time, exactly as [`Paging`] pages a
+/// view, and the reply is matched by `source` so a page for a queue that has
+/// since been replaced is dropped rather than appended to the wrong one.
+struct QueueFill {
+    /// The listing being paged, and the identity the reply is matched against.
+    source: QueueSource,
+    /// The next offset to ask for: where the queue's rows end and the fill goes
+    /// on. Advances by the size of each page that lands.
+    next: u32,
+    /// How many rows the listing has, so the fill knows when it is done. Never
+    /// past [`QUEUE_MAX`], which is the ceiling whatever the listing's length.
+    total: u32,
+    /// Whether a page is in flight, so the once-a-frame driver asks for one at a
+    /// time rather than a burst.
+    inflight: bool,
 }
 
 impl Paging {
@@ -735,6 +775,16 @@ pub struct App {
     /// actually chose stops claiming to be a suggestion. Cleared whenever the
     /// queue is rebuilt, because that is a fresh choice.
     radio_from: Option<usize>,
+
+    /// The listing a queue was built from, and how far it has been filled - or
+    /// `None` when the queue holds the whole of its source already, or came from
+    /// something that cannot be paged (a filtered listing).
+    ///
+    /// This is what makes "play my favorites" mean all of them: the queue starts
+    /// as the rows that were loaded, and keeps growing in the background until it
+    /// holds the listing. Correlated by [`QueueSource`], not by the view, so the
+    /// fill goes on after the listener has navigated somewhere else.
+    queue_fill: Option<QueueFill>,
 
     /// Tracks priel knows are in the user's favorites.
     ///
@@ -1041,6 +1091,7 @@ impl App {
             metas: HashMap::new(),
             advanced: false,
             continue_radio: false,
+            queue_fill: None,
             repeat: Repeat::Off,
             radio_asked: None,
             radio_from: None,
@@ -2204,6 +2255,11 @@ impl App {
                     page,
                 } => self.on_mix_tracks_page(&mix_id, offset, page),
                 FromWorker::Radio { mix_id, page } => self.on_radio_page(&mix_id, page),
+                FromWorker::QueueFilled {
+                    source,
+                    offset,
+                    page,
+                } => self.on_queue_filled(&source, offset, page),
                 FromWorker::SearchResults {
                     query,
                     offset,
@@ -2784,14 +2840,22 @@ impl App {
 
     // ---- queue + gapless playback ----
 
-    /// Build the play queue from the rows on screen and start at one of them.
+    /// Build the play queue from the rows on screen, start at one of them, and
+    /// fill the queue up to the whole listing in the background.
     ///
-    /// The queue is a snapshot, and a page of favorites that lands later does
-    /// **not** join it. The listener chose a set of tracks; extending it behind
-    /// their back would change what plays next without being asked, and the
-    /// track that follows the last one they saw would no longer be the one they
-    /// picked. Pressing Enter again rebuilds the queue from the larger list,
-    /// which is the deliberate way to take the new rows.
+    /// Playing a listing means playing the *listing*, not the rows that happened
+    /// to be paged in - so the queue starts as what is loaded and then grows onto
+    /// the end until it holds all of it, which is what makes a shuffle cover
+    /// every favorite rather than the first hundred. That fill is
+    /// [`App::begin_queue_fill`], correlated to the queue's source so it goes on
+    /// after the listener has navigated away.
+    ///
+    /// A page arriving for the *view* still does not join the queue - only the
+    /// fill, which is the queue's own, grows it. Extending it from an incidental
+    /// view page would change what plays next without being asked; extending it
+    /// from the fill is finishing the job the listener started by pressing play.
+    /// A filtered listing takes neither: it is a deliberate subset and stays the
+    /// snapshot it was.
     fn start_queue_at(&mut self, vis_index: usize) {
         let vis = self.visible();
         if vis.is_empty() {
@@ -2816,6 +2880,7 @@ impl App {
             }
         }
         self.load_fresh(p);
+        self.begin_queue_fill();
     }
 
     /// Replace the queue, and with it everything that was true of the last one.
@@ -2829,10 +2894,155 @@ impl App {
         self.queue_offset = 0;
         self.radio_from = None;
         self.radio_asked = None;
+        // A fresh queue cancels the fill of the last one: a page still on its way
+        // for the queue that was here is no longer wanted, and is dropped on
+        // arrival because its source no longer matches. The caller that built
+        // this queue from a listing starts its own fill.
+        self.queue_fill = None;
         // A queue and its order are made together. The callers that want a
         // shuffled one deal this one again, which is a different decision from
         // "what is in the queue" and belongs to them.
         self.lay_listing_order();
+    }
+
+    /// The listing the current view would build a queue from, if it is one that
+    /// can be paged on in the background.
+    ///
+    /// The playable track listings and nothing else: the playlist and mix
+    /// *indexes* are not queues, and a view with no query or nothing open has no
+    /// source to page.
+    fn queue_source(&self) -> Option<QueueSource> {
+        match self.view {
+            View::Favorites => Some(QueueSource::Favorites),
+            View::PlaylistTracks => Some(QueueSource::Playlist(
+                self.open_playlist.as_ref()?.0.clone(),
+            )),
+            View::MixTracks => Some(QueueSource::Mix(self.open_mix.as_ref()?.0.clone())),
+            View::Search if !self.search_asked.is_empty() => {
+                Some(QueueSource::Search(self.search_asked.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The page size to fill each source with, matched to how the view pages it.
+    fn fill_limit(source: &QueueSource) -> u32 {
+        match source {
+            QueueSource::Favorites => worker::FAVORITES_PAGE,
+            QueueSource::Playlist(_) => worker::PLAYLIST_TRACKS_PAGE,
+            QueueSource::Mix(_) => worker::MIX_TRACKS_PAGE,
+            QueueSource::Search(_) => worker::SEARCH_PAGE,
+        }
+    }
+
+    /// Start filling the queue in the background up to the whole of its listing.
+    ///
+    /// Called by the two paths that build a queue from the visible list. It is
+    /// what turns "play the rows that happened to be loaded" into "play the
+    /// listing": the queue keeps the rows it started with and grows onto the end
+    /// until it holds the listing or reaches [`QUEUE_MAX`].
+    ///
+    /// Does nothing when there is a **filter** active: the queue is then the
+    /// filtered subset the listener chose to see, and paging the unfiltered
+    /// listing in behind it would fill the queue with rows the filter hides.
+    /// Does nothing either when the queue already holds the whole listing, which
+    /// is the ordinary small-playlist case.
+    fn begin_queue_fill(&mut self) {
+        if !self.filter.is_empty() {
+            return;
+        }
+        let Some(source) = self.queue_source() else {
+            return;
+        };
+        let total = self.paging().total.min(QUEUE_MAX_U32);
+        let Ok(have) = u32::try_from(self.queue.len()) else {
+            return;
+        };
+        if have >= total {
+            return; // the queue is already the whole listing
+        }
+        self.queue_fill = Some(QueueFill {
+            source,
+            next: have,
+            total,
+            inflight: false,
+        });
+        self.request_next_fill();
+    }
+
+    /// Ask for the next page of the queue's fill, if one is due.
+    ///
+    /// One page in flight at a time, chained from the reply rather than driven
+    /// off the tick: the fill is a burst that runs once when a listing is
+    /// played, not a thing to re-check ten times a second forever.
+    fn request_next_fill(&mut self) {
+        let Some(fill) = self.queue_fill.as_ref() else {
+            return;
+        };
+        if fill.inflight {
+            return;
+        }
+        if fill.next >= fill.total || self.queue.len() >= QUEUE_MAX {
+            self.queue_fill = None; // the listing is in, or the ceiling is reached
+            return;
+        }
+        let source = fill.source.clone();
+        let offset = fill.next;
+        let limit = Self::fill_limit(&source);
+        if let Some(fill) = self.queue_fill.as_mut() {
+            fill.inflight = true;
+        }
+        self.ask(ToWorker::FillQueue {
+            source,
+            offset,
+            limit,
+        });
+    }
+
+    /// A page of the queue's listing arrived; grow the queue by it.
+    ///
+    /// Matched by source, so a page for a queue that has since been replaced is
+    /// dropped. The new rows go on the end of the queue and are dealt into the
+    /// not-yet-played part of the play order by [`App::extend_order`], exactly as
+    /// a radio page is - so a shuffle keeps "no track twice until every other
+    /// has played" across the fill, and the rows already on screen do not move.
+    fn on_queue_filled(
+        &mut self,
+        source: &QueueSource,
+        offset: u32,
+        page: priel_core::Page<Track>,
+    ) {
+        let still_ours = self
+            .queue_fill
+            .as_ref()
+            .is_some_and(|f| &f.source == source && f.next == offset);
+        if !still_ours {
+            return;
+        }
+        if let Some(fill) = self.queue_fill.as_mut() {
+            fill.inflight = false;
+        }
+        let room = QUEUE_MAX.saturating_sub(self.queue.len());
+        let added: Vec<Track> = page.items.into_iter().take(room).collect();
+        if added.is_empty() {
+            self.queue_fill = None; // the listing gave nothing more, or the ceiling
+            return;
+        }
+        let Ok(grew_by) = u32::try_from(added.len()) else {
+            self.queue_fill = None;
+            return;
+        };
+        let grown_from = self.queue.len();
+        self.queue.extend(added);
+        self.extend_order(grown_from);
+        if let Some(fill) = self.queue_fill.as_mut() {
+            fill.next = fill.next.saturating_add(grew_by);
+        }
+        self.dirty = true;
+        // The preload reads from the grown queue: a fill that lands while the
+        // last loaded track is playing is what makes the next one there to load.
+        self.schedule_next();
+        self.request_next_fill();
     }
 
     fn load_fresh(&mut self, pos: usize) {
@@ -2996,7 +3206,7 @@ impl App {
             self.notice = Some(format!("No radio for “{title}”. The queue ends here."));
             return;
         }
-        if self.queue.len() >= QUEUE_MAX {
+        if self.queue.len() >= RADIO_MAX {
             self.notice = Some("The queue is as long as it goes. Play something to go on.".into());
             return;
         }
@@ -3025,7 +3235,7 @@ impl App {
             log::debug!("dropping the radio for {mix_id}: it is not what is playing");
             return;
         }
-        let room = QUEUE_MAX.saturating_sub(self.queue.len());
+        let room = RADIO_MAX.saturating_sub(self.queue.len());
         let added: Vec<Track> = page
             .items
             .into_iter()
@@ -3765,6 +3975,7 @@ impl App {
                 if let Some(p) = self.queue_at(0) {
                     self.load_fresh(p);
                 }
+                self.begin_queue_fill();
             }
         }
     }
@@ -9514,9 +9725,9 @@ mod tests {
         let mut r = rig();
         on_the_last_track(&mut r, vec![track_with_radio(1, "0016d")]);
         r.app.continue_radio = true;
-        r.app.queue = (1..=QUEUE_MAX as u64).map(|i| track(i, "T", "A")).collect();
-        r.app.queue[QUEUE_MAX - 1].mix_id = "0016d".into();
-        r.app.queue_pos = QUEUE_MAX - 1;
+        r.app.queue = (1..=RADIO_MAX as u64).map(|i| track(i, "T", "A")).collect();
+        r.app.queue[RADIO_MAX - 1].mix_id = "0016d".into();
+        r.app.queue_pos = RADIO_MAX - 1;
         r.app.refresh_for_test();
         assert!(
             radios_asked(&r).is_empty(),
@@ -9531,7 +9742,7 @@ mod tests {
         // past the ceiling either.
         r.to_app.send(radio_page("0016d", 9000..9010)).unwrap();
         r.app.drain_worker();
-        assert_eq!(r.app.queue.len(), QUEUE_MAX, "there was no room left");
+        assert_eq!(r.app.queue.len(), RADIO_MAX, "there was no room left");
     }
 
     #[test]
@@ -11943,6 +12154,211 @@ mod tests {
         assert!(
             said.contains("Enter"),
             "the empty queue was not the answer: {said:?}"
+        );
+    }
+
+    /// Load `have` favorites out of a listing of `total`, ready to play, with a
+    /// list rect so the paging trigger has geometry to reason about.
+    fn favorites_partly_loaded(r: &mut Rig, have: u64, total: u32) {
+        r.app.start();
+        r.to_app
+            .send(favorites_page(0, 1..have + 1, total))
+            .unwrap();
+        r.app.drain_worker();
+        r.app.list_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+        let _ = requests(r); // clear the view's own paging requests
+    }
+
+    /// The `FillQueue` requests among what the app has sent.
+    fn fills(reqs: &[ToWorker]) -> Vec<(QueueSource, u32)> {
+        reqs.iter()
+            .filter_map(|c| match c {
+                ToWorker::FillQueue { source, offset, .. } => Some((source.clone(), *offset)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn playing_a_partly_loaded_listing_fills_the_queue_from_where_it_ends() {
+        // Goal: the fix. Pressing Enter on favorites that are only partly paged
+        // in must build the queue from the loaded rows *and* start pulling the
+        // rest, so shuffle ends up over the whole listing rather than the subset
+        // that happened to be on screen. Method: three of ten loaded, play, and
+        // read what was asked.
+        let mut r = rig();
+        favorites_partly_loaded(&mut r, 3, 10);
+
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(r.app.queue.len(), 3, "the queue starts as the loaded rows");
+        assert_eq!(
+            fills(&requests(&r)),
+            vec![(QueueSource::Favorites, 3)],
+            "and the fill continues from where they end"
+        );
+    }
+
+    #[test]
+    fn a_filled_page_grows_the_queue_and_chains_the_next() {
+        // Goal: a fill page lands, the queue grows by it, its order grows with
+        // it, and the next page is asked for - up until the listing is in.
+        let mut r = rig();
+        favorites_partly_loaded(&mut r, 3, 8);
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        r.to_app
+            .send(FromWorker::QueueFilled {
+                source: QueueSource::Favorites,
+                offset: 3,
+                page: track_page(4..7, 8),
+            })
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(r.app.queue.len(), 6, "the queue grew by the page");
+        assert_eq!(r.app.order.len(), 6, "and the play order grew with it");
+        assert_eq!(
+            fills(&requests(&r)),
+            vec![(QueueSource::Favorites, 6)],
+            "and it asked for the next page"
+        );
+
+        // The last page brings the listing in; the fill then stops.
+        r.to_app
+            .send(FromWorker::QueueFilled {
+                source: QueueSource::Favorites,
+                offset: 6,
+                page: track_page(7..9, 8),
+            })
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(r.app.queue.len(), 8, "the whole listing is in the queue");
+        assert!(
+            fills(&requests(&r)).is_empty(),
+            "and nothing more is asked for once it is complete"
+        );
+    }
+
+    #[test]
+    fn a_filter_keeps_the_queue_a_snapshot_and_does_not_fill() {
+        // Goal: a filtered listing is a deliberate subset, so the queue is the
+        // filtered rows and paging the unfiltered listing in behind them would
+        // fill it with rows the filter hides. Method: filter, play, and check
+        // nothing is asked for.
+        let mut r = rig();
+        favorites_partly_loaded(&mut r, 3, 10);
+        r.app.filter = "t".into(); // matches the test tracks' title
+
+        r.app.on_key(code(KeyCode::Enter));
+        assert!(
+            fills(&requests(&r)).is_empty(),
+            "a filtered queue must not fill from the unfiltered listing"
+        );
+    }
+
+    #[test]
+    fn a_fill_page_for_a_replaced_queue_is_dropped() {
+        // Goal: correlation by source, not arrival. A page still on its way for
+        // the queue that was here must not be appended to whatever queue is now
+        // current. Method: play favorites, replace the queue directly, then hand
+        // back a favorites fill page.
+        let mut r = rig();
+        favorites_partly_loaded(&mut r, 3, 10);
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        // A different queue is now current, from something else.
+        r.app.set_queue(vec![track(99, "Elsewhere", "X")]);
+        let before = r.app.queue.len();
+
+        r.to_app
+            .send(FromWorker::QueueFilled {
+                source: QueueSource::Favorites,
+                offset: 3,
+                page: track_page(4..7, 10),
+            })
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(
+            r.app.queue.len(),
+            before,
+            "a page for the old queue must not grow the new one"
+        );
+    }
+
+    #[test]
+    fn a_fill_page_naming_a_different_source_is_dropped() {
+        // Goal: the source-match, not just the presence of a fill. When one
+        // filling queue has replaced another, a page still on its way for the
+        // old source can land while a fill for the *new* source is waiting at
+        // the same offset - and only the source tells them apart. Method: a
+        // favorites fill is in progress; deliver a page naming a search instead.
+        let mut r = rig();
+        favorites_partly_loaded(&mut r, 3, 10);
+        r.app.on_key(code(KeyCode::Enter)); // a favorites fill is now waiting at offset 3
+        let before = r.app.queue.len();
+
+        r.to_app
+            .send(FromWorker::QueueFilled {
+                source: QueueSource::Search("x".into()),
+                offset: 3,
+                page: track_page(4..7, 10),
+            })
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(
+            r.app.queue.len(),
+            before,
+            "a page whose source is not the queue's must not grow it"
+        );
+    }
+
+    #[test]
+    fn a_fully_loaded_listing_needs_no_fill() {
+        // Goal: the ordinary small case - a playlist wholly on screen - asks for
+        // nothing. Method: all three of three loaded, play, and check.
+        let mut r = rig();
+        favorites_partly_loaded(&mut r, 3, 3);
+        r.app.on_key(code(KeyCode::Enter));
+        assert!(
+            fills(&requests(&r)).is_empty(),
+            "a queue that is already the whole listing has nothing to fill"
+        );
+    }
+
+    #[test]
+    fn the_fill_deals_into_the_shuffle_so_it_covers_the_whole_listing() {
+        // Goal: the point of the whole change - shuffle over the listing, not
+        // the loaded subset. Method: shuffle on, play a partly-loaded listing,
+        // let a fill page land, and check the order is a permutation of the
+        // whole grown queue with every entry once.
+        let mut r = rig();
+        favorites_partly_loaded(&mut r, 3, 6);
+        r.app.shuffle = true;
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        r.to_app
+            .send(FromWorker::QueueFilled {
+                source: QueueSource::Favorites,
+                offset: 3,
+                page: track_page(4..7, 6),
+            })
+            .unwrap();
+        r.app.drain_worker();
+
+        assert_eq!(r.app.queue.len(), 6);
+        let mut seen: Vec<usize> = r.app.order.clone();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..6).collect::<Vec<_>>(),
+            "every entry of the grown queue is in the order exactly once"
         );
     }
 

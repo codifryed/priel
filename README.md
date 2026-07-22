@@ -140,9 +140,11 @@ sign-in boxes accept and cancel with their own keys.
 The now-playing block is always the bottom of the screen — track, progress bar,
 output badge and fidelity verdict — so those four facts never move with the
 width. On a terminal 120 columns or wider the play queue takes a column of its
-own on the right (fold it with `W`). Shuffle deals a play order the queue panel
-shows without reordering the queue itself; a repeating queue suppresses the
-radio, and the `∞` control dims to say so.
+own on the right (fold it with `W`). Playing a listing that is only partly paged
+in fills the queue with the rest of it in the background, so a shuffle covers the
+whole listing rather than the rows that were on screen. Shuffle deals a play
+order the queue panel shows without reordering the queue itself; a repeating
+queue suppresses the radio, and the `∞` control dims to say so.
 
 ## Status
 

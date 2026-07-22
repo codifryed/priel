@@ -63,6 +63,23 @@ pub const MIX_TRACKS_PAGE: u32 = 200;
 /// hour earlier.
 pub const RADIO_PAGE: u32 = 25;
 
+/// Which listing a queue was filled from, so the fill can page it on regardless
+/// of what the on-screen view has since become.
+///
+/// A queue built by pressing Enter on a listing keeps growing in the background
+/// until it holds the whole listing, and that fill is correlated by this rather
+/// than by the view - the listener can navigate away, and a page still landing
+/// for the queue's source is still the queue's, where a page for the view is the
+/// view's. The one that cannot be filled is not here: a filtered listing is a
+/// deliberate subset and stays the snapshot it was.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum QueueSource {
+    Favorites,
+    Playlist(String),
+    Mix(String),
+    Search(String),
+}
+
 /// A request for one page of a listing.
 ///
 /// Every one carries an explicit offset and limit, and the reply carries the
@@ -162,6 +179,18 @@ pub enum ToWorker {
     /// Read the chain to the output device. Runs `pw-dump` and waits for it,
     /// which is why it is here and not on the UI thread.
     ReadAudioGraph,
+    /// One page of the listing a queue was filled from, to grow the queue up to
+    /// the whole listing in the background.
+    ///
+    /// Distinct from the `Load*` requests, which page the *view*: this pages the
+    /// *queue's* source, correlated by [`QueueSource`] so it keeps arriving for
+    /// the right queue after the view has moved on. The reply is
+    /// [`FromWorker::QueueFilled`].
+    FillQueue {
+        source: QueueSource,
+        offset: u32,
+        limit: u32,
+    },
     /// Fetch and decode a track's album cover.
     ///
     /// Both the fetch and the decode happen here, off the render thread: the
@@ -347,6 +376,17 @@ pub enum FromWorker {
     /// it is a request that went wrong, and the overlay has its own sentence
     /// for each case.
     AudioGraph(Result<AudioGraph, GraphError>),
+    /// One page of the listing a queue is being filled from.
+    ///
+    /// Carries the source it answers for, so a page for a queue the listener has
+    /// since replaced is recognised and dropped rather than appended to whatever
+    /// queue is now current. A failed fetch sends nothing: a background fill that
+    /// cannot reach a page simply stops, and the queue keeps what it has.
+    QueueFilled {
+        source: QueueSource,
+        offset: u32,
+        page: Page<Track>,
+    },
     /// A decoded album cover, and the track it belongs to.
     ///
     /// Only ever sent on success: a cover that would not fetch or decode is
@@ -604,6 +644,16 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
             }
             FromWorker::AudioGraph(read)
         }
+        // Page the queue's own source. Distinct from the view's `Load*` so a
+        // fill keeps arriving after the listener has navigated elsewhere. A
+        // failure sends nothing - the fill stops and the queue keeps what it
+        // has - so this returns `None` on error rather than a `Failed`, which
+        // would put a banner over a background job the listener never started.
+        ToWorker::FillQueue {
+            source,
+            offset,
+            limit,
+        } => fill_queue(client, source, offset, limit)?,
         // Fetch the bytes and decode them here, on the worker: a cover is tens
         // of kilobytes, and the cap keeps a broken or hostile response off the
         // heap. Silence on every failure - no URL, a fetch that did not land, a
@@ -617,6 +667,36 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
             FromWorker::Cover { track_id, image }
         }
     })
+}
+
+/// Page a queue's source for the background fill.
+///
+/// Split out of [`serve`] so that arm stays short. A failure returns `None` -
+/// the fill stops and the queue keeps what it has - rather than a `Failed`,
+/// which would put a banner over a job the listener never started.
+fn fill_queue(
+    client: &mut Client,
+    source: QueueSource,
+    offset: u32,
+    limit: u32,
+) -> Option<FromWorker> {
+    let read = match &source {
+        QueueSource::Favorites => client.favorite_tracks(offset, limit),
+        QueueSource::Playlist(uuid) => client.playlist_tracks(uuid, offset, limit),
+        QueueSource::Mix(mix_id) => client.mix_tracks(mix_id, offset, limit),
+        QueueSource::Search(query) => client.search_tracks(query, offset, limit),
+    };
+    match read {
+        Ok(page) => Some(FromWorker::QueueFilled {
+            source,
+            offset,
+            page,
+        }),
+        Err(e) => {
+            log::info!("queue fill at offset {offset} stopped: {e}");
+            None
+        }
+    }
 }
 
 /// The square size the cover is fetched at, in pixels.
@@ -682,7 +762,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Fault, FromWorker, Task, ToWorker, Worker, spawn_with};
+    use super::{Fault, FromWorker, QueueSource, Task, ToWorker, Worker, spawn_with};
     use priel_core::Client;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
@@ -829,6 +909,78 @@ mod tests {
             }
             other => panic!("wrong reply variant: {}", variant(&other)),
         }
+    }
+
+    #[test]
+    fn a_queue_fill_pages_its_source_and_names_it_back() {
+        // Goal: the fill goes to the queue's source, not the view, and the reply
+        // carries the source and offset so the app can match it to the right
+        // queue. Method: ask to fill favorites, then search, and read both back.
+        let w = worker_on(origin());
+
+        w.tx.send(ToWorker::FillQueue {
+            source: QueueSource::Favorites,
+            offset: 1,
+            limit: 1,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::QueueFilled {
+                source,
+                offset,
+                page,
+            } => {
+                assert_eq!(source, QueueSource::Favorites);
+                assert_eq!(offset, 1, "the reply names the page it answers");
+                assert_eq!(page.items[0].id, 2, "the offset reached the URL");
+            }
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+
+        w.tx.send(ToWorker::FillQueue {
+            source: QueueSource::Search("miles".into()),
+            offset: 0,
+            limit: 1,
+        })
+        .unwrap();
+        match next(&w) {
+            FromWorker::QueueFilled { source, .. } => {
+                assert_eq!(source, QueueSource::Search("miles".into()));
+            }
+            other => panic!("wrong reply variant: {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_queue_fill_that_fails_sends_nothing_rather_than_a_banner() {
+        // Goal: a background fill is not something the listener started, so a
+        // failure must not put a `Failed` on the notice line. It sends nothing
+        // and the queue keeps what it has. Method: point the fill at a dead port
+        // and confirm the next thing the channel carries is not this fill.
+        let base = origin();
+        let w = spawn_with(move || {
+            let mut c = Client::new("tok".into())?.with_base_url(base);
+            c.connect()?;
+            Ok(c.with_base_url("http://127.0.0.1:1"))
+        });
+        w.tx.send(ToWorker::FillQueue {
+            source: QueueSource::Favorites,
+            offset: 0,
+            limit: 10,
+        })
+        .unwrap();
+        // A following request that does answer proves the fill sent nothing: if
+        // it had, this would receive the fill's reply first.
+        w.tx.send(ToWorker::FillQueue {
+            source: QueueSource::Favorites,
+            offset: 0,
+            limit: 10,
+        })
+        .unwrap();
+        assert!(
+            w.rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            "a failed fill must send neither a reply nor an error"
+        );
     }
 
     #[test]
@@ -1211,6 +1363,7 @@ mod tests {
             FromWorker::PlaylistTrackRemoved { .. } => "PlaylistTrackRemoved",
             FromWorker::PlaylistTrackAdded { .. } => "PlaylistTrackAdded",
             FromWorker::Cover { .. } => "Cover",
+            FromWorker::QueueFilled { .. } => "QueueFilled",
             FromWorker::Failed { .. } => "Failed",
         }
     }
