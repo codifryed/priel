@@ -1,12 +1,11 @@
 # Test and lint on every push and pull request.
 #
-# Each job installs its own Rust toolchain and runs cargo in the *same* shell
-# step, sourcing ~/.cargo/env rather than trusting a PATH set in an earlier step
-# - Codeberg's default runner image does not ship Rust, and cross-step PATH did
-# not carry. Split into parallel jobs so no single one has to fit formatting,
-# clippy over both feature configurations and the whole test suite inside the
-# runner's time cap; each caches ~/.cargo and target/ so a re-run is quick, and
-# the cache is best-effort so a cache backend that is absent cannot fail a job.
+# Runs in the official Rust image, so cargo, rustfmt and clippy are already there
+# and no toolchain is installed per run. Split into parallel jobs so no single
+# one has to fit formatting, clippy over both feature configurations and the
+# whole test suite inside the runner's time cap. Each caches CARGO_HOME and
+# target/ - relocated under the workspace so the paths are the image's business,
+# not ours - and the cache is best-effort so a missing backend cannot fail a job.
 #
 # Mirrors `make check`, the local gate.
 name: ci
@@ -19,62 +18,56 @@ on:
 jobs:
   fmt:
     runs-on: codeberg-small
+    container: rust:1-bookworm
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v4
-      - name: Format check
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --component rustfmt
-          . "$HOME/.cargo/env"
-          cargo fmt --check
+      - run: cargo fmt --check
 
   clippy:
     runs-on: codeberg-medium
+    container: rust:1-bookworm
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.cargo
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v4
-      - name: Build dependencies
+      - name: mpv headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential pkg-config libmpv-dev
+          apt-get install -y --no-install-recommends pkg-config libmpv-dev
       - uses: https://data.forgejo.org/actions/cache@v4
         continue-on-error: true
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            .cargo
             target
           key: clippy-${{ hashFiles('Cargo.lock') }}
           restore-keys: clippy-
       - name: Clippy, both feature configurations
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --component clippy
-          . "$HOME/.cargo/env"
           cargo clippy --all-targets -- -D warnings
           cargo clippy -p priel-tui --no-default-features --all-targets -- -D warnings
 
   test:
     runs-on: codeberg-medium
+    container: rust:1-bookworm
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.cargo
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v4
-      - name: Build dependencies
+      - name: mpv headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential pkg-config libmpv-dev
+          apt-get install -y --no-install-recommends pkg-config libmpv-dev
       - uses: https://data.forgejo.org/actions/cache@v4
         continue-on-error: true
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            .cargo
             target
           key: test-${{ hashFiles('Cargo.lock') }}
           restore-keys: test-
       - name: Tests, both feature configurations
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal
-          . "$HOME/.cargo/env"
           cargo test --locked
           cargo test -p priel-tui --no-default-features --locked
           cargo test -p priel-player --no-default-features --locked
