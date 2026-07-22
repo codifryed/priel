@@ -4,17 +4,17 @@
 #
 # The tarball is a *prefix tree*: bin/, share/man, share/…/completions and so
 # on, laid out exactly as `make install PREFIX=…` would place them. The install
-# script then unpacks it straight into a prefix with a copy, and the layout is
-# the one a distro package uses too.
+# script unpacks it straight into a prefix with a copy, and the layout is the
+# one a distro package uses too.
 #
 # Needs one secret: RELEASE_TOKEN, a Forgejo application token with
-# `write:repository`, set under Repo Settings → Actions → Secrets. The automatic
-# job token's release permissions vary by Forgejo version, so this uses an
-# explicit one.
+# `write:repository`, under Repo Settings → Actions → Secrets. The automatic job
+# token's release permissions vary by Forgejo version, so this uses an explicit
+# one. `override: true` makes re-running a tag replace its assets rather than
+# fail on the release that already exists.
 #
-# The build is a fat-LTO release and may approach the hosted runner's time cap
-# cold; the cache makes a re-run quick, and a self-hosted runner (change
-# runs-on) removes the cap for the tag builds if it ever bites.
+# Rust is installed and used in the same step, sourcing ~/.cargo/env, because
+# the runner image ships no Rust and a PATH set in an earlier step did not carry.
 name: release
 
 on:
@@ -33,13 +33,8 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends build-essential pkg-config libmpv-dev
 
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
       - uses: https://data.forgejo.org/actions/cache@v4
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry
@@ -48,14 +43,15 @@ jobs:
           key: release-${{ hashFiles('Cargo.lock') }}
           restore-keys: release-
 
-      - name: Build binary, man page and completions
+      - name: Build and stage the release tarball
         run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
           cargo build --release --locked -p priel-tui
           make assets
           strip target/release/priel
 
-      - name: Stage the prefix tree and tarball
-        run: |
           tag='${{ github.ref_name }}'
           name="priel-${tag}-x86_64-linux"
           root="dist/${name}"
@@ -87,3 +83,4 @@ jobs:
           tag: ${{ github.ref_name }}
           release-dir: dist/release
           token: ${{ secrets.RELEASE_TOKEN }}
+          override: true
