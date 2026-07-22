@@ -1,0 +1,70 @@
+# Test and lint on every push and pull request.
+#
+# Split into parallel jobs on purpose: Codeberg's hosted runners cap a job at a
+# few minutes (codeberg-medium is ~10), and one job that formatted, ran clippy
+# over both feature configurations and the whole test suite would not fit cold.
+# Each job here caches ~/.cargo and target/, so after the first run they are
+# quick; the first run of each is the one at risk of the cap, and the cache is
+# what keeps it a one-time cost. If a job still times out, either register a
+# self-hosted runner (change runs-on) or lift the limit there.
+#
+# Mirrors `make check`, which is the local gate: fmt-check, clippy pedantic over
+# both feature configurations, and the tests.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fmt:
+    runs-on: codeberg-small
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v4
+      - run: rustup component add rustfmt || rustup toolchain install stable --profile minimal --component rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: codeberg-medium
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v4
+      - name: Build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential pkg-config libmpv-dev
+      - uses: https://data.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: clippy-${{ hashFiles('Cargo.lock') }}
+          restore-keys: clippy-
+      - run: rustup component add clippy || rustup toolchain install stable --profile minimal --component clippy
+      # Both feature configurations, as the local gate does.
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy -p priel-tui --no-default-features --all-targets -- -D warnings
+
+  test:
+    runs-on: codeberg-medium
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v4
+      - name: Build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential pkg-config libmpv-dev
+      - uses: https://data.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-
+      # The suite needs no network, credentials, audio device or terminal, so it
+      # runs unchanged on a runner. Both feature configurations of the two crates
+      # that have them, matching the local gate.
+      - run: cargo test --locked
+      - run: cargo test -p priel-tui --no-default-features --locked
+      - run: cargo test -p priel-player --no-default-features --locked
