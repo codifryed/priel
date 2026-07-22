@@ -1,12 +1,14 @@
 # Test and lint on every push and pull request.
 #
-# Runs in the official Rust image, so cargo, rustfmt and clippy are already there
-# and no toolchain is installed per run. The checkout is done by hand with git
-# rather than the `actions/checkout` action, because that action is JavaScript
-# and the Rust image ships no Node for it to run on - the same reason there is no
-# `actions/cache` step here. Split into parallel jobs so no single one has to fit
-# formatting, clippy over both feature configurations and the whole test suite
-# inside the runner's time cap.
+# Runs in the official Rust image, so cargo and rustc are already there and no
+# toolchain is installed per run. rustfmt and clippy are *not* in that image -
+# they are separate rustup components - so the fmt and clippy jobs add the one
+# they need, which is a quick component download rather than a toolchain. The
+# checkout is done by hand with git rather than the `actions/checkout` action,
+# because that action is JavaScript and the Rust image ships no Node for it to
+# run on - the same reason there is no `actions/cache` step here. Split into
+# parallel jobs so no single one has to fit formatting, clippy over both feature
+# configurations and the whole test suite inside the runner's time cap.
 #
 # The Rust image is pinned to an exact version rather than `rust:1-bookworm`:
 # clippy's lint set moves between releases, so a floating image would fail the
@@ -33,7 +35,9 @@ jobs:
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout -q FETCH_HEAD
-      - run: cargo fmt --check
+      - run: |
+          rustup component add rustfmt
+          cargo fmt --check
 
   clippy:
     runs-on: codeberg-medium
@@ -52,6 +56,7 @@ jobs:
           apt-get install -y --no-install-recommends pkg-config libmpv-dev
       - name: Clippy, both feature configurations
         run: |
+          rustup component add clippy
           cargo clippy --all-targets -- -D warnings
           cargo clippy -p priel-tui --no-default-features --all-targets -- -D warnings
 
