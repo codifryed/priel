@@ -24,6 +24,11 @@ jobs:
   release:
     runs-on: self-hosted
     container: rust:1.97.1-bookworm
+    # Injected at the job level rather than on the publish step: a container job
+    # picks a job-level secret up more reliably, and it keeps the value in one
+    # place. The publish step checks it is actually present before using it.
+    env:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
     steps:
       - name: Checkout
         run: |
@@ -78,10 +83,16 @@ jobs:
       # its old assets so a re-run replaces rather than duplicates, then upload
       # the fresh set.
       - name: Publish release
-        env:
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
-          set -eu
+          set -e
+          # `-u` is off deliberately: an absent secret should give the clear
+          # message below, not an "unbound variable" abort at the first use.
+          if [ -z "${RELEASE_TOKEN:-}" ]; then
+            echo "error: RELEASE_TOKEN is empty. Add a Forgejo application token"
+            echo "with write:repository as the repo secret RELEASE_TOKEN, and make"
+            echo "sure the runner is allowed to receive secrets."
+            exit 1
+          fi
           tag='${{ github.ref_name }}'
           api="https://codeberg.org/api/v1/repos/${GITHUB_REPOSITORY}"
           auth="Authorization: token ${RELEASE_TOKEN}"
