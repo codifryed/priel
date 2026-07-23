@@ -376,6 +376,7 @@ pub enum Mode {
     Help,        // the shortcut reference is up; it swallows input until dismissed
     Log,         // the recent diagnostics are up; modal in the same way
     Graph,       // the chain to the output device is up; modal in the same way
+    SetupAudio,  // confirming, then applying, the rates drop-in; modal in the same way
     Devices,     // the output picker is up; modal in the same way
     Themes,      // the colour theme picker is up; modal in the same way
     Credentials, // first run with no client identity; asking before fetching one
@@ -383,6 +384,41 @@ pub enum Mode {
     Prompt,      // typing a playlist name; modal
     Confirm,     // asking before something that cannot be undone; modal
     AddTo,       // choosing which playlist a track goes into; modal
+}
+
+/// The "set up audio" flow, from the confirm to the outcome.
+///
+/// Held only while the overlay is up. The rates were settled the moment it
+/// opened - from the graph that was already read - so nothing here reaches back
+/// into the graph: what the preview shows and what the worker writes are the one
+/// list, decided once. The step is a small state machine the overlay renders and
+/// the keys advance, and the two `Writing`/`Restarting` steps are the ones with
+/// a request in flight, where a keystroke does nothing but wait.
+pub(crate) struct Setup {
+    /// The rates being added - the device's, that the server was blocking. Kept
+    /// apart from the whole list only to name them in the sentence; it is what
+    /// the offer was about.
+    pub(crate) adding_hz: Vec<u32>,
+    /// The whole list the drop-in would permit: everything already permitted
+    /// plus [`Self::adding_hz`]. This is what is written, because a later drop-in
+    /// replaces the property rather than adding to it.
+    pub(crate) allowed_hz: Vec<u32>,
+    pub(crate) step: SetupStep,
+}
+
+/// Where the "set up audio" flow has got to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum SetupStep {
+    /// The preview is up, waiting for the listener to say write it or not.
+    Confirm,
+    /// The write request is out; the overlay says so and waits for the reply.
+    Writing,
+    /// The file landed at `path`; offering the restart that makes it take effect.
+    Restart { path: String },
+    /// The restart request is out; the overlay says so and waits for the reply.
+    Restarting,
+    /// The flow is over, for good or ill; `message` is what it came to.
+    Done { message: String },
 }
 
 /// What one line of the audio-graph overlay says.
@@ -882,6 +918,9 @@ pub struct App {
     /// The last chain the worker read, or the reason it could not. `None` while
     /// a read is in flight, which is what the overlay says it is doing.
     audio_graph: Option<Result<AudioGraph, GraphError>>,
+    /// The "set up audio" flow while its overlay is up, else `None`. See
+    /// [`Setup`].
+    setup: Option<Setup>,
     /// What the sink at the end of the chain is doing to the level.
     ///
     /// Kept apart from `audio_graph`, which the overlay clears every time it
@@ -1148,6 +1187,7 @@ impl App {
             log_scroll: 0,
             help_scroll: 0,
             audio_graph: None,
+            setup: None,
             sink_volume: SinkVolume::Unread,
             sink_volume_asked: None,
             cover_asked: None,
@@ -2325,6 +2365,8 @@ impl App {
                     // than pointing past the end of the new reading.
                     self.graph_scroll = 0;
                 }
+                FromWorker::AudioSetUp(result) => self.on_audio_set_up(result),
+                FromWorker::AudioRestarted(result) => self.on_audio_restarted(result),
                 FromWorker::Cover { track_id, image } => self.on_cover(track_id, image),
                 FromWorker::UpdateAvailable(tag) => self.on_update_available(tag),
                 FromWorker::Failed {
@@ -4055,6 +4097,7 @@ impl App {
             Mode::Help => self.on_key_help(key),
             Mode::Log => self.on_key_log(key),
             Mode::Graph => self.on_key_graph(key),
+            Mode::SetupAudio => self.on_key_setup(key),
             Mode::Devices => self.on_key_devices(key),
             Mode::Themes => self.on_key_themes(key),
             Mode::Credentials => self.on_key_credentials(key),
@@ -4271,6 +4314,10 @@ impl App {
             }
             KeyCode::Char('g') => self.graph_scroll = 0,
             KeyCode::Char('G') => self.graph_scroll = self.graph_scroll_max(),
+            // Offer to permit the rates the device can do that the server is
+            // blocking. Does nothing when there are none, exactly as the footer
+            // key that fires it is only shown when there are.
+            KeyCode::Char('A') => self.begin_setup(),
             _ => {}
         }
         self.dirty = true;
@@ -4278,6 +4325,155 @@ impl App {
 
     fn graph_scroll_max(&self) -> usize {
         self.graph_rows().len().saturating_sub(1)
+    }
+
+    /// The rates the device can do that the server is not set to use, and the
+    /// whole list a drop-in would permit, from the graph that is already read.
+    ///
+    /// `None` when there is no graph or nothing is blocked - the one case the
+    /// "set up audio" offer is not made, so the key and the footer that reach it
+    /// answer with nothing rather than an empty file.
+    fn setup_targets(&self) -> Option<(Vec<u32>, Vec<u32>)> {
+        let Some(Ok(graph)) = &self.audio_graph else {
+            return None;
+        };
+        let blocked = graph.blocked_supported_hz();
+        if blocked.is_empty() {
+            return None;
+        }
+        let permitted = graph.clock.permitted_hz().unwrap_or_default();
+        let allowed = priel_player::setup::desired_allowed_hz(&permitted, &blocked);
+        Some((blocked, allowed))
+    }
+
+    /// Whether the "set up audio" offer applies right now.
+    ///
+    /// What the graph overlay's footer key hangs on, so the offer and the action
+    /// behind it agree about when there is anything to do.
+    #[must_use]
+    pub fn setup_available(&self) -> bool {
+        self.setup_targets().is_some()
+    }
+
+    /// The "set up audio" flow while its overlay is up, for the renderer to draw.
+    #[must_use]
+    pub(crate) fn setup(&self) -> Option<&Setup> {
+        self.setup.as_ref()
+    }
+
+    /// Open the "set up audio" preview, or do nothing when there is nothing to
+    /// add. The rates are settled here, once, from the graph already read.
+    fn begin_setup(&mut self) {
+        let Some((adding_hz, allowed_hz)) = self.setup_targets() else {
+            return;
+        };
+        self.setup = Some(Setup {
+            adding_hz,
+            allowed_hz,
+            step: SetupStep::Confirm,
+        });
+        self.mode = Mode::SetupAudio;
+        self.dirty = true;
+    }
+
+    /// The "set up audio" overlay: a preview to approve, then the write, then the
+    /// restart that makes it take effect - each step advanced by one key, and the
+    /// two with a request in flight swallowing keys until the reply lands.
+    fn on_key_setup(&mut self, key: KeyEvent) {
+        let Some(setup) = &self.setup else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match &setup.step {
+            SetupStep::Confirm => match key.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                    let allowed_hz = setup.allowed_hz.clone();
+                    self.setup_step(SetupStep::Writing);
+                    self.ask(ToWorker::SetUpAudio { allowed_hz });
+                }
+                KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {
+                    // Back to the report it was opened from, not out of it: the
+                    // reading is still there, so nothing needs reading again.
+                    self.setup = None;
+                    self.mode = Mode::Graph;
+                }
+                _ => {}
+            },
+            SetupStep::Restart { path } => match key.code {
+                KeyCode::Char('r' | 'R') => {
+                    self.setup_step(SetupStep::Restarting);
+                    self.ask(ToWorker::RestartAudio);
+                }
+                KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc | KeyCode::Enter => {
+                    self.notice = Some(format!(
+                        "Written to {path}. Restart PipeWire to use the new rates."
+                    ));
+                    self.setup = None;
+                    self.mode = Mode::Normal;
+                }
+                _ => {}
+            },
+            SetupStep::Done { .. } => {
+                self.setup = None;
+                self.mode = Mode::Normal;
+            }
+            // A request is in flight; the overlay says so and the keys wait.
+            SetupStep::Writing | SetupStep::Restarting => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Move the flow to `step`, if it is still up.
+    fn setup_step(&mut self, step: SetupStep) {
+        if let Some(setup) = &mut self.setup {
+            setup.step = step;
+        }
+    }
+
+    /// The drop-in was written, or not. Only a flow still waiting on the write
+    /// moves - a reply that outlived its overlay is dropped, as everywhere here.
+    fn on_audio_set_up(&mut self, result: Result<String, String>) {
+        if !matches!(
+            &self.setup,
+            Some(Setup {
+                step: SetupStep::Writing,
+                ..
+            })
+        ) {
+            return;
+        }
+        self.setup_step(match result {
+            Ok(path) => SetupStep::Restart { path },
+            Err(e) => SetupStep::Done {
+                message: format!("Could not write it: {e}"),
+            },
+        });
+        self.dirty = true;
+    }
+
+    /// The sound server was restarted, or not. Only a flow still waiting on the
+    /// restart moves.
+    fn on_audio_restarted(&mut self, result: Result<(), String>) {
+        if !matches!(
+            &self.setup,
+            Some(Setup {
+                step: SetupStep::Restarting,
+                ..
+            })
+        ) {
+            return;
+        }
+        self.setup_step(match result {
+            Ok(()) => SetupStep::Done {
+                message: "Done. PipeWire restarted; the new rates are live.".to_string(),
+            },
+            Err(e) => SetupStep::Done {
+                message: format!(
+                    "Written, but the restart failed: {e}. Restart PipeWire yourself."
+                ),
+            },
+        });
+        self.dirty = true;
     }
 
     /// How far down the audio-graph overlay is scrolled.
@@ -4854,7 +5050,7 @@ impl App {
     fn footer_key_clicked(&mut self, m: MouseEvent) -> bool {
         if !matches!(
             self.mode,
-            Mode::Log | Mode::Graph | Mode::Devices | Mode::Themes | Mode::AddTo
+            Mode::Log | Mode::Graph | Mode::SetupAudio | Mode::Devices | Mode::Themes | Mode::AddTo
         ) || !matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
         {
             return false;
@@ -4988,7 +5184,10 @@ impl App {
             }
             return true;
         }
-        false
+        // The setup overlay routes only through its footer keys (handled at the
+        // top); every other click on it is swallowed here, so a misclick cannot
+        // act or reach the list behind the modal.
+        matches!(self.mode, Mode::SetupAudio)
     }
 
     /// A mouse event, routed by what is on screen.
@@ -5419,6 +5618,26 @@ fn clock_rows(clock: &ClockRates, supported_hz: &[u32], source: SourceFormat) ->
     }
 
     rows.extend(advice.lines().iter().map(|line| note(&format!("  {line}"))));
+
+    // The rates the device can do that the server is not set to use: the "set up
+    // audio" offer's reason, shown whether or not this one track needed them, so
+    // the setup can be done once rather than a track at a time.
+    let blocked: Vec<u32> = permitted_hz
+        .as_deref()
+        .map(|allowed| {
+            supported_hz
+                .iter()
+                .copied()
+                .filter(|hz| !allowed.contains(hz))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !blocked.is_empty() {
+        rows.push(note(&format!(
+            "  Your DAC can also do {}, which PipeWire isn't set to use.",
+            crate::ui::fmt_khz_list(&blocked)
+        )));
+    }
     rows
 }
 
@@ -8099,6 +8318,200 @@ mod tests {
                 .all(|row| row.kind != GraphRowKind::Culprit),
             "and nothing to accuse: {text}"
         );
+    }
+
+    // ---- set up audio ----
+
+    /// Permitted 44.1/48; the device also does 88.2 and 176.4, which are blocked.
+    fn chain_with_blocked() -> AudioGraph {
+        let mut g = chain_clocked(&[44_100, 48_000], 48_000);
+        g.supported_hz = vec![44_100, 48_000, 88_200, 176_400];
+        g
+    }
+
+    #[test]
+    fn the_report_says_which_rates_the_device_can_do_that_the_server_blocks() {
+        // Goal: the offer's reason, shown whether or not this one track needed
+        // the rates, so the setup is a thing you do once rather than per track.
+        let r = playing_hires(chain_with_blocked());
+        let text = overlay_text(&r.app);
+        assert!(text.contains("Your DAC can also do"), "{text}");
+        assert!(text.contains("88.2"), "{text}");
+        assert!(r.app.setup_available(), "and the offer applies");
+    }
+
+    #[test]
+    fn set_up_audio_is_not_offered_when_nothing_is_blocked() {
+        // Goal: a device whose rates are all permitted has nothing to set up, and
+        // the key that would do it does nothing.
+        let mut r = playing_hires(chain_clocked(&[44_100, 48_000], 48_000));
+        assert!(!r.app.setup_available());
+        r.app.on_key(key('A'));
+        assert_eq!(r.app.mode, Mode::Graph, "the key does nothing here");
+        assert!(r.app.setup.is_none());
+    }
+
+    #[test]
+    fn the_setup_key_opens_the_preview_with_the_whole_list_to_permit() {
+        // Goal: A opens the confirm, and the list it would write is everything
+        // already permitted plus the device's blocked rates - added, never
+        // dropped, so it cannot take a rate from anything else using it.
+        let mut r = playing_hires(chain_with_blocked());
+        r.app.on_key(key('A'));
+        assert_eq!(r.app.mode, Mode::SetupAudio);
+        let setup = r.app.setup.as_ref().expect("a flow is up");
+        assert_eq!(setup.step, SetupStep::Confirm);
+        assert_eq!(setup.adding_hz, vec![88_200, 176_400]);
+        assert_eq!(setup.allowed_hz, vec![44_100, 48_000, 88_200, 176_400]);
+    }
+
+    #[test]
+    fn confirming_writes_the_whole_list_and_waits_for_the_reply() {
+        // Goal: yes sends the write with the list the preview showed, and the
+        // overlay says it is working until the reply lands.
+        let mut r = playing_hires(chain_with_blocked());
+        r.app.on_key(key('A'));
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        let reqs = requests(&r);
+        assert!(
+            matches!(
+                reqs.as_slice(),
+                [ToWorker::SetUpAudio { allowed_hz }]
+                    if *allowed_hz == vec![44_100, 48_000, 88_200, 176_400]
+            ),
+            "the write carries the whole list"
+        );
+        assert!(matches!(
+            r.app.setup.as_ref().map(|s| &s.step),
+            Some(SetupStep::Writing)
+        ));
+    }
+
+    #[test]
+    fn a_written_file_offers_the_restart_and_r_asks_for_it() {
+        // Goal: the file landing turns the overlay into the restart offer, the
+        // restart is asked for only on the explicit key, and its success is said.
+        let mut r = playing_hires(chain_with_blocked());
+        r.app.on_key(key('A'));
+        r.app.on_key(key('y'));
+        let _ = requests(&r);
+        r.to_app
+            .send(FromWorker::AudioSetUp(Ok(
+                "/x/pipewire.conf.d/99-priel-rates.conf".into(),
+            )))
+            .expect("send");
+        r.app.drain_worker();
+        assert!(matches!(
+            r.app.setup.as_ref().map(|s| &s.step),
+            Some(SetupStep::Restart { .. })
+        ));
+        r.app.on_key(key('r'));
+        assert!(matches!(requests(&r).as_slice(), [ToWorker::RestartAudio]));
+        assert!(matches!(
+            r.app.setup.as_ref().map(|s| &s.step),
+            Some(SetupStep::Restarting)
+        ));
+        r.to_app
+            .send(FromWorker::AudioRestarted(Ok(())))
+            .expect("send");
+        r.app.drain_worker();
+        match r.app.setup.as_ref().map(|s| &s.step) {
+            Some(SetupStep::Done { message }) => assert!(message.contains("live"), "{message}"),
+            _ => panic!("expected Done"),
+        }
+        r.app.on_key(key('q'));
+        assert!(r.app.setup.is_none());
+        assert_eq!(r.app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn declining_the_restart_keeps_the_file_and_says_how_to_finish() {
+        // Goal: the file is written; declining the restart is not a failure, so
+        // the notice says what is left to do rather than pretending it is done.
+        let mut r = playing_hires(chain_with_blocked());
+        r.app.on_key(key('A'));
+        r.app.on_key(key('y'));
+        r.to_app
+            .send(FromWorker::AudioSetUp(Ok("/x/99-priel-rates.conf".into())))
+            .expect("send");
+        r.app.drain_worker();
+        let _ = requests(&r);
+        r.app.on_key(key('n'));
+        assert!(r.app.setup.is_none());
+        assert_eq!(r.app.mode, Mode::Normal);
+        assert!(
+            r.app
+                .notice
+                .clone()
+                .unwrap_or_default()
+                .contains("Restart PipeWire"),
+            "{:?}",
+            r.app.notice
+        );
+        assert!(requests(&r).is_empty(), "and nothing was restarted");
+    }
+
+    #[test]
+    fn a_write_that_failed_says_so_and_asks_for_no_restart() {
+        // Goal: a write that could not happen ends the flow with the reason, and
+        // never offers the restart of a file that is not there.
+        let mut r = playing_hires(chain_with_blocked());
+        r.app.on_key(key('A'));
+        r.app.on_key(key('y'));
+        let _ = requests(&r);
+        r.to_app
+            .send(FromWorker::AudioSetUp(Err("permission denied".into())))
+            .expect("send");
+        r.app.drain_worker();
+        match r.app.setup.as_ref().map(|s| &s.step) {
+            Some(SetupStep::Done { message }) => {
+                assert!(message.contains("permission denied"), "{message}");
+            }
+            _ => panic!("expected Done"),
+        }
+        r.app.on_key(key('q'));
+        assert!(r.app.setup.is_none());
+        assert!(requests(&r).is_empty(), "a failed write asks for nothing");
+    }
+
+    #[test]
+    fn a_restart_that_failed_says_the_file_landed_but_it_did_not() {
+        // Goal: the honest split - the file is there, the restart is not - so the
+        // listener knows the rates are written but not yet live.
+        let mut r = playing_hires(chain_with_blocked());
+        r.app.on_key(key('A'));
+        r.app.on_key(key('y'));
+        r.to_app
+            .send(FromWorker::AudioSetUp(Ok("/x/99-priel-rates.conf".into())))
+            .expect("send");
+        r.app.drain_worker();
+        r.app.on_key(key('r'));
+        let _ = requests(&r);
+        r.to_app
+            .send(FromWorker::AudioRestarted(Err("unit not found".into())))
+            .expect("send");
+        r.app.drain_worker();
+        match r.app.setup.as_ref().map(|s| &s.step) {
+            Some(SetupStep::Done { message }) => {
+                assert!(message.contains("Written"), "{message}");
+                assert!(message.contains("unit not found"), "{message}");
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn cancelling_the_confirm_returns_to_the_report_without_writing() {
+        // Goal: no is not a write. It goes back to the report it was opened from,
+        // which is still read, so nothing is asked of the worker.
+        let mut r = playing_hires(chain_with_blocked());
+        r.app.on_key(key('A'));
+        let _ = requests(&r);
+        r.app.on_key(key('n'));
+        assert!(r.app.setup.is_none());
+        assert_eq!(r.app.mode, Mode::Graph, "back to the report");
+        assert!(requests(&r).is_empty(), "nothing written");
     }
 
     #[test]

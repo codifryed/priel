@@ -29,7 +29,7 @@ use priel_player::graph::{SinkStage, SinkVolume};
 use priel_player::{Alteration, Fidelity, OutputAccess, StreamVolume, Verdict};
 
 use crate::app::{
-    App, Focus, GraphRow, GraphRowKind, Hit, Mode, QUEUE_ROWS_PER_ENTRY, Repeat, View,
+    App, Focus, GraphRow, GraphRowKind, Hit, Mode, QUEUE_ROWS_PER_ENTRY, Repeat, SetupStep, View,
 };
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
@@ -217,6 +217,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.mode == Mode::Graph {
         let area = f.area();
         graph_overlay(f, area, app);
+    }
+    if app.mode == Mode::SetupAudio {
+        let area = f.area();
+        setup_overlay(f, area, app);
     }
     if app.mode == Mode::Devices {
         device_overlay(f, f.area(), app);
@@ -1237,32 +1241,38 @@ fn graph_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         .collect();
     f.render_widget(Paragraph::new(lines), body);
 
-    overlay_footer(
-        f,
-        app,
-        Rect {
-            y: inner.y + inner.height.saturating_sub(1),
-            height: 1,
-            ..inner
-        },
-        &[
-            Foot::Text("  "),
-            Foot::Key("j", KeyCode::Char('j')),
-            Foot::Text(" "),
-            Foot::Key("k", KeyCode::Char('k')),
-            Foot::Text(" scroll \u{b7} "),
-            Foot::Key("g", KeyCode::Char('g')),
-            Foot::Text(" "),
-            Foot::Key("G", KeyCode::Char('G')),
-            Foot::Text(" top / bottom \u{b7} "),
-            Foot::Key("D", KeyCode::Char('D')),
-            Foot::Text(", "),
-            Foot::Key("Esc", KeyCode::Esc),
-            Foot::Text(" or "),
-            Foot::Key("q", KeyCode::Char('q')),
-            Foot::Text(" to close"),
-        ],
-    );
+    // The "set up audio" key is offered only when there is something to add, and
+    // it is a real footer key so a click on it runs the same action the key
+    // does - the overlay's whole mouse/keyboard parity comes for free that way.
+    let footer_rect = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+    let mut footer = vec![
+        Foot::Text("  "),
+        Foot::Key("j", KeyCode::Char('j')),
+        Foot::Text(" "),
+        Foot::Key("k", KeyCode::Char('k')),
+        Foot::Text(" scroll \u{b7} "),
+        Foot::Key("g", KeyCode::Char('g')),
+        Foot::Text(" "),
+        Foot::Key("G", KeyCode::Char('G')),
+        Foot::Text(" top / bottom \u{b7} "),
+    ];
+    if app.setup_available() {
+        footer.push(Foot::Key("A", KeyCode::Char('A')));
+        footer.push(Foot::Text(" set up audio \u{b7} "));
+    }
+    footer.extend([
+        Foot::Key("D", KeyCode::Char('D')),
+        Foot::Text(", "),
+        Foot::Key("Esc", KeyCode::Esc),
+        Foot::Text(" or "),
+        Foot::Key("q", KeyCode::Char('q')),
+        Foot::Text(" to close"),
+    ]);
+    overlay_footer(f, app, footer_rect, &footer);
 }
 
 /// One row of the graph overlay: what the node is on the left, what it
@@ -1302,6 +1312,145 @@ fn graph_line(row: &GraphRow, width: u16, t: &Theme) -> Line<'static> {
         .saturating_sub(label.width() + detail.width())
         .max(1);
     Line::from(vec![label, Span::raw(" ".repeat(gap)), detail])
+}
+
+/// The body lines and footer keys of the setup overlay for one step.
+///
+/// Split out so [`setup_overlay`] is just the box around it, and so what each
+/// step says is one place to read. The preview reads only the settled rates and
+/// the config path - never the graph again.
+fn setup_step_view(
+    step: &SetupStep,
+    adding: &[u32],
+    allowed: &[u32],
+    t: &Theme,
+) -> (Vec<Line<'static>>, Vec<Foot>) {
+    let styled = |s: String, c| Line::from(Span::styled(s, Style::default().fg(c)));
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let footer = match step {
+        SetupStep::Confirm => {
+            let path = priel_player::setup::conf_dir().map_or_else(
+                || "(priel could not find your config directory)".to_string(),
+                |d| {
+                    d.join(priel_player::setup::RATES_CONF)
+                        .display()
+                        .to_string()
+                },
+            );
+            body.push(styled(
+                format!(
+                    "Your DAC can do {} rate{} PipeWire is not using: {}.",
+                    adding.len(),
+                    if adding.len() == 1 { "" } else { "s" },
+                    fmt_khz_list(adding)
+                ),
+                t.text,
+            ));
+            body.push(Line::default());
+            body.push(styled(
+                "priel will write this file \u{2014} its own; nothing else is touched:".to_string(),
+                t.muted,
+            ));
+            body.push(styled(format!("  {path}"), t.accent));
+            body.push(Line::default());
+            for conf in priel_player::setup::rates_conf_text(allowed).lines() {
+                body.push(styled(format!("  {conf}"), t.faint));
+            }
+            vec![
+                Foot::Text("  ["),
+                Foot::Key("y", KeyCode::Char('y')),
+                Foot::Text("] write it   ["),
+                Foot::Key("n", KeyCode::Char('n')),
+                Foot::Text("] cancel"),
+            ]
+        }
+        SetupStep::Writing => {
+            body.push(styled("Writing\u{2026}".to_string(), t.muted));
+            Vec::new()
+        }
+        SetupStep::Restart { path } => {
+            body.push(styled(format!("Written to {path}."), t.text));
+            body.push(Line::default());
+            body.push(styled(
+                "PipeWire has to restart to use the new rates.".to_string(),
+                t.muted,
+            ));
+            vec![
+                Foot::Text("  ["),
+                Foot::Key("r", KeyCode::Char('r')),
+                Foot::Text("] restart now   ["),
+                Foot::Key("n", KeyCode::Char('n')),
+                Foot::Text("] I'll do it later"),
+            ]
+        }
+        SetupStep::Restarting => {
+            body.push(styled("Restarting PipeWire\u{2026}".to_string(), t.muted));
+            Vec::new()
+        }
+        SetupStep::Done { message } => {
+            body.push(styled(message.clone(), t.text));
+            vec![
+                Foot::Text("  ["),
+                Foot::Key("q", KeyCode::Char('q')),
+                Foot::Text("] close"),
+            ]
+        }
+    };
+    (body, footer)
+}
+
+/// The "set up audio" confirm-and-apply overlay.
+///
+/// One box for the whole flow: the preview to approve, then what the write and
+/// the restart came to. Modal like the other overlays, and its footer keys are
+/// live [`overlay_footer`] buttons, so [y]/[n]/[r] click as well as press - the
+/// parity every action in priel keeps.
+fn setup_overlay(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(setup) = app.setup() else {
+        return;
+    };
+    // Cloned so the frame below is free to borrow `app` mutably; the preview is
+    // settled, so a copy cannot go stale under it.
+    let step = setup.step.clone();
+    let adding = setup.adding_hz.clone();
+    let allowed = setup.allowed_hz.clone();
+    let t = app.theme();
+    app.hits.clear();
+
+    let (body, footer) = setup_step_view(&step, &adding, &allowed, &t);
+
+    let width = overlay_width(area, OVERLAY_MEDIUM);
+    let body_h = u16::try_from(body.len()).unwrap_or(u16::MAX);
+    // Two for the border, one for the footer.
+    let height = body_h.saturating_add(3).min(area.height);
+    let rect = centred(area, width, height);
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(t.surface())
+        .border_style(Style::default().fg(t.accent))
+        .title(" Set up audio ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+    let text_area = indented(Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    });
+    f.render_widget(Paragraph::new(body), text_area);
+    overlay_footer(
+        f,
+        app,
+        Rect {
+            y: inner.y + inner.height.saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+        &footer,
+    );
 }
 
 /// How much of the overlay the identifier column may take.
@@ -5013,6 +5162,84 @@ mod tests {
         // Unlike the help and log overlays this one is sized to its content, so
         // it is not expected to cover the whole list. Being modal is about the
         // input it swallows, which `app` covers.
+    }
+
+    /// Permitted 44.1/48; the device also does 88.2 and 176.4, which are blocked.
+    fn blocked_chain() -> AudioGraph {
+        AudioGraph {
+            path: vec![
+                node("mpv", NodeRole::Stream, 44_100, "S32LE"),
+                node("Studio DAC", NodeRole::Device, 48_000, "S32LE"),
+            ],
+            clock: ClockRates {
+                allowed_hz: Some(vec![44_100, 48_000]),
+                current_hz: Some(48_000),
+                forced_hz: None,
+            },
+            supported_hz: vec![44_100, 48_000, 88_200, 176_400],
+            ..AudioGraph::default()
+        }
+    }
+
+    #[test]
+    fn the_report_offers_set_up_audio_as_a_clickable_key_when_rates_are_blocked() {
+        // Goal: the offer is a real footer key, so a click on it runs the same
+        // action the key does - the parity every control in priel keeps. It is
+        // shown only when there is something to add.
+        let mut sc = screen();
+        with_chain(&mut sc, blocked_chain());
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 40);
+        assert!(out.contains("Your DAC can also do"), "the reason: {out}");
+        assert!(out.contains("set up audio"), "the offer: {out}");
+        click_hit(&mut sc.app, Hit::Key(KeyCode::Char('A')));
+        assert_eq!(sc.app.mode, Mode::SetupAudio, "the click opens the confirm");
+    }
+
+    #[test]
+    fn the_confirm_shows_the_file_and_its_whole_content_before_writing() {
+        // Goal: nothing is written unseen. The preview names the file priel will
+        // write, says it is priel's own, and shows the exact setting going in it.
+        let mut sc = screen();
+        with_chain(&mut sc, blocked_chain());
+        sc.app.mode = Mode::Graph;
+        let _ = text(&mut sc.app, 100, 40);
+        click_hit(&mut sc.app, Hit::Key(KeyCode::Char('A')));
+        let out = text(&mut sc.app, 100, 40);
+        assert!(out.contains("Set up audio"), "the title: {out}");
+        assert!(out.contains("99-priel-rates.conf"), "the file: {out}");
+        assert!(
+            out.contains("nothing else is touched"),
+            "whose file it is: {out}"
+        );
+        assert!(
+            out.contains("default.clock.allowed-rates = [ 44100 48000 88200 176400 ]"),
+            "the whole content, on screen before it is written: {out}"
+        );
+        assert!(out.contains("write it"), "and how to say yes: {out}");
+    }
+
+    #[test]
+    fn clicking_write_it_sends_the_write_the_same_as_the_key() {
+        // Goal: [y] is a real button; a click on it writes exactly as pressing y
+        // does, and carries the list the preview showed.
+        let mut sc = screen();
+        with_chain(&mut sc, blocked_chain());
+        sc.app.mode = Mode::Graph;
+        let _ = text(&mut sc.app, 100, 40);
+        click_hit(&mut sc.app, Hit::Key(KeyCode::Char('A')));
+        let _ = text(&mut sc.app, 100, 40);
+        let _ = sc.from_app.try_iter().count(); // drop the ReadAudioGraph
+        click_hit(&mut sc.app, Hit::Key(KeyCode::Char('y')));
+        let sent: Vec<ToWorker> = sc.from_app.try_iter().collect();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [ToWorker::SetUpAudio { allowed_hz }]
+                    if *allowed_hz == vec![44_100, 48_000, 88_200, 176_400]
+            ),
+            "the click wrote the whole list"
+        );
     }
 
     #[test]
