@@ -985,6 +985,26 @@ pub fn probe() -> Result<AudioGraph, GraphError> {
     Ok(graph)
 }
 
+/// Read just the server's clock, without needing priel's stream in the graph.
+///
+/// [`probe`] fails with [`GraphError::NoStream`] until priel's output node shows
+/// up in the dump - which is not until the first track has actually started to
+/// play. The verdict's resample fallback is read at track *start*, so on the
+/// very first track it landed before the stream existed and came back blank,
+/// letting a resample read as bit-perfect; every later track found the stream
+/// already there. The clock (`clock.allowed-rates` and friends) is a global
+/// setting on the server's own object, present whether or not priel is
+/// streaming, so it is read on its own here.
+///
+/// `None` only when `pw-dump` could not be run at all; an answer with no clock
+/// in it is [`ClockRates::default`], which claims nothing.
+#[must_use]
+pub fn probe_clock() -> Option<ClockRates> {
+    let out = run::capture("pw-dump", &[], DUMP_TIMEOUT).ok()?;
+    let text = String::from_utf8(out).ok()?;
+    Some(parse_clock(&text))
+}
+
 /// A sound-server sink that fronts an ALSA card.
 ///
 /// This is the join between the two ways of naming one DAC. A hardware device
