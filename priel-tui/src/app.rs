@@ -2367,6 +2367,9 @@ impl App {
                 }
                 FromWorker::AudioSetUp(result) => self.on_audio_set_up(result),
                 FromWorker::AudioRestarted(result) => self.on_audio_restarted(result),
+                // The clock read at track start: hand it to the player, where the
+                // verdict falls back to it when there is no ALSA readout.
+                FromWorker::OutputClock(clock) => self.player.set_clock(clock),
                 FromWorker::Cover { track_id, image } => self.on_cover(track_id, image),
                 FromWorker::UpdateAvailable(tag) => self.on_update_available(tag),
                 FromWorker::Failed {
@@ -2564,6 +2567,11 @@ impl App {
     fn mint_play(&mut self) {
         self.plays = self.plays.wrapping_add(1);
         self.track_path = mpris::track_path(self.plays);
+        // A track is starting: read the server's graph clock once, here rather
+        // than on the status poll. It is what the verdict falls back to on an
+        // output with no ALSA readout - a Bluetooth sink - so a resample the
+        // server did on our behalf is caught rather than hidden.
+        self.ask(ToWorker::ReadClock);
     }
 
     /// The state a status tick is allowed to look at.
@@ -5775,7 +5783,7 @@ fn row_matches(primary: &str, secondary: &str, filter_lower: &str) -> bool {
 mod tests {
     use super::*;
     use priel_core::{PlayableSource, ResolvedStream};
-    use priel_player::graph::{HeldDevice, SinkLevels};
+    use priel_player::graph::{ClockRates, HeldDevice, SinkLevels};
     use priel_player::hw::HwParams;
     use priel_player::{Fidelity, OutputAccess};
 
@@ -5974,6 +5982,34 @@ mod tests {
             height: 4,
         };
         app.selected = app.visible_len().saturating_sub(1);
+    }
+
+    #[test]
+    fn a_track_starting_reads_the_graph_clock_and_hands_the_reply_to_the_player() {
+        // Goal: the verdict's fallback where there is no ALSA readout - a
+        // Bluetooth sink - is the graph clock, read once when a track starts
+        // (not on the status poll) and handed to the player. Playing a row must
+        // ask the worker for it, and the reply must be forwarded without
+        // disturbing the app.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "A", "X")];
+        r.app.selected = 0;
+        r.app.on_key(code(KeyCode::Enter));
+        assert!(
+            requests(&r)
+                .iter()
+                .any(|c| matches!(c, ToWorker::ReadClock)),
+            "a fresh play asks the worker for the clock"
+        );
+
+        r.to_app
+            .send(FromWorker::OutputClock(Some(ClockRates {
+                allowed_hz: Some(vec![48_000]),
+                current_hz: Some(48_000),
+                forced_hz: None,
+            })))
+            .expect("send");
+        r.app.drain_worker(); // handed to the player, no panic
     }
 
     #[test]
