@@ -25,6 +25,7 @@ use std::thread;
 use priel_core::auth::Credentials;
 use priel_core::{Client, Fault, Mix, Page, Playlist, Quality, ResolvedStream, Track};
 use priel_player::graph::{self, AudioGraph, GraphError};
+use priel_player::setup;
 
 /// Rows one favorites request asks for.
 ///
@@ -179,6 +180,15 @@ pub enum ToWorker {
     /// Read the chain to the output device. Runs `pw-dump` and waits for it,
     /// which is why it is here and not on the UI thread.
     ReadAudioGraph,
+    /// Write priel's own `pipewire.conf.d` drop-in so the sound server may clock
+    /// at the rates in `allowed_hz`. Touches the filesystem, which is why it is
+    /// here. The reply is [`FromWorker::AudioSetUp`].
+    SetUpAudio {
+        allowed_hz: Vec<u32>,
+    },
+    /// Restart the user's sound server so a freshly written drop-in takes effect.
+    /// Waits on a subprocess. The reply is [`FromWorker::AudioRestarted`].
+    RestartAudio,
     /// One page of the listing a queue was filled from, to grow the queue up to
     /// the whole listing in the background.
     ///
@@ -382,6 +392,14 @@ pub enum FromWorker {
     /// it is a request that went wrong, and the overlay has its own sentence
     /// for each case.
     AudioGraph(Result<AudioGraph, GraphError>),
+    /// priel's rates drop-in was written, or the reason it was not. `Ok` carries
+    /// the path written, for the sentence that offers the restart; `Err` carries
+    /// a reason already fit to show.
+    AudioSetUp(Result<String, String>),
+    /// The sound server was restarted, or the reason it was not. `Err` carries a
+    /// reason already fit to show, so the interface can say the file landed but
+    /// the restart did not.
+    AudioRestarted(Result<(), String>),
     /// One page of the listing a queue is being filled from.
     ///
     /// Carries the source it answers for, so a page for a queue the listener has
@@ -559,6 +577,23 @@ fn removed(client: &mut Client, uuid: String, track_id: u64) -> FromWorker {
 /// added, and so the answer to "what does this request reply with" is one
 /// `match` rather than a hundred lines of thread setup around it. `None` is a
 /// success the interface does not need to hear about.
+/// Write priel's rates drop-in - and only that file - into the user's config.
+///
+/// Always answers, so the overlay is never left waiting: an `Err` carries a
+/// reason already fit to show.
+fn set_up_audio(allowed_hz: &[u32]) -> FromWorker {
+    let done = match setup::conf_dir() {
+        Some(dir) => setup::write_rates(&dir, allowed_hz)
+            .map(|path| path.display().to_string())
+            .map_err(|e| e.to_string()),
+        None => Err("priel could not find your config directory".to_string()),
+    };
+    if let Err(e) = &done {
+        log::info!("set up audio: {e}");
+    }
+    FromWorker::AudioSetUp(done)
+}
+
 fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
     Some(match cmd {
         ToWorker::LoadFavorites { offset, limit } => match client.favorite_tracks(offset, limit) {
@@ -656,6 +691,13 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
             }
             FromWorker::AudioGraph(read)
         }
+        // Write priel's own drop-in - never another file - into the user's
+        // config directory. Filesystem work, so it is here and not on the render
+        // thread, and it always answers so the overlay can move on.
+        ToWorker::SetUpAudio { allowed_hz } => set_up_audio(&allowed_hz),
+        // Restart the user's sound server. Waits on `systemctl`, so it too is
+        // here and not on the UI thread.
+        ToWorker::RestartAudio => FromWorker::AudioRestarted(setup::restart_pipewire()),
         // Page the queue's own source. Distinct from the view's `Load*` so a
         // fill keeps arriving after the listener has navigated elsewhere. A
         // failure sends nothing - the fill stops and the queue keeps what it
@@ -1387,6 +1429,8 @@ mod tests {
             FromWorker::SearchResults { .. } => "SearchResults",
             FromWorker::Resolved(..) => "Resolved",
             FromWorker::AudioGraph(_) => "AudioGraph",
+            FromWorker::AudioSetUp(_) => "AudioSetUp",
+            FromWorker::AudioRestarted(_) => "AudioRestarted",
             FromWorker::PlaylistCreated(_) => "PlaylistCreated",
             FromWorker::PlaylistDeleted { .. } => "PlaylistDeleted",
             FromWorker::PlaylistTrackRemoved { .. } => "PlaylistTrackRemoved",

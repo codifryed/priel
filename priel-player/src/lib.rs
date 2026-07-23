@@ -37,6 +37,7 @@ use crate::hw::HwParams;
 pub mod graph;
 pub mod hw;
 mod run;
+pub mod setup;
 
 #[cfg(feature = "libmpv")]
 mod backend_mpv;
