@@ -1039,7 +1039,7 @@ pub struct App {
 }
 
 /// Snapshot of the render-relevant state that moves on its own.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "a change-detection snapshot; the fields mirror PlaybackStatus"
@@ -1053,7 +1053,6 @@ struct RenderSig {
     volume: u32,
     current_id: u64,
     has_next: bool,
-    cache_secs: u32,
     sample_rate: u32,
     spinner: usize,
 }
@@ -2324,7 +2323,13 @@ impl App {
                     return;
                 }
             };
-            self.dirty = true;
+            // Every reply repaints the screen - except the background
+            // sink-volume poll (an `AudioGraph`), which routinely finds the same
+            // value with the report closed. It earns its repaint in its own arm
+            // rather than taking the blanket one, so an idle poll costs no frame.
+            if !matches!(msg, FromWorker::AudioGraph(_)) {
+                self.dirty = true;
+            }
             match msg {
                 FromWorker::Favorites { offset, page } => self.on_favorites_page(offset, page),
                 FromWorker::Playlists { offset, page } => self.on_playlists_page(offset, page),
@@ -2358,12 +2363,20 @@ impl App {
                     self.notice = Some(format!("Added to “{title}”."));
                 }
                 FromWorker::AudioGraph(read) => {
+                    let before = self.sink_volume.clone();
                     self.note_sink_volume(&read);
                     self.audio_graph = Some(read);
                     // The reply can be longer than the request that opened the
                     // overlay left room for, so the scroll starts again rather
                     // than pointing past the end of the new reading.
                     self.graph_scroll = 0;
+                    // The overlay shows the whole graph; the now-playing badge
+                    // rests only on the sink volume. Repaint for the first
+                    // whenever it is open, for the second only when the value
+                    // moved - the 5-second background poll usually finds neither.
+                    if self.mode == Mode::Graph || self.sink_volume != before {
+                        self.dirty = true;
+                    }
                 }
                 FromWorker::AudioSetUp(result) => self.on_audio_set_up(result),
                 FromWorker::AudioRestarted(result) => self.on_audio_restarted(result),
@@ -2404,14 +2417,25 @@ impl App {
         let s = &self.status;
         RenderSig {
             position: s.position as u64,
-            duration: s.duration as u64,
+            // The figure the progress bar actually shows (see `App::duration`),
+            // not mpv's raw `duration`. For a segment stream mpv does not know
+            // the length and estimates it, and that estimate *grows* about once
+            // a second - a number the UI never displays, yet it was repainting
+            // the whole window every time it ticked up. The listing's figure is
+            // fixed, so the signature stops moving with it.
+            duration: self.duration() as u64,
             paused: s.paused,
             playing: s.playing,
             loaded: s.loaded,
             volume: s.volume as u32,
             current_id: s.current_id,
             has_next: s.has_next,
-            cache_secs: s.cache_secs as u32,
+            // Deliberately NOT the buffered-seconds count. mpv's
+            // demuxer-cache-duration wobbles across whole-second boundaries
+            // several times a second, and driving the redraw off it repaints
+            // that often - a full-window GPU composite each time - for a number
+            // nobody needs to the fraction of a second. The buffered readout
+            // rides the once-a-second position update instead.
             sample_rate: s.sample_rate,
             // While a spinner is on screen it must keep animating.
             spinner: if self.is_resolving() || self.is_buffering() {
@@ -11192,6 +11216,55 @@ mod tests {
         let _ = r.app.take_dirty();
         r.app.refresh_for_test();
         assert!(r.app.take_dirty(), "the spinner must keep animating");
+    }
+
+    #[test]
+    fn a_wobbling_buffer_count_is_not_in_the_redraw_signature() {
+        // Goal: mpv's demuxer-cache-duration wobbles across whole-second
+        // boundaries several times a second. In the signature, each wobble
+        // repaints the whole window - a GPU composite for a number nobody needs
+        // to the fraction of a second. The buffered readout rides the
+        // once-a-second position update instead; the count itself repaints
+        // nothing.
+        let mut r = rig();
+        r.app.status.loaded = true;
+        r.app.status.playing = true;
+        let before = r.app.render_sig();
+        r.app.status.cache_secs = 119.0;
+        r.app.status.bitrate = 950_000;
+        assert_eq!(
+            before,
+            r.app.render_sig(),
+            "a changed buffer count or bitrate must not change the signature"
+        );
+        r.app.status.cache_secs = 121.0;
+        assert_eq!(before, r.app.render_sig());
+        // But moving on to a new whole second still does.
+        r.app.status.position = f64::from(u32::try_from(before.position).unwrap_or(0)) + 2.0;
+        assert_ne!(before, r.app.render_sig(), "the position still repaints");
+    }
+
+    #[test]
+    fn mpvs_growing_duration_estimate_is_not_in_the_redraw_signature() {
+        // Goal: a segment stream advertises no length, so mpv estimates the
+        // duration and the estimate grows about once a second. The progress bar
+        // shows the listing's fixed figure (`App::duration`), not mpv's, so the
+        // signature must watch that too - or the whole window repaints every
+        // time mpv's guess ticks up, which is the constant GPU load this fixes.
+        let mut r = rig();
+        r.app.status.loaded = true;
+        r.app.status.playing = true;
+        r.app.now_playing = Some(track(1, "A", "X"));
+        r.app.now_playing.as_mut().expect("just set").duration_secs = 200;
+        let before = r.app.render_sig();
+        r.app.status.duration = 140.0; // mpv's estimate
+        assert_eq!(
+            before,
+            r.app.render_sig(),
+            "mpv's growing estimate must not move the signature"
+        );
+        r.app.status.duration = 160.0; // it grew again
+        assert_eq!(before, r.app.render_sig());
     }
 
     #[test]
