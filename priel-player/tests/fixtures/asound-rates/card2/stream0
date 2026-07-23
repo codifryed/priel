@@ -1,0 +1,21 @@
+Focusrite Scarlett 2i2 USB at usb-0000:66:00.4-1.2, high speed : USB Audio
+
+Playback:
+  Status: Stop
+  Interface 1
+    Altset 1
+    Format: S32_LE
+    Channels: 2
+    Endpoint: 0x01 (1 OUT) (SYNC)
+    Rates: 44100, 48000, 88200, 96000, 176400, 192000
+    Bits: 24
+
+Capture:
+  Status: Stop
+  Interface 2
+    Altset 1
+    Format: S32_LE
+    Channels: 2
+    Endpoint: 0x82 (2 IN) (ASYNC)
+    Rates: 44100, 48000, 88200, 96000, 176400, 192000
+    Bits: 24

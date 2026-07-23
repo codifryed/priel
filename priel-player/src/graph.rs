@@ -134,6 +134,60 @@ pub struct AudioGraph {
     /// What the sink at the end of the chain is doing to the level, from the
     /// same dump for the same reason.
     pub volume: SinkVolume,
+    /// The rates the device at the end of the chain can be clocked at, read from
+    /// `/proc/asound` (see [`crate::hw::supported_playback_rates`]). Empty when
+    /// not known - a non-ALSA sink, or a descriptor that could not be read - and
+    /// then no capability claim is made from it. Filled in by [`probe`] rather
+    /// than [`parse`], because it comes from the kernel and not from `pw-dump`.
+    pub supported_hz: Vec<u32>,
+}
+
+impl AudioGraph {
+    /// The rates the device supports that the server may not use: S minus A, the
+    /// set a one-time "set up audio" pass would add to `clock.allowed-rates`.
+    ///
+    /// Empty when either side is unknown - the device's rates could not be read,
+    /// or the server published no permitted list - because there is then nothing
+    /// to compare, and a difference invented from a missing side would send the
+    /// listener to change a setting that was never the problem.
+    #[must_use]
+    pub fn blocked_supported_hz(&self) -> Vec<u32> {
+        blocked_rates(self.clock.permitted_hz().as_deref(), &self.supported_hz)
+    }
+
+    /// The ALSA card index of the sink at the end of the chain, when it has one.
+    ///
+    /// A server-held ALSA device names its PCM as `hw:N,M`, and `N` is the
+    /// `/proc/asound/cardN` its supported rates are read from. `None` for a
+    /// non-ALSA sink - a Bluetooth or network device names no card - or a chain
+    /// that reaches no device at all.
+    fn sink_card_index(&self) -> Option<u32> {
+        let DeviceHolder::Server(held) = &self.holder else {
+            return None;
+        };
+        held.pcm
+            .as_deref()?
+            .strip_prefix("hw:")?
+            .split(',')
+            .next()?
+            .parse()
+            .ok()
+    }
+}
+
+/// The rates in `supported` that `permitted` does not include - S minus A, the
+/// set a "set up audio" pass would add to `clock.allowed-rates`. A `None`
+/// permitted list is the server naming no rates at all, so nothing is claimed
+/// against it; an empty `supported` is the device's rates being unknown.
+fn blocked_rates(permitted: Option<&[u32]>, supported: &[u32]) -> Vec<u32> {
+    let Some(allowed) = permitted else {
+        return Vec::new();
+    };
+    supported
+        .iter()
+        .copied()
+        .filter(|hz| !allowed.contains(hz))
+        .collect()
 }
 
 /// The volume the sound server has on the sink at the end of the chain.
@@ -381,15 +435,28 @@ impl ClockRates {
 
     /// Whether this track may be played at its own rate, and what to change.
     ///
-    /// Pure over the published setting and one rate, so the whole of the advice
-    /// is a table of tests rather than something only a live sound server can
-    /// show. A `track_rate_hz` of zero means there is no rate to check - nothing
-    /// playing, or a source whose rate is not known - and is never treated as a
-    /// rate the server refused.
+    /// Pure over the published setting, the device's supported rates and one
+    /// rate, so the whole of the advice is a table of tests rather than
+    /// something only a live sound server can show. A `track_rate_hz` of zero
+    /// means there is no rate to check - nothing playing, or a source whose rate
+    /// is not known - and is never treated as a rate the server refused.
+    ///
+    /// `supported_hz` is the device's own rates (see
+    /// [`AudioGraph::supported_hz`]); an empty slice means they are not known,
+    /// and no capability claim is made from it.
     #[must_use]
-    pub fn advise(&self, track_rate_hz: u32) -> RateAdvice {
+    pub fn advise(&self, track_rate_hz: u32, supported_hz: &[u32]) -> RateAdvice {
         if track_rate_hz == 0 {
             return RateAdvice::NoTrack;
+        }
+        // The hardware's own limit is checked first: if the device cannot be
+        // clocked at this rate, no server setting changes that, and proposing a
+        // config edit would send the listener to fix a file that fixes nothing.
+        // An empty list is "not known", so no claim is made from it.
+        if !supported_hz.is_empty() && !supported_hz.contains(&track_rate_hz) {
+            return RateAdvice::Unsupported {
+                ceiling_hz: supported_hz.iter().copied().max().unwrap_or(0),
+            };
         }
         // Checked before the list, because a pin applies whether or not the
         // dump published a list at all.
@@ -438,6 +505,10 @@ pub enum RateAdvice {
     /// `clock.force-rate` pins the graph to `at_hz` and the permitted list is
     /// not consulted at all, so extending it would change nothing.
     Pinned { at_hz: u32 },
+    /// The device itself cannot be clocked at this rate - it is above what the
+    /// hardware does - so no server setting helps and the resample is forced by
+    /// the hardware's own limit. `ceiling_hz` is the highest rate it can do.
+    Unsupported { ceiling_hz: u32 },
 }
 
 /// The longest line the audio-graph overlay can draw without losing its tail.
@@ -476,7 +547,23 @@ impl RateAdvice {
                 "Clear the pin with:".to_string(),
                 "  pw-metadata -n settings 0 clock.force-rate 0".to_string(),
             ],
+            Self::Unsupported { ceiling_hz } => vec![
+                format!(
+                    "Your DAC does not do this rate; it tops out at {}.",
+                    khz(*ceiling_hz)
+                ),
+                "This track is resampled, and no audio setting changes that.".to_string(),
+            ],
         }
+    }
+}
+
+/// One rate as kilohertz, e.g. `192 kHz` or `44.1 kHz`.
+fn khz(hz: u32) -> String {
+    if hz.is_multiple_of(1000) {
+        format!("{} kHz", hz / 1000)
+    } else {
+        format!("{:.1} kHz", f64::from(hz) / 1000.0)
     }
 }
 
@@ -861,7 +948,13 @@ pub fn probe() -> Result<AudioGraph, GraphError> {
         RunError::Unreadable => GraphError::Unavailable("its output could not be read".into()),
     })?;
     let text = String::from_utf8(out).map_err(|_| GraphError::Unreadable)?;
-    parse(&text, std::process::id())
+    let mut graph = parse(&text, std::process::id())?;
+    // The device's rates come from the kernel, not the dump: `parse` cannot read
+    // them and stay pure, so they are filled in here, keyed by the sink's card.
+    if let Some(index) = graph.sink_card_index() {
+        graph.supported_hz = crate::hw::supported_rates_for_card(index);
+    }
+    Ok(graph)
 }
 
 /// A sound-server sink that fronts an ALSA card.
@@ -1059,6 +1152,9 @@ pub fn parse(dump: &str, pid: u32) -> Result<AudioGraph, GraphError> {
         volume: sink_volume_of(&objects, &path),
         path,
         clock: clock_of(&objects),
+        // The kernel names the device's rates, not `pw-dump`; `probe` fills this
+        // in. `parse` stays a pure function of the dump so it keeps its tests.
+        supported_hz: Vec::new(),
     })
 }
 
@@ -2068,11 +2164,107 @@ mod tests {
 
         for (clock, track_rate_hz, expected) in cases {
             assert_eq!(
-                clock.advise(track_rate_hz),
+                clock.advise(track_rate_hz, &[]),
                 expected,
                 "{clock:?} against {track_rate_hz} Hz"
             );
         }
+    }
+
+    #[test]
+    fn a_rate_the_device_cannot_do_is_not_a_config_the_reader_should_change() {
+        // Goal: the difference the descriptor buys. A rate above what the
+        // hardware does is resampled whatever the server allows, so proposing a
+        // file edit there would send the reader to fix something that fixes
+        // nothing. The ceiling is what the device tops out at.
+        let clock = clock(Some(&[44_100, 48_000, 96_000]), Some(48_000));
+        let supported = [44_100, 48_000, 96_000];
+        assert_eq!(
+            clock.advise(192_000, &supported),
+            RateAdvice::Unsupported { ceiling_hz: 96_000 },
+            "192 kHz is above the device's 96 kHz ceiling"
+        );
+        let text = clock.advise(192_000, &supported).lines().join("\n");
+        assert!(text.contains("96 kHz"), "names the ceiling: {text}");
+        assert!(
+            !text.contains("allowed-rates"),
+            "and does not send the reader to change a setting: {text}"
+        );
+    }
+
+    #[test]
+    fn a_rate_the_device_can_do_but_the_server_blocks_is_still_a_config_to_add() {
+        // Goal: the fixable case must survive the new check. The device does
+        // 88.2 kHz and the server is not permitted to use it, so the advice is
+        // still to add it - the descriptor only rules out what the hardware
+        // truly cannot do.
+        assert_eq!(
+            clock(Some(&[44_100, 48_000]), Some(48_000))
+                .advise(88_200, &[44_100, 48_000, 88_200, 96_000]),
+            RateAdvice::Missing {
+                proposed_hz: vec![44_100, 48_000, 88_200]
+            }
+        );
+    }
+
+    #[test]
+    fn no_capability_claim_is_made_when_the_devices_rates_are_not_known() {
+        // Goal: an empty supported set is "not known", not "the device can do
+        // none". The advice must fall back to what it said before the descriptor
+        // existed rather than calling every rate unsupported.
+        assert_eq!(
+            clock(Some(&[48_000]), Some(48_000)).advise(44_100, &[]),
+            RateAdvice::Missing {
+                proposed_hz: vec![44_100, 48_000]
+            },
+            "unknown rates propose the change, they do not refuse it"
+        );
+    }
+
+    #[test]
+    fn the_rates_a_device_can_do_that_the_server_blocks_are_the_set_to_add() {
+        // Goal: the "set up audio" check - S minus A. Only what the device
+        // supports and the server does not permit, and nothing when either side
+        // is unknown, because a difference invented from a missing side would
+        // point at a setting that was never the problem.
+        assert_eq!(
+            super::blocked_rates(Some(&[44_100, 48_000]), &[44_100, 48_000, 88_200, 96_000]),
+            vec![88_200, 96_000],
+            "the supported rates the server is not allowing"
+        );
+        assert!(
+            super::blocked_rates(None, &[44_100, 48_000]).is_empty(),
+            "no permitted list means nothing is claimed"
+        );
+        assert!(
+            super::blocked_rates(Some(&[44_100, 48_000]), &[]).is_empty(),
+            "unknown device rates claim nothing either"
+        );
+    }
+
+    #[test]
+    fn the_sink_card_index_is_read_from_the_held_pcm() {
+        // Goal: the join from the graph to /proc/asound. A server-held ALSA
+        // device names its PCM as hw:N,M, and N is the card its rates are read
+        // from; a holder that names no ALSA card yields nothing to read.
+        let held = AudioGraph {
+            holder: DeviceHolder::Server(HeldDevice {
+                sink: "DAC".into(),
+                opened_by: None,
+                pcm: Some("hw:2,0".into()),
+                card_name: None,
+            }),
+            ..AudioGraph::default()
+        };
+        assert_eq!(held.sink_card_index(), Some(2));
+        assert_eq!(
+            AudioGraph {
+                holder: DeviceHolder::NoDevice,
+                ..AudioGraph::default()
+            }
+            .sink_card_index(),
+            None
+        );
     }
 
     #[test]
@@ -2125,7 +2317,7 @@ mod tests {
             current_hz: Some(48_000),
             forced_hz: None,
         }
-        .advise(44_100);
+        .advise(44_100, &[]);
         let lines = advice.lines();
         let text = lines.join("\n");
         assert!(
@@ -2152,7 +2344,7 @@ mod tests {
         // runtime and has no spelling in the configuration file, so advising a
         // file edit here would be a change that cannot work.
         let lines = pinned_at(48_000, Some(&[44_100, 48_000]))
-            .advise(44_100)
+            .advise(44_100, &[])
             .lines();
         let text = lines.join("\n");
         assert!(text.contains("clock.force-rate"), "names the pin: {text}");
@@ -2175,7 +2367,7 @@ mod tests {
         let long = [
             44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600,
         ];
-        let advice = clock(Some(&long), Some(48_000)).advise(768_000);
+        let advice = clock(Some(&long), Some(48_000)).advise(768_000, &[]);
         let lines = advice.lines();
         for line in &lines {
             assert!(line.chars().count() <= 70, "too long to draw: {line}");

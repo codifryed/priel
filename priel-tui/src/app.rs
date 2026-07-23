@@ -4306,7 +4306,7 @@ impl App {
                 // server was never permitted to use is refused before any node
                 // on the path sees a sample, which is how the chain can diverge
                 // nowhere and something still move.
-                rows.extend(clock_rows(&g.clock, source));
+                rows.extend(clock_rows(&g.clock, &g.supported_hz, source));
                 // Last, because it is the one section that is true whatever the
                 // rest of them found: a chain that alters nothing is still a
                 // chain the sound server owns and can reshape when the next
@@ -5377,12 +5377,12 @@ const RATES_PER_ROW: usize = 8;
 /// is enough to be worth a row: what the server permits is a fact about the
 /// machine even between tracks, and an unreadable setting is worth admitting
 /// once there is a rate it would have been compared against.
-fn clock_rows(clock: &ClockRates, source: SourceFormat) -> Vec<GraphRow> {
+fn clock_rows(clock: &ClockRates, supported_hz: &[u32], source: SourceFormat) -> Vec<GraphRow> {
     let permitted_hz = clock.permitted_hz();
     if permitted_hz.is_none() && source.rate_hz == 0 {
         return Vec::new();
     }
-    let advice = clock.advise(source.rate_hz);
+    let advice = clock.advise(source.rate_hz, supported_hz);
     let mut rows = vec![note(""), note("  Server clock")];
 
     match permitted_hz.as_deref() {
@@ -5398,7 +5398,7 @@ fn clock_rows(clock: &ClockRates, source: SourceFormat) -> Vec<GraphRow> {
     if source.rate_hz > 0 {
         let refused = matches!(
             advice,
-            RateAdvice::Missing { .. } | RateAdvice::Pinned { .. }
+            RateAdvice::Missing { .. } | RateAdvice::Pinned { .. } | RateAdvice::Unsupported { .. }
         );
         let mut detail = crate::ui::fmt_khz(source.rate_hz);
         if refused {
