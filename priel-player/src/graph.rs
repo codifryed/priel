@@ -433,6 +433,34 @@ impl ClockRates {
         }
     }
 
+    /// The rate the graph actually clocks the output at for a stream of
+    /// `track_rate_hz`: the track's own rate when the graph may run at it - it
+    /// rate-follows - otherwise the rate it is held at, which the stream is
+    /// resampled to. `None` when the dump said nothing to decide it on, so no
+    /// claim is made from it.
+    ///
+    /// This is the fallback the verdict needs where there is no ALSA readout - a
+    /// Bluetooth or network sink - because mpv reports only the rate it handed
+    /// the server, not the rate the server then clocked the graph at. A
+    /// `track_rate_hz` of zero is "not known", and answers `None`.
+    #[must_use]
+    pub fn output_rate_for(&self, track_rate_hz: u32) -> Option<u32> {
+        if track_rate_hz == 0 {
+            return None;
+        }
+        // A pin runs everything at one rate, whatever the stream asks for.
+        if let Some(forced) = self.forced_hz {
+            return Some(forced);
+        }
+        let permitted = self.permitted_hz()?;
+        // The stream's own rate is allowed, so the graph switches to it: native.
+        if permitted.contains(&track_rate_hz) {
+            return Some(track_rate_hz);
+        }
+        // Not allowed: the graph resamples the stream to the rate it runs at.
+        self.current_hz.or_else(|| permitted.into_iter().max())
+    }
+
     /// Whether this track may be played at its own rate, and what to change.
     ///
     /// Pure over the published setting, the device's supported rates and one
@@ -2288,6 +2316,39 @@ mod tests {
         assert_eq!(
             clock(Some(&[44_100, 48_000]), Some(48_000)).permitted_hz(),
             Some(vec![44_100, 48_000])
+        );
+    }
+
+    #[test]
+    fn the_output_rate_a_stream_ends_at_is_the_track_rate_only_when_it_is_allowed() {
+        // Goal: the fallback the verdict uses where there is no ALSA readout. A
+        // permitted rate means the graph runs at it (native); a rate not
+        // permitted is resampled to the rate the graph runs at; a pin runs
+        // everything at itself; and a dump that says nothing makes no claim.
+        assert_eq!(
+            clock(Some(&[44_100, 48_000]), Some(48_000)).output_rate_for(44_100),
+            Some(44_100),
+            "a permitted rate is played natively"
+        );
+        assert_eq!(
+            clock(Some(&[48_000]), Some(48_000)).output_rate_for(44_100),
+            Some(48_000),
+            "a rate not permitted is resampled to the graph's rate"
+        );
+        assert_eq!(
+            pinned_at(48_000, Some(&[44_100, 48_000])).output_rate_for(44_100),
+            Some(48_000),
+            "a pin runs everything at itself"
+        );
+        assert_eq!(
+            clock(None, Some(48_000)).output_rate_for(44_100),
+            None,
+            "no permitted list, no claim"
+        );
+        assert_eq!(
+            clock(Some(&[48_000]), Some(48_000)).output_rate_for(0),
+            None,
+            "no track rate, no claim"
         );
     }
 

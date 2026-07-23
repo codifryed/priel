@@ -113,6 +113,16 @@ pub struct PlaybackStatus {
     /// How the output device is being held **now**, which is not the same thing
     /// as what was asked for. See [`OutputAccess`].
     pub access: OutputAccess,
+    /// The sound server's graph clock, read by the frontend at track start.
+    ///
+    /// Set from outside via [`Player::set_clock`], because reading it needs a
+    /// `pw-dump` the player thread must not run. It is a *better fallback* than
+    /// [`Self::sample_rate`] where there is no ALSA readout ([`Self::hw`] is
+    /// `None`) - a Bluetooth or network sink - because mpv reports only the rate
+    /// it handed the server, not the rate the server clocked the graph at, which
+    /// is where a resample it performed on our behalf would otherwise hide. See
+    /// [`Self::effective_output`].
+    pub clock: Option<crate::graph::ClockRates>,
 }
 
 /// How priel is holding the output device.
@@ -324,10 +334,21 @@ impl PlaybackStatus {
     /// server that resampled on our behalf still reports the rate we asked for.
     #[must_use]
     pub fn effective_output(&self) -> (u32, &str) {
-        match &self.hw {
-            Some(h) => (h.rate, h.format.as_str()),
-            None => (self.sample_rate, self.out_format.as_str()),
+        // The ALSA readout is the truth when there is one.
+        if let Some(h) = &self.hw {
+            return (h.rate, h.format.as_str());
         }
+        // Without it, mpv's `sample_rate` is only the rate we handed the server,
+        // so it hides a resample the server did. The graph clock, when the
+        // frontend has read it, is the rate the output is really running at -
+        // the honest fallback for a Bluetooth or network sink.
+        let rate = self
+            .clock
+            .as_ref()
+            .and_then(|c| c.output_rate_for(self.in_sample_rate))
+            .filter(|&r| r > 0)
+            .unwrap_or(self.sample_rate);
+        (rate, self.out_format.as_str())
     }
 
     /// Is the output going straight to the hardware, with no sound server in
@@ -548,6 +569,11 @@ pub(crate) enum Cmd {
     SetDevice(String),
     /// Ask for, or give up, exclusive use of the output device.
     SetExclusive(bool),
+    /// Carry the sound server's graph clock into the status, read by the
+    /// frontend at track start. The player thread cannot read it itself - it
+    /// needs a `pw-dump`, which must not run on this thread - so it arrives as a
+    /// command and is published unchanged in every status until the next one.
+    SetClock(Option<crate::graph::ClockRates>),
     Quit,
 }
 
@@ -678,6 +704,16 @@ impl Player {
     }
     pub fn stop(&self) {
         self.send(Cmd::Stop);
+    }
+
+    /// Tell the player the sound server's graph clock, read at track start.
+    ///
+    /// Fire-and-forget like every other command. It becomes the output rate the
+    /// verdict falls back to when there is no ALSA readout - a Bluetooth or
+    /// network sink - so a resample the server performed on our behalf is caught
+    /// rather than hidden. `None` clears it.
+    pub fn set_clock(&self, clock: Option<crate::graph::ClockRates>) {
+        self.send(Cmd::SetClock(clock));
     }
     /// Ask the player thread to re-read the audio devices.
     ///
@@ -1191,6 +1227,66 @@ mod tests {
             Fidelity::Altered(Alteration::Resampled),
             "the device is clocked elsewhere, so this is a resample"
         );
+    }
+
+    /// A graph clock allowed to run at `allowed`, currently at `current`.
+    fn clock_at(allowed: &[u32], current: u32) -> crate::graph::ClockRates {
+        crate::graph::ClockRates {
+            allowed_hz: Some(allowed.to_vec()),
+            current_hz: Some(current),
+            forced_hz: None,
+        }
+    }
+
+    #[test]
+    fn a_resample_the_server_hid_is_caught_from_the_clock_when_there_is_no_readout() {
+        // Goal: a Bluetooth sink has no /proc/asound readout, so mpv reports only
+        // the 44.1 kHz it handed the server and hides the 48 kHz the graph is
+        // clocked at. The clock, read at track start, is the fallback that
+        // catches it - the verdict must not call a resampled, volume-scaled
+        // stream near bit-perfect while the report's own clock section says the
+        // rate is not permitted.
+        let mut s = PlaybackStatus {
+            volume: 50.0,
+            clock: Some(clock_at(&[48_000], 48_000)),
+            ..playing(44_100, 44_100, "s16", "s16")
+        };
+        assert_eq!(s.fidelity(16), Fidelity::Altered(Alteration::Resampled));
+
+        // Without the clock it is missed and only the volume shows - proof the
+        // clock is what catches it, not something else in the reading.
+        s.clock = None;
+        assert_ne!(s.fidelity(16), Fidelity::Altered(Alteration::Resampled));
+    }
+
+    #[test]
+    fn a_permissive_clock_does_not_invent_a_resample_for_native_playback() {
+        // Goal: the fallback must never turn native playback into a false
+        // resample. When the track's own rate is permitted the graph runs at it,
+        // so the clock reports the track rate and nothing is altered.
+        let s = PlaybackStatus {
+            clock: Some(clock_at(&[44_100, 48_000], 48_000)),
+            ..playing(44_100, 44_100, "s16", "s16")
+        };
+        assert_eq!(s.fidelity(16), Fidelity::BitPerfect);
+    }
+
+    #[test]
+    fn the_hardware_readout_still_wins_over_the_clock() {
+        // Goal: where there is a real readout it is the truth and the clock is
+        // ignored. A DAC clocked at 44.1 is native however the graph metadata
+        // would have read.
+        let s = PlaybackStatus {
+            hw: Some(HwParams {
+                card: "DAC".into(),
+                rate: 44_100,
+                format: "s16".into(),
+                channels: 2,
+            }),
+            clock: Some(clock_at(&[48_000], 48_000)),
+            ..playing(44_100, 44_100, "s16", "s16")
+        };
+        assert_eq!(s.fidelity(16), Fidelity::BitPerfect, "the readout wins");
     }
 
     #[test]

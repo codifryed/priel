@@ -24,7 +24,7 @@ use std::thread;
 
 use priel_core::auth::Credentials;
 use priel_core::{Client, Fault, Mix, Page, Playlist, Quality, ResolvedStream, Track};
-use priel_player::graph::{self, AudioGraph, GraphError};
+use priel_player::graph::{self, AudioGraph, ClockRates, GraphError};
 use priel_player::setup;
 
 /// Rows one favorites request asks for.
@@ -180,6 +180,10 @@ pub enum ToWorker {
     /// Read the chain to the output device. Runs `pw-dump` and waits for it,
     /// which is why it is here and not on the UI thread.
     ReadAudioGraph,
+    /// Read just the sound server's graph clock, at track start, so the verdict
+    /// can tell a resample the server hid on an output with no ALSA readout. The
+    /// reply is [`FromWorker::OutputClock`]. Runs `pw-dump`, so it is here.
+    ReadClock,
     /// Write priel's own `pipewire.conf.d` drop-in so the sound server may clock
     /// at the rates in `allowed_hz`. Touches the filesystem, which is why it is
     /// here. The reply is [`FromWorker::AudioSetUp`].
@@ -392,6 +396,10 @@ pub enum FromWorker {
     /// it is a request that went wrong, and the overlay has its own sentence
     /// for each case.
     AudioGraph(Result<AudioGraph, GraphError>),
+    /// The sound server's graph clock at track start, or `None` when it could
+    /// not be read - a background read, so a failure is silent, not a banner.
+    /// The app hands it to the player, where the verdict falls back to it.
+    OutputClock(Option<ClockRates>),
     /// priel's rates drop-in was written, or the reason it was not. `Ok` carries
     /// the path written, for the sentence that offers the restart; `Err` carries
     /// a reason already fit to show.
@@ -691,6 +699,9 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
             }
             FromWorker::AudioGraph(read)
         }
+        // Just the clock, read at track start. A background read: on failure the
+        // reply is `None` and the verdict keeps its old fallback, no banner.
+        ToWorker::ReadClock => FromWorker::OutputClock(graph::probe().ok().map(|g| g.clock)),
         // Write priel's own drop-in - never another file - into the user's
         // config directory. Filesystem work, so it is here and not on the render
         // thread, and it always answers so the overlay can move on.
@@ -1429,6 +1440,7 @@ mod tests {
             FromWorker::SearchResults { .. } => "SearchResults",
             FromWorker::Resolved(..) => "Resolved",
             FromWorker::AudioGraph(_) => "AudioGraph",
+            FromWorker::OutputClock(_) => "OutputClock",
             FromWorker::AudioSetUp(_) => "AudioSetUp",
             FromWorker::AudioRestarted(_) => "AudioRestarted",
             FromWorker::PlaylistCreated(_) => "PlaylistCreated",

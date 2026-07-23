@@ -170,6 +170,9 @@ struct Output {
     /// track. Without this every subsequent load would re-arm the judgement and
     /// a slow-starting track could condemn a working exclusive output.
     judged: bool,
+    /// The sound server's graph clock, as the frontend last read it. Published
+    /// unchanged in the status; see [`crate::Cmd::SetClock`].
+    clock: Option<crate::graph::ClockRates>,
 }
 
 /// A device change waiting to be judged.
@@ -749,6 +752,7 @@ pub fn spawn(
             exclusive: config.exclusive,
             refused: false,
             judged: false,
+            clock: None,
         };
         // The ALSA readout costs a handful of /proc reads, so it is refreshed on
         // its own slower cadence rather than on every status tick.
@@ -1099,6 +1103,7 @@ fn handle_cmd(
         }
         Cmd::SetDevice(device) => set_device(mpv, output, device),
         Cmd::SetExclusive(exclusive) => set_exclusive(mpv, output, exclusive),
+        Cmd::SetClock(clock) => output.clock = clock,
     }
     false
 }
@@ -1475,6 +1480,7 @@ fn read_status(
         device_error: output.error.clone(),
         hw,
         access,
+        clock: output.clock.clone(),
     }
 }
 
@@ -1561,6 +1567,7 @@ mod tests {
             exclusive: false,
             refused: false,
             judged: false,
+            clock: None,
         }
     }
 
