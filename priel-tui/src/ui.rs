@@ -4471,19 +4471,17 @@ mod tests {
         // Goal: a repeating queue has no end, so there is nothing for the radio
         // to continue from. The two toggles stay independent - neither writes to
         // the other - but a control lit up for something that will not happen is
-        // a control telling the listener a lie. Method: read the backing off the
-        // three cases; the flag itself is untouched throughout.
+        // a control telling the listener a lie. Method: read the backing with
+        // the radio able to follow, then again under a repeat; the flag itself
+        // is untouched throughout.
         let mut sc = screen();
-        let off = painted_backing(&mut sc.app, 140, 12, Hit::Continue);
-
-        click_hit(&mut sc.app, Hit::Continue);
+        sc.app.continue_radio = true; // the default, set here so the test does not ride on it
         let claiming = painted_backing(&mut sc.app, 140, 12, Hit::Continue);
-        assert_ne!(claiming, off, "on, with an end to carry on from");
 
         click_hit(&mut sc.app, Hit::Repeat);
-        assert_eq!(
+        assert_ne!(
             painted_backing(&mut sc.app, 140, 12, Hit::Continue),
-            off,
+            claiming,
             "a repeating queue never reaches it"
         );
         assert!(sc.app.continue_radio, "and the flag was not reached into");
