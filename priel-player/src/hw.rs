@@ -86,6 +86,42 @@ pub fn parse_hw_params(body: &str) -> Option<HwParams> {
     Some(params)
 }
 
+/// The sample rates a card's playback stream advertises it can be clocked at.
+///
+/// Parsed from the body of `/proc/asound/cardN/streamN`, the USB-Audio
+/// descriptor: the device's *capabilities*, there whether or not anything is
+/// playing, unlike the `hw_params` an open substream shows. Only the
+/// `Playback:` section counts - a capture-only interface, a webcam microphone,
+/// is not an output - and the union across every playback altset is taken,
+/// because a device may split its rates one to an altset rather than listing
+/// them together. The result is sorted and deduplicated.
+///
+/// An empty list means "not known", not "the hardware can do none": a
+/// capture-only device, a body this cannot make sense of, or a descriptor that
+/// stated a continuous range rather than a list. The caller must read it that
+/// way and make no capability claim from it, because telling a listener their
+/// DAC cannot do a rate it can would be worse than saying nothing.
+#[must_use]
+pub fn supported_playback_rates(body: &str) -> Vec<u32> {
+    let mut rates = Vec::new();
+    let mut in_playback = false;
+    for line in body.lines() {
+        match line.trim() {
+            "Playback:" => in_playback = true,
+            "Capture:" => in_playback = false,
+            rest if in_playback => {
+                if let Some(list) = rest.strip_prefix("Rates:") {
+                    rates.extend(list.split(',').filter_map(|r| r.trim().parse::<u32>().ok()));
+                }
+            }
+            _ => {}
+        }
+    }
+    rates.sort_unstable();
+    rates.dedup();
+    rates
+}
+
 /// Does this output device identifier name this card?
 ///
 /// Three spellings reach here, and a plain substring test only answers the
@@ -433,7 +469,7 @@ mod tests {
 
     use super::{
         card_devices, card_devices_in, card_matches, is_direct_card_device, parse_hw_params, probe,
-        refers_to_card,
+        refers_to_card, supported_playback_rates,
     };
 
     /// A copy of a real `/proc/asound`, trimmed to the files this reads.
@@ -810,5 +846,118 @@ buffer_size: 32768";
         // nothing is a valid answer; failing is not.
         let _ = probe(None);
         let _ = probe(Some("AUDIO"));
+    }
+
+    /// A `stream0` from a real two-channel USB interface: a playback altset and
+    /// a capture altset, each listing the same six rates.
+    const SCARLETT: &str =
+        "Focusrite Scarlett 2i2 USB at usb-0000:66:00.4-1.2, high speed : USB Audio
+
+Playback:
+  Status: Stop
+  Interface 1
+    Altset 1
+    Format: S32_LE
+    Channels: 2
+    Endpoint: 0x01 (1 OUT) (SYNC)
+    Rates: 44100, 48000, 88200, 96000, 176400, 192000
+    Bits: 24
+
+Capture:
+  Status: Running
+  Interface 2
+    Altset 1
+    Format: S32_LE
+    Channels: 2
+    Endpoint: 0x82 (2 IN) (ASYNC)
+    Rates: 44100, 48000, 88200, 96000, 176400, 192000
+    Bits: 24";
+
+    /// A dock: its playback tops out at 48 kHz and its capture is a mono mic.
+    const DOCK: &str = "Lenovo ThinkPad USB-C Dock Gen2 USB Au at usb-x, full speed : USB Audio
+
+Playback:
+  Status: Stop
+  Interface 2
+    Altset 1
+    Format: S16_LE
+    Channels: 2
+    Rates: 8000, 16000, 32000, 44100, 48000
+    Bits: 16
+
+Capture:
+  Status: Stop
+  Interface 1
+    Altset 1
+    Format: S16_LE
+    Channels: 1
+    Rates: 8000, 16000, 32000, 44100, 48000
+    Bits: 16";
+
+    /// A webcam: capture only, its rates split one to an altset, no playback.
+    const WEBCAM: &str = "Logitech Webcam C930e at usb-x, high speed : USB Audio
+
+Capture:
+  Status: Stop
+  Interface 3
+    Altset 1
+    Rates: 16000
+  Interface 3
+    Altset 2
+    Rates: 24000
+  Interface 3
+    Altset 3
+    Rates: 32000
+  Interface 3
+    Altset 4
+    Rates: 48000";
+
+    #[test]
+    fn a_dacs_supported_rates_are_read_from_its_playback_descriptor() {
+        // Goal: this is what a resample can be checked against - the rates the
+        // hardware can be clocked at, not the one it is clocked at now.
+        assert_eq!(
+            supported_playback_rates(SCARLETT),
+            vec![44_100, 48_000, 88_200, 96_000, 176_400, 192_000]
+        );
+        assert_eq!(
+            supported_playback_rates(DOCK),
+            vec![8_000, 16_000, 32_000, 44_100, 48_000]
+        );
+    }
+
+    #[test]
+    fn the_capture_side_is_never_mistaken_for_an_output() {
+        // Goal: an interface carries both, and a microphone's rates are not the
+        // DAC's. A capture-only device is not an output at all, and where the
+        // two sides list different rates only the playback ones may come back.
+        assert!(
+            supported_playback_rates(WEBCAM).is_empty(),
+            "a capture-only device is not an output"
+        );
+        let mixed = "X at usb : USB Audio\n\nPlayback:\n  Interface 1\n    Altset 1\n    Rates: 44100, 48000\n\nCapture:\n  Interface 2\n    Altset 1\n    Rates: 192000";
+        assert_eq!(
+            supported_playback_rates(mixed),
+            vec![44_100, 48_000],
+            "the capture-only 192000 must not leak into the output rates"
+        );
+    }
+
+    #[test]
+    fn rates_split_one_to_an_altset_are_gathered_into_one_set() {
+        // Goal: a device may advertise one rate per playback altset rather than
+        // a list, so the union is what it can do - sorted and without repeats.
+        let per_altset = "Y at usb : USB Audio\n\nPlayback:\n  Interface 1\n    Altset 1\n    Rates: 44100\n  Interface 1\n    Altset 2\n    Rates: 96000\n  Interface 1\n    Altset 3\n    Rates: 44100";
+        assert_eq!(supported_playback_rates(per_altset), vec![44_100, 96_000]);
+    }
+
+    #[test]
+    fn a_body_with_no_playback_rates_is_empty_rather_than_a_guess() {
+        // Goal: an empty list means "not known", and the caller reads it that
+        // way. A blank read, the `closed` placeholder, and a playback section
+        // that named no rate must all come back empty rather than inventing one.
+        assert!(supported_playback_rates("").is_empty());
+        assert!(supported_playback_rates("closed").is_empty());
+        assert!(supported_playback_rates("Playback:\n  Status: Stop").is_empty());
     }
 }
