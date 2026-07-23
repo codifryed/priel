@@ -3246,10 +3246,26 @@ fn verdict_colour(fidelity: Fidelity, t: &Theme) -> Color {
 /// records. Below one bit the count is dropped rather than printed as zero,
 /// which reads as a finding when it is the absence of one.
 fn level_words(gain: f64) -> String {
+    level_words_with(gain, &fmt_pct(gain))
+}
+
+/// [`level_words`] for a sink, whose figures come straight from a `PipeWire`
+/// node in the linear scale: the percentage is the one a mixer shows (the cube
+/// root of the gain), while the decibel loss and bit cost stay measured from
+/// the linear gain the samples were actually multiplied by.
+fn sink_level_words(gain: f64) -> String {
+    level_words_with(gain, &mixer_pct(gain))
+}
+
+/// The shared body of the two above: a percentage - already formatted, because
+/// the sink shows a different one from the rest - then the decibel loss and bit
+/// cost the linear gain carries. Below one bit the count is dropped rather than
+/// printed as zero, which reads as a finding when it is the absence of one.
+fn level_words_with(gain: f64, pct: &str) -> String {
     if (gain - 1.0).abs() <= f64::EPSILON {
         return "100%".to_string();
     }
-    let mut out = format!("{}  {:.0} dB", fmt_pct(gain), SinkStage::db(gain));
+    let mut out = format!("{pct}  {:.0} dB", SinkStage::db(gain));
     let bits = SinkStage::bits_lost(gain);
     if bits > 0 {
         let _ = write!(out, "  ~{bits} bits");
@@ -3257,8 +3273,9 @@ fn level_words(gain: f64) -> String {
     out
 }
 
-/// A linear gain as the percentage a mixer shows, with a decimal only where it
-/// carries something.
+/// A 0-to-1 fraction as a percentage, with a decimal only where it carries
+/// something. This is the plain linear figure; [`mixer_pct`] is the one a mixer
+/// shows.
 fn fmt_pct(gain: f64) -> String {
     let pct = gain * 100.0;
     if (pct - pct.round()).abs() < 0.05 {
@@ -3266,6 +3283,20 @@ fn fmt_pct(gain: f64) -> String {
     } else {
         format!("{pct:.1}%")
     }
+}
+
+/// A sink's linear gain as the percentage a mixer shows.
+///
+/// `PipeWire` stores a sink's volume as a linear amplitude, but every desktop
+/// mixer - KDE, wpctl, `PulseAudio` - shows the cube root of it, the perceptual
+/// curve a slider moves along. So a slider left at 50% sits at 0.125 in the
+/// node, and reading that back out to print "12.5%" is a figure no mixer shows
+/// and does not match the desktop. The cube root, "50%", is the number the
+/// listener actually set. Keep the cube root here: the raw value still drives
+/// the decibel loss, so this only changes what the reader is shown, not the
+/// grade.
+fn mixer_pct(gain: f64) -> String {
+    fmt_pct(gain.cbrt())
 }
 
 /// priel's own volume, which is a percentage already.
@@ -3284,36 +3315,42 @@ pub(crate) fn stream_volume_words(s: &priel_player::PlaybackStatus) -> String {
 
 /// The sound server's level on the sink everything is mixed into.
 ///
-/// The figure shown is the control - the number the listener set and a mixer
-/// displays - and a loss is only ever quoted where the server was found to be
-/// applying it. Quoting 31 dB of loss against a control the server is not
-/// applying would invent a fault; showing nothing at all would hide a control
-/// that was plainly set.
+/// The figure shown is the one a mixer shows - the number the listener set, on
+/// the cube-root curve every desktop mixer uses (see [`mixer_pct`]) - and a loss
+/// is only ever quoted where the software was found to be applying it. Quoting
+/// 31 dB of loss against a level the software is not applying would invent a
+/// fault; showing nothing at all would hide a level that was plainly set.
 pub(crate) fn sink_volume_words(sink: &SinkVolume) -> String {
     match sink.stage() {
         SinkStage::Absent => "none in this chain".to_string(),
         SinkStage::Unread => "unknown".to_string(),
         SinkStage::Unity => "100%".to_string(),
         SinkStage::Silenced => "muted".to_string(),
-        SinkStage::InSoftware { gain } => level_words(gain),
-        SinkStage::Elsewhere { set } => fmt_pct(set),
+        SinkStage::InSoftware { gain } => sink_level_words(gain),
+        SinkStage::Elsewhere { set } => mixer_pct(set),
     }
 }
 
-/// Where the sink's level is being applied, where that is worth a line.
+/// What the sink's level is doing to the audio, in plain terms, where that is
+/// worth a line.
 ///
-/// The whole finding in one sentence. `channelVolumes` is the control and
-/// `softVolumes` is what the server multiplies by, and on a real machine they
-/// disagree - a sink at 2.7% whose software stage sits at unity, on a card with
-/// no volume control in ALSA at all. Saying which of the two was read is the
-/// difference between a measurement and a guess.
+/// The whole finding in one sentence, and the words are chosen so anyone can
+/// read them: what matters to a listener is whether the audio samples are being
+/// changed, not the names of the two fields it was read from. `channelVolumes`
+/// is what a mixer sets and `softVolumes` is what the sound server actually
+/// multiplies by; on a real machine they disagree - a sink set to 30% whose
+/// software stage sits at unity, on a card with no volume control in ALSA at
+/// all - and only the second one can cost resolution.
 pub(crate) fn sink_volume_note(sink: &SinkVolume) -> Option<String> {
     match sink.stage() {
-        SinkStage::InSoftware { .. } => Some("in software, by the server".to_string()),
-        SinkStage::Elsewhere { .. } => {
-            Some("not applied by the server; where is not in the graph".to_string())
+        SinkStage::InSoftware { .. } => {
+            Some("the software is changing the audio samples".to_string())
         }
-        SinkStage::Silenced => Some("the server is passing silence".to_string()),
+        SinkStage::Elsewhere { .. } => Some(
+            "the audio samples are untouched; the level is set by your hardware, or not at all"
+                .to_string(),
+        ),
+        SinkStage::Silenced => Some("the software is silencing the audio".to_string()),
         SinkStage::Absent | SinkStage::Unread | SinkStage::Unity => None,
     }
 }

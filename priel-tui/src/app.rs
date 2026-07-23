@@ -7563,9 +7563,11 @@ mod tests {
     #[test]
     fn a_sink_attenuating_in_software_is_reported_in_percent_decibels_and_bits() {
         // Goal: "how much did I lose" is the question nothing on screen answers
-        // today. The percentage is the unit the listener set it in, the decibel
-        // figure is the one that compares, and the bits are what it cost - by
-        // the one-bit-per-6-dB rule the README already records.
+        // today. The percentage is the one a mixer shows (the cube root of the
+        // linear gain - a slider at 30% sits at 0.027 in the node), the decibel
+        // figure is the one that compares, and the bits are what it cost - by the
+        // one-bit-per-6-dB rule the README already records. The loss is measured
+        // from the linear gain, not the percentage.
         let mut r = rig();
         r.app.status = through_server();
         let mut g = chain();
@@ -7579,18 +7581,25 @@ mod tests {
         r.app.drain_worker();
         let out = report(&r.app);
 
-        assert!(out.contains("2.7%"), "the unit it was set in: {out}");
-        assert!(out.contains("-31 dB"), "the unit that compares: {out}");
+        assert!(out.contains("30%"), "the number a mixer shows: {out}");
+        assert!(!out.contains("2.7%"), "not the raw linear value: {out}");
+        assert!(
+            out.contains("-31 dB"),
+            "the loss, from the linear gain: {out}"
+        );
         assert!(out.contains("5 bits"), "what it cost: {out}");
-        assert!(out.contains("in software"), "where it happened: {out}");
+        assert!(
+            out.contains("changing the audio samples"),
+            "in plain terms, what it did: {out}"
+        );
     }
 
     #[test]
     fn a_level_the_server_is_not_applying_is_shown_without_a_loss_it_did_not_cause() {
         // Goal: the reading measured on a real machine, and the reason this
-        // needs two fields rather than one. The control is at 2.7% and the
-        // server is multiplying nothing, so quoting 31 dB of loss there would
-        // invent a fault - and saying nothing at all would hide a control the
+        // needs two fields rather than one. The level is set to 30% and the
+        // software is multiplying nothing, so quoting 31 dB of loss there would
+        // invent a fault - and saying nothing at all would hide a level the
         // listener plainly did set.
         let mut r = rig();
         r.app.status = through_server();
@@ -7605,11 +7614,44 @@ mod tests {
         r.app.drain_worker();
         let out = report(&r.app);
 
-        assert!(out.contains("2.7%"), "the control is still shown: {out}");
+        assert!(out.contains("30%"), "the level is still shown: {out}");
         assert!(!out.contains("bits"), "no loss is claimed: {out}");
         assert!(
-            out.contains("not applied by the server"),
-            "and the reader is told why not: {out}"
+            out.contains("the audio samples are untouched"),
+            "and the reader is told, plainly, why it costs nothing: {out}"
+        );
+    }
+
+    #[test]
+    fn a_desktop_slider_at_half_reads_as_a_mixer_shows_it_not_the_linear_value() {
+        // Goal: PipeWire stores the sink volume as a linear amplitude - a slider
+        // left at 50% sits at 0.125 in the node - but every mixer (KDE, wpctl,
+        // PulseAudio) shows the cube root of it. Printing the raw 0.125 as
+        // "12.5%" is a figure no mixer shows and does not match the desktop; the
+        // cube root, "50%", is the number the listener actually set. The software
+        // is not applying it, so the samples are untouched and nothing is lost.
+        let mut r = rig();
+        r.app.status = through_server();
+        let mut g = chain();
+        g.volume = SinkVolume::Read(SinkLevels {
+            set: vec![0.125, 0.125],
+            software: vec![1.0, 1.0],
+            silenced: false,
+        });
+        r.app.on_key(key('D'));
+        r.to_app.send(FromWorker::AudioGraph(Ok(g))).expect("send");
+        r.app.drain_worker();
+        let out = report(&r.app);
+
+        assert!(out.contains("50%"), "the number the slider shows: {out}");
+        assert!(!out.contains("12.5%"), "not the raw linear value: {out}");
+        assert!(
+            !out.contains("bits"),
+            "the samples are untouched, no loss: {out}"
+        );
+        assert!(
+            out.contains("the audio samples are untouched"),
+            "and it says so plainly: {out}"
         );
     }
 
