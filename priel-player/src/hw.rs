@@ -122,6 +122,40 @@ pub fn supported_playback_rates(body: &str) -> Vec<u32> {
     rates
 }
 
+/// The playback rates the card at `index` advertises, read from
+/// `/proc/asound/card<index>/stream*`.
+///
+/// Empty when the card has no such descriptor (a PCI or Bluetooth sink has
+/// none), which the caller reads as "not known", exactly as
+/// [`supported_playback_rates`] documents. The union across every `stream` file,
+/// because a device with more than one interface splits them.
+#[must_use]
+pub fn supported_rates_for_card(index: u32) -> Vec<u32> {
+    supported_rates_in(Path::new(ASOUND), index)
+}
+
+/// [`supported_rates_for_card`] against any directory, so it is testable against
+/// a fixture on a machine whose sound cards are nothing like it.
+fn supported_rates_in(root: &Path, index: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(root.join(format!("card{index}"))) else {
+        return Vec::new();
+    };
+    let mut rates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_stream = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("stream"));
+        if is_stream && let Ok(body) = std::fs::read_to_string(&path) {
+            rates.extend(supported_playback_rates(&body));
+        }
+    }
+    rates.sort_unstable();
+    rates.dedup();
+    rates
+}
+
 /// Does this output device identifier name this card?
 ///
 /// Three spellings reach here, and a plain substring test only answers the
@@ -469,7 +503,7 @@ mod tests {
 
     use super::{
         card_devices, card_devices_in, card_matches, is_direct_card_device, parse_hw_params, probe,
-        refers_to_card, supported_playback_rates,
+        refers_to_card, supported_playback_rates, supported_rates_for_card, supported_rates_in,
     };
 
     /// A copy of a real `/proc/asound`, trimmed to the files this reads.
@@ -959,5 +993,28 @@ Capture:
         assert!(supported_playback_rates("").is_empty());
         assert!(supported_playback_rates("closed").is_empty());
         assert!(supported_playback_rates("Playback:\n  Status: Stop").is_empty());
+    }
+
+    /// A `/proc/asound` trimmed to one card with a `stream0` descriptor.
+    const ASOUND_RATES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/asound-rates");
+
+    #[test]
+    fn a_cards_supported_rates_are_read_from_its_stream_file() {
+        // Goal: the wiring from a card index to the rates the descriptor names,
+        // which is what the graph's sink index is turned into.
+        assert_eq!(
+            supported_rates_in(Path::new(ASOUND_RATES), 2),
+            vec![44_100, 48_000, 88_200, 96_000, 176_400, 192_000]
+        );
+    }
+
+    #[test]
+    fn a_card_with_no_stream_descriptor_reports_no_rates() {
+        // Goal: a PCI or Bluetooth sink has no USB-Audio stream file, and a
+        // missing card directory is the same answer. Empty, never a panic - the
+        // suite runs where /proc/asound is nothing like the fixture.
+        assert!(supported_rates_in(Path::new(ASOUND_RATES), 99).is_empty());
+        assert!(supported_rates_in(Path::new("/nonexistent/asound"), 2).is_empty());
+        let _ = supported_rates_for_card(2);
     }
 }

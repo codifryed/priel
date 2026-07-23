@@ -154,6 +154,25 @@ impl AudioGraph {
     pub fn blocked_supported_hz(&self) -> Vec<u32> {
         blocked_rates(self.clock.permitted_hz().as_deref(), &self.supported_hz)
     }
+
+    /// The ALSA card index of the sink at the end of the chain, when it has one.
+    ///
+    /// A server-held ALSA device names its PCM as `hw:N,M`, and `N` is the
+    /// `/proc/asound/cardN` its supported rates are read from. `None` for a
+    /// non-ALSA sink - a Bluetooth or network device names no card - or a chain
+    /// that reaches no device at all.
+    fn sink_card_index(&self) -> Option<u32> {
+        let DeviceHolder::Server(held) = &self.holder else {
+            return None;
+        };
+        held.pcm
+            .as_deref()?
+            .strip_prefix("hw:")?
+            .split(',')
+            .next()?
+            .parse()
+            .ok()
+    }
 }
 
 /// The rates in `supported` that `permitted` does not include - S minus A, the
@@ -929,7 +948,13 @@ pub fn probe() -> Result<AudioGraph, GraphError> {
         RunError::Unreadable => GraphError::Unavailable("its output could not be read".into()),
     })?;
     let text = String::from_utf8(out).map_err(|_| GraphError::Unreadable)?;
-    parse(&text, std::process::id())
+    let mut graph = parse(&text, std::process::id())?;
+    // The device's rates come from the kernel, not the dump: `parse` cannot read
+    // them and stay pure, so they are filled in here, keyed by the sink's card.
+    if let Some(index) = graph.sink_card_index() {
+        graph.supported_hz = crate::hw::supported_rates_for_card(index);
+    }
+    Ok(graph)
 }
 
 /// A sound-server sink that fronts an ALSA card.
@@ -2214,6 +2239,31 @@ mod tests {
         assert!(
             super::blocked_rates(Some(&[44_100, 48_000]), &[]).is_empty(),
             "unknown device rates claim nothing either"
+        );
+    }
+
+    #[test]
+    fn the_sink_card_index_is_read_from_the_held_pcm() {
+        // Goal: the join from the graph to /proc/asound. A server-held ALSA
+        // device names its PCM as hw:N,M, and N is the card its rates are read
+        // from; a holder that names no ALSA card yields nothing to read.
+        let held = AudioGraph {
+            holder: DeviceHolder::Server(HeldDevice {
+                sink: "DAC".into(),
+                opened_by: None,
+                pcm: Some("hw:2,0".into()),
+                card_name: None,
+            }),
+            ..AudioGraph::default()
+        };
+        assert_eq!(held.sink_card_index(), Some(2));
+        assert_eq!(
+            AudioGraph {
+                holder: DeviceHolder::NoDevice,
+                ..AudioGraph::default()
+            }
+            .sink_card_index(),
+            None
         );
     }
 
