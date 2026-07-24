@@ -32,6 +32,9 @@ priel-core.workspace = true
 priel-player = { workspace = true }
 clap.workspace = true
 log.workspace = true
+# Serializing listing metadata for the on-disk cache (see `cache` + the
+# revalidate path in `worker`).
+serde_json.workspace = true
 clap_complete = { workspace = true, optional = true }
 clap_mangen = { workspace = true, optional = true }
 unicode-width.workspace = true

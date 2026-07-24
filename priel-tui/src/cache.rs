@@ -57,17 +57,31 @@ pub const DEFAULT_CAP_MIB: u64 = 256;
 /// - and the caller treats that as "just fetch", never an error.
 #[must_use]
 pub fn cover_dir() -> Option<PathBuf> {
-    cover_dir_from(env::var_os("XDG_CACHE_HOME"), env::var_os("HOME"))
+    cache_subdir(env::var_os("XDG_CACHE_HOME"), env::var_os("HOME"), "covers")
 }
 
-/// [`cover_dir`] over its two inputs, so the resolution is a table of tests
-/// rather than something that reads the real environment.
-fn cover_dir_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+/// The listing-metadata cache directory: `$XDG_CACHE_HOME/priel/meta`, or
+/// `~/.cache/priel/meta`.
+///
+/// Separate from `covers` so eviction over one does not reach into the other,
+/// and so the two are easy to tell apart on disk. Unlike a cover, cached
+/// metadata can go stale (a listing changes on another device), so a caller
+/// serves it only while revalidating it. `None` when no cache directory is
+/// known - the caller then just fetches, which is never an error.
+#[must_use]
+pub fn meta_dir() -> Option<PathBuf> {
+    cache_subdir(env::var_os("XDG_CACHE_HOME"), env::var_os("HOME"), "meta")
+}
+
+/// The `priel/<sub>` cache directory under `$XDG_CACHE_HOME`, or `~/.cache` when
+/// that is unset or empty. Its inputs are passed so the resolution is a table of
+/// tests rather than something that reads the real environment.
+fn cache_subdir(xdg: Option<OsString>, home: Option<OsString>, sub: &str) -> Option<PathBuf> {
     let base = xdg
         .filter(|x| !x.is_empty())
         .map(PathBuf::from)
         .or_else(|| home.map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("priel").join("covers"))
+    Some(base.join("priel").join(sub))
 }
 
 /// A key as a safe filename: a cover id can carry a slash or other path-unsafe
@@ -160,7 +174,7 @@ fn evict(dir: &Path, cap_bytes: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_CAP_BYTES, cover_dir_from, evict, get, key_file, put};
+    use super::{DEFAULT_CAP_BYTES, cache_subdir, evict, get, key_file, put};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -174,26 +188,47 @@ mod tests {
     }
 
     #[test]
-    fn the_cover_dir_prefers_xdg_cache_then_falls_back_to_home() {
-        // Goal: regenerable, machine-local data belongs in the XDG cache dir.
+    fn the_cache_dirs_prefer_xdg_cache_then_fall_back_to_home() {
+        // Goal: regenerable, machine-local data belongs in the XDG cache dir, and
+        // covers and metadata sit in sibling subdirectories under it.
         assert_eq!(
-            cover_dir_from(Some("/x/cache".into()), Some("/home/u".into())),
+            cache_subdir(Some("/x/cache".into()), Some("/home/u".into()), "covers"),
             Some(PathBuf::from("/x/cache/priel/covers"))
         );
         assert_eq!(
-            cover_dir_from(None, Some("/home/u".into())),
-            Some(PathBuf::from("/home/u/.cache/priel/covers"))
+            cache_subdir(None, Some("/home/u".into()), "meta"),
+            Some(PathBuf::from("/home/u/.cache/priel/meta"))
         );
         assert_eq!(
-            cover_dir_from(Some(OsString::new()), Some("/home/u".into())),
+            cache_subdir(Some(OsString::new()), Some("/home/u".into()), "covers"),
             Some(PathBuf::from("/home/u/.cache/priel/covers")),
             "an empty XDG_CACHE_HOME is unset"
         );
         assert_eq!(
-            cover_dir_from(None, None),
+            cache_subdir(None, None, "meta"),
             None,
             "no home, nowhere to cache"
         );
+    }
+
+    #[test]
+    fn a_metadata_blob_reads_back_from_its_own_dir() {
+        // Goal: the metadata cache reuses the same get/put over its own
+        // directory, so a serialized listing round-trips exactly as a cover does.
+        let dir = scratch("meta-roundtrip");
+        assert!(get(&dir, "favorites").is_none(), "nothing cached yet");
+        put(
+            &dir,
+            "favorites",
+            br#"{"items":[],"total":9}"#,
+            DEFAULT_CAP_BYTES,
+        )
+        .expect("put");
+        assert_eq!(
+            get(&dir, "favorites").as_deref(),
+            Some(&br#"{"items":[],"total":9}"#[..])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

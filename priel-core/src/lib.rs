@@ -24,7 +24,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Read as _;
 use ureq::http::Response;
 use ureq::{Agent, Body};
@@ -119,7 +119,7 @@ impl Quality {
 /// `Default` is derived so a caller can build a partial row - a placeholder, a
 /// test fixture - without listing every field, and so that adding a twelfth does
 /// not break every construction site.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Track {
     pub id: u64,
     pub title: String,
@@ -250,7 +250,7 @@ pub struct Mix {
 /// limit asked for looks like the end and is not: the service caps some
 /// listings below whatever limit it was given, and a caller that stopped there
 /// would silently hide the rest of the library.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Page<T> {
     /// The rows in this page, in the order the service returned them.
     pub items: Vec<T>,
@@ -3138,5 +3138,38 @@ mod tests {
             "dashes become path separators and the size is square"
         );
         assert_eq!(cover_url("", 80), None, "no cover, no URL");
+    }
+
+    #[test]
+    fn a_page_of_tracks_survives_a_json_round_trip() {
+        // Goal: a listing can be cached on disk and read back unchanged, so
+        // serving a listing from cache shows the same rows the fetch did. The
+        // fields the UI reads have to survive the trip.
+        let page = Page {
+            items: vec![Track {
+                id: 42,
+                title: "So What".into(),
+                artist: "Miles Davis".into(),
+                artists: vec!["Miles Davis".into(), "John Coltrane".into()],
+                album: "Kind of Blue".into(),
+                duration_secs: 545,
+                quality: "HI-RES".into(),
+                cover: "1234-5678".into(),
+                mix_id: "0016d".into(),
+                ..Track::default()
+            }],
+            total: 917,
+        };
+        let json = serde_json::to_vec(&page).expect("serialize");
+        let back: Page<Track> = serde_json::from_slice(&json).expect("deserialize");
+        assert_eq!(back.total, 917);
+        assert_eq!(back.items.len(), 1);
+        let t = &back.items[0];
+        assert_eq!(t.id, 42);
+        assert_eq!(t.title, "So What");
+        assert_eq!(t.artists, vec!["Miles Davis", "John Coltrane"]);
+        assert_eq!(t.duration_secs, 545);
+        assert_eq!(t.cover, "1234-5678");
+        assert_eq!(t.mix_id, "0016d");
     }
 }

@@ -4887,6 +4887,7 @@ mod tests {
                     items: tracks,
                     total,
                 },
+                from_cache: false,
             })
             .expect("the rigged worker channel is open");
         sc.app.drain_worker();
