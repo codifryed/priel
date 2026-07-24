@@ -193,6 +193,12 @@ pub enum ToWorker {
     /// Restart the user's sound server so a freshly written drop-in takes effect.
     /// Waits on a subprocess. The reply is [`FromWorker::AudioRestarted`].
     RestartAudio,
+    /// Switch a Bluetooth device to the A2DP profile that carries a better codec.
+    /// Waits on `wpctl`, so it is here. The reply is [`FromWorker::BtCodecSwitched`].
+    SwitchBtCodec {
+        device_id: u32,
+        profile_index: u32,
+    },
     /// One page of the listing a queue was filled from, to grow the queue up to
     /// the whole listing in the background.
     ///
@@ -408,6 +414,9 @@ pub enum FromWorker {
     /// reason already fit to show, so the interface can say the file landed but
     /// the restart did not.
     AudioRestarted(Result<(), String>),
+    /// The Bluetooth codec was switched, or the reason it was not. `Err` carries
+    /// a reason already fit to show.
+    BtCodecSwitched(Result<(), String>),
     /// One page of the listing a queue is being filled from.
     ///
     /// Carries the source it answers for, so a page for a queue the listener has
@@ -602,6 +611,16 @@ fn set_up_audio(allowed_hz: &[u32]) -> FromWorker {
     FromWorker::AudioSetUp(done)
 }
 
+/// Switch a Bluetooth device's A2DP profile. Waits on `wpctl`, so it is here and
+/// not on the render thread.
+fn switch_bt(device_id: u32, profile_index: u32) -> FromWorker {
+    FromWorker::BtCodecSwitched(setup::switch_bt_codec(device_id, profile_index))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one dispatch match over every request; an arm per feature, splitting it would scatter the dispatch"
+)]
 fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
     Some(match cmd {
         ToWorker::LoadFavorites { offset, limit } => match client.favorite_tracks(offset, limit) {
@@ -713,6 +732,10 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
         // Restart the user's sound server. Waits on `systemctl`, so it too is
         // here and not on the UI thread.
         ToWorker::RestartAudio => FromWorker::AudioRestarted(setup::restart_pipewire()),
+        ToWorker::SwitchBtCodec {
+            device_id,
+            profile_index,
+        } => switch_bt(device_id, profile_index),
         // Page the queue's own source. Distinct from the view's `Load*` so a
         // fill keeps arriving after the listener has navigated elsewhere. A
         // failure sends nothing - the fill stops and the queue keeps what it
@@ -1447,6 +1470,7 @@ mod tests {
             FromWorker::OutputClock(_) => "OutputClock",
             FromWorker::AudioSetUp(_) => "AudioSetUp",
             FromWorker::AudioRestarted(_) => "AudioRestarted",
+            FromWorker::BtCodecSwitched(_) => "BtCodecSwitched",
             FromWorker::PlaylistCreated(_) => "PlaylistCreated",
             FromWorker::PlaylistDeleted { .. } => "PlaylistDeleted",
             FromWorker::PlaylistTrackRemoved { .. } => "PlaylistTrackRemoved",

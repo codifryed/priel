@@ -154,12 +154,58 @@ pub fn restart_pipewire() -> Result<(), String> {
         })
 }
 
+/// The command that switches a Bluetooth device's A2DP profile, as a program and
+/// its arguments.
+///
+/// Pure, so what would run can be checked without running it. `wpctl set-profile
+/// <device> <profile>` selects one of the device's profiles - on a bluez device
+/// each A2DP codec is a profile, so this is how the codec is changed. User-level;
+/// nothing here needs root.
+#[must_use]
+pub fn switch_argv(device_id: u32, profile_index: u32) -> (&'static str, [String; 3]) {
+    (
+        "wpctl",
+        [
+            "set-profile".to_string(),
+            device_id.to_string(),
+            profile_index.to_string(),
+        ],
+    )
+}
+
+/// Switch a Bluetooth device to the A2DP profile `profile_index`. Blocking, so
+/// it runs off the UI thread.
+///
+/// Selecting a codec profile re-negotiates the A2DP link, so the sound briefly
+/// drops - that is the device's doing, not a fault here.
+///
+/// # Errors
+///
+/// A human-readable reason when `wpctl` is missing, is killed, fails, or does not
+/// finish in time.
+pub fn switch_bt_codec(device_id: u32, profile_index: u32) -> Result<(), String> {
+    let (cmd, args) = switch_argv(device_id, profile_index);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run::capture(cmd, &args, RESTART_TIMEOUT)
+        .map(|_| ())
+        .map_err(|e| match e {
+            RunError::NotFound => "wpctl was not found".to_string(),
+            RunError::TimedOut => "the switch did not finish in time".to_string(),
+            RunError::Spawn(why) => format!("the switch could not be started: {why}"),
+            RunError::Failed(Some(code)) => format!("the switch exited with status {code}"),
+            RunError::Failed(None) => "the switch was killed by a signal".to_string(),
+            RunError::Unreadable => "the switch output could not be read".to_string(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{conf_dir_from, desired_allowed_hz, rates_conf_text, restart_argv, write_rates};
+    use super::{
+        conf_dir_from, desired_allowed_hz, rates_conf_text, restart_argv, switch_argv, write_rates,
+    };
 
     #[test]
     fn the_desired_list_adds_the_blocked_rates_and_keeps_the_permitted_ones() {
@@ -247,5 +293,14 @@ mod tests {
         assert_eq!(cmd, "systemctl");
         assert!(args.contains(&"--user"), "user scope, nothing system-wide");
         assert!(args.contains(&"pipewire") && args.contains(&"wireplumber"));
+    }
+
+    #[test]
+    fn the_codec_switch_sets_the_devices_profile() {
+        // Goal: `wpctl set-profile <device> <profile>` names the bluez device
+        // and the profile that carries the wanted codec - user-level, no root.
+        let (cmd, args) = switch_argv(56, 131_079);
+        assert_eq!(cmd, "wpctl");
+        assert_eq!(args, ["set-profile", "56", "131079"]);
     }
 }

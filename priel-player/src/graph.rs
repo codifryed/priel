@@ -166,6 +166,10 @@ pub struct AudioGraph {
     /// unreadable - never a guess. Lets the verdict say whether the active codec
     /// is the best the device has, and a later pass switch to a better one.
     pub bt_available: Vec<BtProfile>,
+    /// The bluez device object's id, the `device.id` the sink names. `None` for
+    /// a non-Bluetooth sink. It is what `wpctl set-profile` targets to switch the
+    /// codec, paired with a [`BtProfile::profile_index`] from [`Self::bt_available`].
+    pub bt_device_id: Option<u32>,
 }
 
 impl AudioGraph {
@@ -1226,6 +1230,7 @@ pub fn parse(dump: &str, pid: u32) -> Result<AudioGraph, GraphError> {
         volume: sink_volume_of(&objects, &path),
         bt_codec: bt_codec_of(&objects, &path),
         bt_available: bt_available_of(&objects, &path),
+        bt_device_id: bt_device_id_of(&objects, &path),
         path,
         clock: clock_of(&objects),
         // The kernel names the device's rates, not `pw-dump`; `probe` fills this
@@ -1290,6 +1295,22 @@ fn bt_available_of(objects: &[Value], path: &[GraphNode]) -> Vec<BtProfile> {
     out.sort_by_key(|p| p.profile_index);
     out.dedup();
     out
+}
+
+/// The bluez device id behind the sink, the `device.id` it names.
+///
+/// The same sink -> node -> `device.id` lookup [`bt_available_of`] begins with,
+/// kept apart because a switch needs the device to target even though the
+/// profiles come with it. `None` for a non-Bluetooth sink or any missing piece.
+fn bt_device_id_of(objects: &[Value], path: &[GraphNode]) -> Option<u32> {
+    let sink = path.last().filter(|n| n.role == NodeRole::Device)?;
+    let node = object_at(objects, "PipeWire:Interface:Node", sink.id)?;
+    // An ALSA sink also names a `device.id` - its card - so restrict this to a
+    // Bluetooth sink, whose card carries the A2DP profiles a switch would set.
+    if prop_str(node, "device.api") != Some("bluez5") {
+        return None;
+    }
+    prop_u32(node, "device.id")
 }
 
 /// The codec named in a profile description, as a canonical id.
@@ -1557,7 +1578,7 @@ mod tests {
     use super::{
         Attribution, AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, HeldDevice,
         NodeRole, RateAdvice, SinkLevels, SinkStage, SinkVolume, SourceFormat, bt_available_of,
-        bt_codec_of, canonical_codec, parse, parse_clock, parse_sinks,
+        bt_codec_of, bt_device_id_of, canonical_codec, parse, parse_clock, parse_sinks,
     };
     use crate::Alteration;
 
@@ -1700,6 +1721,38 @@ mod tests {
         assert!(
             path_of(DUMP, PID).bt_available.is_empty(),
             "an ALSA sink offers no A2DP codecs"
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_sink_names_its_device_and_an_alsa_sink_names_none() {
+        // Goal: the device id a codec switch targets - the `device.id` the sink
+        // names, the object whose profile `wpctl set-profile` sets. An ALSA sink
+        // has no bluez device behind it.
+        let objects: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"type":"PipeWire:Interface:Node","id":150,
+                 "info":{"props":{"media.class":"Audio/Sink","device.api":"bluez5","device.id":56}}}]"#,
+        )
+        .expect("valid json");
+        let sink = GraphNode {
+            id: 150,
+            name: "bluez_output.EC_66_D1_CE_50_4F.1".into(),
+            description: "Px7 S3".into(),
+            media_class: "Audio/Sink".into(),
+            role: NodeRole::Device,
+            rate_hz: Some(48_000),
+            format: Some("S24LE".into()),
+            channels: Some(2),
+        };
+        assert_eq!(
+            bt_device_id_of(&objects, &[sink]),
+            Some(56),
+            "the bluez device"
+        );
+        assert_eq!(
+            path_of(DUMP, PID).bt_device_id,
+            None,
+            "an ALSA sink has no bluez device to switch"
         );
     }
 
