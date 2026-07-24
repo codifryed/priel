@@ -701,7 +701,11 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
         }
         // Just the clock, read at track start. A background read: on failure the
         // reply is `None` and the verdict keeps its old fallback, no banner.
-        ToWorker::ReadClock => FromWorker::OutputClock(graph::probe().ok().map(|g| g.clock)),
+        // Just the clock, not the whole graph: the graph needs priel's stream to
+        // be present, which on the first track it is not yet, and the verdict's
+        // resample fallback needs the clock from the very first track. See
+        // `graph::probe_clock`.
+        ToWorker::ReadClock => FromWorker::OutputClock(graph::probe_clock()),
         // Write priel's own drop-in - never another file - into the user's
         // config directory. Filesystem work, so it is here and not on the render
         // thread, and it always answers so the overlay can move on.
