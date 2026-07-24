@@ -140,6 +140,16 @@ pub struct Cli {
     /// `~/.local/state` when `XDG_STATE_HOME` is unset. Truncated at startup.
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<String>,
+
+    /// Album-art cache ceiling, in MiB
+    ///
+    /// priel caches cover art under `$XDG_CACHE_HOME/priel` (falling back to
+    /// `~/.cache`) so reopening a listing re-shows covers rather than
+    /// re-downloading them. The cache is bounded: once it passes this size it
+    /// evicts the least-recently-seen covers. Defaults to 256 MiB, plenty for a
+    /// large library; `cache_size` in the settings file sets it for good.
+    #[arg(long, value_name = "MIB")]
+    pub cache_size: Option<u64>,
 }
 
 /// Which built-in palette priel paints with.
@@ -229,6 +239,17 @@ impl Cli {
     #[must_use]
     pub fn device(&self, from_file: Option<String>) -> Option<String> {
         self.device.clone().or(from_file)
+    }
+
+    /// The album-art cache ceiling in bytes: the flag, else the settings file,
+    /// else the default. Taken in MiB (what the flag and the file speak) and
+    /// returned in bytes (what the cache is measured in).
+    #[must_use]
+    pub fn cache_size(&self, from_file: Option<u64>) -> u64 {
+        self.cache_size
+            .or(from_file)
+            .unwrap_or(crate::cache::DEFAULT_CAP_MIB)
+            .saturating_mul(1024 * 1024)
     }
 
     /// Whether to ask for the device exclusively: either flag, then the settings

@@ -803,6 +803,10 @@ pub struct StreamMeta {
 pub struct App {
     pub player: Player,
     worker: Worker,
+    /// The album-art cache ceiling in bytes, passed to each worker the app
+    /// spawns. Held so a worker restart uses the same figure the run started
+    /// with rather than falling back to the default.
+    cache_cap: u64,
 
     // View data.
     pub view: View,
@@ -1145,6 +1149,7 @@ impl App {
         recent: crate::logging::Recent,
         theme: ThemeName,
         bus: Option<Bus>,
+        cache_cap: u64,
     ) -> anyhow::Result<Self> {
         // Read before the config is handed over: the picker shows what was
         // asked for, and `--exclusive` is where a session starts from.
@@ -1152,8 +1157,9 @@ impl App {
         let player = Player::with_config(player)?;
         let creds_path = Credentials::default_path();
         let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
-        let worker = worker::spawn(token_path.clone(), creds_path.clone());
+        let worker = worker::spawn(token_path.clone(), creds_path.clone(), cache_cap);
         let mut app = Self::with(player, worker);
+        app.cache_cap = cache_cap;
         app.bus = bus;
         app.set_theme(theme);
         app.exclusive = exclusive;
@@ -1186,10 +1192,15 @@ impl App {
     ///
     /// Separate from `new` so tests can supply a silent player and a rigged
     /// worker; without this seam none of the queue orchestration is reachable.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the app's one constructor: every field initialised once, in one place"
+    )]
     pub fn with(player: Player, worker: Worker) -> Self {
         Self {
             player,
             worker,
+            cache_cap: crate::cache::DEFAULT_CAP_BYTES,
             view: View::Favorites,
             favorites: Vec::new(),
             playlists: Vec::new(),
@@ -1438,7 +1449,7 @@ impl App {
         else {
             return;
         };
-        self.worker = worker::spawn(token, creds);
+        self.worker = worker::spawn(token, creds, self.cache_cap);
         self.worker_lost = false;
         self.load_favorites_from_the_top();
     }
@@ -12109,6 +12120,7 @@ mod tests {
             crate::logging::Recent::default(),
             ThemeName::OneLight,
             None,
+            crate::cache::DEFAULT_CAP_BYTES,
         )
         .expect("an app should be constructible without a valid token");
         assert_eq!(app.view, View::Favorites);

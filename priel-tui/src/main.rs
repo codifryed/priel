@@ -34,6 +34,7 @@
 mod app;
 mod art;
 mod bus;
+mod cache;
 mod cli;
 mod logging;
 mod settings;
@@ -231,6 +232,7 @@ fn session(
         recent,
         theme,
         bus,
+        args.cache_size(remembered.cache_size),
     )
     .and_then(|mut app| {
         // One unauthenticated read of the forge's latest version, before the
@@ -582,6 +584,7 @@ mod tests {
             exclusive: Some(true),
             log_level: Some(LogLevel::Info),
             update_check: None,
+            cache_size: None,
         };
         let bare = parse(&[]);
         assert_eq!(bare.theme(file.theme), ThemeName::Dracula);

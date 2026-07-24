@@ -493,18 +493,21 @@ fn failed(task: Task, e: &anyhow::Error) -> FromWorker {
 /// Both paths are passed in rather than resolved here so the caller decides,
 /// and so a test is not at the mercy of whatever happens to be configured on
 /// the machine running it.
-pub fn spawn(token_path: String, credentials_path: String) -> Worker {
-    spawn_with(move || {
-        // With credentials configured the client renews its own session, which
-        // is what stops the access token expiring mid-listen. Without them it
-        // still works from the stored token, until that token runs out.
-        let mut client = match Credentials::load(&credentials_path) {
-            Ok(creds) => Client::with_auth(&token_path, creds.into_config())?,
-            Err(_) => Client::from_token_file(&token_path)?,
-        };
-        client.connect()?;
-        Ok(client)
-    })
+pub fn spawn(token_path: String, credentials_path: String, cache_cap: u64) -> Worker {
+    spawn_with_cap(
+        move || {
+            // With credentials configured the client renews its own session, which
+            // is what stops the access token expiring mid-listen. Without them it
+            // still works from the stored token, until that token runs out.
+            let mut client = match Credentials::load(&credentials_path) {
+                Ok(creds) => Client::with_auth(&token_path, creds.into_config())?,
+                Err(_) => Client::from_token_file(&token_path)?,
+            };
+            client.connect()?;
+            Ok(client)
+        },
+        cache_cap,
+    )
 }
 
 /// Spawn a worker around a caller-supplied client factory.
@@ -621,7 +624,7 @@ fn switch_bt(device_id: u32, profile_index: u32) -> FromWorker {
     clippy::too_many_lines,
     reason = "one dispatch match over every request; an arm per feature, splitting it would scatter the dispatch"
 )]
-fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
+fn serve(client: &mut Client, cmd: ToWorker, cache_cap: u64) -> Option<FromWorker> {
     Some(match cmd {
         ToWorker::LoadFavorites { offset, limit } => match client.favorite_tracks(offset, limit) {
             Ok(page) => FromWorker::Favorites { offset, page },
@@ -757,8 +760,7 @@ fn serve(client: &mut Client, cmd: ToWorker) -> Option<FromWorker> {
         // box already draws, and an error banner over the now-playing row would
         // be louder than a missing picture is worth.
         ToWorker::FetchCover { track_id, cover_id } => {
-            let url = priel_core::cover_url(&cover_id, COVER_FETCH_PX)?;
-            let bytes = client.fetch_bytes(&url, COVER_FETCH_CAP).ok()?;
+            let bytes = cover_bytes(client, &cover_id, cache_cap)?;
             let image = crate::art::decode_jpeg(&bytes)?;
             FromWorker::Cover { track_id, image }
         }
@@ -823,7 +825,66 @@ const COVER_FETCH_PX: u32 = 160;
 /// fill the heap. See [`Client::fetch_bytes`].
 const COVER_FETCH_CAP: usize = 4 * 1024 * 1024;
 
+/// A cover's bytes: from the on-disk cache when it is there, otherwise the
+/// network - caching what it fetches, bounded by `cache_cap`.
+///
+/// Art is immutable per URL, so a cache hit is always the right image and never
+/// needs revalidating. The cache is best-effort throughout: a machine with no
+/// cache directory, or a write that fails, just falls back to fetching, exactly
+/// as before the cache existed. `None` (the whole thing is `?`-chained) is the
+/// same silence the caller already treats as "no cover to draw".
+fn cover_bytes(client: &mut Client, cover_id: &str, cache_cap: u64) -> Option<Vec<u8>> {
+    let dir = crate::cache::cover_dir();
+    cached_or_fetch(dir.as_deref(), cover_id, cache_cap, || {
+        let url = priel_core::cover_url(cover_id, COVER_FETCH_PX)?;
+        client.fetch_bytes(&url, COVER_FETCH_CAP).ok()
+    })
+}
+
+/// The cache-around-a-fetch itself, over an injected directory and fetch, so it
+/// is testable without the network or a real cache directory.
+///
+/// A hit serves the cached bytes and never runs `fetch`; a miss runs it and
+/// caches what it returns. A `None` directory (no cache on this machine) skips
+/// both, fetching exactly as before the cache existed.
+fn cached_or_fetch(
+    dir: Option<&std::path::Path>,
+    key: &str,
+    cache_cap: u64,
+    fetch: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    if let Some(dir) = dir
+        && let Some(hit) = crate::cache::get(dir, key)
+    {
+        return Some(hit);
+    }
+    let bytes = fetch()?;
+    if let Some(dir) = dir {
+        let _ = crate::cache::put(dir, key, &bytes, cache_cap);
+    }
+    Some(bytes)
+}
+
+/// Spawn a worker with the default cache ceiling.
+///
+/// The one the tests use: they exercise requests, not the cover cache, so the
+/// cap is left at its default rather than plumbed through every call site. Only
+/// the tests need it - production goes through [`spawn`], which sets the cap -
+/// so it is compiled only for them.
+#[cfg(test)]
 pub fn spawn_with<F>(build: F) -> Worker
+where
+    F: FnOnce() -> anyhow::Result<Client> + Send + 'static,
+{
+    spawn_with_cap(build, crate::cache::DEFAULT_CAP_BYTES)
+}
+
+/// Spawn a worker around a caller-supplied client factory, with the cover
+/// cache bounded to `cache_cap` bytes.
+///
+/// The factory runs *on the worker thread* so a failure to authenticate becomes
+/// a `FromWorker::Error` on screen rather than a panic before the UI exists.
+pub fn spawn_with_cap<F>(build: F, cache_cap: u64) -> Worker
 where
     F: FnOnce() -> anyhow::Result<Client> + Send + 'static,
 {
@@ -847,7 +908,7 @@ where
             // A request that changed something and succeeded answers with
             // nothing: the interface already shows what it asked for, so there
             // is no reply worth the channel. Only `None` means that.
-            let Some(msg) = serve(&mut client, cmd) else {
+            let Some(msg) = serve(&mut client, cmd, cache_cap) else {
                 continue;
             };
             // Recorded here rather than at each call site: one place covers
@@ -871,7 +932,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Fault, FromWorker, QueueSource, Task, ToWorker, Worker, spawn_with};
+    use super::{
+        Fault, FromWorker, QueueSource, Task, ToWorker, Worker, cached_or_fetch, spawn_with,
+    };
     use priel_core::Client;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
@@ -1596,6 +1659,7 @@ mod tests {
         let w = super::spawn(
             "/nonexistent/priel/token.json".into(),
             "/nonexistent/priel/credentials.json".into(),
+            crate::cache::DEFAULT_CAP_BYTES,
         );
         match next(&w) {
             FromWorker::Failed {
@@ -1716,5 +1780,71 @@ mod tests {
         ] {
             assert_eq!(task.to_string(), wanted);
         }
+    }
+
+    /// A fresh empty directory under the OS temp dir, unique to this process -
+    /// never a real cache. Removed first so a rerun starts clean.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("priel-worker-cache-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn a_cached_cover_is_served_without_fetching() {
+        // Goal: the point of the cache - a cover already on disk is returned and
+        // the network is never touched.
+        let dir = scratch("hit");
+        crate::cache::put(
+            &dir,
+            "cov1",
+            b"cached-bytes",
+            crate::cache::DEFAULT_CAP_BYTES,
+        )
+        .expect("seed the cache");
+        let mut fetched = false;
+        let out = cached_or_fetch(Some(&dir), "cov1", crate::cache::DEFAULT_CAP_BYTES, || {
+            fetched = true;
+            Some(b"from-the-network".to_vec())
+        });
+        assert_eq!(
+            out.as_deref(),
+            Some(&b"cached-bytes"[..]),
+            "served the cache"
+        );
+        assert!(!fetched, "a hit must not fetch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_cover_is_fetched_and_then_cached() {
+        // Goal: a miss fetches, and what it fetched is cached so the next look is
+        // a hit.
+        let dir = scratch("miss");
+        let out = cached_or_fetch(Some(&dir), "cov2", crate::cache::DEFAULT_CAP_BYTES, || {
+            Some(b"from-the-network".to_vec())
+        });
+        assert_eq!(out.as_deref(), Some(&b"from-the-network"[..]));
+        assert_eq!(
+            crate::cache::get(&dir, "cov2").as_deref(),
+            Some(&b"from-the-network"[..]),
+            "the fetched bytes are now cached"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_no_cache_directory_it_simply_fetches() {
+        // Goal: a machine with no cache dir degrades to fetching, exactly as
+        // before the cache existed - never a panic, never a skipped cover.
+        let mut fetched = false;
+        let out = cached_or_fetch(None, "cov3", crate::cache::DEFAULT_CAP_BYTES, || {
+            fetched = true;
+            Some(b"bytes".to_vec())
+        });
+        assert!(fetched, "with no cache there is nothing to do but fetch");
+        assert_eq!(out.as_deref(), Some(&b"bytes"[..]));
     }
 }
