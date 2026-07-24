@@ -2997,6 +2997,23 @@ impl App {
             .and_then(|(id, image)| (*id == playing).then_some(image))
     }
 
+    /// Does the track that is playing have album art - held, or still on its way?
+    ///
+    /// The now-playing box reserves the cover column on this, not on whether the
+    /// image has finished decoding. A track carries its cover id from the moment
+    /// it starts, so the column is held across a track change instead of
+    /// collapsing for the moment between the change and the art arriving - nearly
+    /// every change - and only folds for the rare track that truly has none. The
+    /// decoded cover is accepted too, so a cover set without a matching id still
+    /// counts.
+    #[must_use]
+    pub fn now_playing_has_cover(&self) -> bool {
+        self.now_playing
+            .as_ref()
+            .is_some_and(|t| !t.cover.is_empty())
+            || self.cover_for_now_playing().is_some()
+    }
+
     /// Point the keyboard at a region, clamping the cursor it finds there.
     ///
     /// The queue is the one list that changes length without anybody moving
