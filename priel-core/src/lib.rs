@@ -214,7 +214,7 @@ fn quality_label(tags: &[String], audio_quality: &str) -> String {
 }
 
 /// A playlist as it appears in listings / search.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Playlist {
     pub uuid: String,
     pub title: String,
@@ -3171,5 +3171,29 @@ mod tests {
         assert_eq!(t.duration_secs, 545);
         assert_eq!(t.cover, "1234-5678");
         assert_eq!(t.mix_id, "0016d");
+    }
+
+    #[test]
+    fn a_page_of_playlists_survives_a_json_round_trip() {
+        // Goal: the playlists listing is cached and served the same way the
+        // favorites one is, so a playlist's fields have to survive the trip too.
+        let page = Page {
+            items: vec![Playlist {
+                uuid: "abc-123".into(),
+                title: "Late Night".into(),
+                num_tracks: 40,
+                duration_secs: 9000,
+            }],
+            total: 12,
+        };
+        let json = serde_json::to_vec(&page).expect("serialize");
+        let back: Page<Playlist> = serde_json::from_slice(&json).expect("deserialize");
+        assert_eq!(back.total, 12);
+        assert_eq!(back.items.len(), 1);
+        let p = &back.items[0];
+        assert_eq!(p.uuid, "abc-123");
+        assert_eq!(p.title, "Late Night");
+        assert_eq!(p.num_tracks, 40);
+        assert_eq!(p.duration_secs, 9000);
     }
 }
