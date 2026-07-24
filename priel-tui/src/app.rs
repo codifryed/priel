@@ -436,6 +436,21 @@ pub enum GraphRowKind {
     Note,
 }
 
+/// How the active Bluetooth codec stands against what the device offers.
+///
+/// Derived at this layer, from the active codec (in the status) and the
+/// available ones (in the last-read graph), rather than threaded through the
+/// player: nothing on the player thread needs it, and it changes only when the
+/// graph is re-read. `None` from [`App::bt_codec_standing`] means either not a
+/// Bluetooth output, or the available codecs could not be read.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum BtStanding {
+    /// On the best codec the device offers: nothing more to do.
+    Best,
+    /// A higher-quality codec is available; `better` is its canonical id.
+    Improvable { better: String },
+}
+
 /// One line of the audio-graph overlay, ready to draw.
 ///
 /// Built in `App` rather than in the renderer so the overlay's scroll bounds and
@@ -4668,6 +4683,39 @@ impl App {
     /// glyph in front of the word is what carries the meaning - on a light
     /// theme, a dark one, a monochrome terminal, and to the red/green
     /// deficiency these grades already lean on.
+    /// Whether the active Bluetooth codec is the best the device offers.
+    ///
+    /// From the active codec (the status) and the available ones (the last-read
+    /// graph). `None` when the output is not Bluetooth, or when the available
+    /// codecs are not known - in which case priel cannot call the active one
+    /// optimal, and the verdict treats it as improvable rather than claim it is
+    /// best. Ranks by [`crate::ui::codec_rank`]; a tie counts as best.
+    pub(crate) fn bt_codec_standing(&self) -> Option<BtStanding> {
+        let active = self.status.bt_codec.as_deref()?;
+        let Some(Ok(graph)) = &self.audio_graph else {
+            return None;
+        };
+        let best = graph
+            .bt_available
+            .iter()
+            .max_by_key(|p| crate::ui::codec_rank(&p.codec))?;
+        if crate::ui::codec_rank(active) >= crate::ui::codec_rank(&best.codec) {
+            Some(BtStanding::Best)
+        } else {
+            Some(BtStanding::Improvable {
+                better: best.codec.clone(),
+            })
+        }
+    }
+
+    /// The Bluetooth standing as the verdict glyph and colour read it:
+    /// `Some(false)` best, `Some(true)` a better codec available, `None` not
+    /// applicable or unknown.
+    pub(crate) fn bt_improvable(&self) -> Option<bool> {
+        self.bt_codec_standing()
+            .map(|s| matches!(s, BtStanding::Improvable { .. }))
+    }
+
     fn verdict_rows(&self) -> Vec<GraphRow> {
         // `verdict_words` answers with an empty string when there is nothing to
         // grade, and on the bottom row that is exactly right - it is what
@@ -4676,7 +4724,11 @@ impl App {
         // failed to load. So the report says what the silence means, the same
         // way `access_words` already does, and the shared function is left
         // alone rather than taught to answer two questions at once.
-        let words = crate::ui::verdict_words(self.verdict(), self.status.bt_codec.as_deref());
+        let words = crate::ui::verdict_words(
+            self.verdict(),
+            self.status.bt_codec.as_deref(),
+            self.bt_improvable(),
+        );
         let words = if words.is_empty() {
             "nothing playing".to_string()
         } else {
@@ -4701,6 +4753,18 @@ impl App {
             // A Bluetooth output: name the link codec, which is what its sound
             // quality rests on and why the verdict cannot be bit-perfect.
             rows.push(reading("    codec", crate::ui::codec_label(codec)));
+            // And whether a better one is on offer: the one thing a listener can
+            // do for a Bluetooth link's fidelity. Silent when already on the
+            // best, or when the available codecs could not be read.
+            if let Some(BtStanding::Improvable { better }) = self.bt_codec_standing() {
+                rows.push(reading(
+                    "    available",
+                    format!(
+                        "{} — a higher-quality codec",
+                        crate::ui::codec_label(&better)
+                    ),
+                ));
+            }
         }
         rows
     }
@@ -7828,6 +7892,62 @@ mod tests {
             ],
             ..AudioGraph::default()
         }
+    }
+
+    #[test]
+    fn the_bluetooth_standing_compares_the_active_codec_to_what_the_device_offers() {
+        // Goal: whether the active codec is the best the device offers - what
+        // colours the verdict yellow (best, nothing to do) or red (a better one
+        // exists), and what the report names as available.
+        let available = vec![
+            priel_player::graph::BtProfile {
+                codec: "sbc".into(),
+                profile_index: 1,
+            },
+            priel_player::graph::BtProfile {
+                codec: "aac".into(),
+                profile_index: 2,
+            },
+            priel_player::graph::BtProfile {
+                codec: "aptx".into(),
+                profile_index: 3,
+            },
+            priel_player::graph::BtProfile {
+                codec: "aptx_hd".into(),
+                profile_index: 4,
+            },
+        ];
+        let mut r = rig();
+        let mut g = chain();
+        g.bt_available = available;
+        r.app.audio_graph = Some(Ok(g));
+
+        // On the best available codec: Best, and the verdict reads "not improvable".
+        r.app.status.bt_codec = Some("aptx_hd".into());
+        assert_eq!(r.app.bt_codec_standing(), Some(BtStanding::Best));
+        assert_eq!(r.app.bt_improvable(), Some(false));
+
+        // On a lesser codec: Improvable, naming the best available.
+        r.app.status.bt_codec = Some("sbc".into());
+        assert_eq!(
+            r.app.bt_codec_standing(),
+            Some(BtStanding::Improvable {
+                better: "aptx_hd".into()
+            })
+        );
+        assert_eq!(r.app.bt_improvable(), Some(true));
+
+        // Not a Bluetooth output at all: no standing.
+        r.app.status.bt_codec = None;
+        assert_eq!(r.app.bt_codec_standing(), None);
+
+        // Bluetooth but the available codecs are unknown: no standing - priel
+        // cannot call the active one best or offer a better.
+        r.app.status.bt_codec = Some("aptx_hd".into());
+        let mut unknown = chain();
+        unknown.bt_available = Vec::new();
+        r.app.audio_graph = Some(Ok(unknown));
+        assert_eq!(r.app.bt_codec_standing(), None);
     }
 
     #[test]

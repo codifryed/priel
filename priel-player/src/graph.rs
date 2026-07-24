@@ -117,6 +117,20 @@ pub struct GraphNode {
     pub channels: Option<u32>,
 }
 
+/// One A2DP codec a Bluetooth device offers, and the profile index that selects
+/// it.
+///
+/// `PipeWire` exposes each codec as a device profile (e.g. "High Fidelity
+/// Playback (A2DP Sink, codec aptX HD)"). `codec` is that codec as a lowercase
+/// id matching `api.bluez5.codec` (see [`canonical_codec`]), so the active codec
+/// and the available ones are compared on one spelling; `profile_index` is the
+/// `EnumProfile` index a switch would set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtProfile {
+    pub codec: String,
+    pub profile_index: u32,
+}
+
 /// The chain from priel's stream to the device that plays it, in order.
 ///
 /// `Eq` deliberately absent: the sink's volume is a set of `f64` gains read off
@@ -146,6 +160,12 @@ pub struct AudioGraph {
     /// which comes from the kernel. Its presence means the output re-encodes
     /// every sample and so cannot be bit-perfect, whatever the rate or depth.
     pub bt_codec: Option<String>,
+    /// The A2DP codecs the Bluetooth device offers, each with the profile index
+    /// that selects it, read from the device object behind the sink (found via
+    /// the sink's `device.id`). Empty for a non-Bluetooth sink or when
+    /// unreadable - never a guess. Lets the verdict say whether the active codec
+    /// is the best the device has, and a later pass switch to a better one.
+    pub bt_available: Vec<BtProfile>,
 }
 
 impl AudioGraph {
@@ -1205,6 +1225,7 @@ pub fn parse(dump: &str, pid: u32) -> Result<AudioGraph, GraphError> {
         holder: holder_of(&objects, &path),
         volume: sink_volume_of(&objects, &path),
         bt_codec: bt_codec_of(&objects, &path),
+        bt_available: bt_available_of(&objects, &path),
         path,
         clock: clock_of(&objects),
         // The kernel names the device's rates, not `pw-dump`; `probe` fills this
@@ -1223,6 +1244,73 @@ fn bt_codec_of(objects: &[Value], path: &[GraphNode]) -> Option<String> {
     let sink = path.last().filter(|n| n.role == NodeRole::Device)?;
     let node = object_at(objects, "PipeWire:Interface:Node", sink.id)?;
     prop_str(node, "api.bluez5.codec").map(ToString::to_string)
+}
+
+/// The A2DP codecs the Bluetooth device at the end of the path offers.
+///
+/// The active codec is on the sink node ([`bt_codec_of`]); the *available* ones
+/// are on the device object behind it, one per profile. The sink names its
+/// device with `device.id`, and that device's `EnumProfile` lists a profile per
+/// codec ("...codec aptX HD"). Only the A2DP output profiles count - the "off"
+/// entry and the HSP/HFP headset profiles are call-quality, not hi-fi playback.
+/// Empty for a non-Bluetooth sink or any missing piece, never a guess.
+fn bt_available_of(objects: &[Value], path: &[GraphNode]) -> Vec<BtProfile> {
+    let Some(sink) = path.last().filter(|n| n.role == NodeRole::Device) else {
+        return Vec::new();
+    };
+    let Some(node) = object_at(objects, "PipeWire:Interface:Node", sink.id) else {
+        return Vec::new();
+    };
+    let Some(device_id) = prop_u32(node, "device.id") else {
+        return Vec::new();
+    };
+    let Some(device) = object_at(objects, "PipeWire:Interface:Device", device_id) else {
+        return Vec::new();
+    };
+    let Some(profiles) = device
+        .pointer("/info/params/EnumProfile")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<BtProfile> = profiles
+        .iter()
+        .filter_map(|p| {
+            let name = p.get("name").and_then(Value::as_str)?;
+            // A2DP output only: skip "off" and the HSP/HFP headset profiles.
+            if !name.starts_with("a2dp-sink") {
+                return None;
+            }
+            Some(BtProfile {
+                codec: codec_from_description(p.get("description").and_then(Value::as_str)?)?,
+                profile_index: p.get("index").and_then(as_u32)?,
+            })
+        })
+        .collect();
+    out.sort_by_key(|p| p.profile_index);
+    out.dedup();
+    out
+}
+
+/// The codec named in a profile description, as a canonical id.
+///
+/// The descriptions read "High Fidelity Playback (A2DP Sink, codec aptX HD)":
+/// the codec is the text after the last "codec " up to the closing paren.
+/// `None` when the description is not shaped that way.
+fn codec_from_description(description: &str) -> Option<String> {
+    let after = description.rsplit_once("codec ")?.1;
+    let name = after.split(')').next().unwrap_or(after).trim();
+    (!name.is_empty()).then(|| canonical_codec(name))
+}
+
+/// A codec name as a canonical lowercase id, matching how `api.bluez5.codec`
+/// spells it: lower-cased, with spaces and dashes folded to underscores. So
+/// "aptX HD" and "SBC-XQ" become `aptx_hd` and `sbc_xq`, the same ids the sink's
+/// active-codec property carries. Shared across the crates so the active codec
+/// and the available ones are always compared on one spelling.
+#[must_use]
+pub fn canonical_codec(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace([' ', '-'], "_")
 }
 
 /// What the sink at the end of the path is doing to the level.
@@ -1468,8 +1556,8 @@ fn as_u32(v: &Value) -> Option<u32> {
 mod tests {
     use super::{
         Attribution, AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, HeldDevice,
-        NodeRole, RateAdvice, SinkLevels, SinkStage, SinkVolume, SourceFormat, bt_codec_of, parse,
-        parse_clock, parse_sinks,
+        NodeRole, RateAdvice, SinkLevels, SinkStage, SinkVolume, SourceFormat, bt_available_of,
+        bt_codec_of, canonical_codec, parse, parse_clock, parse_sinks,
     };
     use crate::Alteration;
 
@@ -1558,6 +1646,72 @@ mod tests {
             None,
             "an ALSA sink is not a Bluetooth link"
         );
+    }
+
+    #[test]
+    fn a_bluetooth_device_lists_its_a2dp_codecs_and_an_alsa_sink_lists_none() {
+        // Goal: the codecs a Bluetooth device offers, read off its EnumProfile
+        // (found via the sink's device.id), so the verdict can say whether the
+        // active one is the best available. Only the A2DP output profiles count -
+        // "off" and the HSP/HFP headset profiles are call-quality, not playback.
+        let objects: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+              {"type":"PipeWire:Interface:Node","id":150,
+               "info":{"props":{"media.class":"Audio/Sink","device.id":56}}},
+              {"type":"PipeWire:Interface:Device","id":56,"info":{"params":{"EnumProfile":[
+                {"index":0,"name":"off","description":"Off"},
+                {"index":131073,"name":"a2dp-sink-sbc","description":"High Fidelity Playback (A2DP Sink, codec SBC)"},
+                {"index":131074,"name":"a2dp-sink-sbc_xq","description":"High Fidelity Playback (A2DP Sink, codec SBC-XQ)"},
+                {"index":131076,"name":"a2dp-sink-aac","description":"High Fidelity Playback (A2DP Sink, codec AAC)"},
+                {"index":131078,"name":"a2dp-sink-aptx","description":"High Fidelity Playback (A2DP Sink, codec aptX)"},
+                {"index":131079,"name":"a2dp-sink","description":"High Fidelity Playback (A2DP Sink, codec aptX HD)"},
+                {"index":196865,"name":"headset-head-unit","description":"Headset Head Unit (HSP/HFP, codec MSBC)"}
+              ]}}}
+            ]"#,
+        )
+        .expect("valid json");
+        let sink = GraphNode {
+            id: 150,
+            name: "bluez_output.EC_66_D1_CE_50_4F.1".into(),
+            description: "Px7 S3".into(),
+            media_class: "Audio/Sink".into(),
+            role: NodeRole::Device,
+            rate_hz: Some(48_000),
+            format: Some("S24LE".into()),
+            channels: Some(2),
+        };
+        let available = bt_available_of(&objects, &[sink]);
+        let codecs: Vec<&str> = available.iter().map(|p| p.codec.as_str()).collect();
+        assert_eq!(
+            codecs,
+            vec!["sbc", "sbc_xq", "aac", "aptx", "aptx_hd"],
+            "the A2DP codecs, sorted by index; off and HSP/HFP excluded"
+        );
+        assert_eq!(
+            available
+                .iter()
+                .find(|p| p.codec == "aptx_hd")
+                .map(|p| p.profile_index),
+            Some(131_079),
+            "the profile index a switch would set"
+        );
+
+        // The USB DAC fixture is an ALSA sink - no bluez device behind it.
+        assert!(
+            path_of(DUMP, PID).bt_available.is_empty(),
+            "an ALSA sink offers no A2DP codecs"
+        );
+    }
+
+    #[test]
+    fn a_codec_name_folds_to_the_id_the_sink_property_uses() {
+        // Goal: the profile descriptions spell codecs as their makers do
+        // ("aptX HD", "SBC-XQ"); the sink's api.bluez5.codec spells them as
+        // lowercase ids ("aptx_hd", "sbc_xq"). One folding so the two compare.
+        assert_eq!(canonical_codec("aptX HD"), "aptx_hd");
+        assert_eq!(canonical_codec("SBC-XQ"), "sbc_xq");
+        assert_eq!(canonical_codec("LDAC"), "ldac");
+        assert_eq!(canonical_codec("aptx_hd"), "aptx_hd", "already an id");
     }
 
     #[test]
