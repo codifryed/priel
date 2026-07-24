@@ -631,6 +631,18 @@ pub struct Paging {
     /// second for as long as priel stayed open. Cleared by a deliberate user
     /// action - reloading, or coming back to the view.
     stalled: bool,
+    /// The true end of the listing has been reached, so [`Self::total`] is exact
+    /// and no later page may raise it.
+    ///
+    /// The service's advertised count is sometimes an over-count - a favourites
+    /// listing that claims 922 but delivers 921, an unavailable row counted but
+    /// never sent. The only honest end signal is running out of rows, and two
+    /// things see it: this view's own paging reaching an empty page, and the
+    /// background queue fill paging the same listing to its end while the view
+    /// stayed lazy (see [`App::confirm_listing_total`]). Once either does, the
+    /// count is known, and [`Self::absorb`] stops folding in the service's
+    /// figure so a later page cannot re-inflate a total that has been corrected.
+    confirmed: bool,
 }
 
 /// The state of filling a queue up to the whole of its listing.
@@ -673,7 +685,20 @@ impl Paging {
             total: known_total,
             wanted: Some(0),
             stalled: false,
+            confirmed: false,
         };
+    }
+
+    /// Record the listing's true length, learnt from outside this view's own
+    /// paging - the queue fill having paged the same listing to its end.
+    ///
+    /// Marks the count exact so [`Self::absorb`] will not let a later page fold
+    /// the service's over-count back in. Never below what is already loaded,
+    /// for the same reason `absorb` is not: a figure under the rows on screen
+    /// would read as fewer than are plainly there.
+    fn confirm(&mut self, count: u32, loaded: u32) {
+        self.total = count.max(loaded);
+        self.confirmed = true;
     }
 
     /// Take in a page that answers `offset`, and record how much is left.
@@ -698,8 +723,17 @@ impl Paging {
         if ran_out {
             // The service has no more rows to give, whatever it counted. Its
             // count is sometimes the larger of the two, and believing it over
-            // an empty answer asks for that same empty page on every tick.
+            // an empty answer asks for that same empty page on every tick. This
+            // is the end, so the count is now exact.
             self.total = loaded;
+            self.confirmed = true;
+            return;
+        }
+        if self.confirmed {
+            // The end has already been seen - here or by the queue fill - so the
+            // total is exact. A later page may only carry the loaded count up to
+            // it, never fold the service's over-count back in.
+            self.total = self.total.max(loaded);
             return;
         }
         // Never below what is already loaded: an answer carrying no count would
@@ -3144,9 +3178,20 @@ impl App {
         if let Some(fill) = self.queue_fill.as_mut() {
             fill.inflight = false;
         }
+        // An empty page from the service is the listing's true end: it has
+        // exactly `offset` rows, indices 0..offset and nothing beyond. Told
+        // apart from the ceiling case below, where the page had rows but no
+        // room, which is not an end.
+        let service_end = page.items.is_empty();
         let room = QUEUE_MAX.saturating_sub(self.queue.len());
         let added: Vec<Track> = page.items.into_iter().take(room).collect();
         if added.is_empty() {
+            if service_end {
+                // The fill paged this listing to its end while the view stayed
+                // lazy, so `offset` is the count the view's heading should show -
+                // authoritative over the service's advertised over-count.
+                self.confirm_listing_total(source, offset);
+            }
             self.queue_fill = None; // the listing gave nothing more, or the ceiling
             return;
         }
@@ -3165,6 +3210,41 @@ impl App {
         // last loaded track is playing is what makes the next one there to load.
         self.schedule_next();
         self.request_next_fill();
+    }
+
+    /// Correct the view that pages `source`'s listing to its true length,
+    /// learnt from the queue fill reaching the listing's end.
+    ///
+    /// Only when that view is still showing the same listing: a fill that
+    /// finished after the listener moved to another playlist has nothing on
+    /// screen to correct, and writing the count into whatever view is open now
+    /// would put the wrong figure there. Favourites is always the favourites
+    /// view; the other three must match the listing the view currently holds.
+    fn confirm_listing_total(&mut self, source: &QueueSource, count: u32) {
+        let loaded = match source {
+            QueueSource::Favorites => self.favorites.len(),
+            QueueSource::Playlist(id) if self.open_playlist.as_ref().map(|p| &p.0) == Some(id) => {
+                self.playlist_tracks.len()
+            }
+            QueueSource::Mix(id) if self.open_mix.as_ref().map(|m| &m.0) == Some(id) => {
+                self.mix_tracks.len()
+            }
+            QueueSource::Search(query) if &self.search_asked == query => self.search_tracks.len(),
+            // The fill's listing is not the one on screen, so there is nothing
+            // here to correct.
+            _ => return,
+        };
+        let loaded = u32::try_from(loaded).unwrap_or(u32::MAX);
+        // The guards above already dropped every mismatched view, so this maps
+        // the source straight to its paging.
+        let paging = match source {
+            QueueSource::Favorites => &mut self.favorites_paging,
+            QueueSource::Playlist(_) => &mut self.playlist_tracks_paging,
+            QueueSource::Mix(_) => &mut self.mix_tracks_paging,
+            QueueSource::Search(_) => &mut self.search_paging,
+        };
+        paging.confirm(count, loaded);
+        self.dirty = true;
     }
 
     fn load_fresh(&mut self, pos: usize) {
@@ -12879,6 +12959,75 @@ mod tests {
         assert!(
             fills(&requests(&r)).is_empty(),
             "and nothing more is asked for once it is complete"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_total_is_not_re_inflated_by_a_later_page() {
+        // Goal: once the true end is known - here as the queue fill would set it -
+        // a later view page still carrying the service's over-count must not
+        // raise the total back up, or scrolling after the correction would undo
+        // it. The view has three loaded and the fill found the listing is seven.
+        let mut p = Paging::default();
+        p.confirm(7, 3);
+        assert_eq!(p.total, 7, "the fill's count, not the service's");
+
+        // The view scrolls and loads its next page; the service still says 8.
+        let mut rows: Vec<u32> = (0..3).collect();
+        p.absorb(
+            &mut rows,
+            3,
+            priel_core::Page {
+                items: vec![3, 4, 5],
+                total: 8,
+            },
+        );
+        assert_eq!(rows.len(), 6, "the rows still grow by the page");
+        assert_eq!(p.total, 7, "but the confirmed count holds against the 8");
+    }
+
+    #[test]
+    fn a_fill_reaching_the_end_corrects_an_over_counted_heading() {
+        // Goal: #36. The service advertises one more favourite than it delivers
+        // (8 claimed, 7 real). The lazy view heading trusts the 8, but the
+        // background queue fill pages the whole listing and hits the empty page
+        // at offset 7 - so the heading's total is corrected to 7 without the
+        // listener ever scrolling to the end.
+        let mut r = rig();
+        favorites_partly_loaded(&mut r, 3, 8);
+        assert_eq!(
+            r.app.favorites_paging.total, 8,
+            "the service's advertised count to begin with"
+        );
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        for (offset, ids) in [(3u32, 4..7u64), (6, 7..8)] {
+            r.to_app
+                .send(FromWorker::QueueFilled {
+                    source: QueueSource::Favorites,
+                    offset,
+                    page: track_page(ids, 8),
+                })
+                .unwrap();
+            r.app.drain_worker();
+            let _ = requests(&r);
+        }
+        assert_eq!(r.app.queue.len(), 7, "the fill has the real seven rows");
+
+        // At offset 7 the service returns nothing: the listing's true end.
+        r.to_app
+            .send(FromWorker::QueueFilled {
+                source: QueueSource::Favorites,
+                offset: 7,
+                page: track_page(7..7, 8),
+            })
+            .unwrap();
+        r.app.drain_worker();
+
+        assert_eq!(
+            r.app.favorites_paging.total, 7,
+            "the heading's total is corrected from the service's 8 to the real 7"
         );
     }
 
