@@ -1237,12 +1237,13 @@ impl Client {
         if !resp.status().is_success() {
             bail!("mix tracks -> HTTP {}", resp.status());
         }
-        let screen: ScreenResp<ItemRow> = resp.body_mut().read_json()?;
+        // A mix page's TRACK_LIST returns bare track objects, not the
+        // `{ "item": ... }` wrapper favorites and playlists use. Reading it as
+        // `ItemRow` failed every mix with `missing field 'item'`, so the rows
+        // are `TrackBrief` directly.
+        let screen: ScreenResp<TrackBrief> = resp.body_mut().read_json()?;
         let (rows, total) = screen.first_list();
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows {
-            items.push(row.item.into_track());
-        }
+        let items = rows.into_iter().map(TrackBrief::into_track).collect();
         Ok(Page { items, total })
     }
 
@@ -2230,15 +2231,18 @@ mod tests {
     fn a_mixs_tracks_come_from_the_first_module_that_holds_a_list() {
         // Goal: the page for one mix leads with a header module that carries no
         // list at all, so taking the first module would return nothing. It is
-        // the first module *with* a list that holds the tracks, and they arrive
-        // in the nested envelope the favorites use rather than the flat one the
-        // playlist tracks use.
+        // the first module *with* a list that holds the tracks - and a mix's
+        // tracks are BARE track objects, not the `{ "item": ... }` envelope
+        // favorites and playlists wrap theirs in. This test used to encode the
+        // wrapped shape, which is exactly why every real mix failed to load with
+        // `missing field 'item'`; the fixture below matches what the service
+        // actually sends.
         let body = r#"{"rows":[
             {"modules":[{"type":"MIX_HEADER","mix":{"id":"0007a","title":"My Mix 1"}}]},
             {"modules":[{"type":"TRACK_LIST","pagedList":{"totalNumberOfItems":42,
-              "items":[{"type":"track","item":{"id":5,"title":"So What","duration":545,
+              "items":[{"type":"track","id":5,"title":"So What","duration":545,
                 "artists":[{"name":"Miles Davis"}],"album":{"title":"Kind of Blue"},
-                "audioQuality":"LOSSLESS"}}]}}]}]}"#;
+                "audioQuality":"LOSSLESS"}]}}]}]}"#;
         let s = stub(vec![ok(SESSION), ok(body)]);
         let page = connected(&s).mix_tracks("0007a", 100, 50).unwrap();
 

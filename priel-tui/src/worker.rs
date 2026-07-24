@@ -1205,7 +1205,7 @@ mod tests {
                         r#"{{"rows":[{{"modules":[{{"type":"MIX_HEADER","mix":{{"id":"m1"}}}}]}},
                           {{"modules":[{{"type":"TRACK_LIST","pagedList":{{
                             "totalNumberOfItems":2,
-                            "items":[{{"type":"track","item":{{"id":{id}}}}}]}}}}]}}]}}"#
+                            "items":[{{"type":"track","id":{id}}}]}}}}]}}]}}"#
                     )
                 } else if line.contains("create-playlist") {
                     // The newer API wraps what it made, and the uuid is the one
