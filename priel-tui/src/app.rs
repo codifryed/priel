@@ -2399,6 +2399,14 @@ impl App {
                 FromWorker::AudioGraph(read) => {
                     let before = self.sink_volume.clone();
                     self.note_sink_volume(&read);
+                    // The Bluetooth codec rides these graph reads (the 5-second
+                    // sink-volume poll and the report open); thread it to the
+                    // player so the verdict grades a Bluetooth output. Only on a
+                    // successful read - a transient NoStream must not clear a
+                    // codec already known.
+                    if let Ok(graph) = &read {
+                        self.player.set_bt_codec(graph.bt_codec.clone());
+                    }
                     self.audio_graph = Some(read);
                     // The reply can be longer than the request that opened the
                     // overlay left room for, so the scroll starts again rather
@@ -4668,7 +4676,7 @@ impl App {
         // failed to load. So the report says what the silence means, the same
         // way `access_words` already does, and the shared function is left
         // alone rather than taught to answer two questions at once.
-        let words = crate::ui::verdict_words(self.verdict());
+        let words = crate::ui::verdict_words(self.verdict(), self.status.bt_codec.as_deref());
         let words = if words.is_empty() {
             "nothing playing".to_string()
         } else {
@@ -4689,6 +4697,11 @@ impl App {
             crate::ui::device_readout(&self.status),
         ));
         rows.push(reading("    access", crate::ui::access_words(&self.status)));
+        if let Some(codec) = self.status.bt_codec.as_deref() {
+            // A Bluetooth output: name the link codec, which is what its sound
+            // quality rests on and why the verdict cannot be bit-perfect.
+            rows.push(reading("    codec", crate::ui::codec_label(codec)));
+        }
         rows
     }
 

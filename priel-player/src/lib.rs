@@ -123,6 +123,14 @@ pub struct PlaybackStatus {
     /// is where a resample it performed on our behalf would otherwise hide. See
     /// [`Self::effective_output`].
     pub clock: Option<crate::graph::ClockRates>,
+    /// The Bluetooth A2DP codec of the current output, or `None` when the output
+    /// is not a Bluetooth link.
+    ///
+    /// Threaded from the graph like [`Self::clock`], via [`Player::set_bt_codec`]:
+    /// the frontend reads it off the sink node (`api.bluez5.codec`), which the
+    /// player thread cannot. `Some` means the link re-encodes every sample, so
+    /// [`Self::fidelity`] grades it [`Fidelity::Bluetooth`] whatever the rate.
+    pub bt_codec: Option<String>,
 }
 
 /// How priel is holding the output device.
@@ -169,6 +177,15 @@ pub enum Fidelity {
     NearBitPerfect(Alteration),
     /// The sample stream itself is being rebuilt.
     Altered(Alteration),
+    /// The output is a Bluetooth A2DP link, which re-encodes every sample, so
+    /// nothing downstream is bit-perfect whatever the rate or depth.
+    ///
+    /// A grade of its own rather than an [`Altered`](Self::Altered) cause: the
+    /// loss is inherent to the link, not something the graph rebuilt and could
+    /// be asked to account for, and it is not a change a listener can undo from
+    /// here. The codec name is carried in [`PlaybackStatus::bt_codec`] and named
+    /// at the UI, so this stays a unit variant and [`Fidelity`] stays `Copy`.
+    Bluetooth,
 }
 
 impl Fidelity {
@@ -497,6 +514,14 @@ impl PlaybackStatus {
             return Fidelity::Unknown;
         }
 
+        // A Bluetooth A2DP link re-encodes every sample, so nothing downstream
+        // is bit-perfect whatever the rate or depth. It outranks the rate,
+        // depth and volume grades below because it is the dominant, inherent
+        // loss; the codec name is carried in `bt_codec` and named at the UI.
+        if self.bt_codec.is_some() {
+            return Fidelity::Bluetooth;
+        }
+
         if out_rate != self.in_sample_rate {
             return Fidelity::Altered(Alteration::Resampled);
         }
@@ -574,6 +599,11 @@ pub(crate) enum Cmd {
     /// needs a `pw-dump`, which must not run on this thread - so it arrives as a
     /// command and is published unchanged in every status until the next one.
     SetClock(Option<crate::graph::ClockRates>),
+    /// Carry the Bluetooth A2DP codec of the current output into the status,
+    /// read by the frontend from the graph. Like [`Cmd::SetClock`] it needs a
+    /// `pw-dump` the player thread must not run, so it arrives as a command and
+    /// is published unchanged in every status until the next one.
+    SetBtCodec(Option<String>),
     Quit,
 }
 
@@ -714,6 +744,15 @@ impl Player {
     /// rather than hidden. `None` clears it.
     pub fn set_clock(&self, clock: Option<crate::graph::ClockRates>) {
         self.send(Cmd::SetClock(clock));
+    }
+    /// Tell the player the Bluetooth codec of the current output, read from the
+    /// graph.
+    ///
+    /// Fire-and-forget like [`Self::set_clock`]. `Some` makes the verdict grade
+    /// the output [`Fidelity::Bluetooth`] - a lossy link that cannot be
+    /// bit-perfect - and `None` clears it when the output is not Bluetooth.
+    pub fn set_bt_codec(&self, codec: Option<String>) {
+        self.send(Cmd::SetBtCodec(codec));
     }
     /// Ask the player thread to re-read the audio devices.
     ///
@@ -1257,6 +1296,34 @@ mod tests {
         // clock is what catches it, not something else in the reading.
         s.clock = None;
         assert_ne!(s.fidelity(16), Fidelity::Altered(Alteration::Resampled));
+    }
+
+    #[test]
+    fn a_bluetooth_output_is_graded_by_its_codec_not_bit_perfect() {
+        // Goal: a Bluetooth A2DP link re-encodes every sample, so it can never
+        // be bit-perfect whatever the rate or depth. The codec's presence is the
+        // verdict, outranking the rate, depth and volume grades below it.
+        let mut s = PlaybackStatus {
+            bt_codec: Some("aptx_hd".into()),
+            ..playing(44_100, 44_100, "s16", "s16") // otherwise bit-perfect
+        };
+        assert_eq!(
+            s.fidelity(16),
+            Fidelity::Bluetooth,
+            "an otherwise-clean link is still Bluetooth, not bit-perfect"
+        );
+
+        // It outranks a resample: the link loss dominates.
+        s.sample_rate = 48_000; // out != in
+        assert_eq!(
+            s.fidelity(16),
+            Fidelity::Bluetooth,
+            "the link loss dominates a resample"
+        );
+
+        // With no codec the same status grades as before - here, the resample.
+        s.bt_codec = None;
+        assert_eq!(s.fidelity(16), Fidelity::Altered(Alteration::Resampled));
     }
 
     #[test]

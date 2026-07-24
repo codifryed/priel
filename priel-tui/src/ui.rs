@@ -3342,14 +3342,18 @@ fn source_words(app: &App) -> String {
 fn verdict_badge(app: &App) -> (String, Color) {
     let verdict = app.verdict();
     (
-        verdict_words(verdict),
+        verdict_words(verdict, app.status.bt_codec.as_deref()),
         verdict_colour(verdict.fidelity, &app.theme()),
     )
 }
 
 /// The verdict in words, shared by the row and the report so the two cannot
 /// come to different conclusions about one moment.
-pub(crate) fn verdict_words(verdict: Verdict) -> String {
+///
+/// `bt_codec` names the Bluetooth codec for the [`Fidelity::Bluetooth`] grade -
+/// it is carried in the status rather than the grade so [`Fidelity`] stays
+/// `Copy`, and folded into the word here.
+pub(crate) fn verdict_words(verdict: Verdict, bt_codec: Option<&str>) -> String {
     let tick = if verdict.needs_qualifying() {
         "✓?"
     } else {
@@ -3370,6 +3374,35 @@ pub(crate) fn verdict_words(verdict: Verdict) -> String {
         ) => "≈ near bit-perfect".to_string(),
         Fidelity::Altered(Alteration::Resampled) => "⚠ resampled".to_string(),
         Fidelity::Altered(Alteration::Truncated) => "⚠ truncated".to_string(),
+        // A Bluetooth link is a rebuilt (lossy) sample stream, so it takes the
+        // same ⚠ and red as the other altered grades - the distinctness is the
+        // word and the codec, not a second colour. `⚠ bluetooth` alone when the
+        // codec is somehow unread.
+        Fidelity::Bluetooth => match bt_codec {
+            Some(codec) => format!("⚠ bluetooth ({})", codec_label(codec)),
+            None => "⚠ bluetooth".to_string(),
+        },
+    }
+}
+
+/// A bluez codec id as a listener would recognise it: `aptx_hd` -> `aptX HD`.
+///
+/// The known ids are spelled the way their makers write them; anything else -
+/// a codec added to the sound server after this was written - falls back to the
+/// raw id tidied up, so a new codec is named rather than hidden.
+pub(crate) fn codec_label(raw: &str) -> String {
+    match raw {
+        "sbc" => "SBC".to_string(),
+        "sbc_xq" => "SBC XQ".to_string(),
+        "aac" => "AAC".to_string(),
+        "aptx" => "aptX".to_string(),
+        "aptx_hd" => "aptX HD".to_string(),
+        "aptx_ll" => "aptX LL".to_string(),
+        "aptx_adaptive" => "aptX Adaptive".to_string(),
+        "ldac" => "LDAC".to_string(),
+        "lc3" => "LC3".to_string(),
+        "faststream" => "FastStream".to_string(),
+        other => other.replace('_', " ").to_uppercase(),
     }
 }
 
@@ -3379,10 +3412,13 @@ fn verdict_colour(fidelity: Fidelity, t: &Theme) -> Color {
     match fidelity {
         Fidelity::Unknown => t.verdict_unknown,
         Fidelity::BitPerfect => t.verdict_clean,
-        Fidelity::Altered(Alteration::Resampled | Alteration::Truncated) => t.verdict_altered,
+        // A rebuilt sample stream gets red: a resample, a truncation, or a
+        // Bluetooth link re-encoding every sample.
+        Fidelity::Altered(Alteration::Resampled | Alteration::Truncated) | Fidelity::Bluetooth => {
+            t.verdict_altered
+        }
         // Every level change, whichever stage made it and whichever grade it
-        // arrived under. A rebuilt sample stream is the only thing that gets
-        // red here.
+        // arrived under.
         Fidelity::NearBitPerfect(_) | Fidelity::Altered(_) => t.verdict_near,
     }
 }
@@ -3727,7 +3763,7 @@ mod tests {
     use super::{
         ControlBar, FOCUS_HINT, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, OVERLAY_MARGIN,
         OVERLAY_MEDIUM, OVERLAY_NARROW, OVERLAY_WIDE, QUEUE_COLS, QUEUE_ROWS_PER_ENTRY, WIDE_COLS,
-        hint_width, push_hints, render,
+        codec_label, hint_width, push_hints, render, verdict_words,
     };
     use crate::app::{App, Click, Focus, Hit, Mode, View};
     use crate::cli::ThemeName;
@@ -3740,6 +3776,7 @@ mod tests {
         AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, HeldDevice, NodeRole,
         SinkLevels, SinkVolume,
     };
+    use priel_player::{Evidence, Fidelity, Verdict};
     use ratatui::layout::Rect;
     use ratatui::style::Color;
     use ratatui::style::Style;
@@ -6697,6 +6734,29 @@ mod tests {
             !out.contains("truncated to"),
             "the format it dropped to is in the device readout already: {out}"
         );
+    }
+
+    #[test]
+    fn a_codec_id_is_shown_the_way_its_maker_writes_it() {
+        // Goal: the report and badge name a codec a listener recognises; an id
+        // added after this was written is tidied rather than hidden.
+        assert_eq!(codec_label("aptx_hd"), "aptX HD");
+        assert_eq!(codec_label("ldac"), "LDAC");
+        assert_eq!(codec_label("aac"), "AAC");
+        assert_eq!(codec_label("some_new_codec"), "SOME NEW CODEC");
+    }
+
+    #[test]
+    fn a_bluetooth_verdict_names_the_link_and_the_codec() {
+        // Goal: the distinct grade the listener sees - unmistakably a Bluetooth
+        // link, with the codec its sound quality rests on.
+        let verdict = Verdict {
+            fidelity: Fidelity::Bluetooth,
+            evidence: Evidence::Complete,
+        };
+        let words = verdict_words(verdict, Some("aptx_hd"));
+        assert!(words.contains("bluetooth"), "names the link: {words}");
+        assert!(words.contains("aptX HD"), "names the codec: {words}");
     }
 
     #[test]
