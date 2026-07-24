@@ -5990,7 +5990,9 @@ fn clock_rows(clock: &ClockRates, supported_hz: &[u32], source: SourceFormat) ->
         });
     }
 
-    rows.extend(advice.lines().iter().map(|line| note(&format!("  {line}"))));
+    let advice_lines = advice.lines();
+    let advising = !advice_lines.is_empty();
+    rows.extend(advice_lines.iter().map(|line| note(&format!("  {line}"))));
 
     // The rates the device can do that the server is not set to use: the "set up
     // audio" offer's reason, shown whether or not this one track needed them, so
@@ -6010,6 +6012,21 @@ fn clock_rows(clock: &ClockRates, supported_hz: &[u32], source: SourceFormat) ->
             "  Your DAC can also do {}, which PipeWire isn't set to use.",
             crate::ui::fmt_khz_list(&blocked)
         )));
+    } else if !advising {
+        // Nothing to add, and nothing advised for this track either: say where
+        // the rate setup stands, so the feature is visible rather than silently
+        // absent - the reason a listener could not find where to configure it.
+        if supported_hz.is_empty() {
+            // No hardware rate readout - a Bluetooth or other non-ALSA sink,
+            // whose rates are not priel's to configure.
+            rows.push(note("  Sample-rate setup does not apply to this output."));
+        } else if permitted_hz.is_some() {
+            // The device's rates are known and every one is already permitted:
+            // the config is optimal, said so rather than shown by its absence.
+            rows.push(note(
+                "  All the rates your DAC supports are already permitted.",
+            ));
+        }
     }
     rows
 }
@@ -8935,6 +8952,36 @@ mod tests {
         r.app.on_key(key('A'));
         assert_eq!(r.app.mode, Mode::Graph, "the key does nothing here");
         assert!(r.app.setup.is_none());
+    }
+
+    #[test]
+    fn the_report_confirms_when_the_devices_rates_are_all_permitted() {
+        // Goal: #60. A device whose supported rates are all permitted has nothing
+        // to set up, but the report must still say so - otherwise the feature is
+        // invisible and the listener cannot tell their config is already optimal.
+        let mut g = chain_clocked(&[44_100, 48_000, 88_200, 176_400], 48_000);
+        g.supported_hz = vec![44_100, 48_000, 88_200, 176_400];
+        let r = playing_hires(g);
+        let text = overlay_text(&r.app);
+        assert!(
+            text.contains("already permitted"),
+            "the report confirms the config is complete: {text}"
+        );
+        assert!(!r.app.setup_available(), "and there is nothing to add");
+    }
+
+    #[test]
+    fn the_report_says_rate_setup_does_not_apply_without_a_rate_readout() {
+        // Goal: #60. A Bluetooth or other non-ALSA sink has no hardware rate list
+        // to add, so priel cannot set its rates up - say so rather than showing
+        // nothing, so the absence of the offer is explained. The chain here has
+        // no `supported_hz`, standing in for a sink with no ALSA readout.
+        let r = playing_hires(chain_clocked(&[44_100, 48_000], 48_000));
+        let text = overlay_text(&r.app);
+        assert!(
+            text.contains("does not apply"),
+            "the report explains rate setup is not applicable here: {text}"
+        );
     }
 
     #[test]
