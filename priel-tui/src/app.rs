@@ -377,6 +377,7 @@ pub enum Mode {
     Log,         // the recent diagnostics are up; modal in the same way
     Graph,       // the chain to the output device is up; modal in the same way
     SetupAudio,  // confirming, then applying, the rates drop-in; modal in the same way
+    CodecSwitch, // confirming, then applying, a Bluetooth codec switch; modal too
     Devices,     // the output picker is up; modal in the same way
     Themes,      // the colour theme picker is up; modal in the same way
     Credentials, // first run with no client identity; asking before fetching one
@@ -417,6 +418,33 @@ pub(crate) enum SetupStep {
     Restart { path: String },
     /// The restart request is out; the overlay says so and waits for the reply.
     Restarting,
+    /// The flow is over, for good or ill; `message` is what it came to.
+    Done { message: String },
+}
+
+/// The "switch codec" flow, from the confirm to the outcome.
+///
+/// Held only while the overlay is up, and settled the moment it opened - the
+/// device and the profile to set were read from the graph then, so nothing here
+/// reaches back into it. Mirrors [`Setup`]: a small state machine the overlay
+/// renders and the keys advance, with one in-flight step that only waits.
+pub(crate) struct CodecSwitch {
+    /// The bluez device the profile is set on.
+    pub(crate) device_id: u32,
+    /// The profile that carries the better codec.
+    pub(crate) profile_index: u32,
+    /// The better codec's canonical id, to name it in the sentences.
+    pub(crate) target: String,
+    pub(crate) step: CodecStep,
+}
+
+/// Where the "switch codec" flow has got to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum CodecStep {
+    /// The preview is up, waiting for the listener to say switch it or not.
+    Confirm,
+    /// The switch request is out; the overlay says so and waits for the reply.
+    Switching,
     /// The flow is over, for good or ill; `message` is what it came to.
     Done { message: String },
 }
@@ -970,6 +998,7 @@ pub struct App {
     /// The "set up audio" flow while its overlay is up, else `None`. See
     /// [`Setup`].
     setup: Option<Setup>,
+    codec_switch: Option<CodecSwitch>,
     /// What the sink at the end of the chain is doing to the level.
     ///
     /// Kept apart from `audio_graph`, which the overlay clears every time it
@@ -1236,6 +1265,7 @@ impl App {
             help_scroll: 0,
             audio_graph: None,
             setup: None,
+            codec_switch: None,
             sink_volume: SinkVolume::Unread,
             sink_volume_asked: None,
             cover_asked: None,
@@ -2437,6 +2467,7 @@ impl App {
                 }
                 FromWorker::AudioSetUp(result) => self.on_audio_set_up(result),
                 FromWorker::AudioRestarted(result) => self.on_audio_restarted(result),
+                FromWorker::BtCodecSwitched(result) => self.on_bt_codec_switched(result),
                 // The clock read at track start: hand it to the player, where the
                 // verdict falls back to it when there is no ALSA readout.
                 FromWorker::OutputClock(clock) => self.player.set_clock(clock),
@@ -4255,6 +4286,7 @@ impl App {
             Mode::Log => self.on_key_log(key),
             Mode::Graph => self.on_key_graph(key),
             Mode::SetupAudio => self.on_key_setup(key),
+            Mode::CodecSwitch => self.on_key_codec_switch(key),
             Mode::Devices => self.on_key_devices(key),
             Mode::Themes => self.on_key_themes(key),
             Mode::Credentials => self.on_key_credentials(key),
@@ -4475,6 +4507,10 @@ impl App {
             // blocking. Does nothing when there are none, exactly as the footer
             // key that fires it is only shown when there are.
             KeyCode::Char('A') => self.begin_setup(),
+            // Offer to switch a Bluetooth output to a better codec the device
+            // supports. Does nothing when there is none, exactly as the footer
+            // key that fires it is only shown when there is.
+            KeyCode::Char('C') => self.begin_codec_switch(),
             _ => {}
         }
         self.dirty = true;
@@ -4714,6 +4750,126 @@ impl App {
     pub(crate) fn bt_improvable(&self) -> Option<bool> {
         self.bt_codec_standing()
             .map(|s| matches!(s, BtStanding::Improvable { .. }))
+    }
+
+    /// The device, profile and codec a switch would set, when a better codec is
+    /// available and the graph names both the device and the profile for it.
+    ///
+    /// Settled from the last-read graph in one place, so the footer key that is
+    /// offered, the overlay that opens, and the request that goes out all agree
+    /// about what there is to switch to. `None` when there is nothing better, or
+    /// the graph does not name the device or the target profile.
+    fn codec_switch_target(&self) -> Option<(u32, u32, String)> {
+        let Some(BtStanding::Improvable { better }) = self.bt_codec_standing() else {
+            return None;
+        };
+        let Some(Ok(graph)) = &self.audio_graph else {
+            return None;
+        };
+        let device_id = graph.bt_device_id?;
+        let profile_index = graph
+            .bt_available
+            .iter()
+            .find(|p| p.codec == better)?
+            .profile_index;
+        Some((device_id, profile_index, better))
+    }
+
+    /// Whether the "switch codec" offer applies right now - what the report's
+    /// footer key hangs on, so the offer and the action behind it agree.
+    #[must_use]
+    pub fn codec_switch_available(&self) -> bool {
+        self.codec_switch_target().is_some()
+    }
+
+    /// The "switch codec" flow while its overlay is up, for the renderer to draw.
+    #[must_use]
+    pub(crate) fn codec_switch(&self) -> Option<&CodecSwitch> {
+        self.codec_switch.as_ref()
+    }
+
+    /// Open the "switch codec" preview, or do nothing when there is nothing
+    /// better to switch to. The device and profile are settled here, once.
+    fn begin_codec_switch(&mut self) {
+        let Some((device_id, profile_index, target)) = self.codec_switch_target() else {
+            return;
+        };
+        self.codec_switch = Some(CodecSwitch {
+            device_id,
+            profile_index,
+            target,
+            step: CodecStep::Confirm,
+        });
+        self.mode = Mode::CodecSwitch;
+        self.dirty = true;
+    }
+
+    /// The "switch codec" overlay: a preview to approve, then the switch. One key
+    /// advances each step; the in-flight `Switching` step swallows keys until the
+    /// reply lands.
+    fn on_key_codec_switch(&mut self, key: KeyEvent) {
+        let Some(switch) = &self.codec_switch else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match &switch.step {
+            CodecStep::Confirm => match key.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                    let (device_id, profile_index) = (switch.device_id, switch.profile_index);
+                    self.codec_switch_step(CodecStep::Switching);
+                    self.ask(ToWorker::SwitchBtCodec {
+                        device_id,
+                        profile_index,
+                    });
+                }
+                KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {
+                    // Back to the report it was opened from, not out of it.
+                    self.codec_switch = None;
+                    self.mode = Mode::Graph;
+                }
+                _ => {}
+            },
+            CodecStep::Done { .. } => {
+                self.codec_switch = None;
+                self.mode = Mode::Normal;
+            }
+            // The request is in flight; the overlay says so and the keys wait.
+            CodecStep::Switching => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Move the switch flow to `step`, if it is still up.
+    fn codec_switch_step(&mut self, step: CodecStep) {
+        if let Some(switch) = &mut self.codec_switch {
+            switch.step = step;
+        }
+    }
+
+    /// The Bluetooth codec was switched, or not. Only a flow still waiting on the
+    /// switch moves - a reply that outlived its overlay is dropped.
+    fn on_bt_codec_switched(&mut self, result: Result<(), String>) {
+        if !matches!(
+            &self.codec_switch,
+            Some(CodecSwitch {
+                step: CodecStep::Switching,
+                ..
+            })
+        ) {
+            return;
+        }
+        let message = match result {
+            Ok(()) => {
+                let target = self
+                    .codec_switch
+                    .as_ref()
+                    .map_or_else(String::new, |s| crate::ui::codec_label(&s.target));
+                format!("Switched to {target}. It updates on the next read.")
+            }
+            Err(e) => format!("Could not switch the codec: {e}"),
+        };
+        self.codec_switch_step(CodecStep::Done { message });
+        self.dirty = true;
     }
 
     fn verdict_rows(&self) -> Vec<GraphRow> {
@@ -5261,7 +5417,13 @@ impl App {
     fn footer_key_clicked(&mut self, m: MouseEvent) -> bool {
         if !matches!(
             self.mode,
-            Mode::Log | Mode::Graph | Mode::SetupAudio | Mode::Devices | Mode::Themes | Mode::AddTo
+            Mode::Log
+                | Mode::Graph
+                | Mode::SetupAudio
+                | Mode::CodecSwitch
+                | Mode::Devices
+                | Mode::Themes
+                | Mode::AddTo
         ) || !matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
         {
             return false;
@@ -5395,10 +5557,10 @@ impl App {
             }
             return true;
         }
-        // The setup overlay routes only through its footer keys (handled at the
-        // top); every other click on it is swallowed here, so a misclick cannot
-        // act or reach the list behind the modal.
-        matches!(self.mode, Mode::SetupAudio)
+        // The setup and switch-codec overlays route only through their footer
+        // keys (handled at the top); every other click on them is swallowed here,
+        // so a misclick cannot act or reach the list behind the modal.
+        matches!(self.mode, Mode::SetupAudio | Mode::CodecSwitch)
     }
 
     /// A mouse event, routed by what is on screen.
@@ -7948,6 +8110,135 @@ mod tests {
         unknown.bt_available = Vec::new();
         r.app.audio_graph = Some(Ok(unknown));
         assert_eq!(r.app.bt_codec_standing(), None);
+    }
+
+    /// A rig on a Bluetooth output stuck on SBC while the device also offers
+    /// aptX HD (profile 131079), with the report open.
+    fn on_a_lesser_codec(r: &mut Rig) {
+        let mut g = chain();
+        g.bt_available = vec![
+            priel_player::graph::BtProfile {
+                codec: "sbc".into(),
+                profile_index: 131_073,
+            },
+            priel_player::graph::BtProfile {
+                codec: "aptx_hd".into(),
+                profile_index: 131_079,
+            },
+        ];
+        g.bt_device_id = Some(56);
+        r.app.audio_graph = Some(Ok(g));
+        r.app.status.bt_codec = Some("sbc".into());
+        r.app.mode = Mode::Graph;
+    }
+
+    /// The message the switch flow came to rest on, or empty if it has not.
+    fn done_message(r: &Rig) -> String {
+        match r.app.codec_switch.as_ref().map(|s| &s.step) {
+            Some(CodecStep::Done { message }) => message.clone(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn the_switch_key_opens_the_preview_for_the_best_available_codec() {
+        // Goal: C opens the confirm, aimed at the device and the profile that
+        // carries the best codec the device offers.
+        let mut r = rig();
+        on_a_lesser_codec(&mut r);
+        r.app.on_key(key('C'));
+        assert_eq!(r.app.mode, Mode::CodecSwitch);
+        let switch = r.app.codec_switch.as_ref().expect("a flow is up");
+        assert_eq!(switch.step, CodecStep::Confirm);
+        assert_eq!(switch.device_id, 56);
+        assert_eq!(switch.profile_index, 131_079, "the aptX HD profile");
+        assert_eq!(switch.target, "aptx_hd");
+    }
+
+    #[test]
+    fn the_switch_key_does_nothing_on_the_best_codec() {
+        // Goal: nothing to switch to when already on the best available, so C is
+        // inert and the offer is not made.
+        let mut r = rig();
+        on_a_lesser_codec(&mut r);
+        r.app.status.bt_codec = Some("aptx_hd".into());
+        assert!(!r.app.codec_switch_available());
+        r.app.on_key(key('C'));
+        assert_eq!(r.app.mode, Mode::Graph, "still the report, no switch flow");
+        assert!(r.app.codec_switch.is_none());
+    }
+
+    #[test]
+    fn confirming_sends_the_switch_and_waits_for_the_reply() {
+        // Goal: yes sends `wpctl set-profile` for the device and target profile,
+        // and the overlay says it is working until the reply lands.
+        let mut r = rig();
+        on_a_lesser_codec(&mut r);
+        r.app.on_key(key('C'));
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        let reqs = requests(&r);
+        assert!(
+            matches!(
+                reqs.as_slice(),
+                [ToWorker::SwitchBtCodec { device_id, profile_index }]
+                    if *device_id == 56 && *profile_index == 131_079
+            ),
+            "the switch names the device and the profile"
+        );
+        assert!(matches!(
+            r.app.codec_switch.as_ref().map(|s| &s.step),
+            Some(CodecStep::Switching)
+        ));
+    }
+
+    #[test]
+    fn a_successful_switch_says_so_and_a_failed_one_says_why() {
+        // Goal: the reply turns the overlay into the outcome - the new codec
+        // named on success, the reason shown on failure.
+        let mut r = rig();
+        on_a_lesser_codec(&mut r);
+        r.app.on_key(key('C'));
+        r.app.on_key(key('y'));
+        let _ = requests(&r);
+        r.to_app
+            .send(FromWorker::BtCodecSwitched(Ok(())))
+            .expect("send");
+        r.app.drain_worker();
+        let done = done_message(&r);
+        assert!(
+            done.contains("aptX HD"),
+            "names the codec switched to: {done}"
+        );
+
+        // A failure reports the reason rather than pretending it worked.
+        let mut r = rig();
+        on_a_lesser_codec(&mut r);
+        r.app.on_key(key('C'));
+        r.app.on_key(key('y'));
+        let _ = requests(&r);
+        r.to_app
+            .send(FromWorker::BtCodecSwitched(Err(
+                "wpctl was not found".into()
+            )))
+            .expect("send");
+        r.app.drain_worker();
+        assert!(
+            done_message(&r).contains("wpctl was not found"),
+            "the reason is shown"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_switch_returns_to_the_report() {
+        // Goal: no leaves the reading up, not the list - nothing needs reading
+        // again.
+        let mut r = rig();
+        on_a_lesser_codec(&mut r);
+        r.app.on_key(key('C'));
+        r.app.on_key(key('n'));
+        assert_eq!(r.app.mode, Mode::Graph, "back to the report");
+        assert!(r.app.codec_switch.is_none());
     }
 
     #[test]

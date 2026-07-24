@@ -29,7 +29,8 @@ use priel_player::graph::{SinkStage, SinkVolume};
 use priel_player::{Alteration, Fidelity, OutputAccess, StreamVolume, Verdict};
 
 use crate::app::{
-    App, Focus, GraphRow, GraphRowKind, Hit, Mode, QUEUE_ROWS_PER_ENTRY, Repeat, SetupStep, View,
+    App, CodecStep, Focus, GraphRow, GraphRowKind, Hit, Mode, QUEUE_ROWS_PER_ENTRY, Repeat,
+    SetupStep, View,
 };
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
@@ -221,6 +222,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.mode == Mode::SetupAudio {
         let area = f.area();
         setup_overlay(f, area, app);
+    }
+    if app.mode == Mode::CodecSwitch {
+        let area = f.area();
+        codec_switch_overlay(f, area, app);
     }
     if app.mode == Mode::Devices {
         device_overlay(f, f.area(), app);
@@ -1264,6 +1269,10 @@ fn graph_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         footer.push(Foot::Key("A", KeyCode::Char('A')));
         footer.push(Foot::Text(" set up audio \u{b7} "));
     }
+    if app.codec_switch_available() {
+        footer.push(Foot::Key("C", KeyCode::Char('C')));
+        footer.push(Foot::Text(" switch codec \u{b7} "));
+    }
     footer.extend([
         Foot::Key("D", KeyCode::Char('D')),
         Foot::Text(", "),
@@ -1388,6 +1397,99 @@ fn setup_step_view(
             Vec::new()
         }
         SetupStep::Done { message } => {
+            body.push(styled(message.clone(), t.text));
+            vec![
+                Foot::Text("  ["),
+                Foot::Key("q", KeyCode::Char('q')),
+                Foot::Text("] close"),
+            ]
+        }
+    };
+    (body, footer)
+}
+
+/// The "switch codec" confirm-and-apply overlay.
+///
+/// Built like [`setup_overlay`]: the flow is cloned so the frame is free to
+/// borrow `app` mutably, one box around a per-step body, and the footer keys are
+/// real hit boxes so a click runs the same action the key does.
+fn codec_switch_overlay(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(switch) = app.codec_switch() else {
+        return;
+    };
+    let step = switch.step.clone();
+    let target = switch.target.clone();
+    let t = app.theme();
+    app.hits.clear();
+
+    let (body, footer) = codec_switch_step_view(&step, &target, &t);
+
+    let width = overlay_width(area, OVERLAY_MEDIUM);
+    let body_h = u16::try_from(body.len()).unwrap_or(u16::MAX);
+    let height = body_h.saturating_add(3).min(area.height);
+    let rect = centred(area, width, height);
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(t.surface())
+        .border_style(Style::default().fg(t.accent))
+        .title(" Switch codec ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+    let text_area = indented(Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    });
+    f.render_widget(Paragraph::new(body), text_area);
+    overlay_footer(
+        f,
+        app,
+        Rect {
+            y: inner.y + inner.height.saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+        &footer,
+    );
+}
+
+/// The body and footer of the "switch codec" overlay for one step. Split out so
+/// the overlay is just the box around it, like [`setup_step_view`].
+fn codec_switch_step_view(
+    step: &CodecStep,
+    target: &str,
+    t: &Theme,
+) -> (Vec<Line<'static>>, Vec<Foot>) {
+    let styled = |s: String, c| Line::from(Span::styled(s, Style::default().fg(c)));
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let footer = match step {
+        CodecStep::Confirm => {
+            body.push(styled(
+                format!("Switch the Bluetooth codec to {}?", codec_label(target)),
+                t.text,
+            ));
+            body.push(Line::default());
+            body.push(styled(
+                "This briefly re-negotiates the link (about a second of silence).".to_string(),
+                t.muted,
+            ));
+            vec![
+                Foot::Text("  ["),
+                Foot::Key("y", KeyCode::Char('y')),
+                Foot::Text("] switch   ["),
+                Foot::Key("n", KeyCode::Char('n')),
+                Foot::Text("] cancel"),
+            ]
+        }
+        CodecStep::Switching => {
+            body.push(styled("Switching\u{2026}".to_string(), t.muted));
+            Vec::new()
+        }
+        CodecStep::Done { message } => {
             body.push(styled(message.clone(), t.text));
             vec![
                 Foot::Text("  ["),
@@ -5279,6 +5381,60 @@ mod tests {
         assert!(out.contains("set up audio"), "the offer: {out}");
         click_hit(&mut sc.app, Hit::Key(KeyCode::Char('A')));
         assert_eq!(sc.app.mode, Mode::SetupAudio, "the click opens the confirm");
+    }
+
+    fn bt_improvable_chain() -> AudioGraph {
+        AudioGraph {
+            path: vec![
+                node("mpv", NodeRole::Stream, 48_000, "S16LE"),
+                node("Px7 S3", NodeRole::Device, 48_000, "S24LE"),
+            ],
+            bt_available: vec![
+                priel_player::graph::BtProfile {
+                    codec: "sbc".into(),
+                    profile_index: 131_073,
+                },
+                priel_player::graph::BtProfile {
+                    codec: "aptx_hd".into(),
+                    profile_index: 131_079,
+                },
+            ],
+            bt_device_id: Some(56),
+            ..AudioGraph::default()
+        }
+    }
+
+    #[test]
+    fn the_report_offers_switch_codec_as_a_clickable_key_when_a_better_one_exists() {
+        // Goal: the switch offer is a real footer key too - shown only when a
+        // better codec is available, and a click on it opens the same confirm the
+        // key does.
+        let mut sc = screen();
+        with_chain(&mut sc, bt_improvable_chain());
+        sc.app.status.bt_codec = Some("sbc".into());
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 40);
+        assert!(out.contains("switch codec"), "the offer: {out}");
+        click_hit(&mut sc.app, Hit::Key(KeyCode::Char('C')));
+        assert_eq!(
+            sc.app.mode,
+            Mode::CodecSwitch,
+            "the click opens the confirm"
+        );
+    }
+
+    #[test]
+    fn the_switch_codec_key_is_hidden_on_the_best_codec() {
+        // Goal: nothing to offer when already on the best the device has.
+        let mut sc = screen();
+        with_chain(&mut sc, bt_improvable_chain());
+        sc.app.status.bt_codec = Some("aptx_hd".into());
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 40);
+        assert!(
+            !out.contains("switch codec"),
+            "no offer on the best codec: {out}"
+        );
     }
 
     #[test]
