@@ -173,6 +173,9 @@ struct Output {
     /// The sound server's graph clock, as the frontend last read it. Published
     /// unchanged in the status; see [`crate::Cmd::SetClock`].
     clock: Option<crate::graph::ClockRates>,
+    /// The Bluetooth codec of the output, as the frontend last read it from the
+    /// graph. Published unchanged in the status; see [`crate::Cmd::SetBtCodec`].
+    bt_codec: Option<String>,
 }
 
 /// A device change waiting to be judged.
@@ -753,6 +756,7 @@ pub fn spawn(
             refused: false,
             judged: false,
             clock: None,
+            bt_codec: None,
         };
         // The ALSA readout costs a handful of /proc reads, so it is refreshed on
         // its own slower cadence rather than on every status tick.
@@ -1104,6 +1108,7 @@ fn handle_cmd(
         Cmd::SetDevice(device) => set_device(mpv, output, device),
         Cmd::SetExclusive(exclusive) => set_exclusive(mpv, output, exclusive),
         Cmd::SetClock(clock) => output.clock = clock,
+        Cmd::SetBtCodec(codec) => output.bt_codec = codec,
     }
     false
 }
@@ -1481,6 +1486,7 @@ fn read_status(
         hw,
         access,
         clock: output.clock.clone(),
+        bt_codec: output.bt_codec.clone(),
     }
 }
 
@@ -1568,6 +1574,7 @@ mod tests {
             refused: false,
             judged: false,
             clock: None,
+            bt_codec: None,
         }
     }
 

@@ -140,6 +140,12 @@ pub struct AudioGraph {
     /// then no capability claim is made from it. Filled in by [`probe`] rather
     /// than [`parse`], because it comes from the kernel and not from `pw-dump`.
     pub supported_hz: Vec<u32>,
+    /// The A2DP link codec of the Bluetooth sink at the end of the chain, from
+    /// `api.bluez5.codec` (e.g. `aptx_hd`). `None` for a non-Bluetooth sink. Read
+    /// from the dump, so [`parse`] fills it - unlike [`Self::supported_hz`],
+    /// which comes from the kernel. Its presence means the output re-encodes
+    /// every sample and so cannot be bit-perfect, whatever the rate or depth.
+    pub bt_codec: Option<String>,
 }
 
 impl AudioGraph {
@@ -1198,12 +1204,25 @@ pub fn parse(dump: &str, pid: u32) -> Result<AudioGraph, GraphError> {
     Ok(AudioGraph {
         holder: holder_of(&objects, &path),
         volume: sink_volume_of(&objects, &path),
+        bt_codec: bt_codec_of(&objects, &path),
         path,
         clock: clock_of(&objects),
         // The kernel names the device's rates, not `pw-dump`; `probe` fills this
         // in. `parse` stays a pure function of the dump so it keeps its tests.
         supported_hz: Vec::new(),
     })
+}
+
+/// The Bluetooth A2DP codec of the sink at the end of the path, if it is one.
+///
+/// A per-concern extractor over the object list, like [`holder_of`] and
+/// [`sink_volume_of`]: the codec is published as `api.bluez5.codec` on the sink
+/// node itself, beside the `device.api = bluez5` that marks it a Bluetooth sink.
+/// `None` for an ALSA or network sink, which carries no such property.
+fn bt_codec_of(objects: &[Value], path: &[GraphNode]) -> Option<String> {
+    let sink = path.last().filter(|n| n.role == NodeRole::Device)?;
+    let node = object_at(objects, "PipeWire:Interface:Node", sink.id)?;
+    prop_str(node, "api.bluez5.codec").map(ToString::to_string)
 }
 
 /// What the sink at the end of the path is doing to the level.
@@ -1448,9 +1467,9 @@ fn as_u32(v: &Value) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attribution, AudioGraph, ClockRates, DeviceHolder, GraphError, HeldDevice, NodeRole,
-        RateAdvice, SinkLevels, SinkStage, SinkVolume, SourceFormat, parse, parse_clock,
-        parse_sinks,
+        Attribution, AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, HeldDevice,
+        NodeRole, RateAdvice, SinkLevels, SinkStage, SinkVolume, SourceFormat, bt_codec_of, parse,
+        parse_clock, parse_sinks,
     };
     use crate::Alteration;
 
@@ -1505,6 +1524,40 @@ mod tests {
             Ok(g) => g,
             Err(e) => panic!("the fixture should parse: {e}"),
         }
+    }
+
+    #[test]
+    fn a_bluetooth_sink_reports_its_codec_and_an_alsa_sink_reports_none() {
+        // Goal: the codec the verdict grades a Bluetooth output by, read off the
+        // sink node's `api.bluez5.codec` exactly where the volume and holder are
+        // read. An ALSA sink carries no such property, so it reports none.
+        let objects: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"type":"PipeWire:Interface:Node","id":150,
+                 "info":{"props":{"media.class":"Audio/Sink","api.bluez5.codec":"aptx_hd"}}}]"#,
+        )
+        .expect("valid json");
+        let sink = GraphNode {
+            id: 150,
+            name: "bluez_output.EC_66_D1_CE_50_4F.1".into(),
+            description: "Px7 S3".into(),
+            media_class: "Audio/Sink".into(),
+            role: NodeRole::Device,
+            rate_hz: Some(48_000),
+            format: Some("S24LE".into()),
+            channels: Some(2),
+        };
+        assert_eq!(
+            bt_codec_of(&objects, &[sink]),
+            Some("aptx_hd".to_string()),
+            "the sink's A2DP codec"
+        );
+
+        // The USB DAC fixture is an ALSA sink, which carries no bluez codec.
+        assert_eq!(
+            path_of(DUMP, PID).bt_codec,
+            None,
+            "an ALSA sink is not a Bluetooth link"
+        );
     }
 
     #[test]
