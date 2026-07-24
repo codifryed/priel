@@ -2062,7 +2062,11 @@ impl App {
     /// The offset it was asked for is its identity, exactly as a resolve is
     /// matched by track id: a page for an offset the view is no longer waiting
     /// on belongs to a listing that has since been thrown away.
-    fn on_favorites_page(&mut self, offset: u32, page: priel_core::Page<Track>) {
+    fn on_favorites_page(&mut self, offset: u32, page: priel_core::Page<Track>, from_cache: bool) {
+        if from_cache {
+            self.prefill_favorites(offset, page);
+            return;
+        }
         if self.favorites_paging.wanted != Some(offset) {
             log::debug!("dropping a favorites page at offset {offset}: nothing is waiting for it");
             return;
@@ -2100,8 +2104,42 @@ impl App {
         }
     }
 
+    /// Paint favorites from the on-disk cache while the fresh page is still on
+    /// its way, so the listing appears at once on open.
+    ///
+    /// Additive only, and that is the whole of its correctness: it must not
+    /// touch the paging state. `favorites_paging.wanted` stays `Some(0)`, so the
+    /// fresh reply that follows still passes its own guard and replaces these
+    /// rows through the normal `absorb` path - the prefill is a preview, never
+    /// the answer. It acts only on the first page and only while still waiting
+    /// for that answer; a cached page that raced in after the fresh one would
+    /// otherwise clobber fresh rows with stale ones.
+    fn prefill_favorites(&mut self, offset: u32, page: priel_core::Page<Track>) {
+        if offset != 0 || self.favorites_paging.wanted != Some(0) {
+            return;
+        }
+        self.favorite_ids.clear();
+        self.favorite_ids.extend(page.items.iter().map(|t| t.id));
+        // A provisional length for the heading; the fresh page sets the real one.
+        self.favorites_paging.total = page.total;
+        self.favorites = page.items;
+        self.loading = false;
+        if self.view == View::Favorites {
+            self.clamp_selection();
+        }
+    }
+
     /// A page of the user's playlists arrived, matched by the offset it answers.
-    fn on_playlists_page(&mut self, offset: u32, page: priel_core::Page<Playlist>) {
+    fn on_playlists_page(
+        &mut self,
+        offset: u32,
+        page: priel_core::Page<Playlist>,
+        from_cache: bool,
+    ) {
+        if from_cache {
+            self.prefill_playlists(offset, page);
+            return;
+        }
         if self.playlists_paging.wanted != Some(offset) {
             log::debug!("dropping a playlists page at offset {offset}: nothing is waiting for it");
             return;
@@ -2115,13 +2153,39 @@ impl App {
         }
     }
 
+    /// Paint the playlists listing from its cached first page while the fresh
+    /// one is on its way, the additive twin of [`Self::prefill_favorites`]:
+    /// rows only, `wanted` left `Some(0)` so the revalidation still lands.
+    fn prefill_playlists(&mut self, offset: u32, page: priel_core::Page<Playlist>) {
+        if offset != 0 || self.playlists_paging.wanted != Some(0) {
+            return;
+        }
+        // A provisional length for the heading; the fresh page sets the real one.
+        self.playlists_paging.total = page.total;
+        self.playlists = page.items;
+        self.loading = false;
+        if self.view == View::Playlists {
+            self.clamp_selection();
+        }
+    }
+
     /// A page of one playlist's tracks arrived.
     ///
     /// Two things make one of these stale and both have to be checked. A reply
     /// for a playlist the user has left is the one that was always guarded
     /// against; a page of the *open* playlist that was superseded before it
     /// arrived is just as wrong, and paging is what made it possible.
-    fn on_playlist_tracks_page(&mut self, uuid: &str, offset: u32, page: priel_core::Page<Track>) {
+    fn on_playlist_tracks_page(
+        &mut self,
+        uuid: &str,
+        offset: u32,
+        page: priel_core::Page<Track>,
+        from_cache: bool,
+    ) {
+        if from_cache {
+            self.prefill_playlist_tracks(uuid, offset, page);
+            return;
+        }
         if self.open_playlist.as_ref().is_none_or(|(u, _)| u != uuid) {
             log::debug!("dropping tracks for {uuid}: that playlist is not open");
             return;
@@ -2135,6 +2199,26 @@ impl App {
         self.playlist_tracks = rows;
         self.loading = false;
         self.clamp_selection();
+    }
+
+    /// Paint one playlist's tracks from the cached first page while the fresh
+    /// one is on its way. Additive like [`Self::prefill_favorites`], with the
+    /// extra guard the fetch path has: the cached `uuid` must be the playlist
+    /// still open, so a prefill for one navigated away from cannot clobber the
+    /// current listing. `wanted` is left `Some(0)` so the revalidation lands.
+    fn prefill_playlist_tracks(&mut self, uuid: &str, offset: u32, page: priel_core::Page<Track>) {
+        if offset != 0
+            || self.playlist_tracks_paging.wanted != Some(0)
+            || self.open_playlist.as_ref().is_none_or(|(u, _)| u != uuid)
+        {
+            return;
+        }
+        self.playlist_tracks_paging.total = page.total;
+        self.playlist_tracks = page.items;
+        self.loading = false;
+        if self.view == View::PlaylistTracks {
+            self.clamp_selection();
+        }
     }
 
     /// A page of the listener's mixes arrived, matched by the offset it answers.
@@ -2421,10 +2505,23 @@ impl App {
                 self.dirty = true;
             }
             match msg {
-                FromWorker::Favorites { offset, page } => self.on_favorites_page(offset, page),
-                FromWorker::Playlists { offset, page } => self.on_playlists_page(offset, page),
-                FromWorker::PlaylistTracks { uuid, offset, page } => {
-                    self.on_playlist_tracks_page(&uuid, offset, page);
+                FromWorker::Favorites {
+                    offset,
+                    page,
+                    from_cache,
+                } => self.on_favorites_page(offset, page, from_cache),
+                FromWorker::Playlists {
+                    offset,
+                    page,
+                    from_cache,
+                } => self.on_playlists_page(offset, page, from_cache),
+                FromWorker::PlaylistTracks {
+                    uuid,
+                    offset,
+                    page,
+                    from_cache,
+                } => {
+                    self.on_playlist_tracks_page(&uuid, offset, page, from_cache);
                 }
                 FromWorker::Mixes { offset, page } => self.on_mixes_page(offset, page),
                 FromWorker::MixTracks {
@@ -6343,7 +6440,136 @@ mod tests {
         FromWorker::Favorites {
             offset,
             page: track_page(ids, total),
+            from_cache: false,
         }
+    }
+
+    #[test]
+    fn a_cached_favorites_page_prefills_then_the_fresh_page_replaces_it() {
+        // Goal: #50 serve+revalidate. A from_cache first page paints the listing
+        // at once and leaves paging still waiting, so the fresh page that follows
+        // is not dropped - it replaces the rows and their hearts.
+        let mut r = rig();
+        r.app.favorites_paging.restart(0); // waiting for the first page
+
+        r.app.on_favorites_page(0, track_page(1..3, 2), true);
+        assert_eq!(
+            r.app.favorites.len(),
+            2,
+            "the cache paints the listing instantly"
+        );
+        assert!(r.app.is_favorite(1), "with its hearts");
+        assert_eq!(
+            r.app.favorites_paging.wanted,
+            Some(0),
+            "and paging is still waiting, so the fresh page is not dropped"
+        );
+
+        r.app.on_favorites_page(0, track_page(10..13, 3), false);
+        assert_eq!(
+            r.app.favorites.len(),
+            3,
+            "the fresh page replaced the prefill"
+        );
+        assert!(
+            r.app.is_favorite(10) && !r.app.is_favorite(1),
+            "and its hearts, not the stale ones"
+        );
+        assert_eq!(
+            r.app.favorites_paging.wanted, None,
+            "the fresh page cleared the wait"
+        );
+    }
+
+    #[test]
+    fn a_cached_favorites_page_is_ignored_once_the_fresh_one_has_landed() {
+        // Goal: a cached page that raced in after the fresh reply must not clobber
+        // fresh rows with stale ones. With nothing waited on, the prefill is a
+        // no-op.
+        let mut r = rig();
+        r.app.favorites = vec![track(99, "Fresh", "A")];
+        r.app.favorites_paging.wanted = None; // the fresh page already landed
+        r.app.on_favorites_page(0, track_page(1..3, 2), true);
+        assert_eq!(r.app.favorites.len(), 1, "the stale prefill was ignored");
+        assert_eq!(r.app.favorites[0].id, 99);
+    }
+
+    #[test]
+    fn a_cached_playlists_page_prefills_then_the_fresh_page_replaces_it() {
+        // Goal: #50 serve+revalidate for the playlists listing, like favorites.
+        let mut r = rig();
+        r.app.playlists_paging.restart(0);
+
+        let cached = priel_core::Page {
+            items: vec![playlist("p1", "One"), playlist("p2", "Two")],
+            total: 2,
+        };
+        r.app.on_playlists_page(0, cached, true);
+        assert_eq!(
+            r.app.playlists.len(),
+            2,
+            "the cache paints the listing at once"
+        );
+        assert_eq!(
+            r.app.playlists_paging.wanted,
+            Some(0),
+            "and paging still waits, so the fresh page is not dropped"
+        );
+
+        let fresh = priel_core::Page {
+            items: vec![playlist("p9", "Fresh")],
+            total: 1,
+        };
+        r.app.on_playlists_page(0, fresh, false);
+        assert_eq!(
+            r.app.playlists.len(),
+            1,
+            "the fresh page replaced the prefill"
+        );
+        assert_eq!(r.app.playlists[0].uuid, "p9");
+        assert_eq!(
+            r.app.playlists_paging.wanted, None,
+            "the fresh page cleared the wait"
+        );
+    }
+
+    #[test]
+    fn a_cached_playlist_tracks_prefill_only_paints_the_open_playlist() {
+        // Goal: the extra guard - a cached prefill for a playlist the listener
+        // has left must not clobber the one now open.
+        let mut r = rig();
+        r.app.open_playlist = Some(("open".into(), "Open".into()));
+        r.app.playlist_tracks_paging.restart(0);
+
+        r.app
+            .on_playlist_tracks_page("other", 0, track_page(1..4, 3), true);
+        assert!(
+            r.app.playlist_tracks.is_empty(),
+            "a prefill for another playlist is ignored"
+        );
+        assert_eq!(r.app.playlist_tracks_paging.wanted, Some(0));
+
+        r.app
+            .on_playlist_tracks_page("open", 0, track_page(1..4, 3), true);
+        assert_eq!(
+            r.app.playlist_tracks.len(),
+            3,
+            "the open playlist's cache paints it"
+        );
+        assert_eq!(
+            r.app.playlist_tracks_paging.wanted,
+            Some(0),
+            "and paging still waits"
+        );
+
+        r.app
+            .on_playlist_tracks_page("open", 0, track_page(10..12, 2), false);
+        assert_eq!(
+            r.app.playlist_tracks.len(),
+            2,
+            "the fresh page replaced the prefill"
+        );
+        assert_eq!(r.app.playlist_tracks_paging.wanted, None);
     }
 
     fn playlists_page(offset: u32, uuids: &[&str], total: u32) -> FromWorker {
@@ -6353,6 +6579,7 @@ mod tests {
                 items: uuids.iter().map(|u| playlist(u, u)).collect(),
                 total,
             },
+            from_cache: false,
         }
     }
 
@@ -6366,6 +6593,7 @@ mod tests {
             uuid: uuid.into(),
             offset,
             page: track_page(ids, total),
+            from_cache: false,
         }
     }
 
@@ -7454,6 +7682,7 @@ mod tests {
                     items: vec![track(1, "Blue", "A"), track(2, "Red", "B")],
                     total: 2,
                 },
+                from_cache: false,
             })
             .unwrap();
         r.app.drain_worker();

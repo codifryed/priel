@@ -771,6 +771,7 @@ dependencies = [
  "priel-player",
  "rand",
  "ratatui",
+ "serde_json",
  "unicode-width 0.2.0",
  "zune-core",
  "zune-jpeg",

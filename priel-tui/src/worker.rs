@@ -19,6 +19,7 @@
 //! Background worker: owns the blocking `priel_core::Client` so network calls
 //! never touch the UI thread. Talks to the app over two channels.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -337,15 +338,24 @@ pub enum FromWorker {
     Favorites {
         offset: u32,
         page: Page<Track>,
+        /// A prefill from the on-disk cache, sent instantly before the network
+        /// answers, so the listing paints at once. The fresh reply that follows
+        /// carries `false` and replaces it. See `revalidate_tracks` and
+        /// `App::on_favorites_page`.
+        from_cache: bool,
     },
     Playlists {
         offset: u32,
         page: Page<Playlist>,
+        /// A cache prefill, like [`Self::Favorites`]'s.
+        from_cache: bool,
     },
     PlaylistTracks {
         uuid: String,
         offset: u32,
         page: Page<Track>,
+        /// A cache prefill, like [`Self::Favorites`]'s.
+        from_cache: bool,
     },
     Mixes {
         offset: u32,
@@ -507,6 +517,7 @@ pub fn spawn(token_path: String, credentials_path: String, cache_cap: u64) -> Wo
             Ok(client)
         },
         cache_cap,
+        crate::cache::meta_dir(),
     )
 }
 
@@ -624,22 +635,120 @@ fn switch_bt(device_id: u32, profile_index: u32) -> FromWorker {
     clippy::too_many_lines,
     reason = "one dispatch match over every request; an arm per feature, splitting it would scatter the dispatch"
 )]
-fn serve(client: &mut Client, cmd: ToWorker, cache_cap: u64) -> Option<FromWorker> {
+fn serve(
+    client: &mut Client,
+    cmd: ToWorker,
+    cache_cap: u64,
+    meta_cache: Option<&Path>,
+    evt_tx: &Sender<FromWorker>,
+) -> Option<FromWorker> {
     Some(match cmd {
+        // The first page is served from cache while it revalidates; every later
+        // page is a plain fetch. The cached prefill (if any) is sent early on
+        // `evt_tx`; the fresh page is returned and sent by the loop.
+        ToWorker::LoadFavorites { offset: 0, limit } => {
+            let dir = meta_cache;
+            match revalidate_tracks(
+                dir,
+                cache_cap,
+                FAVORITES_KEY,
+                |page| {
+                    let _ = evt_tx.send(FromWorker::Favorites {
+                        offset: 0,
+                        page,
+                        from_cache: true,
+                    });
+                },
+                || client.favorite_tracks(0, limit),
+            ) {
+                Ok(page) => FromWorker::Favorites {
+                    offset: 0,
+                    page,
+                    from_cache: false,
+                },
+                Err(e) => failed(Task::Favorites { offset: 0 }, &e),
+            }
+        }
         ToWorker::LoadFavorites { offset, limit } => match client.favorite_tracks(offset, limit) {
-            Ok(page) => FromWorker::Favorites { offset, page },
+            Ok(page) => FromWorker::Favorites {
+                offset,
+                page,
+                from_cache: false,
+            },
             Err(e) => failed(Task::Favorites { offset }, &e),
         },
+        ToWorker::LoadPlaylists { offset: 0, limit } => {
+            let dir = meta_cache;
+            match revalidate_playlists(
+                dir,
+                cache_cap,
+                |page| {
+                    let _ = evt_tx.send(FromWorker::Playlists {
+                        offset: 0,
+                        page,
+                        from_cache: true,
+                    });
+                },
+                || client.user_playlists(0, limit),
+            ) {
+                Ok(page) => FromWorker::Playlists {
+                    offset: 0,
+                    page,
+                    from_cache: false,
+                },
+                Err(e) => failed(Task::Playlists { offset: 0 }, &e),
+            }
+        }
         ToWorker::LoadPlaylists { offset, limit } => match client.user_playlists(offset, limit) {
-            Ok(page) => FromWorker::Playlists { offset, page },
+            Ok(page) => FromWorker::Playlists {
+                offset,
+                page,
+                from_cache: false,
+            },
             Err(e) => failed(Task::Playlists { offset }, &e),
         },
+        ToWorker::LoadPlaylistTracks {
+            uuid,
+            offset: 0,
+            limit,
+        } => {
+            let dir = meta_cache;
+            let key = playlist_tracks_key(&uuid);
+            let cached_uuid = uuid.clone();
+            match revalidate_tracks(
+                dir,
+                cache_cap,
+                &key,
+                |page| {
+                    let _ = evt_tx.send(FromWorker::PlaylistTracks {
+                        uuid: cached_uuid,
+                        offset: 0,
+                        page,
+                        from_cache: true,
+                    });
+                },
+                || client.playlist_tracks(&uuid, 0, limit),
+            ) {
+                Ok(page) => FromWorker::PlaylistTracks {
+                    uuid,
+                    offset: 0,
+                    page,
+                    from_cache: false,
+                },
+                Err(e) => failed(Task::PlaylistTracks { uuid, offset: 0 }, &e),
+            }
+        }
         ToWorker::LoadPlaylistTracks {
             uuid,
             offset,
             limit,
         } => match client.playlist_tracks(&uuid, offset, limit) {
-            Ok(page) => FromWorker::PlaylistTracks { uuid, offset, page },
+            Ok(page) => FromWorker::PlaylistTracks {
+                uuid,
+                offset,
+                page,
+                from_cache: false,
+            },
             Err(e) => failed(Task::PlaylistTracks { uuid, offset }, &e),
         },
         ToWorker::LoadMixes { offset, limit } => match client.user_mixes(offset, limit) {
@@ -865,6 +974,85 @@ fn cached_or_fetch(
     Some(bytes)
 }
 
+/// The metadata cache key for the first page of favorites.
+const FAVORITES_KEY: &str = "favorites";
+
+/// The metadata cache key for the first page of the playlists listing.
+const PLAYLISTS_KEY: &str = "playlists";
+
+/// The metadata cache key for the first page of one playlist's tracks.
+///
+/// Keyed by the playlist so two playlists do not share one cache entry.
+fn playlist_tracks_key(uuid: &str) -> String {
+    format!("playlist:{uuid}")
+}
+
+/// Serve the first page of a track listing from cache while revalidating it.
+///
+/// The injected `dir` (the metadata cache) and `fetch` make this testable
+/// without a real cache directory or the network, the same shape as
+/// [`cached_or_fetch`]. A cached page, if present, is handed to `send_cached`
+/// FIRST so the listing paints at once; then `fetch` runs, its result is cached,
+/// and the fresh page is returned for the caller to send as the authoritative
+/// reply. A `None` dir skips both cache steps, fetching exactly as before the
+/// cache existed. Unlike a cover, a listing can change on another device, so it
+/// is served only while being refetched, never instead of it. `key` identifies
+/// the listing - favorites, or one playlist's tracks by its uuid.
+///
+/// # Errors
+///
+/// The fetch's error, unchanged: a failed revalidation is reported like any
+/// other failed page, and the cache is left as it was.
+fn revalidate_tracks(
+    dir: Option<&Path>,
+    cache_cap: u64,
+    key: &str,
+    send_cached: impl FnOnce(Page<Track>),
+    fetch: impl FnOnce() -> anyhow::Result<Page<Track>>,
+) -> anyhow::Result<Page<Track>> {
+    if let Some(dir) = dir
+        && let Some(page) = crate::cache::get(dir, key)
+            .and_then(|bytes| serde_json::from_slice::<Page<Track>>(&bytes).ok())
+    {
+        send_cached(page);
+    }
+    let fresh = fetch()?;
+    if let Some(dir) = dir
+        && let Ok(bytes) = serde_json::to_vec(&fresh)
+    {
+        let _ = crate::cache::put(dir, key, &bytes, cache_cap);
+    }
+    Ok(fresh)
+}
+
+/// Serve the first page of the playlists listing from cache while revalidating
+/// it. The [`Page<Playlist>`] twin of [`revalidate_tracks`]; see it for the
+/// shape and the guarantees.
+///
+/// # Errors
+///
+/// The fetch's error, unchanged.
+fn revalidate_playlists(
+    dir: Option<&Path>,
+    cache_cap: u64,
+    send_cached: impl FnOnce(Page<Playlist>),
+    fetch: impl FnOnce() -> anyhow::Result<Page<Playlist>>,
+) -> anyhow::Result<Page<Playlist>> {
+    if let Some(dir) = dir
+        && let Some(page) = crate::cache::get(dir, PLAYLISTS_KEY)
+            .and_then(|bytes| serde_json::from_slice::<Page<Playlist>>(&bytes).ok())
+    {
+        send_cached(page);
+    }
+    let fresh = fetch()?;
+    if let Some(dir) = dir
+        && let Ok(bytes) = serde_json::to_vec(&fresh)
+    {
+        let _ = crate::cache::put(dir, PLAYLISTS_KEY, &bytes, cache_cap);
+    }
+    Ok(fresh)
+}
+
 /// Spawn a worker with the default cache ceiling.
 ///
 /// The one the tests use: they exercise requests, not the cover cache, so the
@@ -876,7 +1064,10 @@ pub fn spawn_with<F>(build: F) -> Worker
 where
     F: FnOnce() -> anyhow::Result<Client> + Send + 'static,
 {
-    spawn_with_cap(build, crate::cache::DEFAULT_CAP_BYTES)
+    // No metadata cache directory: a test exercises requests, not the on-disk
+    // cache, and must never write to a real `~/.cache`. The revalidate path is
+    // tested directly through `revalidate_tracks` with a temp directory.
+    spawn_with_cap(build, crate::cache::DEFAULT_CAP_BYTES, None)
 }
 
 /// Spawn a worker around a caller-supplied client factory, with the cover
@@ -884,7 +1075,7 @@ where
 ///
 /// The factory runs *on the worker thread* so a failure to authenticate becomes
 /// a `FromWorker::Error` on screen rather than a panic before the UI exists.
-pub fn spawn_with_cap<F>(build: F, cache_cap: u64) -> Worker
+pub fn spawn_with_cap<F>(build: F, cache_cap: u64, meta_cache: Option<PathBuf>) -> Worker
 where
     F: FnOnce() -> anyhow::Result<Client> + Send + 'static,
 {
@@ -907,8 +1098,11 @@ where
         for cmd in cmd_rx {
             // A request that changed something and succeeded answers with
             // nothing: the interface already shows what it asked for, so there
-            // is no reply worth the channel. Only `None` means that.
-            let Some(msg) = serve(&mut client, cmd, cache_cap) else {
+            // is no reply worth the channel. Only `None` means that. `evt_tx` is
+            // passed in because a serve-from-cache request sends an extra early
+            // reply (the cached prefill) before returning the fresh one.
+            let Some(msg) = serve(&mut client, cmd, cache_cap, meta_cache.as_deref(), &evt_tx)
+            else {
                 continue;
             };
             // Recorded here rather than at each call site: one place covers
@@ -933,7 +1127,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        Fault, FromWorker, QueueSource, Task, ToWorker, Worker, cached_or_fetch, spawn_with,
+        FAVORITES_KEY, Fault, FromWorker, PLAYLISTS_KEY, Page, Playlist, QueueSource, Task,
+        ToWorker, Track, Worker, cached_or_fetch, playlist_tracks_key, revalidate_playlists,
+        revalidate_tracks, spawn_with,
     };
     use priel_core::Client;
     use std::io::{BufRead, BufReader, Read, Write};
@@ -1061,7 +1257,7 @@ mod tests {
         })
         .unwrap();
         match next(&w) {
-            FromWorker::Favorites { offset, page } => {
+            FromWorker::Favorites { offset, page, .. } => {
                 assert_eq!(offset, 0, "the reply names the page it answers");
                 assert_eq!(page.items[0].id, 1);
                 assert_eq!(page.total, 2, "and carries the length of the listing");
@@ -1075,7 +1271,7 @@ mod tests {
         })
         .unwrap();
         match next(&w) {
-            FromWorker::Favorites { offset, page } => {
+            FromWorker::Favorites { offset, page, .. } => {
                 assert_eq!(offset, 1);
                 assert_eq!(page.items[0].id, 2, "the offset has to reach the URL");
             }
@@ -1338,7 +1534,7 @@ mod tests {
         })
         .unwrap();
         match next(&w) {
-            FromWorker::Playlists { offset, page } => {
+            FromWorker::Playlists { offset, page, .. } => {
                 assert_eq!(offset, 1, "the reply names the page it answers");
                 assert_eq!(page.items[0].uuid, "p2", "the offset has to reach the URL");
                 assert_eq!(page.total, 2, "and carries the length of the listing");
@@ -1353,7 +1549,9 @@ mod tests {
         })
         .unwrap();
         match next(&w) {
-            FromWorker::PlaylistTracks { uuid, offset, page } => {
+            FromWorker::PlaylistTracks {
+                uuid, offset, page, ..
+            } => {
                 assert_eq!((uuid.as_str(), offset), ("abc", 1));
                 assert_eq!(page.items[0].id, 2, "the offset has to reach the URL");
                 assert_eq!(page.total, 2);
@@ -1790,6 +1988,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
+    }
+
+    #[test]
+    fn favorites_are_served_from_cache_then_revalidated() {
+        // Goal: the serve+revalidate core. A cached first page is handed over
+        // instantly (the prefill), then the fresh fetch is cached and returned -
+        // two handovers, the stale cache first and the fresh page second.
+        let dir = scratch("favorites-revalidate");
+        let stale = Page {
+            items: vec![Track {
+                id: 1,
+                ..Track::default()
+            }],
+            total: 1,
+        };
+        crate::cache::put(
+            &dir,
+            FAVORITES_KEY,
+            &serde_json::to_vec(&stale).expect("serialize"),
+            crate::cache::DEFAULT_CAP_BYTES,
+        )
+        .expect("seed the cache");
+
+        let mut served = Vec::new();
+        let fresh = Page {
+            items: vec![
+                Track {
+                    id: 1,
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    ..Track::default()
+                },
+            ],
+            total: 2,
+        };
+        let out = revalidate_tracks(
+            Some(&dir),
+            crate::cache::DEFAULT_CAP_BYTES,
+            FAVORITES_KEY,
+            |page| served.push(page),
+            || Ok(fresh),
+        )
+        .expect("revalidate ok");
+
+        assert_eq!(served.len(), 1, "the cached page was served first");
+        assert_eq!(served[0].items.len(), 1, "and it was the stale one");
+        assert_eq!(
+            out.items.len(),
+            2,
+            "the fresh page is returned as the answer"
+        );
+        let bytes = crate::cache::get(&dir, FAVORITES_KEY).expect("cache written");
+        let cached: Page<Track> = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(
+            cached.items.len(),
+            2,
+            "and the cache now holds the fresh page"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_favorites_cache_fetches_once_and_stores_it() {
+        // Goal: nothing cached means no prefill, one fetch, and the result is
+        // written to the cache for next time.
+        let dir = scratch("favorites-empty");
+        let mut served = Vec::new();
+        let fresh = Page {
+            items: vec![Track {
+                id: 7,
+                ..Track::default()
+            }],
+            total: 1,
+        };
+        let out = revalidate_tracks(
+            Some(&dir),
+            crate::cache::DEFAULT_CAP_BYTES,
+            FAVORITES_KEY,
+            |page| served.push(page),
+            || Ok(fresh),
+        )
+        .expect("revalidate ok");
+        assert!(served.is_empty(), "nothing to serve from an empty cache");
+        assert_eq!(out.items[0].id, 7);
+        assert!(
+            crate::cache::get(&dir, FAVORITES_KEY).is_some(),
+            "the fetch was written to the cache"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn playlists_are_served_from_cache_then_revalidated() {
+        // Goal: the playlists listing serves+revalidates like favorites - the
+        // `Page<Playlist>` twin of the core above.
+        let dir = scratch("playlists-revalidate");
+        let one = |uuid: &str| Playlist {
+            uuid: uuid.into(),
+            title: uuid.into(),
+            num_tracks: 1,
+            duration_secs: 10,
+        };
+        crate::cache::put(
+            &dir,
+            PLAYLISTS_KEY,
+            &serde_json::to_vec(&Page {
+                items: vec![one("p1")],
+                total: 1,
+            })
+            .expect("serialize"),
+            crate::cache::DEFAULT_CAP_BYTES,
+        )
+        .expect("seed the cache");
+
+        let mut served = Vec::new();
+        let fresh = Page {
+            items: vec![one("p1"), one("p2")],
+            total: 2,
+        };
+        let out = revalidate_playlists(
+            Some(&dir),
+            crate::cache::DEFAULT_CAP_BYTES,
+            |page| served.push(page),
+            || Ok(fresh),
+        )
+        .expect("revalidate ok");
+
+        assert_eq!(served.len(), 1, "the cached page was served first");
+        assert_eq!(served[0].items.len(), 1, "and it was the stale one");
+        assert_eq!(
+            out.items.len(),
+            2,
+            "the fresh page is returned as the answer"
+        );
+        let bytes = crate::cache::get(&dir, PLAYLISTS_KEY).expect("cache written");
+        let cached: Page<Playlist> = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(cached.items.len(), 2, "and the cache holds the fresh page");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_playlist_tracks_cache_key_carries_the_playlist_uuid() {
+        // Goal: two playlists must not share one cache entry - the key is per
+        // playlist.
+        assert_eq!(playlist_tracks_key("abc"), "playlist:abc");
+        assert_ne!(playlist_tracks_key("abc"), playlist_tracks_key("xyz"));
     }
 
     #[test]
