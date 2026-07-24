@@ -58,6 +58,7 @@ const HEADER: &str = "\
 #   exclusive     true or false; --exclusive and --shared override it
 #   log_level     off, error, warn, info, debug or trace
 #   update_check  true or false; whether to check the forge for a newer release
+#   cache_size    album-art cache ceiling in MiB (default 256)
 ";
 
 /// `$XDG_CONFIG_HOME/priel/settings.conf`, falling back to `~/.config`.
@@ -87,6 +88,10 @@ pub struct Settings {
     /// the default (on). Only ever read from the file - no picker sets it, so it
     /// is never written back automatically; a user turns it off by hand.
     pub update_check: Option<bool>,
+    /// The album-art cache ceiling in MiB. Unset means the default (256). Like
+    /// [`Self::update_check`], only ever read from the file - no picker sets it -
+    /// so it is never written back automatically; a user sets it by hand.
+    pub cache_size: Option<u64>,
 }
 
 /// Something worth saying about the file, held until there is a log to say it to.
@@ -134,6 +139,9 @@ impl Settings {
         }
         if let Some(check) = self.update_check {
             out.push(("update_check", check.to_string()));
+        }
+        if let Some(size) = self.cache_size {
+            out.push(("cache_size", size.to_string()));
         }
         out
     }
@@ -248,6 +256,14 @@ pub fn parse(text: &str) -> Loaded {
                 line_no,
                 &mut notes,
             ),
+            "cache_size" => set_once(
+                &mut settings.cache_size,
+                parse_u64(value),
+                key,
+                value,
+                line_no,
+                &mut notes,
+            ),
             _ => notes.push(Note::warn(format!(
                 "line {line_no} sets `{key}`, which priel knows nothing about; ignoring it"
             ))),
@@ -306,6 +322,12 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+/// A whole non-negative number, or `None` for anything else - a malformed
+/// `cache_size` line is dropped and named rather than stopping priel starting.
+fn parse_u64(value: &str) -> Option<u64> {
+    value.trim().parse().ok()
 }
 
 /// The text of a settings file with `chosen` applied to it.
@@ -537,6 +559,17 @@ mod tests {
     }
 
     #[test]
+    fn the_cache_size_key_reads_a_number_and_rejects_anything_else() {
+        // Goal: the album-art cache ceiling in MiB - a whole number a user sets
+        // by hand, and a non-number is dropped with a warning, not guessed.
+        assert_eq!(parse("cache_size = 512\n").settings.cache_size, Some(512));
+        assert_eq!(parse("cache_size = 0\n").settings.cache_size, Some(0));
+        let loaded = parse("cache_size = lots\n");
+        assert_eq!(loaded.settings.cache_size, None);
+        assert!(warnings(&loaded)[0].contains("lots"), "{:?}", loaded.notes);
+    }
+
+    #[test]
     fn a_key_set_twice_keeps_the_first_and_says_so() {
         // Goal: first-wins is also what `merge` edits, so a read and a write
         // agree about which of the two lines is the live one. Silently taking
@@ -662,6 +695,7 @@ oversampling = 4
             exclusive: Some(true),
             log_level: None,
             update_check: None,
+            cache_size: None,
         };
         save(&path, &chosen).expect("the directory is created on the way");
         let back = load(&path);
