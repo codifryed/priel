@@ -3207,8 +3207,13 @@ impl App {
         }
         self.dirty = true;
         // The preload reads from the grown queue: a fill that lands while the
-        // last loaded track is playing is what makes the next one there to load.
-        self.schedule_next();
+        // last loaded track is playing with nothing queued behind it is what
+        // makes the next one there to load. Gated so a fill page cannot pile a
+        // second preload onto one already committed - the duplicate that looped
+        // the second track under shuffle.
+        if self.wants_preload() {
+            self.schedule_next();
+        }
         self.request_next_fill();
     }
 
@@ -3384,6 +3389,19 @@ impl App {
         }
     }
 
+    /// Whether a preload should be scheduled right now.
+    ///
+    /// The same decision the tick-driven path makes in [`Self::decide`], reused
+    /// so a caller that grows the queue - a fill page or a radio page - cannot
+    /// append a second preload on top of one already committed to mpv's
+    /// playlist. That duplicate entry is what let a shuffle loop the second
+    /// track: mpv chews through `[A, B, B, B, ...]` and each `B -> B` is a
+    /// same-id transition the app cannot see. Gating the growers here, rather
+    /// than changing `decide`, keeps `decide` the one place the call is made.
+    fn wants_preload(&self) -> bool {
+        Self::decide(&self.tick()).preload
+    }
+
     /// Ask for the radio of whatever is playing, once.
     ///
     /// Called from the preload path rather than from the end-of-track fallback,
@@ -3461,8 +3479,12 @@ impl App {
             seed.title
         ));
         self.dirty = true;
-        // The ordinary preload, which is what carries every other track change.
-        self.schedule_next();
+        // The ordinary preload, which is what carries every other track change -
+        // gated by the same decision, so a radio page cannot pile a second
+        // preload onto one already committed.
+        if self.wants_preload() {
+            self.schedule_next();
+        }
         // If the track ran out before this arrived, the end-of-track fallback
         // has already fired and set the guard that stops it firing again. The
         // thing it was waiting for has now turned up, so the guard is cleared
@@ -12959,6 +12981,87 @@ mod tests {
         assert!(
             fills(&requests(&r)).is_empty(),
             "and nothing more is asked for once it is complete"
+        );
+    }
+
+    #[test]
+    fn a_fill_page_does_not_re_preload_when_a_next_is_already_queued() {
+        // Goal: #53. A track plays with the next already preloaded in mpv. A
+        // queue fill page landing must not schedule that next again - the
+        // duplicate preload that piled up as [A, B, B, ...] and looped the
+        // second track, because each B -> B is a same-id transition the app
+        // cannot see.
+        let mut r = rig();
+        r.app.queue = (1..=5).map(|i| track(i, "T", "A")).collect();
+        r.app.order = (0..5).collect();
+        r.app.queue_pos = 0;
+        r.app.now_playing = Some(track(1, "T", "A"));
+        r.app.status.playing = true;
+        r.app.status.has_next = true; // mpv holds the preloaded next
+        r.app.next_intended = Some(2); // and the app queued it
+        r.app.current_target = None; // the current track is settled
+        r.app.queue_fill = Some(QueueFill {
+            source: QueueSource::Favorites,
+            next: 5,
+            total: 10,
+            inflight: true,
+        });
+        let _ = requests(&r);
+
+        r.to_app
+            .send(FromWorker::QueueFilled {
+                source: QueueSource::Favorites,
+                offset: 5,
+                page: track_page(6..8, 10),
+            })
+            .unwrap();
+        r.app.drain_worker();
+
+        assert_eq!(r.app.queue.len(), 7, "the fill still grows the queue");
+        assert!(
+            !requests(&r)
+                .iter()
+                .any(|c| matches!(c, ToWorker::Resolve(_))),
+            "but it must not re-issue a preload when a next is already queued"
+        );
+    }
+
+    #[test]
+    fn a_fill_page_preloads_when_nothing_is_queued_behind_the_current_track() {
+        // Goal: the flip side, and the reason on_queue_filled preloads at all. A
+        // fill that lands while the last loaded track plays with nothing behind
+        // it is what makes the newly-available next there to load.
+        let mut r = rig();
+        r.app.queue = (1..=3).map(|i| track(i, "T", "A")).collect();
+        r.app.order = (0..3).collect();
+        r.app.queue_pos = 0;
+        r.app.now_playing = Some(track(1, "T", "A"));
+        r.app.status.playing = true;
+        r.app.status.has_next = false; // nothing preloaded yet
+        r.app.next_intended = None;
+        r.app.current_target = None; // the current track is settled
+        r.app.queue_fill = Some(QueueFill {
+            source: QueueSource::Favorites,
+            next: 3,
+            total: 10,
+            inflight: true,
+        });
+        let _ = requests(&r);
+
+        r.to_app
+            .send(FromWorker::QueueFilled {
+                source: QueueSource::Favorites,
+                offset: 3,
+                page: track_page(4..6, 10),
+            })
+            .unwrap();
+        r.app.drain_worker();
+
+        assert!(
+            requests(&r)
+                .iter()
+                .any(|c| matches!(c, ToWorker::Resolve(_))),
+            "with nothing queued behind, the fill preloads the now-available next"
         );
     }
 
