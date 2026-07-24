@@ -86,8 +86,8 @@ const COVER_MIN_HEIGHT: u16 = 30;
 /// The one place the height is decided, because two callers need to agree on
 /// it: [`render`] splits the screen by it, and [`now_playing`] fills what it is
 /// given. Drawn only when all three of the cover's conditions hold - it is
-/// wanted, the terminal has the rows, and there is a cover for the track that is
-/// playing - which mirrors the three ways the queue column can be absent.
+/// wanted, the terminal has the rows, and the track has art (held or still
+/// loading) - which mirrors the three ways the queue column can be absent.
 fn now_playing_rows(area: Rect, app: &App) -> u16 {
     if cover_wanted(area, app) {
         COVER_ROWS.saturating_add(2)
@@ -96,13 +96,17 @@ fn now_playing_rows(area: Rect, app: &App) -> u16 {
     }
 }
 
-/// Whether the cover is drawn this frame: wanted, room for it, and one to draw.
+/// Whether the cover column is reserved this frame: wanted, room for it, and the
+/// track has art.
 ///
-/// Shown only when there is something to show, like the queue column: a track
-/// with no cover, or a cover still on its way, reserves no rows. That is what
-/// keeps the box from standing half-empty while the download runs.
+/// Reserved on whether the track *has* art, not on whether the image has
+/// decoded yet ([`App::now_playing_has_cover`]): a track with a cover still on
+/// its way holds the column and shows a placeholder, so the box does not
+/// collapse and then jump back on the moment between a track change and its art
+/// arriving - nearly every change. Only a track with no art at all folds it,
+/// like the queue column when there is nothing to show.
 fn cover_wanted(area: Rect, app: &App) -> bool {
-    app.cover_shown && area.height >= COVER_MIN_HEIGHT && app.cover_for_now_playing().is_some()
+    app.cover_shown && area.height >= COVER_MIN_HEIGHT && app.now_playing_has_cover()
 }
 
 /// The three widths every overlay is one of, and the margin all of them keep.
@@ -2809,28 +2813,35 @@ fn key_row(f: &mut Frame, app: &mut App, area: Rect) {
 /// Whether to draw at all is [`cover_wanted`], the same question [`render`]
 /// asked to size the box - so the two cannot disagree about whether there is a
 /// cover this frame, and a box sized for one that then drew none would strand
-/// the text in empty rows.
+/// the text in empty rows. When the column is wanted but the art has not decoded
+/// yet, the column is held with a muted placeholder rather than left empty, so
+/// the box keeps the height it was sized for.
 fn cover_column(f: &mut Frame, app: &App, inner: Rect) -> Rect {
     if !cover_wanted(f.area(), app) {
         return inner;
     }
-    let Some(image) = app.cover_for_now_playing() else {
-        return inner;
-    };
     let rows = inner.height;
     // Twice as wide as tall for a square picture, but never wider than half the
     // box - a narrow terminal keeps the words legible ahead of the art.
     let cols = rows
         .saturating_mul(2)
         .min(inner.width.saturating_sub(inner.width / 2));
-    let art = crate::art::draw(image, rows, cols);
-    f.render_widget(
-        Paragraph::new(art),
-        Rect {
-            width: cols,
-            ..inner
-        },
-    );
+    let art_rect = Rect {
+        width: cols,
+        ..inner
+    };
+    match app.cover_for_now_playing() {
+        Some(image) => f.render_widget(
+            Paragraph::new(crate::art::draw(image, rows, cols)),
+            art_rect,
+        ),
+        // The art is still on its way: hold the column with a muted block rather
+        // than collapse and jump when it lands. See [`cover_wanted`].
+        None => f.render_widget(
+            Block::default().style(Style::default().bg(app.theme().muted)),
+            art_rect,
+        ),
+    }
     // One blank column between the art and the text.
     let taken = cols.saturating_add(1);
     Rect {
@@ -6007,6 +6018,67 @@ mod tests {
         assert!(
             !bare.iter().any(|l| l.contains('\u{2580}')),
             "a cover was drawn with the column folded: {bare:?}"
+        );
+    }
+
+    #[test]
+    fn the_cover_box_holds_its_height_while_the_art_loads() {
+        // Goal: issue #49. The art arrives a moment after the track, and the box
+        // must not collapse and then jump back when it lands - it does that on
+        // nearly every track change. A track with a cover id but no decoded image
+        // yet reserves the cover column just as a held cover does; only a track
+        // with no art at all folds it.
+        let tall = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        let mut sc = screen();
+        // A cover id, but the image has not arrived (a fetch in flight).
+        sc.app.now_playing = Some(Track {
+            cover: "art-id".into(),
+            ..track(1, "Reckoner")
+        });
+        assert!(
+            sc.app.now_playing_has_cover(),
+            "a track with a cover id has art coming"
+        );
+        let loading = super::now_playing_rows(tall, &sc.app);
+        assert!(
+            loading > 5,
+            "the box holds the tall cover height while loading"
+        );
+
+        // The same track once the image is in: the height does not change.
+        with_cover(&mut sc, 1);
+        assert_eq!(
+            super::now_playing_rows(tall, &sc.app),
+            loading,
+            "the box is the same height loaded as loading, so it does not jump"
+        );
+
+        // Rendering the loading state draws a placeholder, not the half-block art.
+        let mut sc2 = screen();
+        sc2.app.now_playing = Some(Track {
+            cover: "art-id".into(),
+            ..track(1, "Reckoner")
+        });
+        let framed = draw(&mut sc2.app, 100, 40);
+        assert!(
+            !framed.iter().any(|l| l.contains('\u{2580}')),
+            "no half-block art is painted while it is still loading: {framed:?}"
+        );
+
+        // A track with no cover id at all folds the column.
+        let mut bare = screen();
+        bare.app.now_playing = Some(track(2, "Weird Fishes"));
+        assert!(!bare.app.now_playing_has_cover(), "no cover id, no art");
+        assert_eq!(
+            super::now_playing_rows(tall, &bare.app),
+            5,
+            "a track with no art folds the cover column"
         );
     }
 
