@@ -1270,6 +1270,16 @@ mod tests {
             .expect("the worker should answer")
     }
 
+    /// Zero the HTTP retry backoff before a request is made to fail. The tests
+    /// below fail one by pointing it at a dead port, whose connection error is
+    /// transient, so the worker retries it on the real 250ms..2s schedule - a few
+    /// seconds of sleeping the suite has no reason to pay. Idempotent and global,
+    /// which is safe here: only a failing request ever reaches a retry, so this
+    /// changes nothing for the tests that succeed.
+    fn no_retry_sleeps() {
+        priel_core::set_http_backoff_millis(0);
+    }
+
     #[test]
     fn a_favorites_reply_names_the_page_it_is_for() {
         // Goal: two pages of the same listing are told apart by the offset they
@@ -1351,6 +1361,7 @@ mod tests {
         // failure must not put a `Failed` on the notice line. It sends nothing
         // and the queue keeps what it has. Method: point the fill at a dead port
         // and confirm the next thing the channel carries is not this fill.
+        no_retry_sleeps();
         let base = origin();
         let w = spawn_with(move || {
             let mut c = Client::new("tok".into())?.with_base_url(base);
@@ -1381,6 +1392,7 @@ mod tests {
     fn a_failed_page_says_which_page_it_was() {
         // Goal: a view waiting on a page has to recognise its own failure, or it
         // waits forever for a reply that is never coming.
+        no_retry_sleeps();
         let base = origin();
         let w = spawn_with(move || {
             let mut c = Client::new("tok".into())?.with_base_url(base);
@@ -1628,6 +1640,7 @@ mod tests {
     fn a_failed_listing_page_names_the_page_and_the_listing_too() {
         // Goal: a failure has to carry the same identity a success does, or one
         // view's dead request latches another view's paging.
+        no_retry_sleeps();
         let base = origin();
         let w = spawn_with(move || {
             let mut c = Client::new("tok".into())?.with_base_url(base);
@@ -1710,6 +1723,7 @@ mod tests {
         // put exactly that one back. Correlating by identity rather than by
         // arrival order is what lets it: two tracks toggled in quick succession
         // must not undo each other.
+        no_retry_sleeps();
         let base = origin();
         let w = spawn_with(move || {
             let mut c = Client::new("tok".into())?.with_base_url(base);
@@ -1794,6 +1808,7 @@ mod tests {
         // build on its own thread precisely so this is a message, not a panic
         // before the UI exists.
         // Port 1 on loopback refuses at once, so this never touches the network.
+        no_retry_sleeps();
         let w = worker_on("http://127.0.0.1:1".into());
         match next(&w) {
             FromWorker::Failed { detail, .. } => assert!(detail.contains("startup"), "{detail}"),
@@ -1805,6 +1820,7 @@ mod tests {
     fn a_request_that_fails_reports_which_one_it_was() {
         // Goal: the notice line is one line, so the message has to identify the
         // failed call by itself.
+        no_retry_sleeps();
         let base = origin();
         let w = spawn_with(move || {
             let mut c = Client::new("tok".into())?.with_base_url(base);
@@ -1848,6 +1864,7 @@ mod tests {
     fn every_request_kind_reports_its_own_failure() {
         // Goal: each arm formats its own message. One arm reporting another's
         // name would send the user looking in the wrong place.
+        no_retry_sleeps();
         let base = origin();
         let w = spawn_with(move || {
             let mut c = Client::new("tok".into())?.with_base_url(base);
