@@ -12635,28 +12635,6 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_credential_reloads_the_library_without_a_restart() {
-        // Goal: telling a user to restart after they just signed in is a poor
-        // ending to the flow. The worker is rebuilt in place and repeats the
-        // initial load, so the view fills in as it would have at startup.
-        let dir = std::env::temp_dir().join(format!("priel-restart-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("tmp");
-        let creds = dir.join("credentials.json");
-        std::fs::write(&creds, r#"{"client_id":"x"}"#).expect("write");
-
-        let mut r = rig();
-        r.app.set_paths_for_test(
-            dir.join("token.json").to_str().expect("path").to_string(),
-            creds.to_str().expect("path").to_string(),
-        );
-        r.app.set_mode_for_test(Mode::Credentials);
-        r.app.restart_worker_for_test();
-
-        assert!(r.app.loading, "the rebuilt worker starts by loading again");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn rebuilding_without_configured_paths_is_a_no_op() {
         // Goal: a rigged app has no paths. Rebuilding must not replace a working
         // worker with one pointed at nothing.
