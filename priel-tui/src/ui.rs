@@ -106,7 +106,7 @@ fn now_playing_rows(area: Rect, app: &App) -> u16 {
 /// arriving - nearly every change. Only a track with no art at all folds it,
 /// like the queue column when there is nothing to show.
 fn cover_wanted(area: Rect, app: &App) -> bool {
-    app.cover_shown && area.height >= COVER_MIN_HEIGHT && app.now_playing_has_cover()
+    app.cover_box_shown() && area.height >= COVER_MIN_HEIGHT && app.now_playing_has_cover()
 }
 
 /// The three widths every overlay is one of, and the margin all of them keep.
@@ -860,7 +860,7 @@ const HELP_LEFT: &[(&str, &[HelpRow])] = &[
             // ordinary width: the bottom row gives the focus hint up first and
             // never had room for this one.
             row(&[("W", Some(Hit::QueueColumn))], "show / hide the queue"),
-            row(&[("C", Some(Hit::CoverArt))], "show / hide the cover"),
+            row(&[("C", Some(Hit::CoverArt))], "cycle the cover"),
         ],
     ),
     (
@@ -2104,7 +2104,7 @@ fn header(f: &mut Frame, app: &mut App, area: Rect) {
     // will never reach is a control telling the listener a lie.
     let carrying_on = app.radio_follows();
     let queue_column = app.queue_shown;
-    let cover = app.cover_shown;
+    let cover = app.cover_on();
     // Only where the cover can appear, so the control is not offered where it
     // would do nothing. The same reason the queue toggle is width-gated - and
     // the height is the *frame's*, because this bar's own rect is one row tall.
@@ -2239,6 +2239,15 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
         .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // The full-pane half of the cover cycle stands in for the rows, gated with
+    // the ▣ control on COVER_MIN_HEIGHT so the mouse always has a way back out of
+    // a pane it can no longer click a row in. The list keeps its selection
+    // underneath; `list_inner` is cleared so a click there lands on nothing.
+    if app.cover_full_pane() && f.area().height >= COVER_MIN_HEIGHT {
+        app.list_inner = Rect::default();
+        full_pane_cover(f, app, inner);
+        return;
+    }
     let inner = track_header(f, app, inner);
     app.list_inner = inner;
 
@@ -2288,6 +2297,62 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
             },
         );
     }
+}
+
+/// Fill the list pane with the now-playing cover instead of the rows, or a
+/// muted placeholder when there is nothing to show.
+///
+/// The full-pane half of [`crate::app::CoverMode`]. The cover is the largest
+/// centred square the pane holds: a cell is one pixel wide and two tall, so a
+/// square wants `cols == 2*rows` (see [`crate::art`]), which caps the rows at
+/// half the width. The now-playing box keeps its own thumbnail; this is the same
+/// art at pane size, not a move of it.
+///
+/// Art still on its way holds the square with a muted block rather than a message
+/// a decode would replace a frame later, mirroring [`cover_column`]. Nothing
+/// playing, or a track with no art at all, gets a centred word so the pane reads
+/// as chosen rather than as broken.
+fn full_pane_cover(f: &mut Frame, app: &App, inner: Rect) {
+    let t = app.theme();
+    let rows = inner.height.min(inner.width / 2);
+    if rows > 0 {
+        let cols = rows.saturating_mul(2);
+        let square = Rect {
+            x: inner.x + inner.width.saturating_sub(cols) / 2,
+            y: inner.y + inner.height.saturating_sub(rows) / 2,
+            width: cols,
+            height: rows,
+        };
+        match app.cover_for_now_playing() {
+            Some(image) => {
+                f.render_widget(Paragraph::new(crate::art::draw(image, rows, cols)), square);
+                return;
+            }
+            // Held while the art decodes, like the box thumbnail, so the pane
+            // does not flash a message a frame before the picture lands.
+            None if app.now_playing_has_cover() => {
+                f.render_widget(Block::default().style(Style::default().bg(t.muted)), square);
+                return;
+            }
+            None => {}
+        }
+    }
+    let msg = if app.now_playing.is_none() {
+        "Nothing playing"
+    } else {
+        "No cover art"
+    };
+    let line = Rect {
+        y: inner.y + inner.height / 2,
+        height: 1,
+        ..inner
+    };
+    f.render_widget(
+        Paragraph::new(msg)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(t.faint)),
+        line,
+    );
 }
 
 /// The line the list box wears: which list this is, and how much of it is here.
@@ -3915,7 +3980,7 @@ mod tests {
         OVERLAY_MEDIUM, OVERLAY_NARROW, OVERLAY_WIDE, QUEUE_COLS, QUEUE_ROWS_PER_ENTRY, WIDE_COLS,
         codec_label, hint_width, push_hints, render, verdict_colour, verdict_words,
     };
-    use crate::app::{App, Click, Focus, Hit, Mode, View};
+    use crate::app::{App, Click, CoverMode, Focus, Hit, Mode, View};
     use crate::cli::ThemeName;
     use crate::theme::Theme;
     use crate::worker::{FromWorker, ToWorker};
@@ -5981,7 +6046,7 @@ mod tests {
         let mut without = screen();
         without.app.now_playing = Some(track(1, "Reckoner"));
         without.app.status.position = 61.0;
-        without.app.cover_shown = false;
+        without.app.cover_mode = CoverMode::Hidden;
         let bare = draw(&mut without.app, 100, 40);
 
         // Each fact is the same number of rows off the bottom either way. Found
@@ -6008,6 +6073,48 @@ mod tests {
         assert!(
             !bare.iter().any(|l| l.contains('\u{2580}')),
             "a cover was drawn with the column folded: {bare:?}"
+        );
+    }
+
+    #[test]
+    fn the_full_pane_cover_replaces_the_list() {
+        // Goal: the full-pane mode gives the list pane over to the art. The proof
+        // is that the list's own click region is cleared - a click lands on no
+        // row, because none are drawn - while half blocks fill the pane. The
+        // now-playing box keeps its own thumbnail, so the cover glyph alone is not
+        // proof the list went; `list_inner` being empty is.
+        let mut sc = screen();
+        sc.app.now_playing = Some(track(1, "Reckoner"));
+        with_cover(&mut sc, 1);
+        sc.app.cover_mode = CoverMode::FullPane;
+        let framed = draw(&mut sc.app, 100, 40);
+        assert_eq!(
+            sc.app.list_inner,
+            Rect::default(),
+            "a row was left clickable behind the full-pane art"
+        );
+        assert!(
+            framed.iter().any(|l| l.contains('\u{2580}')),
+            "no full-pane cover was drawn: {framed:?}"
+        );
+    }
+
+    #[test]
+    fn the_full_pane_cover_shows_a_placeholder_when_nothing_plays() {
+        // Goal: the chosen behaviour with no cover to show is a centred word, not
+        // a blank pane and not a fall back to the list. The list still gives way
+        // (its region is cleared), and the word is on screen.
+        let mut sc = screen();
+        sc.app.cover_mode = CoverMode::FullPane;
+        let framed = draw(&mut sc.app, 100, 40);
+        assert_eq!(
+            sc.app.list_inner,
+            Rect::default(),
+            "the list did not give way to the empty full pane"
+        );
+        assert!(
+            framed.iter().any(|l| l.contains("Nothing playing")),
+            "no placeholder shown in the empty full pane: {framed:?}"
         );
     }
 
@@ -6106,10 +6213,12 @@ mod tests {
 
     #[test]
     fn the_cover_folds_away_by_key_and_by_control() {
-        // Goal: the cover has a fold, the same way the queue column does - a
-        // listener who wants the rows for the list has to be able to say so, at
-        // any size. Method: on a terminal tall enough for the art, press the key
-        // and click the control, and read whether the half blocks are there.
+        // Goal: the cover cycle still reaches a fold, the same way the queue
+        // column does - a listener who wants the rows for the list has to be able
+        // to say so, at any size. Method: on a terminal tall enough for the art,
+        // walk the three-way cycle by key and by control and read whether the half
+        // blocks are there. The box thumbnail and the full pane both draw them, so
+        // `has_art` reads shown-versus-hidden, which is the fold.
         let mut sc = screen();
         sc.app.now_playing = Some(track(1, "Reckoner"));
         with_cover(&mut sc, 1);
@@ -6120,13 +6229,26 @@ mod tests {
                 .any(|l| l.contains('\u{2580}'))
         };
 
+        // Default is the box thumbnail: shown.
         assert!(has_art(&mut sc), "the cover is shown by default");
+        // Thumbnail -> full pane: still shown, now filling the list.
+        press(&mut sc.app, 'C');
+        assert!(has_art(&mut sc), "the full pane stopped showing the art");
+        // Full pane -> hidden: folded away.
         press(&mut sc.app, 'C');
         assert!(!has_art(&mut sc), "the key did not fold it away");
+        // Hidden -> thumbnail: back to the start.
         press(&mut sc.app, 'C');
         assert!(has_art(&mut sc), "the key did not bring it back");
 
-        // And the header control runs the same toggle.
+        // The header control runs the same cycle: from the thumbnail, one click
+        // to the full pane (still shown), a second to hidden (folded).
+        let _ = draw(&mut sc.app, 120, 40);
+        click_hit(&mut sc.app, Hit::CoverArt);
+        assert!(
+            has_art(&mut sc),
+            "the control's full pane stopped showing the art"
+        );
         let _ = draw(&mut sc.app, 120, 40);
         click_hit(&mut sc.app, Hit::CoverArt);
         assert!(!has_art(&mut sc), "the control did not fold it away");
