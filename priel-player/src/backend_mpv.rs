@@ -1316,7 +1316,7 @@ fn spawn_downloader(urls: Vec<String>, shared: &Arc<Shared>) {
         for (done, u) in urls.iter().enumerate() {
             // A non-2xx is an `Err` here (the agent keeps ureq's default
             // `http_status_as_error`), matching the old `error_for_status`.
-            let outcome = match HTTP.get(u).call() {
+            let outcome = match priel_core::retry_http(|| HTTP.get(u).call()) {
                 Ok(mut resp) => stream_body(&mut resp, &shared),
                 Err(e) => {
                     log::warn!(target: "priel::download", "segment {} of {total} could not be fetched: {e}", done + 1);
@@ -2045,6 +2045,7 @@ mod tests {
         // Goal: a failed fetch must not leave readers blocked forever. The
         // stream ends short, which is audible, rather than hanging, which is not
         // recoverable without a restart.
+        priel_core::set_http_backoff_millis(0); // the refused fetch is retried; do not sleep for it
         let sh = shared(Vec::new(), false);
         // Port 1 on loopback refuses immediately, so this does not touch DNS.
         spawn_downloader(vec!["http://127.0.0.1:1/x".into()], &sh);
@@ -2066,6 +2067,7 @@ mod tests {
     fn a_direct_source_needs_no_buffer_but_segments_do() {
         // Goal: BTS URLs are handed to mpv untouched; only segmented sources get
         // a registry entry, and each gets a distinct key so two can be live.
+        priel_core::set_http_backoff_millis(0); // the dead segments retry in the background; keep it fast
         let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
         let mut seq = 0;
 
@@ -2235,6 +2237,7 @@ mod tests {
     fn a_segment_that_cannot_be_fetched_says_which_track_ends_short() {
         // Goal: a failed fetch ends the track early with no other symptom. The
         // user hears a song stop; without this nothing anywhere says why.
+        priel_core::set_http_backoff_millis(0); // the failed fetch is retried; do not sleep for it
         let sh = shared(Vec::new(), false);
         let dead = "http://127.0.0.1:1/never".to_string();
         let lines = captured(|| {
