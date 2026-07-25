@@ -1,7 +1,7 @@
-# priel — hi-res terminal client for TIDAL
+# priel: hi-res terminal client for TIDAL
 
 A mouse-first terminal client for TIDAL with a complete VIM keyboard and
-bit-perfect, rate-following playback — straight into PipeWire, or an exclusive
+bit-perfect, rate-following playback, straight into PipeWire or an exclusive
 ALSA device.
 
 > **Unofficial software.** priel is not affiliated with, endorsed by, or
@@ -11,25 +11,25 @@ ALSA device.
 > download or offline-export feature.
 
 On Linux, audio normally passes through the sound server's shared mixer, which
-can resample it to whatever rate the graph is running — so you can be paying for
+can resample it to whatever rate the graph is running, so you can be paying for
 hi-res and hearing a resampled copy without any indication. priel plays straight
 to the hardware and shows you, per track, exactly what the device is doing.
 
-priel is a full TIDAL client — your favorites, playlists (create, edit, delete),
+priel is a full TIDAL client: your favorites, playlists (create, edit, delete),
 mixes, and catalogue search, with shuffle, repeat, and an optional radio
 continuation.
 
-*A **priel** is a tidal channel in the Wadden Sea — the creek that carries the
+*A **priel** is a tidal channel in the Wadden Sea, the creek that carries the
 water in and out of the flats twice a day, on the pull of the moon.*
 
 ## What makes this program different?
 
 - **Helps set up your hardware.** When your system is set for lower quality than
-  the track can deliver, priel flags it and — with your OK — changes the PipeWire
+  the track can deliver, priel flags it and, with your OK, changes the PipeWire
   or Bluetooth setting that's holding it back, instead of leaving you to hand-edit
   configs.
 - **Bit-perfect playback that reads the hardware.** priel grades fidelity against
-  the audio device's live parameters — not what the sound server *claims* —
+  the audio device's live parameters, not what the sound server *claims*,
   because a shared server can report one rate while clocking the card at another.
   Hi-res is reachable on both shared PipeWire and exclusive ALSA; priel shows you,
   per track, which you're getting.
@@ -42,7 +42,7 @@ water in and out of the flats twice a day, on the pull of the moon.*
   playback stays bit-perfect rather than resampling to match.
 - **Mouse-first, with a complete VIM keyboard.** Clickable tabs, transport and a
   scrubbable progress bar; `j`/`k`, `g`/`G`, `/` to filter, `?` for the full
-  reference. Parity runs both ways — no action is reachable by only one of them.
+  reference. Parity runs both ways: no action is reachable by only one of them.
 - **MPRIS support.** The desktop's media keys, panel applets and `playerctl`
   drive it. priel speaks the D-Bus wire protocol directly.
 - **A dependency list you can audit.** Around 100 crates for the whole binary;
@@ -84,10 +84,10 @@ interface with playback stubbed out.
 
 priel follows the XDG layout:
 
-- `~/.config/priel/settings.conf` — theme, device, exclusive, log level
-- `~/.local/state/priel/token.json`, `credentials.json` — session and client key
+- `~/.config/priel/settings.conf`: theme, device, exclusive, log level
+- `~/.local/state/priel/token.json`, `credentials.json`: session and client key
   (runtime state, not settings; no flag moves them)
-- `~/.local/state/priel/priel.log` — diagnostics, fresh each run; mpv's own
+- `~/.local/state/priel/priel.log`: diagnostics, fresh each run; mpv's own
   messages land here too
 
 ```ini
@@ -132,9 +132,9 @@ itself clickable. The essentials:
 ## Development
 
 ```
-priel-core     lib  — API access + hi-res stream resolution (blocking, UI-agnostic)
-priel-player   lib  — embedded libmpv player, thread-owned, stream_cb protocol
-priel-tui      bin  — ratatui frontend (builds the `priel` binary)
+priel-core     lib  - API access + hi-res stream resolution (blocking, UI-agnostic)
+priel-player   lib  - embedded libmpv player, thread-owned, stream_cb protocol
+priel-tui      bin  - ratatui frontend (builds the `priel` binary)
 ```
 
 `make check` runs formatting, clippy at pedantic over both feature
