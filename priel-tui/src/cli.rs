@@ -30,6 +30,13 @@ pub const DISCLAIMER: &str = "priel is unofficial software. It is not affiliated
 or sponsored by TIDAL or Aspiro AB. TIDAL is a trademark of its respective owner. A subscription \
 is required; priel neither circumvents access controls nor exports content for offline use.";
 
+/// The default album-art cache ceiling, in whole MiB.
+///
+/// Lives here rather than in the `cache` module because this file is shared with
+/// the asset generator (`priel-gen-assets`), which has no `cache` module - a
+/// `crate::cache` path would not compile there. `cache` reads it back.
+pub const DEFAULT_CACHE_MIB: u64 = 256;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "priel",
@@ -257,7 +264,7 @@ impl Cli {
     pub fn cache_size(&self, from_file: Option<u64>) -> u64 {
         self.cache_size
             .or(from_file)
-            .unwrap_or(crate::cache::DEFAULT_CAP_MIB)
+            .unwrap_or(DEFAULT_CACHE_MIB)
             .saturating_mul(1024 * 1024)
     }
 

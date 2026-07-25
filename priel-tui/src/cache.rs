@@ -44,11 +44,13 @@ use std::time::SystemTime;
 ///
 /// Art is small (a 160 px cover is tens of kilobytes), so this holds a large
 /// library's covers many times over; the cap is a backstop, not a squeeze.
-pub const DEFAULT_CAP_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_CAP_BYTES: u64 = DEFAULT_CAP_MIB * 1024 * 1024;
 
 /// The default cache ceiling in whole MiB - the unit the flag and settings key
-/// speak, so the default reads the same in both places.
-pub const DEFAULT_CAP_MIB: u64 = 256;
+/// speak, so the default reads the same in both places. Defined in `cli`, the
+/// one module the asset generator also compiles, so a single figure serves the
+/// flag, the settings default and the cache.
+pub const DEFAULT_CAP_MIB: u64 = crate::cli::DEFAULT_CACHE_MIB;
 
 /// The album-art cache directory: `$XDG_CACHE_HOME/priel/covers`, or
 /// `~/.cache/priel/covers` when `XDG_CACHE_HOME` is unset or empty.
