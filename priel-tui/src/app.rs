@@ -2882,12 +2882,24 @@ impl App {
     }
 
     /// Take up a track mpv moved to on its own.
+    ///
+    /// **Which copy.** A queue may hold the same track twice - a playlist that
+    /// lists it twice, a listing whose service sent a row over again - and mpv
+    /// says what is playing with an id, which names every copy of it. The first
+    /// one is the wrong answer: it walks the position backwards, and the queue
+    /// then plays that stretch of itself round for ever without reaching its
+    /// end. A handover lands on the entry the preload asked for, so that is the
+    /// one asked about first - the same question [`Self::schedule_next`] put,
+    /// with the same answer. Anything else falls back to the search.
     fn adopt(&mut self, id: u64) {
         self.mint_play();
         self.expected_id = id;
         // We just advanced, so the end-of-track fallback must not also fire.
         self.advanced = true;
-        if let Some(p) = self.queue.iter().position(|t| t.id == id) {
+        let preloaded = self
+            .next_pos(self.repeat)
+            .filter(|&p| self.queue.get(p).is_some_and(|t| t.id == id));
+        if let Some(p) = preloaded.or_else(|| self.queue.iter().position(|t| t.id == id)) {
             self.queue_pos = p;
             self.follow_queue_cursor();
             self.now_playing = Some(self.queue[p].clone());
@@ -10846,6 +10858,31 @@ mod tests {
 
         assert_eq!(r.app.queue_pos, 1);
         assert_eq!(r.app.now_playing.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn a_handover_onto_a_repeated_track_lands_on_the_copy_that_was_preloaded() {
+        // Goal: a queue can hold the same track twice - a playlist that lists it
+        // twice, or a listing whose service sent a row over again - and mpv
+        // reports what is playing as an id, which names every copy of it. Taking
+        // the first sends the position backwards, and the queue then plays that
+        // stretch of itself round for ever. Method: play the middle of [A, B, A]
+        // and hand over to the third entry.
+        let mut r = rig();
+        r.app.queue = vec![track(1, "A", "X"), track(2, "B", "Y"), track(1, "A", "X")];
+        r.app.order = (0..3).collect();
+        r.app.queue_pos = 1;
+        r.app.now_playing = Some(track(2, "B", "Y"));
+        r.app.expected_id = 2;
+
+        r.app.status.current_id = 1; // the third entry, whose id is the first's
+        r.app.status.playing = true;
+        r.app.refresh_for_test();
+
+        assert_eq!(
+            r.app.queue_pos, 2,
+            "the copy after the one that was playing, not the one behind it"
+        );
     }
 
     #[test]
