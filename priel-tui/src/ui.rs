@@ -677,18 +677,24 @@ fn tail(s: &str, width: usize) -> String {
     s.chars().skip(count - width).collect()
 }
 
-/// Draw the consent screen.
+/// Draw the client-key screen.
 ///
-/// Its three answers - download it, not now, quit - are controls, laid out and
-/// hit-boxed in the same walk the header's are. A stray click is still not
-/// consent: the app answers a click here only where it lands on one of these.
+/// Not a consent prompt: priel fetches the key it needs automatically (a single
+/// unauthenticated GET of a public client id). This screen reports progress and,
+/// if the fetch fails, explains why and offers a retry. Its controls are
+/// hit-boxed in the same walk the header's are, so the mouse reaches them too.
 fn credentials_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme();
-    let status = app.credential_status().map(ToString::to_string);
+    let fetching = app.credentials_fetching();
     // Modal: whatever the header and the bottom row registered this frame is
     // behind this screen and must not be reachable through it.
     app.hits.clear();
-    let rows = u16::try_from(CREDENTIALS_PROMPT.len()).unwrap_or(u16::MAX);
+    let text = if fetching {
+        CREDENTIALS_FETCHING
+    } else {
+        CREDENTIALS_FAILED
+    };
+    let rows = u16::try_from(text.len()).unwrap_or(u16::MAX);
     let width = overlay_width(area, OVERLAY_MEDIUM);
     let height = rows.saturating_add(6).min(area.height);
     let rect = Rect {
@@ -703,16 +709,16 @@ fn credentials_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .style(t.surface())
         .border_style(Style::default().fg(t.notice))
-        .title(" priel needs a client identity ");
+        .title(" priel needs a client key ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let lines: Vec<Line<'static>> = CREDENTIALS_PROMPT
+    let lines: Vec<Line<'static>> = text
         .iter()
         .map(|l| {
-            // The address and the destination path are the two facts a reader
-            // should be able to find without reading the prose.
-            let emphasised = l.contains("github.com") || l.contains("credentials.json");
+            // The one fact a reader may need to act on is where to put a key of
+            // their own, so that line is the one picked out.
+            let emphasised = l.contains("credentials.json");
             let style = if emphasised {
                 Style::default().fg(t.accent)
             } else {
@@ -723,9 +729,10 @@ fn credentials_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 
-    // A blank line after the prose, then the choices, then whatever the last
-    // attempt had to say. Placed by hand rather than pushed onto the paragraph
-    // because the controls need a rect of their own to register hit boxes in.
+    // A blank line after the prose, then the controls. Retry only appears when
+    // nothing is in flight; quit is always there. Placed by hand rather than
+    // pushed onto the paragraph because the controls need a rect of their own to
+    // register hit boxes in.
     let dim = Style::default().fg(t.muted);
     let key = Style::default().fg(t.accent);
     let choices = rows.saturating_add(1);
@@ -739,57 +746,39 @@ fn credentials_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let mut bar = ControlBar::new(line);
     bar.label("    [", dim);
-    bar.button("f", Hit::FetchCredentials, key);
-    bar.label("] download it   [", dim);
-    bar.button("Esc", Hit::DeclineCredentials, key);
-    bar.label("] not now   [", dim);
+    if !fetching {
+        bar.button("r", Hit::FetchCredentials, key);
+        bar.label("] retry   [", dim);
+    }
     bar.button("q", Hit::Quit, key);
     bar.label("] quit", dim);
     app.hits.extend(bar.hits.iter().copied());
     f.render_widget(Paragraph::new(Line::from(bar.spans)), line);
-
-    if let Some(status) = status
-        && choices.saturating_add(1) < inner.height
-    {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("    {status}"),
-                Style::default().fg(t.notice),
-            ))),
-            Rect {
-                y: line.y.saturating_add(1),
-                height: 1,
-                ..inner
-            },
-        );
-    }
 }
 
-/// The first-run consent screen for obtaining a client identity.
+/// The client-key screen while the automatic fetch is in flight.
+const CREDENTIALS_FETCHING: &[&str] = &[
+    "priel needs a client key to sign you in, and fetches",
+    "one automatically from the open-source project the",
+    "native Linux players share - not priel's own key.",
+    "",
+    "Fetching it now…",
+];
+
+/// The client-key screen when the automatic fetch has failed.
 ///
-/// Kept short enough to actually be read, but it still has to carry four facts:
-/// what is downloaded, from where, that the key is not priel's, and where it
-/// lands. A user who later learns whose key this is should find nothing here
-/// they were not told - that is the whole point of asking rather than doing it
-/// silently.
-const CREDENTIALS_PROMPT: &[&str] = &[
-    "priel needs a client key before it can sign you in, and it does not",
-    "ship one of its own.",
+/// It carries what a user can act on: the likely cause, that a retry may help,
+/// and how to supply a key by hand instead.
+const CREDENTIALS_FAILED: &[&str] = &[
+    "priel could not fetch the client key it needs to",
+    "sign you in.",
     "",
-    "The key is published in an open-source project that the other Linux",
-    "players for this service all rely on:",
+    "The upstream credentials may have changed; new ones",
+    "can take a little while to appear - retry in a moment.",
     "",
-    "    github.com/EbbLabs/python-tidal",
-    "",
-    "It is not priel's key and priel is not an official client. This is",
-    "how every native player on Linux works.",
-    "",
-    "If you continue, priel downloads it once and saves it to",
-    "~/.local/state/priel/. Nothing of yours is sent anywhere, and you",
-    "will not be asked again.",
-    "",
-    "Prefer to do it yourself? Put a client_id and client_secret in",
-    "~/.config/priel/credentials.json and restart priel.",
+    "Prefer to set it yourself? Put a client_id (and",
+    "client_secret) in ~/.config/priel/credentials.json",
+    "and restart priel.",
 ];
 
 /// One line of the reference: the keys it names, and what they do.
@@ -7520,54 +7509,38 @@ mod tests {
     }
 
     #[test]
-    fn the_consent_screen_states_what_it_will_do_before_doing_it() {
-        // Goal: priel is about to download a credential belonging to someone
-        // else's application. A user who later discovers that must find nothing
-        // here they were not told: where it comes from, whose it is, what gets
-        // written where, and how to avoid the download entirely.
+    fn the_client_key_screen_explains_a_failed_fetch() {
+        // Goal: when the automatic fetch fails, the screen must say why in terms a
+        // user can act on - that the upstream key may have changed, that a retry
+        // may help, and how to supply one by hand instead.
         let mut sc = screen();
         sc.app.set_mode_for_test(Mode::Credentials);
         let out = text(&mut sc.app, 96, 34);
 
+        assert!(out.contains("may have changed"), "the likely cause: {out}");
         assert!(
-            out.contains("github.com/EbbLabs/python-tidal"),
-            "the source: {out}"
+            out.contains("credentials.json"),
+            "the manual fallback: {out}"
         );
-        assert!(out.contains("credentials.json"), "the destination: {out}");
-        assert!(out.contains("not priel's key"), "whose key it is: {out}");
         assert!(
-            out.contains("not an official client"),
-            "what priel is not: {out}"
+            out.contains("[r]") && out.contains("[q]"),
+            "retry and quit: {out}"
         );
-        assert!(out.contains("downloads it once"), "what it will do: {out}");
-        assert!(
-            out.contains("do it yourself"),
-            "the manual alternative: {out}"
-        );
-        assert!(out.contains("[f]") && out.contains("[Esc]") && out.contains("[q]"));
     }
 
     #[test]
-    fn the_consent_screens_choices_are_painted_where_a_click_lands() {
-        // Goal: this screen appears before anything else priel does, and it had
-        // three actions and no way to point at any of them. Each key is a
-        // control on the cells it printed, and declining runs the same shared
-        // method `Esc` does.
+    fn the_client_key_screens_choices_are_painted_where_a_click_lands() {
+        // Goal: the failed-fetch screen's controls are clickable on the very cells
+        // they print, and each runs the same shared method its key does.
         let mut sc = screen();
         sc.app.set_mode_for_test(Mode::Credentials);
-        for (hit, key) in [
-            (Hit::FetchCredentials, "f"),
-            (Hit::DeclineCredentials, "Esc"),
-            (Hit::Quit, "q"),
-        ] {
+        for (hit, key) in [(Hit::FetchCredentials, "r"), (Hit::Quit, "q")] {
             assert_eq!(painted(&mut sc.app, 100, 30, hit), key);
         }
-        click_hit(&mut sc.app, Hit::DeclineCredentials);
-        assert_eq!(sc.app.mode, Mode::Normal, "declining continues without it");
     }
 
     #[test]
-    fn the_consent_screen_takes_the_hit_boxes_over_from_the_row_behind_it() {
+    fn the_client_key_screen_takes_the_hit_boxes_over_from_the_row_behind_it() {
         // Goal: modal means a click cannot reach a control underneath. The header
         // is drawn first, so its controls have to be replaced by this screen's.
         let mut sc = screen();
@@ -7583,18 +7556,18 @@ mod tests {
         let _ = draw(&mut sc.app, 100, 30);
         assert!(
             !sc.app.hits.iter().any(|(r, _)| r.y == header_row),
-            "nothing behind the consent screen may still be clickable"
+            "nothing behind the client-key screen may still be clickable"
         );
     }
 
     #[test]
-    fn the_consent_screen_fits_a_modest_terminal() {
+    fn the_client_key_screen_fits_a_modest_terminal() {
         // Goal: a wall of text that overflows is a wall of text nobody reads.
         for (w, h) in [(80u16, 30u16), (96, 34), (120, 40)] {
             let mut sc = screen();
             sc.app.set_mode_for_test(Mode::Credentials);
             let out = text(&mut sc.app, w, h);
-            assert!(out.contains("client identity"), "{w}x{h}: {out}");
+            assert!(out.contains("client key"), "{w}x{h}: {out}");
         }
     }
 

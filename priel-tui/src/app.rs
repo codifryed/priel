@@ -283,10 +283,8 @@ pub enum Hit {
     /// Open the colour theme picker.
     Themes,
     SignIn,
-    /// Download a client identity, from the first-run consent screen.
+    /// Retry the automatic client-key fetch after it failed.
     FetchCredentials,
-    /// Carry on without one, from the same screen.
-    DeclineCredentials,
     /// Hand the pasted redirect back for a session, from the sign-in screen.
     SubmitLogin,
     /// Open the authorization page again, from the same screen.
@@ -1172,7 +1170,6 @@ pub struct App {
     /// Kept so the worker can be rebuilt once credentials arrive, rather than
     /// asking the user to restart.
     token_path: Option<String>,
-    credential_status: Option<String>,
     fetching: Option<Receiver<Result<(), String>>>,
     login: Option<LoginFlow>,
     /// What a picker chose this session, and nothing else.
@@ -1248,12 +1245,12 @@ impl App {
         app.recent = recent;
         let has_session = priel_core::auth::StoredToken::load(&token_path).is_ok();
         app.credentials_path = Some(creds_path.clone());
-        app.token_path = Some(token_path.clone());
+        app.token_path = Some(token_path);
         // The screens chain: a client key is needed before signing in, and a
         // session before anything can load. Each step leads to the next rather
         // than failing on its own.
         if !has_credentials {
-            app.prompt_for_credentials(creds_path, token_path);
+            app.begin_credentials_fetch();
         } else if !has_session {
             app.start_login();
         }
@@ -1375,7 +1372,6 @@ impl App {
             last_sig: RenderSig::default(),
             credentials_path: None,
             token_path: None,
-            credential_status: None,
             fetching: None,
             login: None,
             chosen: Settings::default(),
@@ -1486,14 +1482,16 @@ impl App {
         self.theme_name
     }
 
-    /// Ask the user before downloading a client identity.
+    /// Fetch the client identity priel needs to sign in, automatically.
     ///
-    /// Only called when none could be found, and only from `new` - a rigged app
-    /// in a test is never put in this state.
-    fn prompt_for_credentials(&mut self, creds_path: String, token_path: String) {
-        self.credentials_path = Some(creds_path);
-        self.token_path = Some(token_path);
+    /// There is no consent step: obtaining the key is a single unauthenticated GET
+    /// of a public client id from the open-source project the native Linux players
+    /// share. The modal only reports progress and, if the fetch fails, explains why
+    /// and offers a retry. Called from `new` and from `start_login` when the file
+    /// is absent; both have set the paths by then.
+    fn begin_credentials_fetch(&mut self) {
         self.mode = Mode::Credentials;
+        self.fetch_credentials();
     }
 
     /// Offer to sign in again after the session is refused.
@@ -1551,7 +1549,7 @@ impl App {
             return; // nowhere decided to look, so nothing to sign in with
         }
         let Some((creds, _)) = self.read_credentials() else {
-            self.mode = Mode::Credentials;
+            self.begin_credentials_fetch();
             return;
         };
         let (Ok(pkce), Ok(unique_key)) = (Pkce::generate(), priel_core::auth::client_unique_key())
@@ -1773,10 +1771,11 @@ impl App {
         self.radio_from = from;
     }
 
-    /// The line under the consent screen's buttons.
+    /// Whether a client-key download is in flight, so the modal shows progress
+    /// rather than the failure text.
     #[must_use]
-    pub fn credential_status(&self) -> Option<&str> {
-        self.credential_status.as_deref()
+    pub fn credentials_fetching(&self) -> bool {
+        self.fetching.is_some()
     }
 
     /// Download a client identity, off the UI thread.
@@ -1787,7 +1786,6 @@ impl App {
         if self.fetching.is_some() {
             return; // already in flight
         }
-        self.credential_status = Some("downloading…".into());
         let (tx, rx) = std::sync::mpsc::channel();
         // As above: `drain_fetch` reports a download that did not finish.
         let started = std::thread::Builder::new()
@@ -1819,32 +1817,24 @@ impl App {
             }
             Ok(Err(e)) => {
                 self.fetching = None;
-                self.credential_status = Some(e);
+                log::warn!("the client-key fetch failed: {e}");
                 self.dirty = true;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.fetching = None;
-                self.credential_status = Some("the download did not finish".into());
+                log::warn!("the client-key fetch thread ended without a result");
                 self.dirty = true;
             }
         }
     }
 
-    /// Carry on without downloading a client identity.
-    ///
-    /// The one way out that is not quitting: `Esc`, `Enter` and the screen's own
-    /// "not now" control all come through here.
-    fn decline_credentials(&mut self) {
-        self.mode = Mode::Normal;
-    }
-
-    /// The consent screen is modal: nothing reaches the list behind it.
+    /// The client-key screen is modal: nothing reaches the list behind it. The key
+    /// is required to sign in, so there is no "decline" - only retry and quit.
     fn on_key_credentials(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('f') => self.fetch_credentials(),
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc | KeyCode::Enter => self.decline_credentials(),
+            KeyCode::Char('r') | KeyCode::Enter => self.fetch_credentials(),
             _ => {}
         }
     }
@@ -5902,7 +5892,6 @@ impl App {
             Hit::Themes => self.open_themes(),
             Hit::SignIn => self.start_login(),
             Hit::FetchCredentials => self.fetch_credentials(),
-            Hit::DeclineCredentials => self.decline_credentials(),
             Hit::SubmitLogin => self.submit_login(),
             Hit::ReopenBrowser => self.reopen_browser(),
             Hit::ClearPaste => self.clear_paste(),
@@ -12400,11 +12389,11 @@ mod tests {
 
     #[test]
     fn every_control_on_the_two_modal_screens_dispatches_to_a_real_action() {
-        // Goal: the consent and sign-in screens took no mouse input at all, so
+        // Goal: the client-key and sign-in screens took no mouse input at all, so
         // their controls are the newest and the least exercised. A rigged app has
-        // no client identity and no flow in progress, so what this asserts is
-        // that each is wired to a method rather than to nothing - and that the
-        // two that leave a screen do leave it.
+        // no client identity and no flow in progress, so what this asserts is that
+        // each is wired to a method rather than to nothing - and that cancelling
+        // the sign-in leaves it.
         let mut r = rig();
         let press = |app: &mut App, mode: Mode, h: Hit| {
             app.set_mode_for_test(mode);
@@ -12421,9 +12410,10 @@ mod tests {
         };
 
         press(&mut r.app, Mode::Credentials, Hit::FetchCredentials);
-        assert!(r.app.credential_status().is_none(), "nowhere to save it to");
-        press(&mut r.app, Mode::Credentials, Hit::DeclineCredentials);
-        assert_eq!(r.app.mode, Mode::Normal, "not now continues without it");
+        assert!(
+            !r.app.credentials_fetching(),
+            "a rigged app has nowhere to save it, so no fetch starts"
+        );
 
         for h in [Hit::SubmitLogin, Hit::ReopenBrowser, Hit::ClearPaste] {
             press(&mut r.app, Mode::Login, h);
@@ -12587,10 +12577,10 @@ mod tests {
     }
 
     #[test]
-    fn the_consent_screen_swallows_input_and_offers_a_way_out() {
-        // Goal: modal means modal. It appears before the user has asked for
-        // anything, so `Esc` must dismiss it without downloading, and no
-        // keystroke may leak through to the list behind it.
+    fn the_client_key_screen_swallows_input_and_offers_a_way_out() {
+        // Goal: modal means modal. No keystroke may leak through to the list
+        // behind it, `Esc` does not dismiss a step the app cannot run without, and
+        // `q` is always a way out.
         let mut r = rig();
         r.app.favorites = (0..5).map(|i| track(i, "T", "A")).collect();
         r.app.set_mode_for_test(Mode::Credentials);
@@ -12601,16 +12591,19 @@ mod tests {
         r.app.on_key(code(KeyCode::Esc));
         assert_eq!(
             r.app.mode,
-            Mode::Normal,
-            "Esc continues without downloading"
+            Mode::Credentials,
+            "Esc does not dismiss a required step"
         );
         assert!(!r.app.should_quit);
+
+        r.app.on_key(key('q'));
+        assert!(r.app.should_quit, "q is the way out");
     }
 
     #[test]
-    fn the_consent_screen_can_be_declined_by_quitting() {
-        // Goal: a user who wants no part of this must be able to leave from the
-        // screen itself rather than hunting for a way out.
+    fn the_client_key_screen_can_be_left_by_quitting() {
+        // Goal: a user who cannot get past this screen must be able to leave from
+        // the screen itself rather than hunting for a way out.
         let mut r = rig();
         r.app.set_mode_for_test(Mode::Credentials);
         r.app.on_key(key('q'));
@@ -12618,40 +12611,27 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_downloaded_without_a_configured_destination() {
-        // Goal: the fetch writes a file. With no path decided there is nothing
-        // to write, and it must not reach the network to find that out.
+    fn nothing_is_fetched_without_a_configured_destination() {
+        // Goal: the fetch writes a file. With no path decided there is nothing to
+        // write, and it must not reach the network to find that out.
         let mut r = rig();
         r.app.set_mode_for_test(Mode::Credentials);
-        r.app.on_key(key('f'));
+        r.app.on_key(key('r'));
         assert!(
-            r.app.credential_status().is_none(),
+            !r.app.credentials_fetching(),
             "no attempt should have started"
         );
     }
 
     #[test]
-    fn only_a_click_on_one_of_the_consent_screens_choices_answers_it() {
-        // Goal: every other overlay is dismissed by a click. This one is not:
-        // a stray click must not be read as consent to download a credential,
-        // nor as declining. Only a click that lands on one of its own controls
-        // answers, and it runs the same shared method the key does.
+    fn a_stray_click_does_not_dismiss_the_client_key_screen() {
+        // Goal: every other overlay is dismissed by a click. This one is not - it
+        // is modal and required, so a click that lands on none of its controls
+        // must leave it in place.
         let mut r = rig();
         r.app.set_mode_for_test(Mode::Credentials);
         r.app.on_mouse(click(1, 1));
-        assert_eq!(r.app.mode, Mode::Credentials, "a click is not consent");
-
-        r.app.hits = vec![(
-            Rect {
-                x: 0,
-                y: 1,
-                width: 3,
-                height: 1,
-            },
-            Hit::DeclineCredentials,
-        )];
-        r.app.on_mouse(click(1, 1));
-        assert_eq!(r.app.mode, Mode::Normal, "but pointing at `not now` does");
+        assert_eq!(r.app.mode, Mode::Credentials, "a stray click is ignored");
     }
 
     #[test]
