@@ -1159,6 +1159,24 @@ impl App {
         let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
         let worker = worker::spawn(token_path.clone(), creds_path.clone(), cache_cap);
         let mut app = Self::with(player, worker);
+        // Give the player a way to fetch fresh segment URLs when a signed one
+        // expires mid-track: it asks the worker (which owns the client) and
+        // resumes rather than ending the track short. Wired here, not in `with`,
+        // so tests keep the plain end-short behaviour, like the browser guard.
+        {
+            let to_worker = app.worker.tx.clone();
+            let resolver: priel_player::SegmentResolver = std::sync::Arc::new(move |id| {
+                let (reply, answer) = std::sync::mpsc::channel();
+                to_worker
+                    .send(ToWorker::ReResolveSegments { id, reply })
+                    .ok()?;
+                answer
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .ok()
+                    .flatten()
+            });
+            app.player.set_resolver(resolver);
+        }
         app.cache_cap = cache_cap;
         app.bus = bus;
         app.set_theme(theme);
