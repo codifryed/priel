@@ -51,9 +51,12 @@ install_prebuilt() {
     [ "$arch" = x86_64 ] || { warn "no release binary for $arch."; return 1; }
     have tar || { warn 'no tar; cannot unpack a release.'; return 1; }
 
-    # The newest release's tag, read from the one field of the public API.
+    # The newest release's tag, from the one field of the public API. The pattern
+    # tolerates whitespace after the colon because GitHub pretty-prints its JSON
+    # ("tag_name": "v1.2.3"), unlike the compact body the previous forge returned.
     tag="$(curl -fsSL "$API/releases/latest" 2>/dev/null \
-        | grep -o '"tag_name":"[^"]*"' | head -1 | sed 's/.*:"//; s/"$//')"
+        | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+        | sed 's/.*"\([^"]*\)"$/\1/')"
     [ -n "${tag:-}" ] || { warn 'no release published yet.'; return 1; }
 
     asset="${NAME}-${tag}-x86_64-linux.tar.gz"
