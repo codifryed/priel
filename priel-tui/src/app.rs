@@ -7970,9 +7970,22 @@ mod tests {
     /// backend has one to catch up: the stub applies nothing at all, which is
     /// why this and its callers are behind the feature.
     #[cfg(feature = "libmpv")]
-    fn settle(app: &App) {
-        std::thread::sleep(Duration::from_millis(300));
-        let _ = app.player.status();
+    /// Wait for the player's pause snapshot to reach `want`, up to a bound, and
+    /// return the state it reached. The player runs on its own thread and
+    /// refreshes the snapshot a beat after it handles a command, so this reads
+    /// the result the moment it lands instead of sleeping a fixed margin that was
+    /// mostly idle. The bound only stops a genuine regression from hanging; the
+    /// returned state still fails the assertion loudly when the wanted one never
+    /// comes.
+    fn settle_paused(app: &App, want: bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let paused = app.player.status().paused;
+            if paused == want || Instant::now() >= deadline {
+                return paused;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     /// Goal: **`Play` and `Pause` are absolute where the space bar is a
@@ -7985,26 +7998,21 @@ mod tests {
     fn play_and_pause_from_the_desktop_are_absolute_and_play_pause_is_not() {
         let mut r = rig();
         r.app.apply(BusCommand::Pause);
-        settle(&r.app);
-        assert!(r.app.player.status().paused);
+        assert!(settle_paused(&r.app, true));
         r.app.apply(BusCommand::Pause);
-        settle(&r.app);
-        assert!(r.app.player.status().paused, "asking twice is not a cycle");
+        assert!(settle_paused(&r.app, true), "asking twice is not a cycle");
 
         r.app.apply(BusCommand::Play);
-        settle(&r.app);
-        assert!(!r.app.player.status().paused);
+        assert!(!settle_paused(&r.app, false));
         r.app.apply(BusCommand::Play);
-        settle(&r.app);
         assert!(
-            !r.app.player.status().paused,
+            !settle_paused(&r.app, false),
             "Play on a playing track leaves it playing"
         );
 
         r.app.apply(BusCommand::PlayPause);
-        settle(&r.app);
         assert!(
-            r.app.player.status().paused,
+            settle_paused(&r.app, true),
             "and PlayPause is still the toggle the space bar is"
         );
     }
