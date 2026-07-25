@@ -375,7 +375,7 @@ impl Pkce {
     /// If the system random source is unavailable.
     pub fn generate() -> Result<Self> {
         let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed).map_err(|e| anyhow!("no system randomness: {e}"))?;
+        getrandom::fill(&mut seed).map_err(|e| anyhow!("no system randomness: {e}"))?;
         let verifier = URL_SAFE_NO_PAD.encode(seed);
         // The challenge hashes the verifier *string*, not the bytes behind it.
         // Hashing the raw seed instead produces a challenge the server rejects,
@@ -407,7 +407,7 @@ pub fn client_unique_key() -> Result<String> {
     use std::fmt::Write as _;
 
     let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes).map_err(|e| anyhow!("no system randomness: {e}"))?;
+    getrandom::fill(&mut bytes).map_err(|e| anyhow!("no system randomness: {e}"))?;
     Ok(bytes.iter().fold(String::with_capacity(16), |mut out, b| {
         let _ = write!(out, "{b:02x}");
         out

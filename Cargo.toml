@@ -23,11 +23,11 @@ repository = "https://codeberg.org/codifryed/priel"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 # All three are already in the tree via ureq/rustls, so naming them directly
 # costs no new crates: SHA-256 and a CSPRNG for PKCE, and query encoding.
 ring = "0.17"
-getrandom = "0.2"
+getrandom = "0.4"
 percent-encoding = "2.3"
 regex = "1"
 log = { version = "0.4", features = ["std"] }
@@ -54,7 +54,7 @@ zune-core = "0.5"
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 priel-core = { path = "priel-core" }
 # default-features off here so priel-tui's own `libmpv` feature is the single
 # switch that pulls libmpv in (default on) or leaves it out (--no-default-features).
