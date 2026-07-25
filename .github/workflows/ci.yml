@@ -1,0 +1,84 @@
+# Test and lint on every push and pull request.
+#
+# Runs on GitHub's hosted Ubuntu runners inside the official Rust image, so cargo
+# and rustc are already there and no toolchain is installed per run. rustfmt and
+# clippy are *not* in that image - they are separate rustup components - so the
+# fmt and clippy jobs add the one they need, a quick component download rather
+# than a whole toolchain. Split into parallel jobs so formatting, clippy over
+# both feature configurations and the test suite run at once rather than one
+# after another.
+#
+# `runs-on: ubuntu-latest` uses GitHub's free hosted runners, which are far
+# larger than a shared forge runner (4 vCPU / 16 GB RAM / 14 GB disk) - ample for
+# a release build, which is why the move off Codeberg's constrained runners was
+# possible without a self-hosted one.
+#
+# The Rust image is pinned to an exact version rather than `rust:1-bookworm`:
+# clippy's lint set moves between releases, so a floating image would fail the
+# gate on a lint the maintainer's toolchain does not have yet. Bump this in step
+# with the local toolchain, fixing any new lints deliberately when you do.
+#
+# Mirrors `make check`, the local gate.
+name: ci
+
+on:
+  # Every branch push, and every pull request targeting main. `branches: ['**']`
+  # matches all branches but not tags, so a version tag push runs release.yml
+  # alone rather than this too.
+  #
+  # Branch pushes here are trusted: pushing needs write access. A fork PR's code
+  # (and its dependencies' build scripts) runs on a runner as well, but this
+  # workflow carries no secrets, and GitHub holds a first-time contributor's PR
+  # behind a maintainer's "Approve and run" click. Only approve a fork PR after
+  # reading its workflow and dependency changes.
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+# The `if` on each job skips the pull-request event for a PR whose branch lives
+# in this same repo: that branch was already built by its push above, so building
+# it again for the PR would only double the work. A fork PR (its head in another
+# repo) has no push event here, so it still runs - once, after approval.
+jobs:
+  fmt:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    container: rust:1.97.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup component add rustfmt
+          cargo fmt --check
+
+  clippy:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    container: rust:1.97.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: mpv headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends pkg-config libmpv-dev
+      - name: Clippy, both feature configurations
+        run: |
+          rustup component add clippy
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy -p priel-tui --no-default-features --all-targets -- -D warnings
+
+  test:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    container: rust:1.97.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: mpv headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends pkg-config libmpv-dev
+      - name: Tests, both feature configurations
+        run: |
+          cargo test --locked
+          cargo test -p priel-tui --no-default-features --locked
+          cargo test -p priel-player --no-default-features --locked

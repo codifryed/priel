@@ -1,0 +1,85 @@
+# Build a release binary and publish it when a version tag is pushed.
+#
+#   git tag -s v0.3.0 -m 'priel 0.3.0' && git push origin v0.3.0
+#
+# The tarball is a *prefix tree*: bin/, share/man, share/…/completions and so
+# on, laid out exactly as `make install PREFIX=…` would place them. The install
+# script unpacks it straight into a prefix with a copy, and the layout is the
+# one a distro package uses too.
+#
+# Runs on GitHub's hosted runners inside the official Rust image (no toolchain
+# install per run). The release itself is created by softprops/action-gh-release,
+# which authenticates with the automatic GITHUB_TOKEN - the `permissions:
+# contents: write` block below is what grants that token permission to publish,
+# so no manual release secret is needed (the old Forgejo flow needed one).
+# Re-pushing a tag replaces its assets rather than duplicating them.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: rust:1.97.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: mpv headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends pkg-config libmpv-dev
+
+      - name: Build and stage the release tarball
+        # The tag name comes in through env rather than `${{ }}` interpolated into
+        # the script, so a tag carrying shell metacharacters cannot be executed.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cargo build --release --locked -p priel-tui
+          # Generate the man page and completions from the *release* build rather
+          # than `make assets`, which does `cargo run` in debug and so compiles a
+          # whole second `target/debug` tree - reusing the release deps here adds
+          # no debug tree.
+          cargo run --release --locked --features gen-assets --bin priel-gen-assets -- target/assets
+          strip target/release/priel
+
+          name="priel-${TAG}-x86_64-linux"
+          root="dist/${name}"
+          mkdir -p \
+            "${root}/bin" \
+            "${root}/share/man/man1" \
+            "${root}/share/bash-completion/completions" \
+            "${root}/share/zsh/site-functions" \
+            "${root}/share/fish/vendor_completions.d" \
+            "${root}/share/licenses/priel" \
+            "${root}/share/doc/priel" \
+            dist/release
+          cp target/release/priel      "${root}/bin/priel"
+          cp target/assets/priel.1     "${root}/share/man/man1/priel.1"
+          cp target/assets/priel.bash  "${root}/share/bash-completion/completions/priel"
+          cp target/assets/_priel      "${root}/share/zsh/site-functions/_priel"
+          cp target/assets/priel.fish  "${root}/share/fish/vendor_completions.d/priel.fish"
+          cp COPYING                   "${root}/share/licenses/priel/COPYING"
+          cp README.md                 "${root}/share/doc/priel/README.md"
+          tar -czf "dist/release/${name}.tar.gz" -C dist "${name}"
+          ( cd dist/release && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+      # Create or update the release for this tag and upload the tarball and its
+      # checksum. softprops/action-gh-release is a JavaScript action; GitHub
+      # injects Node into the container job, so it runs even though the Rust image
+      # ships none. It replaces same-named assets on a re-run, so re-pushing a tag
+      # refreshes rather than duplicates. The tag and release name default to the
+      # ref that triggered the run.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/release/*.tar.gz
+            dist/release/*.tar.gz.sha256
+          fail_on_unmatched_files: true
