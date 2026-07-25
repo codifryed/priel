@@ -2063,6 +2063,13 @@ mod tests {
         );
 
         let mpv = silent_mpv();
+        // Read the stream as fast as it decodes rather than pacing to the null
+        // output's real-time clock. What this test asserts is a memory bound - the
+        // resident bytes never exceed the ceiling - and that bound is the gap
+        // between the reader and the downloader's own backpressure, which does not
+        // depend on how fast playback runs. Untimed only stops the wait for real
+        // time to pass, and turned ~3s of that wait into a third of a second.
+        set_prop(&mpv, "untimed", true);
         let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
         let sh = shared(Vec::new(), false);
         lock(&registry).insert(1, sh.clone());
@@ -3695,7 +3702,15 @@ mod tests {
         );
 
         command(&mpv, "seek", &["0.05", "absolute"]);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // When the seek is served from cache the backward step shows up at once
+        // (measured in tens of microseconds), so this loop breaks the instant it
+        // does. The starved probe is the opposite case: it never goes back, and
+        // this window is only how long mpv is given to *try* - a backward stream
+        // read would fire the moment the demuxer runs, within a cycle of the
+        // seek, so a second is already a thousandfold margin over what the served
+        // case takes. It used to be five, which is where most of this test's wall
+        // time went for a wait that nothing was ever going to end early.
+        let deadline = Instant::now() + Duration::from_secs(1);
         let mut went_back = false;
         while Instant::now() < deadline {
             if mpv.get_property::<f64>("time-pos").unwrap_or(1.0) < 0.4 {
