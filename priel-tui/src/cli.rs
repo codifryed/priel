@@ -126,6 +126,15 @@ pub struct Cli {
     #[arg(long, value_name = "THEME")]
     pub theme: Option<ThemeName>,
 
+    /// Log everything, for a diagnostic report (same as `--log-level debug`)
+    ///
+    /// The quick way to gather a log when something misbehaves: the queue, the
+    /// downloader and mpv all record what they do. `-V` is `--version`, so
+    /// verbose takes the conventional lowercase `-v`. An explicit `--log-level`
+    /// wins over it.
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+
     /// Detail recorded in the diagnostic log
     ///
     /// Defaults to `warn`. `$PRIEL_LOG` sets it too, for launching from a
@@ -302,11 +311,11 @@ impl Cli {
     /// default.
     #[must_use]
     pub fn log_level(&self, from_file: Option<LogLevel>) -> LevelFilter {
-        Self::resolve_level(
-            self.log_level,
-            std::env::var("PRIEL_LOG").ok().as_deref(),
-            from_file,
-        )
+        // `--verbose` is sugar for `--log-level debug`; an explicit `--log-level`
+        // is more specific and wins over it, and both win over the environment
+        // and the file.
+        let flag = self.log_level.or(self.verbose.then_some(LogLevel::Debug));
+        Self::resolve_level(flag, std::env::var("PRIEL_LOG").ok().as_deref(), from_file)
     }
 
     /// The flag wins over the environment, the environment over the file, and an

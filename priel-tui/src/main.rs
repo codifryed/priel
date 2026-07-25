@@ -24,6 +24,7 @@
 //!   --shared                give it back, whatever the settings file remembers
 //!   --list-devices          print the output devices and exit
 //!   --theme <theme>         colour palette (default: nord; `terminal` defers)
+//!   -v, --verbose           log everything (same as `--log-level debug`)
 //!   --log-level <level>     diagnostics detail (default: warn; `$PRIEL_LOG` too)
 //!   --log-file <path>       default: `~/.local/state/priel/priel.log`
 //!
@@ -412,6 +413,24 @@ mod tests {
         );
         assert_eq!(cli.log_level(None), log::LevelFilter::Warn);
         assert!(cli.log_path().ends_with("/priel/priel.log"));
+    }
+
+    #[test]
+    fn verbose_turns_the_log_up_to_debug() {
+        // Goal: -v / --verbose is the quick way to a diagnostic log, the same as
+        // --log-level debug. `-V` is --version, so verbose is the lowercase -v.
+        // An explicit --log-level is more specific and wins, so the two can be
+        // given together without surprise.
+        assert_eq!(parse(&["-v"]).log_level(None), log::LevelFilter::Debug);
+        assert_eq!(
+            parse(&["--verbose"]).log_level(None),
+            log::LevelFilter::Debug
+        );
+        assert_eq!(
+            parse(&["--verbose", "--log-level", "trace"]).log_level(None),
+            log::LevelFilter::Trace,
+            "an explicit level wins over --verbose",
+        );
     }
 
     #[test]
