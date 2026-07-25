@@ -568,6 +568,17 @@ pub fn audio_devices() -> Vec<AudioDevice> {
     backend::audio_devices()
 }
 
+/// Fetch fresh segment URLs for a track whose signed URLs have expired.
+///
+/// Given a track id, returns a fresh ordered list of segment URLs, or `None`
+/// when it cannot (the source is not segmented, or the request failed). Called
+/// from the downloader thread when a segment 403s partway through a long track,
+/// so the download can resume with fresh URLs rather than ending the track
+/// short. The player thread has no authenticated client of its own, so the
+/// frontend supplies this - it does the round-trip and blocks the caller until
+/// it answers; see [`Player::set_resolver`].
+pub type SegmentResolver = Arc<dyn Fn(u64) -> Option<Vec<String>> + Send + Sync>;
+
 /// Commands sent to the player thread.
 #[allow(dead_code)] // fields go unread in the stub (no-libmpv) backend
 pub(crate) enum Cmd {
@@ -604,6 +615,9 @@ pub(crate) enum Cmd {
     /// `pw-dump` the player thread must not run, so it arrives as a command and
     /// is published unchanged in every status until the next one.
     SetBtCodec(Option<String>),
+    /// Give the player the callback it uses to fetch fresh segment URLs when a
+    /// signed URL expires mid-track. See [`SegmentResolver`].
+    SetResolver(SegmentResolver),
     Quit,
 }
 
@@ -753,6 +767,14 @@ impl Player {
     /// bit-perfect - and `None` clears it when the output is not Bluetooth.
     pub fn set_bt_codec(&self, codec: Option<String>) {
         self.send(Cmd::SetBtCodec(codec));
+    }
+    /// Give the player the callback that fetches fresh segment URLs when a
+    /// signed URL expires mid-track.
+    ///
+    /// Fire-and-forget like [`Self::set_clock`]; the player holds it and hands
+    /// it to each segment download. Set once at startup. See [`SegmentResolver`].
+    pub fn set_resolver(&self, resolver: SegmentResolver) {
+        self.send(Cmd::SetResolver(resolver));
     }
     /// Ask the player thread to re-read the audio devices.
     ///

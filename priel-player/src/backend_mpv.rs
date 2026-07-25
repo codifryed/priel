@@ -40,7 +40,9 @@ use ureq::{Agent, Body, http::Response};
 
 use crate::graph::{self, ServerSink};
 use crate::hw::{self, HwParams};
-use crate::{AudioDevice, Cmd, OutputAccess, PlaybackStatus, PlayerConfig, Published};
+use crate::{
+    AudioDevice, Cmd, OutputAccess, PlaybackStatus, PlayerConfig, Published, SegmentResolver,
+};
 
 /// Lock a mutex, tolerating poisoning.
 ///
@@ -176,6 +178,10 @@ struct Output {
     /// The Bluetooth codec of the output, as the frontend last read it from the
     /// graph. Published unchanged in the status; see [`crate::Cmd::SetBtCodec`].
     bt_codec: Option<String>,
+    /// Fetches fresh segment URLs when a signed one expires mid-track, handed to
+    /// each segment download. `None` until the frontend sets it; see
+    /// [`crate::Cmd::SetResolver`] and [`crate::SegmentResolver`].
+    resolver: Option<SegmentResolver>,
 }
 
 /// A device change waiting to be judged.
@@ -757,6 +763,7 @@ pub fn spawn(
             judged: false,
             clock: None,
             bt_codec: None,
+            resolver: None,
         };
         // The ALSA readout costs a handful of /proc reads, so it is refreshed on
         // its own slower cadence rather than on every status tick.
@@ -1063,7 +1070,7 @@ fn handle_cmd(
         Cmd::Quit => return true,
         Cmd::Load(id, src) => {
             clear_all(registry, entries);
-            let (arg, s) = register_source(registry, seq, src);
+            let (arg, s) = register_source(registry, seq, id, src, output.resolver.clone());
             command(mpv, "loadfile", &[&arg, "replace"]);
             entries.push(Entry {
                 id,
@@ -1073,7 +1080,7 @@ fn handle_cmd(
             arm_exclusive_check(mpv, output);
         }
         Cmd::Append(id, src) => {
-            let (arg, s) = register_source(registry, seq, src);
+            let (arg, s) = register_source(registry, seq, id, src, output.resolver.clone());
             command(mpv, "loadfile", &[&arg, "append"]);
             entries.push(Entry {
                 id,
@@ -1109,6 +1116,7 @@ fn handle_cmd(
         Cmd::SetExclusive(exclusive) => set_exclusive(mpv, output, exclusive),
         Cmd::SetClock(clock) => output.clock = clock,
         Cmd::SetBtCodec(codec) => output.bt_codec = codec,
+        Cmd::SetResolver(resolver) => output.resolver = Some(resolver),
     }
     false
 }
@@ -1214,7 +1222,9 @@ fn arm_exclusive_check(mpv: &Mpv, output: &mut Output) {
 fn register_source(
     registry: &Registry,
     seq: &mut u64,
+    id: u64,
     src: PlayableSource,
+    resolver: Option<SegmentResolver>,
 ) -> (String, Option<u64>) {
     match src {
         PlayableSource::Direct(url) => (url, None),
@@ -1233,7 +1243,7 @@ fn register_source(
                 cv: Condvar::new(),
             });
             lock(registry).insert(s, shared.clone());
-            spawn_downloader(urls, &shared);
+            spawn_downloader(id, urls, &shared, resolver);
             (format!("prielseg://{s}"), Some(s))
         }
     }
@@ -1308,31 +1318,72 @@ enum Stop {
     Failed,
 }
 
-fn spawn_downloader(urls: Vec<String>, shared: &Arc<Shared>) {
+/// How many times one track may re-resolve its segment URLs before giving up.
+///
+/// A signed URL expiring once mid-track is the ordinary case; expiring again a
+/// moment after a fresh manifest is a listener on a link so slow the whole
+/// track outlives a signing window, and a bounded budget stops that turning
+/// into an endless re-resolve loop that never plays a note.
+const SEGMENT_RERESOLVE_BUDGET: u32 = 3;
+
+fn spawn_downloader(
+    id: u64,
+    mut urls: Vec<String>,
+    shared: &Arc<Shared>,
+    resolver: Option<SegmentResolver>,
+) {
     let owned = shared.clone();
     let started = thread::Builder::new().name("segments".into()).spawn(move || {
         let shared = owned;
         let total = urls.len();
-        for (done, u) in urls.iter().enumerate() {
+        let mut budget = SEGMENT_RERESOLVE_BUDGET;
+        // Indexed rather than a `for`, because a re-resolve retries the *same*
+        // segment with a fresh URL, and the URL list is replaced under it.
+        let mut i = 0;
+        while i < urls.len() {
             // A non-2xx is an `Err` here (the agent keeps ureq's default
             // `http_status_as_error`), matching the old `error_for_status`.
-            let outcome = match HTTP.get(u).call() {
-                Ok(mut resp) => stream_body(&mut resp, &shared),
+            match priel_core::retry_http(|| HTTP.get(&urls[i]).call()) {
+                Ok(mut resp) => match stream_body(&mut resp, &shared) {
+                    Ok(()) => i += 1,
+                    Err(Stop::Aborted) => return,
+                    // The body dropped mid-stream, after some of this segment's
+                    // bytes were already published: re-fetching would duplicate
+                    // them, so this one ends the track short like any other.
+                    Err(Stop::Failed) => {
+                        log::error!(
+                            target: "priel::download",
+                            "the track will end short: {i} of {total} segments fetched"
+                        );
+                        break;
+                    }
+                },
                 Err(e) => {
-                    log::warn!(target: "priel::download", "segment {} of {total} could not be fetched: {e}", done + 1);
-                    Err(Stop::Failed)
-                }
-            };
-            match outcome {
-                Ok(()) => {}
-                Err(Stop::Aborted) => return,
-                Err(Stop::Failed) => {
-                    // The buffer is still completed below, so a waiting reader
-                    // is released - but the track stops here, and this line is
-                    // the only thing that will ever say why.
+                    log::warn!(target: "priel::download", "segment {} of {total} could not be fetched: {e}", i + 1);
+                    // Only a status refusal (a 403 on an expired signed URL) is
+                    // worth re-resolving; a transport error that already survived
+                    // `retry_http` is a dead link nothing here can mend. A status
+                    // failure means no bytes of segment `i` were published yet, so
+                    // retrying it with a fresh URL cannot duplicate anything.
+                    let expired = matches!(&e, ureq::Error::StatusCode(_));
+                    if expired
+                        && budget > 0
+                        && let Some(fresh) = resolver.as_ref().and_then(|r| r(id))
+                        && fresh.len() == urls.len()
+                    {
+                        log::info!(
+                            target: "priel::download",
+                            "re-resolved fresh urls: resuming at segment {} of {total}", i + 1
+                        );
+                        urls = fresh;
+                        budget -= 1;
+                        continue; // retry segment `i`; do NOT finish or advance
+                    }
+                    // No fresh URLs to be had: the buffer is completed below so a
+                    // waiting reader is released, but the track stops here.
                     log::error!(
                         target: "priel::download",
-                        "the track will end short: {done} of {total} segments fetched"
+                        "the track will end short: {i} of {total} segments fetched"
                     );
                     break;
                 }
@@ -1575,6 +1626,7 @@ mod tests {
             judged: false,
             clock: None,
             bt_codec: None,
+            resolver: None,
         }
     }
 
@@ -1602,6 +1654,91 @@ mod tests {
             }
         });
         url
+    }
+
+    /// A one-shot server that answers 403 - a segment URL whose signing expired.
+    fn forbidden() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/seg", listener.local_addr().expect("addr"));
+        thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = sock.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        url
+    }
+
+    /// Wait up to ~3s for a download to complete (end normally or short).
+    fn await_complete(sh: &Arc<Shared>) {
+        for _ in 0..300 {
+            if lock(&sh.inner).complete {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn an_expired_segment_is_re_resolved_and_the_track_completes() {
+        // Goal: #52. A segment URL that 403s (its signing expired mid-track) is
+        // re-resolved for a fresh URL, and the download resumes into the same
+        // buffer - so a long track no longer ends short.
+        let fresh = one_shot(b"segment-bytes".to_vec());
+        let resolver: SegmentResolver = {
+            let fresh = fresh.clone();
+            Arc::new(move |_id| Some(vec![fresh.clone()]))
+        };
+        let sh = shared(Vec::new(), false);
+        spawn_downloader(1, vec![forbidden()], &sh, Some(resolver));
+        await_complete(&sh);
+        let g = lock(&sh.inner);
+        assert_eq!(g.data, b"segment-bytes", "resumed with the fresh url");
+        assert!(g.complete);
+    }
+
+    #[test]
+    fn an_expired_segment_with_no_resolver_ends_short() {
+        // Goal: the unchanged fallback - without a resolver a 403 ends the track
+        // short (the buffer still completes so a reader is released).
+        let sh = shared(Vec::new(), false);
+        spawn_downloader(1, vec![forbidden()], &sh, None);
+        await_complete(&sh);
+        let g = lock(&sh.inner);
+        assert!(g.data.is_empty(), "nothing was fetched");
+        assert!(g.complete);
+    }
+
+    #[test]
+    fn a_resolver_that_cannot_help_ends_the_track_short() {
+        // Goal: a resolver returning `None` (or a list of a different length,
+        // which cannot be resumed at the failed index) ends short, not stuck.
+        for resolver in [
+            Arc::new(|_: u64| None) as SegmentResolver,
+            Arc::new(|_: u64| Some(vec!["a".into(), "b".into()])) as SegmentResolver,
+        ] {
+            let sh = shared(Vec::new(), false);
+            spawn_downloader(1, vec![forbidden()], &sh, Some(resolver));
+            await_complete(&sh);
+            assert!(lock(&sh.inner).complete);
+            assert!(lock(&sh.inner).data.is_empty());
+        }
+    }
+
+    #[test]
+    fn re_resolution_gives_up_after_the_budget_rather_than_looping() {
+        // Goal: a resolver that keeps handing back fresh-but-still-forbidden URLs
+        // must not loop forever - it ends short once the budget is spent.
+        let resolver: SegmentResolver = Arc::new(|_id| Some(vec![forbidden()]));
+        let sh = shared(Vec::new(), false);
+        spawn_downloader(1, vec![forbidden()], &sh, Some(resolver));
+        await_complete(&sh);
+        assert!(
+            lock(&sh.inner).complete,
+            "ended short, not an infinite loop"
+        );
+        assert!(lock(&sh.inner).data.is_empty());
     }
 
     // ---- uri routing ----
@@ -1947,7 +2084,7 @@ mod tests {
         // callback data while mpv can still call back into it.
         std::mem::forget(protocol);
 
-        spawn_downloader(vec![one_shot(media)], &sh);
+        spawn_downloader(1, vec![one_shot(media)], &sh, None);
         command(&mpv, "loadfile", &["prielseg://1", "replace"]);
 
         // Enough of the track past the ceiling to prove the point. Not all of
@@ -2027,7 +2164,7 @@ mod tests {
         // tells a waiting reader it has reached the real end of the track.
         let url = one_shot(b"segment-bytes".to_vec());
         let sh = shared(Vec::new(), false);
-        spawn_downloader(vec![url], &sh);
+        spawn_downloader(1, vec![url], &sh, None);
         for _ in 0..200 {
             if lock(&sh.inner).complete {
                 break;
@@ -2045,9 +2182,10 @@ mod tests {
         // Goal: a failed fetch must not leave readers blocked forever. The
         // stream ends short, which is audible, rather than hanging, which is not
         // recoverable without a restart.
+        priel_core::set_http_backoff_millis(0); // the refused fetch is retried; do not sleep for it
         let sh = shared(Vec::new(), false);
         // Port 1 on loopback refuses immediately, so this does not touch DNS.
-        spawn_downloader(vec!["http://127.0.0.1:1/x".into()], &sh);
+        spawn_downloader(1, vec!["http://127.0.0.1:1/x".into()], &sh, None);
         for _ in 0..200 {
             if lock(&sh.inner).complete {
                 break;
@@ -2066,10 +2204,17 @@ mod tests {
     fn a_direct_source_needs_no_buffer_but_segments_do() {
         // Goal: BTS URLs are handed to mpv untouched; only segmented sources get
         // a registry entry, and each gets a distinct key so two can be live.
+        priel_core::set_http_backoff_millis(0); // the dead segments retry in the background; keep it fast
         let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
         let mut seq = 0;
 
-        let (arg, key) = register_source(&reg, &mut seq, PlayableSource::Direct("http://d".into()));
+        let (arg, key) = register_source(
+            &reg,
+            &mut seq,
+            1,
+            PlayableSource::Direct("http://d".into()),
+            None,
+        );
         assert_eq!(arg, "http://d");
         assert!(key.is_none());
         assert!(lock(&reg).is_empty());
@@ -2077,12 +2222,16 @@ mod tests {
         let (a1, k1) = register_source(
             &reg,
             &mut seq,
+            1,
             PlayableSource::Segments(vec!["http://127.0.0.1:1/a".into()]),
+            None,
         );
         let (a2, k2) = register_source(
             &reg,
             &mut seq,
+            2,
             PlayableSource::Segments(vec!["http://127.0.0.1:1/b".into()]),
+            None,
         );
         assert_eq!(a1, "prielseg://1");
         assert_eq!(a2, "prielseg://2");
@@ -2235,10 +2384,11 @@ mod tests {
     fn a_segment_that_cannot_be_fetched_says_which_track_ends_short() {
         // Goal: a failed fetch ends the track early with no other symptom. The
         // user hears a song stop; without this nothing anywhere says why.
+        priel_core::set_http_backoff_millis(0); // the failed fetch is retried; do not sleep for it
         let sh = shared(Vec::new(), false);
         let dead = "http://127.0.0.1:1/never".to_string();
         let lines = captured(|| {
-            spawn_downloader(vec![dead], &sh);
+            spawn_downloader(1, vec![dead], &sh, None);
             for _ in 0..200 {
                 if lock(&sh.inner).complete {
                     break;
@@ -2289,7 +2439,7 @@ mod tests {
         // read together, and they come from different threads.
         let sh = shared(Vec::new(), false);
         let lines = captured(|| {
-            spawn_downloader(vec!["http://127.0.0.1:1/never".into()], &sh);
+            spawn_downloader(1, vec!["http://127.0.0.1:1/never".into()], &sh, None);
             for _ in 0..200 {
                 if lock(&sh.inner).complete {
                     break;
@@ -3303,7 +3453,7 @@ mod tests {
         // is still in flight.
         let url = trickle(b"first-half", b"second-half", Duration::from_millis(400));
         let sh = shared(Vec::new(), false);
-        spawn_downloader(vec![url], &sh);
+        spawn_downloader(1, vec![url], &sh, None);
 
         // A reader blocked on an empty buffer must be released by the first
         // chunk, well before the response completes.
@@ -3330,7 +3480,7 @@ mod tests {
         // bytes are a FLAC stream and a gap in the middle is a decode failure.
         let url = trickle(b"AAAA", b"BBBB", Duration::from_millis(50));
         let sh = shared(Vec::new(), false);
-        spawn_downloader(vec![url], &sh);
+        spawn_downloader(1, vec![url], &sh, None);
         for _ in 0..200 {
             if lock(&sh.inner).complete {
                 break;
@@ -3348,7 +3498,7 @@ mod tests {
         // the thread rather than let it keep filling a discarded buffer.
         let url = trickle(b"early", b"late", Duration::from_secs(3));
         let sh = shared(Vec::new(), false);
-        spawn_downloader(vec![url], &sh);
+        spawn_downloader(1, vec![url], &sh, None);
         for _ in 0..200 {
             if !lock(&sh.inner).data.is_empty() {
                 break;

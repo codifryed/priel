@@ -716,6 +716,111 @@ pub fn new_agent() -> Agent {
     )
 }
 
+// ---- HTTP retry: survive a transient failure ------------------------------
+
+/// How many times an HTTP call is attempted before its failure is final.
+pub const HTTP_MAX_ATTEMPTS: u32 = 4;
+
+/// The longest backoff between attempts, in milliseconds.
+const HTTP_BACKOFF_CAP_MS: u64 = 2000;
+
+/// The backoff before the first retry, in milliseconds; it doubles each retry
+/// up to [`HTTP_BACKOFF_CAP_MS`]. An atomic so a test can zero it - the sleeps
+/// are real time nobody wants in the suite - while production keeps 250 ms.
+static HTTP_BACKOFF_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(250);
+
+/// Set the retry backoff in milliseconds. Tests set it to 0 so the suite pays
+/// no real sleep for a retry it is only counting.
+#[doc(hidden)]
+pub fn set_http_backoff_millis(ms: u64) {
+    HTTP_BACKOFF_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn backoff_start() -> std::time::Duration {
+    std::time::Duration::from_millis(HTTP_BACKOFF_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn next_backoff(current: std::time::Duration) -> std::time::Duration {
+    (current * 2).min(std::time::Duration::from_millis(HTTP_BACKOFF_CAP_MS))
+}
+
+/// Is this HTTP status worth retrying? A momentary server problem (5xx) or a
+/// rate limit (429), never a 4xx the request itself was wrong about (401/403/
+/// 404): a 403 on a segment is an expired URL, and a 401 is a stale session -
+/// both are handled elsewhere, neither by asking again unchanged.
+#[must_use]
+pub fn is_transient_status(code: u16) -> bool {
+    code == 429 || (500..=599).contains(&code)
+}
+
+/// Is this transport error worth retrying? A request that never arrived or timed
+/// out, or a transient status the agent turned into an error.
+#[must_use]
+pub fn is_transient_ureq(err: &ureq::Error) -> bool {
+    match err {
+        ureq::Error::Io(_)
+        | ureq::Error::Timeout(_)
+        | ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::RedirectFailed => true,
+        ureq::Error::StatusCode(code) => is_transient_status(*code),
+        _ => false,
+    }
+}
+
+/// Retry a raw HTTP call while it fails transiently.
+///
+/// For a caller whose agent turns a non-2xx into an `Err` - the player's segment
+/// downloads: a connection reset, a timeout, or a 5xx/429 is retried up to
+/// [`HTTP_MAX_ATTEMPTS`]; a real 4xx (a 403 on an expired segment URL) is
+/// returned at once for the caller to handle.
+///
+/// # Errors
+///
+/// The last attempt's `ureq::Error` once the retries are spent or the failure
+/// is not transient.
+pub fn retry_http<T>(
+    mut f: impl FnMut() -> std::result::Result<T, ureq::Error>,
+) -> std::result::Result<T, ureq::Error> {
+    let mut backoff = backoff_start();
+    let mut attempt = 1;
+    loop {
+        let out = f();
+        let transient = matches!(&out, Err(e) if is_transient_ureq(e));
+        if !transient || attempt >= HTTP_MAX_ATTEMPTS {
+            return out;
+        }
+        std::thread::sleep(backoff);
+        backoff = next_backoff(backoff);
+        attempt += 1;
+    }
+}
+
+/// Retry an authed send while it fails transiently.
+///
+/// For the API `Agent`, which keeps a non-2xx as `Ok(resp)`: a transient
+/// *status* (5xx/429) is retried as well as a transport error. A 401 is not
+/// transient here - the caller refreshes the session and sends again.
+fn retry_send(send: impl Fn() -> Result<Response<Body>>) -> Result<Response<Body>> {
+    let mut backoff = backoff_start();
+    let mut attempt = 1;
+    loop {
+        let out = send();
+        let transient = match &out {
+            Ok(resp) => is_transient_status(resp.status().as_u16()),
+            Err(e) => e
+                .downcast_ref::<ureq::Error>()
+                .is_some_and(is_transient_ureq),
+        };
+        if !transient || attempt >= HTTP_MAX_ATTEMPTS {
+            return out;
+        }
+        std::thread::sleep(backoff);
+        backoff = next_backoff(backoff);
+        attempt += 1;
+    }
+}
+
 impl Client {
     /// # Errors
     /// Currently infallible; kept fallible so adding TLS/proxy configuration
@@ -856,7 +961,7 @@ impl Client {
         F: Fn(&Agent, &str) -> Result<Response<Body>>,
     {
         self.ensure_fresh()?;
-        let resp = send(&self.http, &self.token)?;
+        let resp = retry_send(|| send(&self.http, &self.token))?;
         if resp.status() != 401 || self.auth.is_none() {
             return Ok(resp);
         }
@@ -864,7 +969,7 @@ impl Client {
         self.refresh_session()
             .map_err(|e| e.context(Fault::SignedOut))
             .context("the session was rejected and could not be renewed; log in again")?;
-        send(&self.http, &self.token)
+        retry_send(|| send(&self.http, &self.token))
     }
 
     fn get_authed(&mut self, url: &str, query: &[(&str, &str)]) -> Result<Response<Body>> {
@@ -1781,6 +1886,93 @@ mod tests {
         (200, body.to_string())
     }
 
+    // ---- http retry ----
+
+    #[test]
+    fn a_transient_status_is_worth_retrying_a_real_4xx_is_not() {
+        // Goal: 5xx and 429 are momentary; a 4xx is the request being wrong, and
+        // asking again unchanged would only fail the same way.
+        assert!(is_transient_status(429));
+        assert!(is_transient_status(500));
+        assert!(is_transient_status(503));
+        assert!(!is_transient_status(200));
+        assert!(!is_transient_status(401));
+        assert!(!is_transient_status(403));
+        assert!(!is_transient_status(404));
+    }
+
+    #[test]
+    fn a_transient_transport_error_is_worth_retrying_a_403_is_not() {
+        // Goal: a connection that never arrived, or a 5xx the agent turned into
+        // an error, is retryable; a 403 (an expired segment URL) is not.
+        let reset = ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(is_transient_ureq(&reset));
+        assert!(is_transient_ureq(&ureq::Error::StatusCode(503)));
+        assert!(!is_transient_ureq(&ureq::Error::StatusCode(403)));
+    }
+
+    #[test]
+    fn retry_http_rides_out_transient_failures_and_returns_the_success() {
+        // Goal: a couple of transient failures are ridden out; the first success
+        // is returned, and the call count proves the retries happened.
+        set_http_backoff_millis(0);
+        let calls = std::cell::Cell::new(0u32);
+        let out = retry_http(|| {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(ureq::Error::StatusCode(503))
+            } else {
+                Ok(calls.get())
+            }
+        });
+        assert_eq!(out.ok(), Some(3));
+        assert_eq!(calls.get(), 3, "two retries, then the success");
+    }
+
+    #[test]
+    fn retry_http_gives_up_after_the_attempt_ceiling() {
+        // Goal: a failure that never clears stops after HTTP_MAX_ATTEMPTS rather
+        // than retrying forever.
+        set_http_backoff_millis(0);
+        let calls = std::cell::Cell::new(0u32);
+        let out: std::result::Result<(), ureq::Error> = retry_http(|| {
+            calls.set(calls.get() + 1);
+            Err(ureq::Error::StatusCode(503))
+        });
+        assert!(out.is_err());
+        assert_eq!(calls.get(), HTTP_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_http_does_not_retry_a_real_4xx() {
+        // Goal: a 403 (an expired segment URL) comes back at once - Stage B
+        // re-resolves it; asking the same URL again would only 403 again.
+        set_http_backoff_millis(0);
+        let calls = std::cell::Cell::new(0u32);
+        let out: std::result::Result<(), ureq::Error> = retry_http(|| {
+            calls.set(calls.get() + 1);
+            Err(ureq::Error::StatusCode(403))
+        });
+        assert!(out.is_err());
+        assert_eq!(calls.get(), 1, "final on the first try");
+    }
+
+    #[test]
+    fn a_call_survives_a_transient_5xx_by_retrying() {
+        // Goal: end to end - a momentary 5xx does not fail a request; the client
+        // asks again and the second answer stands. Backoff zeroed so the suite
+        // pays nothing for the retry it is proving happened.
+        set_http_backoff_millis(0);
+        let fav = r#"{"totalNumberOfItems":1,"items":[{"item":{"id":5,"title":"X",
+            "artists":[{"name":"A"}]}}]}"#;
+        let s = stub(vec![ok(SESSION), (503, String::new()), ok(fav)]);
+        let page = connected(&s)
+            .favorite_tracks(0, 10)
+            .expect("retried past the 503");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, 5);
+    }
+
     // ---- session ----
 
     #[test]
@@ -1838,8 +2030,9 @@ mod tests {
     #[test]
     fn an_answer_we_did_not_like_is_a_refusal() {
         // Goal: the service answered, so the connection is fine and the session
-        // is fine. Neither retrying nor signing in again would help.
-        let s = stub(vec![(500, "boom".into())]);
+        // is fine. Neither retrying nor signing in again would help. A 404, not
+        // a 5xx: a 5xx is a momentary server problem the client now retries.
+        let s = stub(vec![(404, "boom".into())]);
         let err = client(&s).connect().unwrap_err();
         assert_eq!(Fault::of(&err), Fault::Refused);
     }
@@ -2188,9 +2381,12 @@ mod tests {
     fn a_failed_listing_reports_which_call_failed() {
         // Goal: the worker turns these into a one-line notice, so the message
         // has to identify the request on its own.
-        let s = stub(vec![ok(SESSION), (500, "boom".into())]);
+        // A 404 (a genuine refusal), not a 5xx: a 5xx is now retried as
+        // transient, so it is no longer the "answered, and the answer was no"
+        // case this asserts.
+        let s = stub(vec![ok(SESSION), (404, "boom".into())]);
         let err = connected(&s).user_playlists(0, 1).unwrap_err().to_string();
-        assert!(err.contains("playlists") && err.contains("500"), "{err}");
+        assert!(err.contains("playlists") && err.contains("404"), "{err}");
     }
 
     // ---- mixes ----
@@ -2295,15 +2491,16 @@ mod tests {
         // Goal: both mix calls go to a page endpoint, so a message naming only
         // the endpoint would not say whether the listing or one mix's tracks
         // failed - and the interface puts that sentence on the notice line.
+        // 404s, not 5xx: a 5xx is retried now, so a refusal that stands is a 4xx.
         let s = stub(vec![
             ok(SESSION),
-            (500, "boom".into()),
-            (500, "boom".into()),
+            (404, "boom".into()),
+            (404, "boom".into()),
         ]);
         let mut c = connected(&s);
         let listing = c.user_mixes(0, 1).unwrap_err().to_string();
         assert!(
-            listing.contains("mixes") && listing.contains("500"),
+            listing.contains("mixes") && listing.contains("404"),
             "{listing}"
         );
         let tracks = c.mix_tracks("0007a", 0, 1).unwrap_err().to_string();

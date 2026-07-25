@@ -24,7 +24,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use priel_core::auth::Credentials;
-use priel_core::{Client, Fault, Mix, Page, Playlist, Quality, ResolvedStream, Track};
+use priel_core::{
+    Client, Fault, Mix, Page, PlayableSource, Playlist, Quality, ResolvedStream, Track,
+};
 use priel_player::graph::{self, AudioGraph, ClockRates, GraphError};
 use priel_player::setup;
 
@@ -185,6 +187,15 @@ pub enum ToWorker {
     /// can tell a resample the server hid on an output with no ALSA readout. The
     /// reply is [`FromWorker::OutputClock`]. Runs `pw-dump`, so it is here.
     ReadClock,
+    /// Fetch fresh segment URLs for a track whose signed URLs expired mid-play,
+    /// replied on the caller's own `reply` channel (not to the app). The player's
+    /// download thread asks for this - synchronously, blocking on the reply - so
+    /// it can resume a long track instead of ending it short; the player has no
+    /// authenticated client of its own. See [`priel_player::SegmentResolver`].
+    ReResolveSegments {
+        id: u64,
+        reply: Sender<Option<Vec<String>>>,
+    },
     /// Write priel's own `pipewire.conf.d` drop-in so the sound server may clock
     /// at the rates in `allowed_hz`. Touches the filesystem, which is why it is
     /// here. The reply is [`FromWorker::AudioSetUp`].
@@ -837,6 +848,21 @@ fn serve(
         // resample fallback needs the clock from the very first track. See
         // `graph::probe_clock`.
         ToWorker::ReadClock => FromWorker::OutputClock(graph::probe_clock()),
+        // Replies on the caller's own channel, not to the app, so it returns
+        // early rather than yielding a `FromWorker`. `resolve_stream` already
+        // retries transient failures; `None` means there are no fresh segment
+        // URLs to hand back (a direct source, or the resolve failed for good).
+        ToWorker::ReResolveSegments { id, reply } => {
+            let fresh = match client.resolve_stream(id, Quality::HiRes) {
+                Ok(ResolvedStream {
+                    source: PlayableSource::Segments(urls),
+                    ..
+                }) => Some(urls),
+                _ => None,
+            };
+            let _ = reply.send(fresh);
+            return None;
+        }
         // Write priel's own drop-in - never another file - into the user's
         // config directory. Filesystem work, so it is here and not on the render
         // thread, and it always answers so the overlay can move on.
@@ -1453,6 +1479,25 @@ mod tests {
             FromWorker::Resolved(id, _) => assert_eq!(id, 7, "resolves are matched by id"),
             other => panic!("wrong reply variant: {}", variant(&other)),
         }
+    }
+
+    #[test]
+    fn a_re_resolve_request_answers_on_its_own_channel_not_the_app() {
+        // Goal: the download thread asks for fresh segment URLs synchronously on
+        // its own reply channel, never as a `FromWorker` to the app. The test
+        // stub resolves to a direct (BTS) source, so there are no segments to
+        // hand back - the reply is `None`, and it arrives on the caller's channel.
+        let w = worker_on(origin());
+        let (reply, answer) = std::sync::mpsc::channel();
+        w.tx.send(ToWorker::ReResolveSegments { id: 7, reply })
+            .unwrap();
+        assert_eq!(
+            answer
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a reply on the caller's channel"),
+            None,
+            "a direct source has no fresh segment urls to resume with"
+        );
     }
 
     #[test]

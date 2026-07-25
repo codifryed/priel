@@ -1159,6 +1159,24 @@ impl App {
         let has_credentials = priel_core::auth::local_credentials(&creds_path).is_some();
         let worker = worker::spawn(token_path.clone(), creds_path.clone(), cache_cap);
         let mut app = Self::with(player, worker);
+        // Give the player a way to fetch fresh segment URLs when a signed one
+        // expires mid-track: it asks the worker (which owns the client) and
+        // resumes rather than ending the track short. Wired here, not in `with`,
+        // so tests keep the plain end-short behaviour, like the browser guard.
+        {
+            let to_worker = app.worker.tx.clone();
+            let resolver: priel_player::SegmentResolver = std::sync::Arc::new(move |id| {
+                let (reply, answer) = std::sync::mpsc::channel();
+                to_worker
+                    .send(ToWorker::ReResolveSegments { id, reply })
+                    .ok()?;
+                answer
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .ok()
+                    .flatten()
+            });
+            app.player.set_resolver(resolver);
+        }
         app.cache_cap = cache_cap;
         app.bus = bus;
         app.set_theme(theme);
@@ -2471,6 +2489,23 @@ impl App {
             // service that is down would otherwise be asked ten times a second
             // until priel was closed.
             paging.stalled = true;
+        }
+        // A resolve that failed even after the core's retries (Stage A) is a
+        // persistent one - the track is unavailable, or the link is down.
+        // Without this the interface spins on "resolving" (current_target stays
+        // set) or "buffering" (now_playing set, nothing playing) forever.
+        //
+        // A preload is only ever scheduled once the current track has settled -
+        // `decide` gates it on `!resolving_current` - so a resolve that fails
+        // while `current_target` is set can only be the track being loaded now.
+        // Stop it cleanly. A resolve that fails with nothing loading was a
+        // gapless preload; drop it and let the end-of-track fallback ask again.
+        if matches!(task, Task::Resolve) {
+            self.next_intended = None;
+            if self.current_target.is_some() {
+                self.current_target = None;
+                self.now_playing = None;
+            }
         }
         // Branching on the classification, never on the words. This was
         // `e.contains("log in again")`, which made the core's wording
@@ -12653,6 +12688,48 @@ mod tests {
             .unwrap();
         r.app.drain_worker();
         assert_eq!(r.app.mode, Mode::Login, "it should offer the way back in");
+    }
+
+    #[test]
+    fn a_persistent_resolve_failure_stops_instead_of_spinning_forever() {
+        // Goal: a resolve that failed even after the core's retries must not
+        // leave the now-playing area spinning on "resolving" (current_target
+        // set) or "buffering" (now_playing set, nothing playing) forever. The
+        // current track's load stops cleanly; a preload failure only drops the
+        // preload.
+        let mut r = rig();
+        r.app.now_playing = Some(track(1, "T", "A"));
+        r.app.current_target = Some(1); // the current track is loading
+        r.to_app
+            .send(FromWorker::Failed {
+                task: Task::Resolve,
+                fault: Fault::Unreachable,
+                detail: "resolve: connection reset".into(),
+            })
+            .unwrap();
+        r.app.drain_worker();
+        assert!(!r.app.is_resolving(), "no longer spinning on resolve");
+        assert!(!r.app.is_buffering(), "and not stuck buffering either");
+        assert!(r.app.now_playing.is_none(), "the failed track is cleared");
+
+        // A preload resolve failure (nothing loading) only drops the preload.
+        r.app.now_playing = Some(track(2, "U", "B"));
+        r.app.status.playing = true; // the current track plays fine
+        r.app.current_target = None; // it already resolved
+        r.app.next_intended = Some(3); // a gapless preload was requested
+        r.to_app
+            .send(FromWorker::Failed {
+                task: Task::Resolve,
+                fault: Fault::Unreachable,
+                detail: "resolve: connection reset".into(),
+            })
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(r.app.next_intended, None, "the failed preload is dropped");
+        assert!(
+            r.app.now_playing.is_some(),
+            "but the playing track is untouched"
+        );
     }
 
     #[test]
