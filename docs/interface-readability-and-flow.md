@@ -581,9 +581,8 @@ last line, the four taste findings, and nothing else.
 
 Worked through with the maintainer question by question. These supersede the
 "left for a decision" items above. **They are recorded here rather than only in
-the issue, because `tea` truncates every comment body at about 80 characters in
-all of its output formats including JSON - so a decision that lives only in a
-comment cannot be read by anyone working from the tracker.** Two implementations
+the issue, because a decision that lives only in a comment cannot be reliably
+read or version-tracked by anyone working from the tracker.** Two implementations
 proceeded partly blind before that was noticed.
 
 1. **The row is a verdict; the overlay is the report.** The bottom row had grown

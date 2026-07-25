@@ -2,8 +2,8 @@
 
 The design for drawing the album cover in the now-playing box, and now the
 record of what was built. Recorded here rather than in the issue thread because
-`tea` truncates every comment body at about 80 characters, so a design that
-lives only in a comment cannot be read by anyone working from the tracker.
+a design that lives only in a comment cannot be reliably read or version-tracked
+by anyone working from the tracker.
 
 Every heading below was settled with the maintainer question by question. Where
 the answer went against a recommendation, both the answer and the recommendation

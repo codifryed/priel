@@ -132,8 +132,11 @@ with no network at all.
 
 ## 7. Publish
 
-Push the branch and the tag to Codeberg, create the release, attach the tarball
-and its checksum, and paste the notes.
+Push the branch and the tag to GitHub. The tag push triggers
+`.github/workflows/release.yml`, which builds the tarball, generates the man page
+and completions, writes the checksum, and creates the GitHub release with both
+assets attached - no manual upload. Then paste the notes onto the release, on the
+web UI or with `gh release edit v0.2.0 --notes-file notes.md`.
 
 ```bash
 git push origin main
