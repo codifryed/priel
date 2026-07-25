@@ -127,7 +127,7 @@ fn main() -> Result<()> {
 /// first install runs, which fetches the newest release and replaces this
 /// binary. Kept as a raw-file URL on the default branch so an old binary always
 /// fetches the current installer.
-const INSTALL_URL: &str = "https://codeberg.org/codifryed/priel/raw/branch/main/install.sh";
+const INSTALL_URL: &str = "https://raw.githubusercontent.com/codifryed/priel/main/install.sh";
 
 /// Update priel by running the installer, and report how it went.
 ///

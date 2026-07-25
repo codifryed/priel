@@ -58,7 +58,7 @@ TIDAL subscription.
 ### Quick install
 
 ```bash
-curl -fsSL https://codeberg.org/codifryed/priel/raw/branch/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/codifryed/priel/main/install.sh | sh
 ```
 
 **Signing in.** On first run priel asks to open your browser; you sign in and

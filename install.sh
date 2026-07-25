@@ -2,7 +2,7 @@
 # priel installer (Linux only).
 #
 # Quick install / update:
-#   curl -fsSL https://codeberg.org/codifryed/priel/raw/branch/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/codifryed/priel/main/install.sh | sh
 #
 # Downloads the latest release binary and installs it under ~/.local, so no root
 # is needed. Where there is no binary for the platform - a non-x86_64 machine, or
@@ -21,8 +21,8 @@
 
 set -eu
 
-REPO='https://codeberg.org/codifryed/priel'
-API='https://codeberg.org/api/v1/repos/codifryed/priel'
+REPO='https://github.com/codifryed/priel'
+API='https://api.github.com/repos/codifryed/priel'
 NAME='priel'
 REF="${PRIEL_REF:-main}"
 PREFIX="${PRIEL_PREFIX:-$HOME/.local}"

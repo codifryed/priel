@@ -38,8 +38,7 @@ use crate::Client;
 /// newest non-draft, non-prerelease release, and the one field taken from it is
 /// `tag_name`. `404` here means there are no releases yet, which is not an error
 /// - it is "nothing to update to".
-pub const LATEST_RELEASE_URL: &str =
-    "https://codeberg.org/api/v1/repos/codifryed/priel/releases/latest";
+pub const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/codifryed/priel/releases/latest";
 
 /// A release document is small, but a cap keeps a wrong or hostile response off
 /// the heap all the same. A release with a long body and many assets is still

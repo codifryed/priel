@@ -17,7 +17,7 @@ version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
-repository = "https://codeberg.org/codifryed/priel"
+repository = "https://github.com/codifryed/priel"
 
 [workspace.dependencies]
 anyhow = "1"
