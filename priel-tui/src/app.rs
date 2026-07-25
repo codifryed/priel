@@ -663,6 +663,18 @@ pub struct Paging {
     /// track count, so that view knows its length before it has asked for a
     /// single track.
     pub total: u32,
+    /// The offset the next page is asked for: how far into the listing the
+    /// *service* has been taken, which is not how many rows are held.
+    ///
+    /// The two used to be the same number, and that is the bug this field
+    /// exists for. A page that comes back short - the service counting a row it
+    /// then leaves out - moves the service on by a window it has not filled, so
+    /// asking again where the rows ended re-reads the tail of that window and
+    /// the service sends those rows a second time. This follows the service
+    /// instead: what it was asked for plus what it sent. See [`repeated_head`]
+    /// for the other half, which drops the rows an already-slipped offset
+    /// brought back.
+    next: u32,
     /// The offset of the request in flight, if any.
     ///
     /// One at a time, and the identity a reply is matched against: a page for
@@ -686,6 +698,39 @@ pub struct Paging {
     /// count is known, and [`Self::absorb`] stops folding in the service's
     /// figure so a later page cannot re-inflate a total that has been corrected.
     confirmed: bool,
+}
+
+/// How many rows at the head of an arriving page the listing has already
+/// delivered: the longest prefix of `page` that is also the tail of `held`.
+///
+/// **The service counts rows it does not send.** An unavailable track is in
+/// `totalNumberOfItems` and then absent from the items, so a page comes back
+/// shorter than the window it was asked for, and the service has moved on
+/// further than the rows it handed over say. The next offset can only be
+/// counted from what arrived, so it names rows the service has already been
+/// past, and it answers with those rows a second time.
+///
+/// Appending them is two visible faults at once: the tail of a queue repeating
+/// itself - a shuffled favorites queue that plays its last stretch round again -
+/// and, where a row lands beside its own copy, a handover mpv reports as an id
+/// that then matches the *earlier* copy, which walks the position backwards and
+/// never reaches the end at all.
+///
+/// **Positional, not by identity alone.** A listing may genuinely hold the same
+/// track twice - a playlist that lists it twice is ordinary - so only rows that
+/// repeat the rows immediately behind them count as a re-delivery. A repeat
+/// anywhere else in the page is the listener's own, and is kept.
+fn repeated_head<T>(held: &[T], page: &[T], same: impl Fn(&T, &T) -> bool) -> usize {
+    // Longest first: the service resends a whole window, not the head of one.
+    (1..=held.len().min(page.len()))
+        .rev()
+        .find(|&k| {
+            held[held.len() - k..]
+                .iter()
+                .zip(&page[..k])
+                .all(|(a, b)| same(a, b))
+        })
+        .unwrap_or(0)
 }
 
 /// The state of filling a queue up to the whole of its listing.
@@ -726,6 +771,7 @@ impl Paging {
     fn restart(&mut self, known_total: u32) {
         *self = Self {
             total: known_total,
+            next: 0,
             wanted: Some(0),
             stalled: false,
             confirmed: false,
@@ -750,24 +796,42 @@ impl Paging {
     /// keeps the user's row under their cursor: selection is an index into the
     /// filtered rows, and rows that only ever arrive after the ones already
     /// there cannot shift it.
-    fn absorb<T>(&mut self, rows: &mut Vec<T>, offset: u32, page: priel_core::Page<T>) {
+    ///
+    /// `same` says when two rows are the same row of the listing, which is what
+    /// [`repeated_head`] needs to drop rows the service has sent twice.
+    fn absorb<T>(
+        &mut self,
+        rows: &mut Vec<T>,
+        offset: u32,
+        page: priel_core::Page<T>,
+        same: impl Fn(&T, &T) -> bool,
+    ) {
         debug_assert!(
-            offset == 0 || usize::try_from(offset).is_ok_and(|o| o == rows.len()),
-            "a page either restarts the list or continues where it ended"
+            offset == 0 || offset == self.next,
+            "a page either restarts the list or continues where the service got to"
         );
         self.wanted = None;
-        let ran_out = page.items.is_empty() && offset > 0;
+        // Where the service is now: what it was asked for plus what it sent.
+        // Never where the rows end - see `next`, and `repeated_head` for what
+        // the difference between the two costs.
+        self.next = offset.saturating_add(u32::try_from(page.items.len()).unwrap_or(u32::MAX));
+        let mut nothing_new = page.items.is_empty();
         if offset == 0 {
             *rows = page.items;
         } else {
-            rows.extend(page.items);
+            let repeated = repeated_head(rows, &page.items, same);
+            nothing_new = repeated == page.items.len();
+            rows.extend(page.items.into_iter().skip(repeated));
         }
         let loaded = u32::try_from(rows.len()).unwrap_or(u32::MAX);
-        if ran_out {
+        if nothing_new && offset > 0 {
             // The service has no more rows to give, whatever it counted. Its
             // count is sometimes the larger of the two, and believing it over
-            // an empty answer asks for that same empty page on every tick. This
-            // is the end, so the count is now exact.
+            // an empty answer asks for that same empty page on every tick. A
+            // page that is nothing but rows already held says the same thing in
+            // the other spelling the service has: asked past its last row, it
+            // answers with the tail of the listing again rather than with
+            // nothing. Either way this is the end, so the count is now exact.
             self.total = loaded;
             self.confirmed = true;
             return;
@@ -2065,9 +2129,10 @@ impl App {
         if self.selected + self.full_page() < self.visible_len() {
             return;
         }
-        let Ok(offset) = u32::try_from(loaded) else {
-            return; // more rows than an offset can name; there is nothing to ask
-        };
+        // Where the service got to, which is not where the rows end: it counts
+        // rows it does not send, and asking again from the rows would re-read
+        // the window it already answered. See `Paging::next`.
+        let offset = self.paging().next;
         let Some(req) = self.page_request(offset) else {
             return;
         };
@@ -2103,7 +2168,8 @@ impl App {
         }
         self.favorite_ids.extend(page.items.iter().map(|t| t.id));
         let mut rows = std::mem::take(&mut self.favorites);
-        self.favorites_paging.absorb(&mut rows, offset, page);
+        self.favorites_paging
+            .absorb(&mut rows, offset, page, |a, b| a.id == b.id);
         self.favorites = rows;
         self.loading = false;
         let loaded = self.favorites.len();
@@ -2163,7 +2229,8 @@ impl App {
             return;
         }
         let mut rows = std::mem::take(&mut self.playlists);
-        self.playlists_paging.absorb(&mut rows, offset, page);
+        self.playlists_paging
+            .absorb(&mut rows, offset, page, |a, b| a.uuid == b.uuid);
         self.playlists = rows;
         self.loading = false;
         if self.view == View::Playlists {
@@ -2213,7 +2280,8 @@ impl App {
             return;
         }
         let mut rows = std::mem::take(&mut self.playlist_tracks);
-        self.playlist_tracks_paging.absorb(&mut rows, offset, page);
+        self.playlist_tracks_paging
+            .absorb(&mut rows, offset, page, |a, b| a.id == b.id);
         self.playlist_tracks = rows;
         self.loading = false;
         self.clamp_selection();
@@ -2246,7 +2314,8 @@ impl App {
             return;
         }
         let mut rows = std::mem::take(&mut self.mixes);
-        self.mixes_paging.absorb(&mut rows, offset, page);
+        self.mixes_paging
+            .absorb(&mut rows, offset, page, |a, b| a.id == b.id);
         self.mixes = rows;
         self.loading = false;
         if self.view == View::Mixes {
@@ -2270,7 +2339,8 @@ impl App {
             return;
         }
         let mut rows = std::mem::take(&mut self.mix_tracks);
-        self.mix_tracks_paging.absorb(&mut rows, offset, page);
+        self.mix_tracks_paging
+            .absorb(&mut rows, offset, page, |a, b| a.id == b.id);
         self.mix_tracks = rows;
         self.loading = false;
         self.clamp_selection();
@@ -2297,7 +2367,8 @@ impl App {
             self.selected = 0;
         }
         let mut rows = std::mem::take(&mut self.search_tracks);
-        self.search_paging.absorb(&mut rows, offset, page);
+        self.search_paging
+            .absorb(&mut rows, offset, page, |a, b| a.id == b.id);
         self.search_tracks = rows;
         self.loading = false;
         let loaded = self.search_tracks.len();
@@ -3345,7 +3416,10 @@ impl App {
         }
         self.queue_fill = Some(QueueFill {
             source,
-            next: have,
+            // Where the view's own paging left the service, which is at least
+            // where the queue's rows end and is further whenever the service
+            // has already sent a page short. See `Paging::next`.
+            next: self.paging().next.max(have),
             total,
             inflight: false,
         });
@@ -3401,36 +3475,43 @@ impl App {
         if !still_ours {
             return;
         }
+        let sent = u32::try_from(page.items.len()).unwrap_or(u32::MAX);
         if let Some(fill) = self.queue_fill.as_mut() {
             fill.inflight = false;
+            // Where the service got to, which is what it was asked for plus what
+            // it sent - never how far the queue grew. See `Paging::next`.
+            fill.next = offset.saturating_add(sent);
         }
-        // An empty page from the service is the listing's true end: it has
-        // exactly `offset` rows, indices 0..offset and nothing beyond. Told
-        // apart from the ceiling case below, where the page had rows but no
-        // room, which is not an end.
+        // The rows of the listing the queue already holds, which is all of it up
+        // to wherever the radio took over. Not `offset`: that counts rows the
+        // service passed over without sending.
+        let delivered =
+            u32::try_from(self.radio_from.unwrap_or(self.queue.len())).unwrap_or(u32::MAX);
+        // An empty page from the service is the listing's true end: there is
+        // nothing beyond what it has already sent. A page of nothing but rows
+        // the queue holds already is the same end in the service's other
+        // spelling - asked past its last row it answers with the tail again -
+        // and appending that is the queue repeating itself and asking for more.
+        // Both are told apart from the ceiling case below, where the page had
+        // fresh rows but no room, which is not an end.
         let service_end = page.items.is_empty();
+        let repeated = repeated_head(&self.queue, &page.items, |a, b| a.id == b.id);
+        let all_repeated = !service_end && repeated == page.items.len();
         let room = QUEUE_MAX.saturating_sub(self.queue.len());
-        let added: Vec<Track> = page.items.into_iter().take(room).collect();
+        let added: Vec<Track> = page.items.into_iter().skip(repeated).take(room).collect();
         if added.is_empty() {
-            if service_end {
+            if service_end || all_repeated {
                 // The fill paged this listing to its end while the view stayed
-                // lazy, so `offset` is the count the view's heading should show -
-                // authoritative over the service's advertised over-count.
-                self.confirm_listing_total(source, offset);
+                // lazy, so what it delivered is the count the view's heading
+                // should show - authoritative over the advertised over-count.
+                self.confirm_listing_total(source, delivered);
             }
             self.queue_fill = None; // the listing gave nothing more, or the ceiling
             return;
         }
-        let Ok(grew_by) = u32::try_from(added.len()) else {
-            self.queue_fill = None;
-            return;
-        };
         let grown_from = self.queue.len();
         self.queue.extend(added);
         self.extend_order(grown_from);
-        if let Some(fill) = self.queue_fill.as_mut() {
-            fill.next = fill.next.saturating_add(grew_by);
-        }
         self.dirty = true;
         // The preload reads from the grown queue: a fill that lands while the
         // last loaded track is playing with nothing queued behind it is what
@@ -13928,6 +14009,7 @@ mod tests {
 
         // The view scrolls and loads its next page; the service still says 8.
         let mut rows: Vec<u32> = (0..3).collect();
+        p.next = 3; // the service is where the three loaded rows end
         p.absorb(
             &mut rows,
             3,
@@ -13935,6 +14017,7 @@ mod tests {
                 items: vec![3, 4, 5],
                 total: 8,
             },
+            |a, b| a == b,
         );
         assert_eq!(rows.len(), 6, "the rows still grow by the page");
         assert_eq!(p.total, 7, "but the confirmed count holds against the 8");
@@ -13982,6 +14065,133 @@ mod tests {
         assert_eq!(
             r.app.favorites_paging.total, 7,
             "the heading's total is corrected from the service's 8 to the real 7"
+        );
+    }
+
+    #[test]
+    fn a_fill_page_repeating_the_queues_tail_is_not_appended_twice() {
+        // Goal: the service counts rows it does not send, so a page comes back
+        // shorter than the window asked for and the next offset - which can only
+        // be where the rows that arrived ended - names rows already held. The
+        // service then sends them again at the head of the next page, and
+        // appending them is the duplicated tail of a shuffled queue. Method: a
+        // fill page whose first row is the one the queue already ends on.
+        let mut r = rig();
+        favorites_partly_loaded(&mut r, 3, 8);
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        r.to_app
+            .send(FromWorker::QueueFilled {
+                source: QueueSource::Favorites,
+                offset: 3,
+                page: track_page(3..6, 8), // 3 is the row the queue already ends on
+            })
+            .unwrap();
+        r.app.drain_worker();
+
+        assert_eq!(
+            ids(&r.app.queue),
+            vec![1, 2, 3, 4, 5],
+            "the row sent again is dropped and only the fresh ones appended"
+        );
+        assert_eq!(
+            fills(&requests(&r)),
+            vec![(QueueSource::Favorites, 6)],
+            "and the next page is asked for where the service got to"
+        );
+    }
+
+    #[test]
+    fn a_fill_page_of_nothing_but_rows_already_held_ends_the_listing() {
+        // Goal: the runaway. Asked past the last row it can deliver, the service
+        // answers with the tail of the listing again rather than with nothing at
+        // all, and a fill that appends it repeats the end of the queue and asks
+        // for more. A page carrying nothing the queue does not already hold is
+        // the end of what the listing can deliver, whatever the count said.
+        let mut r = rig();
+        favorites_partly_loaded(&mut r, 3, 8);
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+
+        r.to_app
+            .send(FromWorker::QueueFilled {
+                source: QueueSource::Favorites,
+                offset: 3,
+                page: track_page(2..4, 8), // the last two rows, over again
+            })
+            .unwrap();
+        r.app.drain_worker();
+
+        assert_eq!(ids(&r.app.queue), vec![1, 2, 3], "nothing was appended");
+        assert!(
+            fills(&requests(&r)).is_empty(),
+            "and the fill stops rather than asking for the same rows again"
+        );
+        assert_eq!(
+            r.app.favorites_paging.total, 3,
+            "the heading is corrected to what the listing can deliver"
+        );
+    }
+
+    #[test]
+    fn a_view_page_repeating_loaded_rows_shows_them_once_and_moves_on() {
+        // Goal: the same over-count in the list itself, which is where the queue
+        // is built from. A page that repeats rows already loaded must neither
+        // show them twice nor leave the view asking for that same window again -
+        // the next offset follows the service's own position, which is what it
+        // was asked for plus what it actually sent.
+        let mut r = rig();
+        r.app.start();
+        r.to_app.send(favorites_page(0, 0..5, 500)).unwrap();
+        r.app.drain_worker();
+        let _ = requests(&r);
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh();
+        let _ = requests(&r);
+
+        r.to_app.send(favorites_page(5, 4..8, 500)).unwrap(); // 4 is loaded already
+        r.app.drain_worker();
+        assert_eq!(
+            ids(&r.app.favorites),
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            "the row sent again is not listed twice"
+        );
+
+        scrolled_to_the_end(&mut r.app);
+        r.app.refresh();
+        assert!(
+            requests(&r)
+                .iter()
+                .any(|c| matches!(c, ToWorker::LoadFavorites { offset: 9, .. })),
+            "the next page continues from where the service got to, not from the rows"
+        );
+    }
+
+    #[test]
+    fn a_repeat_inside_a_page_is_kept_and_only_the_head_is_dropped() {
+        // Goal: a listing may genuinely hold the same track twice - a playlist
+        // that lists it twice is the ordinary case - so identity alone cannot say
+        // a row is a re-delivery. Only rows repeating the rows immediately behind
+        // them are, which is what the service's overlapping window produces.
+        let mut rows = vec![1u32, 2, 3];
+        let mut p = Paging {
+            next: 3, // where the service got to, one window in
+            ..Paging::default()
+        };
+        p.absorb(
+            &mut rows,
+            3,
+            priel_core::Page {
+                items: vec![3, 4, 3, 5],
+                total: 9,
+            },
+            |a, b| a == b,
+        );
+        assert_eq!(
+            rows,
+            vec![1, 2, 3, 4, 3, 5],
+            "the head repeat goes, the one inside the page stays"
         );
     }
 
