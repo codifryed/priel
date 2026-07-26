@@ -99,6 +99,36 @@ Rejected: scaling the art to whatever rows are spare. It gives a tall terminal a
 bigger cover, but the art then changes size on every resize and the list gains
 and loses rows continuously.
 
+## The full pane: a third state on the same key
+
+`C` and the `▣` control cycle three states rather than toggling two: hidden, the
+box thumbnail described above, and a **full-pane** cover that fills the list pane
+in place of the rows. `CoverMode` in `app.rs` holds it, and `CoverMode::next` is
+the cycle - hidden, thumbnail, full pane, and round again - so the key and the
+control share one ordering.
+
+The full pane is `full_pane_cover` in `ui.rs`. It draws the largest centred
+square the pane holds (`cols == 2*rows` again, so the height caps the rows and
+the width caps them at half itself) and clears `list_inner`, so a click lands on
+no row rather than on a row that is not drawn. It is gated on the same
+`COVER_MIN_HEIGHT` as the `▣` control, which is what keeps the mouse/keyboard
+parity honest: whenever the pane can replace the list, the control is there to
+cycle back out of it.
+
+Settled with the maintainer:
+
+- **The box thumbnail steps aside in the full pane.** The full pane replaces
+  only the list, not the whole screen, but the now-playing box drops its own
+  thumbnail while the pane is up (`cover_box_shown` is the thumbnail mode only),
+  so the cover is painted large in one place rather than large and small at once.
+  The box returns to its short height, which hands the pane the rows to fill.
+- **Nothing to show is a centred word, not a blank pane.** With no now-playing
+  cover the pane centres `Nothing playing` or `No cover art` rather than falling
+  back to the list. Art still decoding holds the square with the same muted block
+  the box uses, so a message does not flash a frame before the picture lands.
+- **Session-only.** The mode is not written to the settings file, exactly as the
+  old fold was not: no flag sets it, so ADR 0004 keeps it out.
+
 ## Colour depth: always truecolor, no detection
 
 **Settled against the recommendation, deliberately.** The art is always drawn

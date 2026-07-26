@@ -87,6 +87,40 @@ pub enum Focus {
 /// have a fourth combination that means nothing. Spec 2.2's `LoopStatus` has the
 /// same three, which is why one type serves the key, the control and the bus.
 ///
+/// How the album cover is shown, cycled by `C` and the ▣ control.
+///
+/// Three states rather than a bool: the cover was a thumbnail in the now-playing
+/// box or nothing, and full-pane art that replaces the list is a third answer to
+/// the same question, so the key cycles rather than toggles. Session state, not a
+/// setting, exactly as [`Repeat`] below is and for the same reason: no flag sets
+/// it, so `docs/adr/0004-a-settings-file-that-is-edited-never-rewritten.md` keeps
+/// it out of the settings file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CoverMode {
+    /// No cover anywhere.
+    Hidden,
+    /// A thumbnail down the left of the now-playing box - the historical
+    /// behaviour, and the default.
+    #[default]
+    Thumbnail,
+    /// The cover fills the list pane at square size, in place of the rows. The
+    /// now-playing box keeps its own thumbnail; this is the same art, larger.
+    FullPane,
+}
+
+impl CoverMode {
+    /// The state after this one, which the key and the ▣ control both ask for:
+    /// hidden, then the box thumbnail, then the full pane, and round again.
+    #[must_use]
+    const fn next(self) -> Self {
+        match self {
+            Self::Hidden => Self::Thumbnail,
+            Self::Thumbnail => Self::FullPane,
+            Self::FullPane => Self::Hidden,
+        }
+    }
+}
+
 /// **Session state rather than a setting**, in the sense
 /// `docs/adr/0004-a-settings-file-that-is-edited-never-rewritten.md` means it:
 /// its membership test is "can a flag already set it", no flag can, and its
@@ -1140,11 +1174,11 @@ pub struct App {
     /// Whether the album cover is wanted in the now-playing box.
     ///
     /// An *intent*, exactly like [`App::queue_shown`], and for the same reason:
-    /// the renderer still asks whether the terminal has the rows to spare, so
-    /// this can be true on a short terminal and draw nothing. A gesture rather
-    /// than a setting, so it is kept for the session and never written to the
-    /// settings file.
-    pub cover_shown: bool,
+    /// the renderer still asks whether the terminal has the rows to spare, so a
+    /// mode past hidden can be set on a short terminal and draw nothing. A
+    /// gesture rather than a setting, so it is kept for the session and never
+    /// written to the settings file. See [`CoverMode`].
+    pub cover_mode: CoverMode,
     /// The cover for the track that is playing, once it has arrived.
     ///
     /// Decoded off the render thread and held as pixels, keyed by the track it
@@ -1343,7 +1377,7 @@ impl App {
             list_inner: Rect::default(),
             queue_inner: Rect::default(),
             queue_shown: true,
-            cover_shown: true,
+            cover_mode: CoverMode::Thumbnail,
             cover: None,
             progress_rect: Rect::default(),
             hits: Vec::new(),
@@ -3189,14 +3223,14 @@ impl App {
         self.queue_shown = !self.queue_shown;
     }
 
-    /// Hide the album cover, or ask for it back. **The one way in**, from the
-    /// key and from the header control alike.
+    /// Cycle the album cover: hidden, the box thumbnail, the full pane, and
+    /// round again. **The one way in**, from the key and the header control alike.
     ///
     /// An intent and nothing else, like [`App::toggle_queue_column`]: a terminal
     /// without the rows to spare draws no cover whatever this says, and that
     /// decision stays with the renderer so there is only one place it is made.
-    fn toggle_cover(&mut self) {
-        self.cover_shown = !self.cover_shown;
+    fn cycle_cover(&mut self) {
+        self.cover_mode = self.cover_mode.next();
     }
 
     /// The cover to draw right now, if the one held belongs to the track that is
@@ -3228,6 +3262,27 @@ impl App {
             .as_ref()
             .is_some_and(|t| !t.cover.is_empty())
             || self.cover_for_now_playing().is_some()
+    }
+
+    /// Whether the now-playing box shows its cover thumbnail. The thumbnail mode
+    /// only: the full pane shows the same art large, so the box drops it rather
+    /// than paint the cover twice on one screen.
+    #[must_use]
+    pub fn cover_box_shown(&self) -> bool {
+        matches!(self.cover_mode, CoverMode::Thumbnail)
+    }
+
+    /// Whether the cover fills the list pane in place of the rows.
+    #[must_use]
+    pub fn cover_full_pane(&self) -> bool {
+        matches!(self.cover_mode, CoverMode::FullPane)
+    }
+
+    /// Whether any cover is shown at all, for the ▣ control's lit state: true in
+    /// every mode but hidden.
+    #[must_use]
+    pub fn cover_on(&self) -> bool {
+        !matches!(self.cover_mode, CoverMode::Hidden)
     }
 
     /// Point the keyboard at a region, clamping the cursor it finds there.
@@ -5574,7 +5629,7 @@ impl App {
             // away, so the pair names the same thing rather than spending a
             // second idiom on it.
             KeyCode::Char('W') => self.toggle_queue_column(),
-            KeyCode::Char('C') => self.toggle_cover(),
+            KeyCode::Char('C') => self.cycle_cover(),
             _ => {}
         }
     }
@@ -5884,7 +5939,7 @@ impl App {
             Hit::CycleView => self.cycle_view(),
             Hit::CycleFocus => self.cycle_focus(),
             Hit::QueueColumn => self.toggle_queue_column(),
-            Hit::CoverArt => self.toggle_cover(),
+            Hit::CoverArt => self.cycle_cover(),
             Hit::Help => self.open_help(),
             Hit::Log => self.open_log(),
             Hit::Graph => self.open_graph(),
@@ -14407,6 +14462,35 @@ mod tests {
         assert!(
             r.app.cover_for_now_playing().is_none(),
             "a stale cover was kept for the wrong track"
+        );
+    }
+
+    #[test]
+    fn the_cover_key_cycles_hidden_thumbnail_full_pane() {
+        // Goal: C is a three-way cycle now, not a toggle: hidden, the box
+        // thumbnail, the full pane, and round again. The ▣ control click runs the
+        // same code, so both are checked here.
+        let mut r = rig();
+        r.app.cover_mode = CoverMode::Hidden;
+        r.app.on_key(key('C'));
+        assert_eq!(
+            r.app.cover_mode,
+            CoverMode::Thumbnail,
+            "hidden -> thumbnail"
+        );
+        r.app.on_key(key('C'));
+        assert_eq!(
+            r.app.cover_mode,
+            CoverMode::FullPane,
+            "thumbnail -> full pane"
+        );
+        r.app.on_key(key('C'));
+        assert_eq!(r.app.cover_mode, CoverMode::Hidden, "full pane -> hidden");
+        r.app.dispatch(Hit::CoverArt);
+        assert_eq!(
+            r.app.cover_mode,
+            CoverMode::Thumbnail,
+            "the control click runs the same cycle as the key"
         );
     }
 }
