@@ -1765,7 +1765,7 @@ mod tests {
         // across the FFI boundary. An immediate clean EOF is the safe answer.
         let mut reg: Registry = Arc::new(Mutex::new(HashMap::new()));
         let mut c = open(&mut reg, "prielseg://404");
-        let mut buf = [0i8; 8];
+        let mut buf: [c_char; 8] = [0; 8];
         assert_eq!(read(&mut c, &mut buf), 0, "unknown stream reads as EOF");
         assert_eq!(size(&mut c), 0);
     }
@@ -1777,7 +1777,7 @@ mod tests {
         lock(&reg).insert(3, shared(b"abcd".to_vec(), true));
         let mut reg2 = reg.clone();
         let mut c = open(&mut reg2, "prielseg://3");
-        let mut buf = [0i8; 8];
+        let mut buf: [c_char; 8] = [0; 8];
         assert_eq!(read(&mut c, &mut buf), 4);
         close(Box::new(c));
     }
@@ -1787,13 +1787,18 @@ mod tests {
     #[test]
     fn reads_copy_bytes_verbatim_and_advance() {
         // Goal: mpv gets a C `char*`; the bytes must be reinterpreted, not
-        // numerically converted, or anything above 0x7F is corrupted. 0xFF as a
-        // signed byte is -1, and that is what must land in the buffer.
+        // numerically converted, or anything above 0x7F is corrupted. `c_char` is
+        // signed on x86_64 and unsigned on aarch64, so 0xFF reads back as -1 or as
+        // 255 by platform - the same reinterpret either way, which is why the
+        // expected array recomputes it from the bytes rather than hard-coding one.
         let sh = shared(vec![0x00, 0x7F, 0x80, 0xFF], true);
         let mut c = cookie(&sh);
-        let mut buf = [0i8; 4];
+        let mut buf: [c_char; 4] = [0; 4];
         assert_eq!(read(&mut c, &mut buf), 4);
-        assert_eq!(buf, [0, 127, -128, -1]);
+        assert_eq!(
+            buf,
+            [0x00u8, 0x7F, 0x80, 0xFF].map(|b| c_char::from_ne_bytes([b]))
+        );
         assert_eq!(read(&mut c, &mut buf), 0, "a second read is at EOF");
     }
 
@@ -1803,9 +1808,9 @@ mod tests {
         // the next read must resume exactly where this one stopped.
         let sh = shared(b"abcdef".to_vec(), true);
         let mut c = cookie(&sh);
-        let mut buf = [0i8; 4];
+        let mut buf: [c_char; 4] = [0; 4];
         assert_eq!(read(&mut c, &mut buf), 4);
-        assert_eq!(&buf, b"abcd".map(|b| i8::from_ne_bytes([b])).as_slice());
+        assert_eq!(&buf, b"abcd".map(|b| c_char::from_ne_bytes([b])).as_slice());
         assert_eq!(
             read(&mut c, &mut buf),
             2,
@@ -1827,7 +1832,7 @@ mod tests {
             writer.cv.notify_all();
         });
         let mut c = cookie(&sh);
-        let mut buf = [0i8; 8];
+        let mut buf: [c_char; 8] = [0; 8];
         assert_eq!(
             read(&mut c, &mut buf),
             4,
@@ -1846,7 +1851,7 @@ mod tests {
             abort(&other);
         });
         let mut c = cookie(&sh);
-        let mut buf = [0i8; 8];
+        let mut buf: [c_char; 8] = [0; 8];
         assert_eq!(read(&mut c, &mut buf), 0);
     }
 
@@ -1921,7 +1926,7 @@ mod tests {
         // download stalls until the next unrelated notification.
         let sh = shared(b"xy".to_vec(), false);
         let mut c = cookie(&sh);
-        let mut buf = [0i8; 2];
+        let mut buf: [c_char; 2] = [0; 2];
         assert_eq!(read(&mut c, &mut buf), 2);
         assert_eq!(lock(&sh.inner).read_pos, 2, "consumption must be recorded");
     }
@@ -1938,8 +1943,8 @@ mod tests {
         shared(v, false)
     }
 
-    fn at(offset: usize) -> i8 {
-        i8::from_ne_bytes([u8::try_from(offset % 251).unwrap_or(0)])
+    fn at(offset: usize) -> c_char {
+        c_char::from_ne_bytes([u8::try_from(offset % 251).unwrap_or(0)])
     }
 
     #[test]
@@ -1988,7 +1993,7 @@ mod tests {
         let mut c = cookie(&sh);
         // On the heap: mpv's own read buffer is not on this thread's stack
         // either, and 64 KiB of it would be over clippy's limit.
-        let mut buf = vec![0i8; STEP];
+        let mut buf: Vec<c_char> = vec![0; STEP];
         let mut got = 0usize;
         while got < LEN {
             let n = read(&mut c, &mut buf);
@@ -2145,7 +2150,7 @@ mod tests {
             g.read_pos = 32;
         }
         let mut c = cookie(&sh);
-        let mut buf = [0i8; 8];
+        let mut buf: [c_char; 8] = [0; 8];
         assert_eq!(read(&mut c, &mut buf), -1, "offset 0 is gone");
 
         c.pos = 32;
@@ -3471,7 +3476,7 @@ mod tests {
         // A reader blocked on an empty buffer must be released by the first
         // chunk, well before the response completes.
         let mut c = cookie(&sh);
-        let mut buf = [0i8; 64];
+        let mut buf: [c_char; 64] = [0; 64];
         let started = std::time::Instant::now();
         let n = read(&mut c, &mut buf);
         let waited = started.elapsed();
@@ -3574,7 +3579,7 @@ mod tests {
     }
 
     /// `read`, recording every offset a read starts at.
-    fn watching_read(cookie: &mut Cookie, buf: &mut [i8]) -> i64 {
+    fn watching_read(cookie: &mut Cookie, buf: &mut [c_char]) -> i64 {
         {
             let mut high = lock(&HIGH_WATER);
             if cookie.pos < *high {
