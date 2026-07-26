@@ -4955,25 +4955,28 @@ mod tests {
     fn a_row_says_whether_the_track_is_kept() {
         // Goal: the state has to be readable without acting on it, on the row
         // itself. Both glyphs are asserted from one frame: a renderer that drew
-        // the same heart either way would satisfy half of this.
+        // the same heart either way would satisfy half of this. Shown in the
+        // search view, which - unlike the favorites listing, now that un-keeping a
+        // track drops its row - holds both kept and unkept tracks at once.
         let mut sc = screen();
-        favorites_arrive(&mut sc, vec![track(1, "Kept One"), track(2, "Dropped One")]);
-        sc.app.selected = 1;
-        press(&mut sc.app, 'f');
+        favorites_arrive(&mut sc, vec![track(1, "Kept One")]); // priel knows 1 is kept
+        sc.app.view = View::Search;
+        sc.app.search_query = "one".into();
+        sc.app.search_tracks = vec![track(1, "Kept One"), track(2, "Not Kept")];
 
         let out = draw(&mut sc.app, 100, 20);
         let kept = out
             .iter()
             .find(|l| l.contains("Kept One"))
-            .expect("the first row");
-        let dropped = out
+            .expect("the kept row");
+        let unkept = out
             .iter()
-            .find(|l| l.contains("Dropped One"))
-            .expect("the second row");
+            .find(|l| l.contains("Not Kept"))
+            .expect("the unkept row");
         assert!(kept.contains('\u{2665}'), "a kept track is filled: {kept}");
         assert!(
-            dropped.contains('\u{2661}'),
-            "and one taken off is hollow: {dropped}"
+            unkept.contains('\u{2661}'),
+            "and one not kept is hollow: {unkept}"
         );
     }
 

@@ -2568,6 +2568,13 @@ impl App {
         // not there.
         if let Task::SetFavorite { track_id, wanted } = task {
             self.remember_favorite(*track_id, !*wanted);
+            // A refused *add* also takes back the row it optimistically put at the
+            // top of the favorites listing. A refused *remove* leaves the listing
+            // as it is: the heart is back, and the listing rights itself on its
+            // next load.
+            if *wanted {
+                self.favorites.retain(|t| t.id != *track_id);
+            }
         }
         // The other change shown before it was agreed to. Guarded by the uuid
         // rather than unguarded: unlike a favorite this is not one bit, and a
@@ -3975,11 +3982,28 @@ impl App {
     /// keystroke in priel whose whole effect is one bit - and one bit is the
     /// cheapest thing there is to undo. The failure is not swallowed: it reaches
     /// the notice line the way every other refusal does.
-    fn toggle_favorite(&mut self, track_id: u64) {
-        let wanted = !self.is_favorite(track_id);
-        self.remember_favorite(track_id, wanted);
+    fn toggle_favorite(&mut self, track: &Track) {
+        let wanted = !self.is_favorite(track.id);
+        self.remember_favorite(track.id, wanted);
+        // Keep the favorites *listing* in step with the belief, so a track kept or
+        // dropped from anywhere - a queue row, the playing track, a search hit -
+        // shows in the listing at once rather than only on its next load. A newly
+        // kept track heads the listing, where the service lists it; a dropped one
+        // leaves it.
+        if wanted {
+            if !self.favorites.iter().any(|t| t.id == track.id) {
+                self.favorites.insert(0, track.clone());
+            }
+        } else {
+            self.favorites.retain(|t| t.id != track.id);
+        }
+        // A dropped row shortens the listing under the cursor; keep the cursor on
+        // a row that is still there.
+        if self.view == View::Favorites {
+            self.clamp_selection();
+        }
         self.ask(ToWorker::SetFavorite {
-            track_id,
+            track_id: track.id,
             favorite: wanted,
         });
     }
@@ -4005,15 +4029,24 @@ impl App {
         self.current_tracks().get(index).map(|t| t.id)
     }
 
+    /// The track under the cursor as an owned copy, if this view has tracks.
+    ///
+    /// Through `visible()`, like [`Self::selected_track_id`]: selection indexes
+    /// the filtered rows, so the backing vec must be read through it.
+    fn selected_track(&self) -> Option<Track> {
+        let index = *self.visible().get(self.selected)?;
+        self.current_tracks().get(index).cloned()
+    }
+
     fn favorite_selected(&mut self) {
-        if let Some(id) = self.selected_track_id() {
-            self.toggle_favorite(id);
+        if let Some(track) = self.selected_track() {
+            self.toggle_favorite(&track);
         }
     }
 
     fn favorite_now_playing(&mut self) {
-        if let Some(id) = self.now_playing.as_ref().map(|t| t.id) {
-            self.toggle_favorite(id);
+        if let Some(track) = self.now_playing.clone() {
+            self.toggle_favorite(&track);
         }
     }
 
@@ -7735,48 +7768,112 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_that_arrives_late_does_not_undo_a_newer_change() {
-        // Goal: two presses in quick succession send two requests, and the
-        // failure for the first can land after the second has been shown. The
-        // newer state has to stand. It does so without a guard, because the
-        // state is one bit: the belief has already moved to `!wanted`, and
-        // putting `!wanted` back over it is a no-op.
+    fn favoriting_puts_the_track_at_the_top_of_the_listing() {
+        // Goal: issue 2. A track kept from anywhere shows in the favorites listing
+        // at once, at the top where the service lists a new one, rather than only
+        // on the listing's next load.
+        let mut r = rig();
+        favorites_loaded(&mut r, 1..4); // the listing holds 1, 2, 3
+        r.app.now_playing = Some(track(9, "Nine", "N")); // not kept
+        assert!(!r.app.is_favorite(9));
+
+        r.app.dispatch(Hit::FavoriteNowPlaying);
+        assert!(r.app.is_favorite(9), "the heart fills");
+        assert_eq!(
+            r.app.favorites.first().map(|t| t.id),
+            Some(9),
+            "and it heads the listing at once"
+        );
+        assert_eq!(r.app.favorites.len(), 4);
+    }
+
+    #[test]
+    fn un_favoriting_drops_the_row_from_the_listing() {
+        // Goal: the other half of issue 2. Un-keeping a listed track takes it out
+        // of the listing now, not on reload - which was the stale-favorites bug.
+        let mut r = rig();
+        favorites_loaded(&mut r, 1..4); // 1, 2, 3, cursor on the first
+        r.app.on_key(key('f'));
+
+        assert!(!r.app.is_favorite(1));
+        assert!(
+            r.app.favorites.iter().all(|t| t.id != 1),
+            "gone from the listing at once"
+        );
+        assert_eq!(r.app.favorites.len(), 2);
+    }
+
+    #[test]
+    fn a_refused_add_takes_the_new_row_back_out_of_the_listing() {
+        // Goal: the optimism stays honest for the listing too. A refused add must
+        // remove the row it put at the top, not leave a track the service never
+        // kept sitting there.
         let mut r = rig();
         favorites_loaded(&mut r, 1..4);
-        r.app.on_key(key('f')); // off
-        r.app.on_key(key('f')); // and on again
-        assert!(r.app.is_favorite(1));
+        r.app.now_playing = Some(track(9, "Nine", "N"));
+        r.app.dispatch(Hit::FavoriteNowPlaying);
+        assert_eq!(r.app.favorites.first().map(|t| t.id), Some(9));
+        let _ = requests(&r);
 
         r.to_app
             .send(unreachable(Task::SetFavorite {
-                track_id: 1,
-                wanted: false,
+                track_id: 9,
+                wanted: true,
+            }))
+            .unwrap();
+        r.app.drain_worker();
+
+        assert!(!r.app.is_favorite(9), "the heart empties");
+        assert!(
+            r.app.favorites.iter().all(|t| t.id != 9),
+            "and the row it added is gone"
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_arrives_late_does_not_undo_a_newer_change() {
+        // Goal: two presses in quick succession send two requests, and the failure
+        // for the first can land after the second has been shown. The newer state
+        // has to stand. It does so without a guard: the belief has already moved
+        // to its newer value, and putting the reverse of the failed change back
+        // over it is a no-op. Uses the playing track, whose target does not move
+        // as the listing changes under it.
+        let mut r = rig();
+        r.app.now_playing = Some(track(9, "Nine", "N"));
+        r.app.dispatch(Hit::FavoriteNowPlaying); // kept
+        r.app.dispatch(Hit::FavoriteNowPlaying); // and dropped again
+        assert!(!r.app.is_favorite(9));
+
+        r.to_app
+            .send(unreachable(Task::SetFavorite {
+                track_id: 9,
+                wanted: true,
             }))
             .unwrap();
         r.app.drain_worker();
 
         assert!(
-            r.app.is_favorite(1),
+            !r.app.is_favorite(9),
             "the newer state stands; only the change that failed is undone"
         );
     }
 
     #[test]
-    fn a_track_taken_off_the_favorites_keeps_its_row_until_the_list_is_reloaded() {
-        // Goal: the deliberate answer to what happens to a loaded page. The row
-        // stays and only its heart changes, for two reasons that both bite.
-        // Dropping it would move every row below it out from under the cursor -
-        // including the one just acted on, which makes the undo unreachable -
-        // and `Paging::absorb` requires the next page to continue where the
-        // loaded rows end, so a hole in the middle would silently skip a row.
+    fn a_track_taken_off_the_favorites_leaves_the_listing_at_once() {
+        // Goal: issue 2. Un-keeping a listed track drops its row now, not on
+        // reload (which was the stale-favorites bug), and the cursor stays on a
+        // row that still exists rather than sliding off the end.
         let mut r = rig();
         favorites_loaded(&mut r, 1..4);
-        r.app.selected = 1;
+        r.app.selected = 1; // the middle row, track 2
         r.app.on_key(key('f'));
 
-        assert_eq!(ids(&r.app.favorites), vec![1, 2, 3], "the row stays put");
-        assert_eq!(r.app.selected, 1, "and so does the cursor");
-        assert!(!r.app.is_favorite(2), "only the heart changed");
+        assert_eq!(ids(&r.app.favorites), vec![1, 3], "the row is gone at once");
+        assert!(!r.app.is_favorite(2));
+        assert_eq!(
+            r.app.selected, 1,
+            "the cursor stays put, now on the row that slid up"
+        );
     }
 
     #[test]
