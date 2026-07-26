@@ -68,6 +68,12 @@ const QUEUE_COLS: u16 = 36;
 /// controls: a heart and a `+`, with a space before each.
 const QUEUE_ROW_CONTROLS: u16 = 4;
 
+/// Cell offset of the heart within a browse-list track row, from the row's left
+/// edge. [`row_text`] prints a two-cell mark (`♪ ` or two spaces) and then the
+/// heart, so the heart sits at cell two - and the click box registered over it
+/// has to be measured from the same figure, never guessed, or the two drift.
+const LIST_HEART_COL: u16 = 2;
+
 /// The album cover, when it is drawn, is this many rows tall and twice that wide.
 ///
 /// A cell is one pixel wide and two tall, so `COVER_ROWS` rows is `2*COVER_ROWS`
@@ -962,7 +968,7 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
             row(
                 &[
                     ("a", Some(Hit::AddToPlaylist)),
-                    ("P", Some(Hit::AddNowPlaying)),
+                    ("A", Some(Hit::AddNowPlaying)),
                 ],
                 "add selected / playing track",
             ),
@@ -989,7 +995,7 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
     (
         "Session",
         &[
-            row(&[("A", Some(Hit::SignIn))], "sign in again"),
+            row(&[("S", Some(Hit::SignIn))], "sign in again"),
             row(&[("t", Some(Hit::Themes))], "colour theme"),
             row(&[("q", Some(Hit::Quit))], "quit priel"),
             // Not an action, and the only place the running program says where
@@ -2306,6 +2312,23 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
                 height: 1,
             },
         );
+        // The heart on the row is a control, not just text: a click on it keeps
+        // or drops that track, the way the heart on a queue row does, while a
+        // click anywhere else on the row still selects it. Registered over the
+        // glyph `row_text` drew - so only where one was drawn, since the playlist
+        // and mix lists carry none - and checked before the row's own click box,
+        // which is what lets the two clicks a cell apart mean different things.
+        if !matches!(app.view, View::Playlists | View::Mixes) && LIST_HEART_COL < inner.width {
+            app.hits.push((
+                Rect {
+                    x: inner.x + LIST_HEART_COL,
+                    y,
+                    width: 1,
+                    height: 1,
+                },
+                Hit::FavoriteListRow(vi),
+            ));
+        }
     }
 }
 
@@ -2716,10 +2739,13 @@ fn row_text(app: &App, visible: &[usize], vi: usize, width: usize) -> (String, b
     if let Some(t) = tracks.get(idx) {
         let is_now = app.now_playing.as_ref().is_some_and(|n| n.id == t.id);
         let mark = if is_now { "♪ " } else { "  " };
-        // The heart is text here rather than a control: a row is selected by
-        // clicking it, and a second clickable target inside the same row would
-        // make a click mean two different things a cell apart. The keyboard row
-        // carries the control, and it acts on whatever the click selected.
+        // Two cells of mark, then the heart at [`LIST_HEART_COL`]. The heart is a
+        // control as well as a mark: a click on it keeps or drops the track,
+        // while a click on the rest of the row still selects it - the caller
+        // registers its hit box over this glyph, so the offset here and there
+        // must agree. A second clickable target a cell from the first was the
+        // thing this row set out to avoid; keeping or filing a just-seen track
+        // without first selecting it turned out to be worth the one it costs.
         let kept = heart(app.is_favorite(t.id));
         let row = lay_out(width, &format!("{mark}{kept} "), |col| match col {
             Column::Title => t.title.clone(),
@@ -5110,6 +5136,53 @@ mod tests {
     }
 
     #[test]
+    fn a_list_rows_heart_is_the_button_for_that_row() {
+        // Goal: the heart on a browse-list row is a control as well as a mark, the
+        // way the queue's is. Clicking it keeps or drops that row's track and
+        // leaves the selection where it was, while a click on the rest of the row
+        // still selects it. What is painted and what answers the click are one
+        // glyph, checked from one frame.
+        let mut sc = screen();
+        favorites_arrive(&mut sc, vec![track(1, "Kept One"), track(2, "Kept Two")]);
+        assert_eq!(
+            painted(&mut sc.app, 100, 20, Hit::FavoriteListRow(1)),
+            "\u{2665}",
+            "the hit box covers the filled heart drawn on the second row"
+        );
+
+        click_hit(&mut sc.app, Hit::FavoriteListRow(1));
+        assert!(!sc.app.is_favorite(2), "the click dropped that row's track");
+        assert!(
+            sc.app.is_favorite(1),
+            "and left the other row's track alone"
+        );
+        assert_eq!(sc.app.selected, 0, "the click did not move the selection");
+    }
+
+    #[test]
+    fn the_playlist_and_mix_lists_offer_no_row_heart() {
+        // Goal: those rows carry no heart to click - a mix or a playlist is not a
+        // track and cannot be kept - so no hit box may be registered over cells
+        // that hold something else.
+        let mut sc = screen();
+        sc.app.view = View::Playlists;
+        sc.app.playlists = vec![Playlist {
+            uuid: "u".into(),
+            title: "Evening".into(),
+            num_tracks: 12,
+            duration_secs: 3725,
+        }];
+        let _ = draw(&mut sc.app, 100, 20);
+        assert!(
+            !sc.app
+                .hits
+                .iter()
+                .any(|(_, h)| matches!(h, Hit::FavoriteListRow(_))),
+            "a heart was made clickable on a list that draws none"
+        );
+    }
+
+    #[test]
     fn nothing_playing_offers_no_heart_to_click() {
         // Goal: a control that could not act on anything must not be on screen.
         // Registering its hit box anyway is how a click lands on a no-op that
@@ -5233,7 +5306,7 @@ mod tests {
         for (hit, glyph) in [
             (Hit::Log, "M"),
             (Hit::Devices, "d"),
-            (Hit::SignIn, "A"),
+            (Hit::SignIn, "S"),
             (Hit::EditSearch, "i"),
             (Hit::PageDown, "J"),
             (Hit::HalfPageUp, "Ctrl-U"),
