@@ -50,6 +50,17 @@ water in and out of the flats twice a day, on the pull of the moon.*
   redraws only on change and holds a bounded ~40 MiB window of each track however
   long it is.
 
+## Features
+
+- **A now-playing queue.** See what's playing and what's coming up, and favorite
+  or save any track right from the list.
+- **Live quality readings.** See how good the sound is and whether your gear is
+  really playing it at full quality, as it plays.
+- **Your whole library.** Favorites, playlists, Mixes, and search, all in one
+  place.
+- **Album art in any terminal.** Cover art at different sizes, even in a plain
+  text terminal.
+
 ## Install
 
 Linux only. Needs `libmpv` at runtime, a working PipeWire or ALSA setup, and a
