@@ -1,4 +1,4 @@
-# Test and lint on every push and pull request.
+# Test and lint pull requests, and main as changes land on it.
 #
 # Runs on GitHub's hosted Ubuntu runners inside the official Rust image, so cargo
 # and rustc are already there and no toolchain is installed per run. rustfmt and
@@ -22,27 +22,23 @@
 name: ci
 
 on:
-  # Every branch push, and every pull request targeting main. `branches: ['**']`
-  # matches all branches but not tags, so a version tag push runs release.yml
-  # alone rather than this too.
+  # A pull request gets the gate before it merges; main gets it again as a change
+  # lands, so a direct push or a fast-forward merge to main is covered too. A
+  # feature branch is validated through its PR rather than on every push, which
+  # runs the gate once per change - a branch push and its own PR would otherwise
+  # both fire - and so leaves no skipped duplicate checks sitting on the PR.
   #
-  # Branch pushes here are trusted: pushing needs write access. A fork PR's code
-  # (and its dependencies' build scripts) runs on a runner as well, but this
-  # workflow carries no secrets, and GitHub holds a first-time contributor's PR
-  # behind a maintainer's "Approve and run" click. Only approve a fork PR after
-  # reading its workflow and dependency changes.
+  # A fork PR's code (and its dependencies' build scripts) runs on a runner here,
+  # but this workflow carries no secrets, and GitHub holds a first-time
+  # contributor's PR behind a maintainer's "Approve and run" click. Only approve a
+  # fork PR after reading its workflow and dependency changes.
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
     branches: [main]
 
-# The `if` on each job skips the pull-request event for a PR whose branch lives
-# in this same repo: that branch was already built by its push above, so building
-# it again for the PR would only double the work. A fork PR (its head in another
-# repo) has no push event here, so it still runs - once, after approval.
 jobs:
   fmt:
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: ubuntu-latest
     container: rust:1.97.1-bookworm
     steps:
@@ -52,7 +48,6 @@ jobs:
           cargo fmt --check
 
   clippy:
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: ubuntu-latest
     container: rust:1.97.1-bookworm
     steps:
@@ -68,7 +63,6 @@ jobs:
           cargo clippy -p priel-tui --no-default-features --all-targets -- -D warnings
 
   test:
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: ubuntu-latest
     container: rust:1.97.1-bookworm
     steps:
