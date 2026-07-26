@@ -3352,22 +3352,20 @@ impl App {
     /// fill, which is the queue's own, grows it. Extending it from an incidental
     /// view page would change what plays next without being asked; extending it
     /// from the fill is finishing the job the listener started by pressing play.
-    /// A filtered listing takes neither: it is a deliberate subset and stays the
-    /// snapshot it was.
+    /// A filter is only a finder: it picks the row to start on, not what the
+    /// queue holds, so playing a filtered view still queues the whole listing.
     fn start_queue_at(&mut self, vis_index: usize) {
-        let vis = self.visible();
-        if vis.is_empty() {
+        // The filter only chooses where to start: resolve the filtered row to its
+        // place in the full listing, then queue the whole listing from there.
+        let Some(&start) = self.visible().get(vis_index) else {
+            return;
+        };
+        let tracks: Vec<Track> = self.current_tracks().to_vec();
+        if tracks.is_empty() {
             return;
         }
-        let tracks: Vec<Track> = {
-            let items = self.current_tracks();
-            if items.is_empty() {
-                return;
-            }
-            vis.iter().filter_map(|&i| items.get(i).cloned()).collect()
-        };
         self.set_queue(tracks);
-        let p = vis_index.min(self.queue.len() - 1);
+        let p = start.min(self.queue.len() - 1);
         if self.shuffle {
             // The row that was pointed at starts, and the rest follows it
             // dealt: a track the listener chose must not be dealt into the
@@ -3435,20 +3433,14 @@ impl App {
 
     /// Start filling the queue in the background up to the whole of its listing.
     ///
-    /// Called by the two paths that build a queue from the visible list. It is
-    /// what turns "play the rows that happened to be loaded" into "play the
-    /// listing": the queue keeps the rows it started with and grows onto the end
-    /// until it holds the listing or reaches [`QUEUE_MAX`].
+    /// Called by the two paths that build a queue from a listing. It is what turns
+    /// "play the rows that happened to be loaded" into "play the listing": the
+    /// queue keeps the rows it started with and grows onto the end until it holds
+    /// the listing or reaches [`QUEUE_MAX`].
     ///
-    /// Does nothing when there is a **filter** active: the queue is then the
-    /// filtered subset the listener chose to see, and paging the unfiltered
-    /// listing in behind it would fill the queue with rows the filter hides.
-    /// Does nothing either when the queue already holds the whole listing, which
-    /// is the ordinary small-playlist case.
+    /// Does nothing when the queue already holds the whole listing, which is the
+    /// ordinary small-playlist case.
     fn begin_queue_fill(&mut self) {
-        if !self.filter.is_empty() {
-            return;
-        }
         let Some(source) = self.queue_source() else {
             return;
         };
@@ -10832,8 +10824,8 @@ mod tests {
 
     #[test]
     fn playing_a_row_builds_a_queue_and_resolves_that_track() {
-        // Goal: the queue is built from what is *visible*, so a filtered list
-        // plays only the rows the user can see.
+        // Goal: playing a row builds the queue from the listing and resolves the
+        // track that was played.
         let mut r = rig();
         r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "Y"), track(3, "C", "Z")];
         r.app.selected = 1;
@@ -14209,19 +14201,45 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_keeps_the_queue_a_snapshot_and_does_not_fill() {
-        // Goal: a filtered listing is a deliberate subset, so the queue is the
-        // filtered rows and paging the unfiltered listing in behind them would
-        // fill it with rows the filter hides. Method: filter, play, and check
-        // nothing is asked for.
+    fn a_filter_does_not_stop_the_queue_filling() {
+        // Goal: a filter is a finder, not a constraint on what plays, so playing a
+        // filtered listing still fills the queue up to the whole listing. Method:
+        // three of ten loaded, filter, play, and check the fill is asked for.
         let mut r = rig();
         favorites_partly_loaded(&mut r, 3, 10);
         r.app.filter = "t".into(); // matches the test tracks' title
 
         r.app.on_key(code(KeyCode::Enter));
         assert!(
-            fills(&requests(&r)).is_empty(),
-            "a filtered queue must not fill from the unfiltered listing"
+            !fills(&requests(&r)).is_empty(),
+            "a filter must not stop the queue filling to the whole listing"
+        );
+    }
+
+    #[test]
+    fn playing_a_filtered_row_queues_the_whole_listing_not_the_matches() {
+        // Goal: the filter picks which track to start on, not what the queue
+        // holds. Method: three rows, a filter that hides two of them, play the one
+        // that shows, and check the queue is all three - starting on the match.
+        let mut r = rig();
+        r.app.favorites = vec![
+            track(1, "apple", "X"),
+            track(2, "banana", "Y"),
+            track(3, "cherry", "Z"),
+        ];
+        r.app.filter = "ban".into(); // only "banana" survives
+        r.app.selected = 0; // the one visible row
+
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(
+            r.app.queue.len(),
+            3,
+            "the queue is the whole listing, not the filtered match"
+        );
+        assert_eq!(
+            r.app.now_playing.as_ref().unwrap().id,
+            2,
+            "and it starts on the row the filter left showing"
         );
     }
 
