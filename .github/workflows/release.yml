@@ -1,18 +1,27 @@
-# Build a release binary and publish it when a version tag is pushed.
+# Build and publish a release binary for each architecture when a version tag is
+# pushed.
 #
 #   git tag -s v0.3.0 -m 'priel 0.3.0' && git push origin v0.3.0
 #
-# The tarball is a *prefix tree*: bin/, share/man, share/…/completions and so
-# on, laid out exactly as `make install PREFIX=…` would place them. The install
-# script unpacks it straight into a prefix with a copy, and the layout is the
-# one a distro package uses too.
+# The tarball is a *prefix tree*: bin/, share/man, share/…/completions and so on,
+# laid out exactly as `make install PREFIX=…` would place them. The install script
+# unpacks it straight into a prefix with a copy, and the layout is the one a distro
+# package uses too.
 #
-# Runs on GitHub's hosted runners inside the official Rust image (no toolchain
-# install per run). The release itself is created by softprops/action-gh-release,
-# which authenticates with the automatic GITHUB_TOKEN - the `permissions:
-# contents: write` block below is what grants that token permission to publish,
-# so no manual release secret is needed (the old Forgejo flow needed one).
-# Re-pushing a tag replaces its assets rather than duplicating them.
+# One tarball per architecture, each built on a *native* runner: x86_64 on
+# ubuntu-latest, aarch64 on ubuntu-24.04-arm (free for public repositories). The
+# aarch64 binary is compiled and linked against a real aarch64 libmpv rather than
+# cross-linked - a cross build would need an aarch64 sysroot with libmpv in it,
+# which the native runner makes unnecessary. `uname -m` names the asset, so it is
+# exactly the string the install script tests to choose one.
+#
+# The two architectures build one after another (`max-parallel: 1`), not at once:
+# each leg creates-or-updates the one release for the tag, and serialising them
+# keeps the two legs from racing to create it. A release is infrequent, so the
+# extra wall-clock is cheap next to not having to reason about that race.
+#
+# Runs inside the official Rust image (no toolchain install per run); the image is
+# multi-arch, so the same pinned tag pulls the arm64 variant on the arm runner.
 name: release
 
 on:
@@ -25,7 +34,19 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    strategy:
+      # `fail-fast: false` lets both architectures attempt even if one fails, so a
+      # broken arm build does not mask an x86_64 one; `max-parallel: 1` runs them
+      # one at a time so they do not race to create the release.
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     container: rust:1.97.1-bookworm
     steps:
       - uses: actions/checkout@v4
@@ -49,7 +70,10 @@ jobs:
           cargo run --release --locked --features gen-assets --bin priel-gen-assets -- target/assets
           strip target/release/priel
 
-          name="priel-${TAG}-x86_64-linux"
+          # `uname -m` names the asset, so it is exactly the string the install
+          # script tests: x86_64 here, aarch64 on the arm runner.
+          arch="$(uname -m)"
+          name="priel-${TAG}-${arch}-linux"
           root="dist/${name}"
           mkdir -p \
             "${root}/bin" \
@@ -70,12 +94,11 @@ jobs:
           tar -czf "dist/release/${name}.tar.gz" -C dist "${name}"
           ( cd dist/release && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
-      # Create or update the release for this tag and upload the tarball and its
-      # checksum. softprops/action-gh-release is a JavaScript action; GitHub
-      # injects Node into the container job, so it runs even though the Rust image
-      # ships none. It replaces same-named assets on a re-run, so re-pushing a tag
-      # refreshes rather than duplicates. The tag and release name default to the
-      # ref that triggered the run.
+      # Create or update the release for this tag and upload this architecture's
+      # tarball and its checksum. softprops/action-gh-release replaces same-named
+      # assets on a re-run, so re-pushing a tag refreshes rather than duplicates,
+      # and the second matrix leg adds its asset to the release the first created.
+      # The tag and release name default to the ref that triggered the run.
       #
       # Pinned to a full commit SHA, not the `v3` tag: this step runs with
       # `contents: write` and the GITHUB_TOKEN, so a moved or compromised tag on a
