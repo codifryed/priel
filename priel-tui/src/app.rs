@@ -308,6 +308,11 @@ pub enum Hit {
     /// The index is the display row, which [`crate::app::App::queue_at`] maps to
     /// the queue entry.
     FavoriteQueueRow(usize),
+    /// Keep or drop the track on a browse-list row, from the heart drawn on that
+    /// row. The index is the row's place in [`crate::app::App::visible`] - the
+    /// same index the rest of the row selects with - so the heart and the
+    /// selection cannot come to name different tracks.
+    FavoriteListRow(usize),
     CycleView,
     /// Hand the keyboard to the other of the two lists.
     ///
@@ -4044,7 +4049,14 @@ impl App {
     /// Through `visible()`, like [`Self::selected_track_id`]: selection indexes
     /// the filtered rows, so the backing vec must be read through it.
     fn selected_track(&self) -> Option<Track> {
-        let index = *self.visible().get(self.selected)?;
+        self.list_row_track(self.selected)
+    }
+
+    /// The track on a browse-list row, by its place in `visible()`. Used by the
+    /// per-row heart the list draws, which names a row rather than the selection,
+    /// and by [`Self::selected_track`], which reads the selected row.
+    fn list_row_track(&self, vi: usize) -> Option<Track> {
+        let index = *self.visible().get(vi)?;
         self.current_tracks().get(index).cloned()
     }
 
@@ -4080,6 +4092,12 @@ impl App {
 
     fn favorite_queue_row(&mut self, row: usize) {
         if let Some(track) = self.queue_row_track(row) {
+            self.toggle_favorite(&track);
+        }
+    }
+
+    fn favorite_list_row(&mut self, vi: usize) {
+        if let Some(track) = self.list_row_track(vi) {
             self.toggle_favorite(&track);
         }
     }
@@ -5679,7 +5697,7 @@ impl App {
             KeyCode::Char('D') => self.open_graph(),
             KeyCode::Char('d') => self.open_devices(),
             KeyCode::Char('t') => self.open_themes(),
-            KeyCode::Char('A') => self.start_login(),
+            KeyCode::Char('S') => self.start_login(),
             KeyCode::Enter => self.on_enter(),
             KeyCode::Char(' ') => self.player.toggle_pause(),
             KeyCode::Char('s') => self.toggle_shuffle(),
@@ -5697,7 +5715,7 @@ impl App {
             KeyCode::Char('F') => self.favorite_now_playing(),
             KeyCode::Char('r') => self.reload_view(),
             KeyCode::Char('a') => self.add_selected_to_playlist(),
-            KeyCode::Char('P') => self.add_now_playing_to_playlist(),
+            KeyCode::Char('A') => self.add_now_playing_to_playlist(),
             KeyCode::Char('N') => self.new_playlist(),
             KeyCode::Char('R') => self.rename_selected_playlist(),
             KeyCode::Char('X') => self.remove_selected(),
@@ -6012,6 +6030,7 @@ impl App {
             Hit::FavoriteSelected => self.favorite_selected(),
             Hit::FavoriteNowPlaying => self.favorite_now_playing(),
             Hit::FavoriteQueueRow(row) => self.favorite_queue_row(row),
+            Hit::FavoriteListRow(vi) => self.favorite_list_row(vi),
             Hit::EditSearch => self.edit_search(),
             Hit::Reload => self.reload_view(),
             Hit::CycleView => self.cycle_view(),
@@ -13681,11 +13700,13 @@ mod tests {
 
     #[test]
     fn the_playing_track_can_be_added_to_a_playlist() {
-        // Goal: issue 3. `P`, and the now-playing box's own `+`, file the playing
+        // Goal: issue 3. `A`, and the now-playing box's own `+`, file the playing
         // track - routinely neither the highlighted nor the queue-selected one.
+        // `A` is to `a` what `F` is to `f`: the shifted key acts on the playing
+        // track, the unshifted one on the selection.
         let mut r = rig();
         r.app.now_playing = Some(track(7, "Seven", "A"));
-        r.app.on_key(key('P'));
+        r.app.on_key(key('A'));
         assert_eq!(r.app.mode, Mode::AddTo);
         assert_eq!(r.app.add_track, Some(7), "the playing track");
 
@@ -13693,6 +13714,26 @@ mod tests {
         r2.app.now_playing = Some(track(7, "Seven", "A"));
         r2.app.dispatch(Hit::AddNowPlaying);
         assert_eq!(r2.app.add_track, Some(7), "the control runs the same thing");
+    }
+
+    #[test]
+    fn a_and_shift_a_add_the_selection_and_the_playing_track() {
+        // Goal: the pair reads like `f`/`F` - the unshifted key files the row
+        // under the cursor, the shifted one the track in the speakers - and the
+        // two are routinely different tracks, so pressing the wrong case must not
+        // land on the same one.
+        let mut r = rig();
+        r.app.favorites = vec![track(1, "Selected", "A"), track(2, "Other", "B")];
+        r.app.view = View::Favorites;
+        r.app.selected = 0;
+        r.app.now_playing = Some(track(9, "Playing", "C"));
+
+        r.app.on_key(key('a'));
+        assert_eq!(r.app.add_track, Some(1), "`a` files the highlighted row");
+        r.app.cancel_modal();
+
+        r.app.on_key(key('A'));
+        assert_eq!(r.app.add_track, Some(9), "`A` files the playing track");
     }
 
     #[test]
