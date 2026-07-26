@@ -29,6 +29,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
+use std::os::raw::c_char;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -605,7 +606,7 @@ fn close(_cookie: Box<Cookie>) {}
     clippy::cast_possible_wrap,
     reason = "the stream_cb ABI is i64/u64; buffer offsets are bounded by a track in RAM"
 )]
-fn read(cookie: &mut Cookie, buf: &mut [i8]) -> i64 {
+fn read(cookie: &mut Cookie, buf: &mut [c_char]) -> i64 {
     let want = buf.len();
     let mut g = lock(&cookie.shared.inner);
     loop {
@@ -626,7 +627,10 @@ fn read(cookie: &mut Cookie, buf: &mut [i8]) -> i64 {
             let n = ((end - cookie.pos) as usize).min(want);
             for (d, s) in buf[..n].iter_mut().zip(g.data.range(start..start + n)) {
                 // mpv hands us a C `char*`; reinterpret, never numerically convert.
-                *d = i8::from_ne_bytes([*s]);
+                // `c_char` is signed on x86_64 and unsigned on aarch64, so the
+                // buffer element type is the platform's, and the byte is cast into
+                // it rather than forced through `i8`.
+                *d = *s as c_char;
             }
             cookie.pos += n as u64;
             // Let the downloader know it may resume (see DOWNLOAD_AHEAD_MAX).
