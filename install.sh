@@ -47,8 +47,15 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 # `make install` and a distro package do too. Returns non-zero (rather than
 # exiting) on anything it cannot do, so the caller can fall back to source.
 install_prebuilt() {
-    arch="$(uname -m)"
-    [ "$arch" = x86_64 ] || { warn "no release binary for $arch."; return 1; }
+    # Map what the kernel reports to the architecture string the release assets
+    # are named with. Only the two priel publishes a binary for; anything else
+    # returns non-zero so the caller falls back to a source build. `arm64` is
+    # tolerated as an alias, though Linux reports `aarch64`.
+    case "$(uname -m)" in
+        x86_64) arch=x86_64 ;;
+        aarch64 | arm64) arch=aarch64 ;;
+        *) warn "no release binary for $(uname -m)."; return 1 ;;
+    esac
     have tar || { warn 'no tar; cannot unpack a release.'; return 1; }
 
     # The newest release's tag, from the one field of the public API. The pattern
@@ -59,7 +66,7 @@ install_prebuilt() {
         | sed 's/.*"\([^"]*\)"$/\1/')"
     [ -n "${tag:-}" ] || { warn 'no release published yet.'; return 1; }
 
-    asset="${NAME}-${tag}-x86_64-linux.tar.gz"
+    asset="${NAME}-${tag}-${arch}-linux.tar.gz"
     url="$REPO/releases/download/${tag}/${asset}"
     say "Downloading priel $tag…"
     curl -fsSL "$url" -o "$tmp/$asset" 2>/dev/null \
@@ -73,7 +80,7 @@ install_prebuilt() {
     fi
 
     tar -xzf "$tmp/$asset" -C "$tmp" || { warn 'the release would not unpack.'; return 1; }
-    tree="$tmp/${NAME}-${tag}-x86_64-linux"
+    tree="$tmp/${NAME}-${tag}-${arch}-linux"
     [ -x "$tree/bin/$NAME" ] || { warn 'the release did not contain a binary.'; return 1; }
 
     # Copy the prefix tree into PREFIX. `cp -a` under bin/ and share/ lands each
