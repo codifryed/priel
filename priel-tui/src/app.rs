@@ -2598,6 +2598,12 @@ impl App {
         if let Task::RenamePlaylist { uuid, was } = task {
             self.retitle_playlist(uuid, was.clone());
         }
+        // The optimistic bump `choose_add_target` made, taken back. Guarded by
+        // the uuid like the rename, not unguarded like the favorite: a count is
+        // not one bit, and each refused add must undo exactly its own increment.
+        if let Task::AddToPlaylist { uuid, .. } = task {
+            self.adjust_playlist_count(uuid, -1);
+        }
         if let Some((paging, offset)) = self.paging_for(task)
             && paging.wanted == Some(offset)
         {
@@ -4377,6 +4383,18 @@ impl App {
         }
     }
 
+    /// Move the track count on the row for `uuid` by `delta`, if it is listed.
+    ///
+    /// Shared by the optimistic add and by its revert, the way `retitle_playlist`
+    /// is by the rename, so the two cannot come to write to different places.
+    /// Saturating: a count cannot go below zero, and a revert that underflowed
+    /// would read as billions of tracks.
+    fn adjust_playlist_count(&mut self, uuid: &str, delta: i32) {
+        if let Some(row) = self.playlists.iter_mut().find(|p| p.uuid == uuid) {
+            row.num_tracks = row.num_tracks.saturating_add_signed(delta);
+        }
+    }
+
     /// Send the highlighted track to the chosen playlist. **The one way in**,
     /// from `Enter` in the picker and from a click on a row.
     fn choose_add_target(&mut self, index: usize) {
@@ -4389,6 +4407,11 @@ impl App {
         let (uuid, title) = (playlist.uuid.clone(), playlist.title.clone());
         self.add_track = None;
         self.mode = Mode::Normal;
+        // Show the new count now; `on_failed` puts it back if the service
+        // refuses. The row added to is usually not the one on screen - a track is
+        // filed from favorites or from search - so without this the count reads a
+        // track short until the listing is reloaded.
+        self.adjust_playlist_count(&uuid, 1);
         self.ask(ToWorker::AddToPlaylist {
             uuid,
             title,
@@ -13533,6 +13556,67 @@ mod tests {
         r.app.drain_worker();
         let notice = r.app.notice.clone().unwrap_or_default();
         assert!(notice.contains("Evening"), "{notice}");
+    }
+
+    #[test]
+    fn adding_a_track_bumps_the_playlists_count_at_once() {
+        // Goal: the fix. The count on the row moves when the track is filed, not
+        // only after a reload - the row added to is usually not the one on screen,
+        // so a stale count that reads a track short is all the listener would see.
+        let mut r = with_playlists();
+        r.app.view = View::Favorites;
+        r.app.favorites = vec![track(1, "One", "A")];
+        r.app.selected = 0;
+
+        r.app.on_key(key('a'));
+        r.app.on_key(key('j')); // Evening (b2), a two-track playlist
+        r.app.on_key(code(KeyCode::Enter));
+
+        let evening = r.app.playlists.iter().find(|p| p.uuid == "b2");
+        assert_eq!(
+            evening.map(|p| p.num_tracks),
+            Some(3),
+            "the count moved with the add"
+        );
+    }
+
+    #[test]
+    fn a_refused_add_puts_the_playlists_count_back() {
+        // Goal: the optimistic bump stays honest. A service that refuses the add
+        // must not leave the count a track high.
+        let mut r = with_playlists();
+        r.app.view = View::Favorites;
+        r.app.favorites = vec![track(1, "One", "A")];
+        r.app.on_key(key('a'));
+        r.app.on_key(key('j')); // Evening (b2)
+        r.app.on_key(code(KeyCode::Enter));
+        assert_eq!(
+            r.app
+                .playlists
+                .iter()
+                .find(|p| p.uuid == "b2")
+                .map(|p| p.num_tracks),
+            Some(3),
+            "shown at once"
+        );
+        let _ = requests(&r);
+
+        r.to_app
+            .send(unreachable(Task::AddToPlaylist {
+                uuid: "b2".into(),
+                track_id: 1,
+            }))
+            .unwrap();
+        r.app.drain_worker();
+        assert_eq!(
+            r.app
+                .playlists
+                .iter()
+                .find(|p| p.uuid == "b2")
+                .map(|p| p.num_tracks),
+            Some(2),
+            "and taken back when the service refuses"
+        );
     }
 
     #[test]

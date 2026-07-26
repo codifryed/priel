@@ -910,7 +910,7 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
         "Play",
         &[
             row(&[("Enter", Some(Hit::Enter))], "play selected track"),
-            row(&[("space", Some(Hit::PlayPause))], "play / pause"),
+            row(&[("space", Some(Hit::PlayPause))], "pause / resume"),
             row(
                 &[("h", Some(Hit::SeekBack)), ("l", Some(Hit::SeekFwd))],
                 "seek -5s / +5s",
@@ -3350,7 +3350,10 @@ struct Hint {
 const HINTS: &[Hint] = &[
     Hint {
         keys: &[("space", Hit::PlayPause)],
-        label: "play",
+        // "pause", not "play": Enter is what starts a track, and a second key
+        // also labelled "play" reads as a rival way to do the same thing. Space
+        // acts on what is already playing, which is a pause.
+        label: "pause",
     },
     Hint {
         keys: &[("h", Hit::SeekBack), ("l", Hit::SeekFwd)],
@@ -4164,7 +4167,7 @@ mod tests {
     ///   h-4  │ 1:01 ███░░░░░░░  4:05 │
     ///   h-3  │ OUT — ✓ bit-perfect   │
     ///   h-2  └───────────────────────┘
-    ///   h-1   [space] play  …  [q] quit
+    ///   h-1   [space] pause  …  [q] quit
     /// ```
     mod block {
         pub const fn title(h: u16) -> usize {
