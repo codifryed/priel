@@ -628,9 +628,11 @@ fn read(cookie: &mut Cookie, buf: &mut [c_char]) -> i64 {
             for (d, s) in buf[..n].iter_mut().zip(g.data.range(start..start + n)) {
                 // mpv hands us a C `char*`; reinterpret, never numerically convert.
                 // `c_char` is signed on x86_64 and unsigned on aarch64, so the
-                // buffer element type is the platform's, and the byte is cast into
-                // it rather than forced through `i8`.
-                *d = *s as c_char;
+                // buffer element is the platform's type and the byte is
+                // reinterpreted into it. `from_ne_bytes` rather than an `as` cast:
+                // where `c_char` is already unsigned the cast is a no-op that
+                // clippy flags, while this reads the same on both.
+                *d = c_char::from_ne_bytes([*s]);
             }
             cookie.pos += n as u64;
             // Let the downloader know it may resume (see DOWNLOAD_AHEAD_MAX).

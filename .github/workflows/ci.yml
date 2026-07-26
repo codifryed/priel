@@ -18,7 +18,8 @@
 # gate on a lint the maintainer's toolchain does not have yet. Bump this in step
 # with the local toolchain, fixing any new lints deliberately when you do.
 #
-# Mirrors `make check`, the local gate.
+# Mirrors `make check`, the local gate, plus an aarch64 compile check that
+# `make check` cannot do on an x86_64 machine.
 name: ci
 
 on:
@@ -76,3 +77,25 @@ jobs:
           cargo test --locked
           cargo test -p priel-tui --no-default-features --locked
           cargo test -p priel-player --no-default-features --locked
+
+  # priel links libmpv, and `c_char` is signed on x86_64 but unsigned on aarch64,
+  # so a callback typed for one architecture does not compile on the other. That
+  # exact bug shipped once and was caught only when the release build ran on arm.
+  # This job compiles both feature configurations on a native aarch64 runner
+  # (free for public repositories) so the mismatch fails a pull request instead of
+  # a release. It *checks* rather than tests: the release builds - never tests -
+  # the arm binary, and the test code is not yet arm-portable (its stream buffers
+  # are typed `i8`, not `c_char`).
+  aarch64:
+    runs-on: ubuntu-24.04-arm
+    container: rust:1.97.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: mpv headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends pkg-config libmpv-dev
+      - name: Check both feature configurations on aarch64
+        run: |
+          cargo check --locked
+          cargo check -p priel-tui --no-default-features --locked
