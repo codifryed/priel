@@ -304,6 +304,10 @@ pub enum Hit {
     /// because the row under the cursor and the track in the speakers are
     /// routinely different tracks, and the heart beside each one has to mean it.
     FavoriteNowPlaying,
+    /// Keep or drop the track on a queue row, from the heart drawn on that row.
+    /// The index is the display row, which [`crate::app::App::queue_at`] maps to
+    /// the queue entry.
+    FavoriteQueueRow(usize),
     CycleView,
     /// Hand the keyboard to the other of the two lists.
     ///
@@ -341,6 +345,12 @@ pub enum Hit {
     RemoveSelected,
     /// Put the highlighted track into a playlist. Opens the target picker.
     AddToPlaylist,
+    /// Put the track on a queue row into a playlist, from the glyph on that row.
+    AddQueueRow(usize),
+    /// Put the playing track into a playlist, from the now-playing box's own
+    /// control beside its heart - separate for the reason
+    /// [`Hit::FavoriteNowPlaying`] is.
+    AddNowPlaying,
     /// Accept what is typed in the name prompt.
     SubmitPrompt,
     /// Abandon the name prompt.
@@ -4038,14 +4048,38 @@ impl App {
         self.current_tracks().get(index).cloned()
     }
 
+    /// The track a favorite or add-to-playlist action targets: the queue-selected
+    /// one when the queue holds the keyboard, otherwise the highlighted list row.
+    /// The `f` and `a` keys and their controls all read this, so an action lands
+    /// on whichever of the two lists the listener is looking at.
+    fn action_track(&self) -> Option<Track> {
+        if self.focus() == Focus::Queue {
+            self.queue_row_track(self.queue_selected)
+        } else {
+            self.selected_track()
+        }
+    }
+
+    /// The track on a queue row, by its display row. Used by the per-row controls
+    /// the queue draws, which name a row rather than the focused one.
+    fn queue_row_track(&self, row: usize) -> Option<Track> {
+        self.queue_at(row).and_then(|i| self.queue.get(i)).cloned()
+    }
+
     fn favorite_selected(&mut self) {
-        if let Some(track) = self.selected_track() {
+        if let Some(track) = self.action_track() {
             self.toggle_favorite(&track);
         }
     }
 
     fn favorite_now_playing(&mut self) {
         if let Some(track) = self.now_playing.clone() {
+            self.toggle_favorite(&track);
+        }
+    }
+
+    fn favorite_queue_row(&mut self, row: usize) {
+        if let Some(track) = self.queue_row_track(row) {
             self.toggle_favorite(&track);
         }
     }
@@ -4144,10 +4178,27 @@ impl App {
     /// one the listener means, since tracks are collected from favorites and
     /// from search.
     fn add_selected_to_playlist(&mut self) {
-        let Some(track_id) = self.selected_track_id() else {
-            self.notice = Some("Highlight a track first.".into());
-            return;
-        };
+        match self.action_track() {
+            Some(track) => self.open_add_to_playlist(track.id),
+            None => self.notice = Some("Highlight a track first.".into()),
+        }
+    }
+
+    fn add_now_playing_to_playlist(&mut self) {
+        match self.now_playing.as_ref().map(|t| t.id) {
+            Some(id) => self.open_add_to_playlist(id),
+            None => self.notice = Some("Nothing is playing.".into()),
+        }
+    }
+
+    fn add_queue_row_to_playlist(&mut self, row: usize) {
+        if let Some(track) = self.queue_row_track(row) {
+            self.open_add_to_playlist(track.id);
+        }
+    }
+
+    /// Open the target picker for a track, wherever it was named from.
+    fn open_add_to_playlist(&mut self, track_id: u64) {
         self.add_track = Some(track_id);
         self.add_selected = 0;
         self.add_offset = 0;
@@ -5646,6 +5697,7 @@ impl App {
             KeyCode::Char('F') => self.favorite_now_playing(),
             KeyCode::Char('r') => self.reload_view(),
             KeyCode::Char('a') => self.add_selected_to_playlist(),
+            KeyCode::Char('P') => self.add_now_playing_to_playlist(),
             KeyCode::Char('N') => self.new_playlist(),
             KeyCode::Char('R') => self.rename_selected_playlist(),
             KeyCode::Char('X') => self.remove_selected(),
@@ -5959,6 +6011,7 @@ impl App {
             Hit::Filter => self.start_filter(),
             Hit::FavoriteSelected => self.favorite_selected(),
             Hit::FavoriteNowPlaying => self.favorite_now_playing(),
+            Hit::FavoriteQueueRow(row) => self.favorite_queue_row(row),
             Hit::EditSearch => self.edit_search(),
             Hit::Reload => self.reload_view(),
             Hit::CycleView => self.cycle_view(),
@@ -5980,6 +6033,8 @@ impl App {
             Hit::RenamePlaylist => self.rename_selected_playlist(),
             Hit::RemoveSelected => self.remove_selected(),
             Hit::AddToPlaylist => self.add_selected_to_playlist(),
+            Hit::AddQueueRow(row) => self.add_queue_row_to_playlist(row),
+            Hit::AddNowPlaying => self.add_now_playing_to_playlist(),
             Hit::SubmitPrompt => self.submit_prompt(),
             Hit::CancelPrompt | Hit::ConfirmNo => self.cancel_modal(),
             Hit::ConfirmYes => self.confirm_yes(),
@@ -13585,6 +13640,59 @@ mod tests {
         assert_eq!(r.app.focus(), Focus::Queue);
         r.app.on_key(ctrl('w'));
         assert_eq!(r.app.focus(), Focus::List);
+    }
+
+    #[test]
+    fn f_and_a_act_on_the_queue_row_when_the_queue_has_the_keyboard() {
+        // Goal: issues 1 and 3, by keyboard. With the keyboard on the queue, `f`
+        // keeps the queue-selected track (a just-played one, say) and `a` opens the
+        // picker for it - not a list row.
+        let mut r = rig();
+        queued(&mut r, 3); // T1, T2, T3
+        with_column(&mut r.app);
+        r.app.give_focus(Focus::Queue);
+        r.app.queue_selected = 1; // T2
+
+        r.app.on_key(key('f'));
+        assert!(r.app.is_favorite(2), "the queue-selected track was kept");
+        assert_eq!(favorite_requests(&requests(&r)), vec![(2, true)]);
+
+        r.app.queue_selected = 2; // T3
+        r.app.on_key(key('a'));
+        assert_eq!(r.app.mode, Mode::AddTo, "the picker opened");
+        assert_eq!(r.app.add_track, Some(3), "for the queue-selected track");
+    }
+
+    #[test]
+    fn a_queue_row_glyph_favorites_or_adds_that_row() {
+        // Goal: issues 1 and 3, by mouse. The heart and `+` on a queue row act on
+        // that row, whichever one the cursor is on.
+        let mut r = rig();
+        queued(&mut r, 3);
+        with_column(&mut r.app);
+
+        r.app.dispatch(Hit::FavoriteQueueRow(2)); // T3
+        assert!(r.app.is_favorite(3), "the heart kept that row's track");
+
+        r.app.dispatch(Hit::AddQueueRow(0)); // T1
+        assert_eq!(r.app.mode, Mode::AddTo);
+        assert_eq!(r.app.add_track, Some(1), "for that row's track");
+    }
+
+    #[test]
+    fn the_playing_track_can_be_added_to_a_playlist() {
+        // Goal: issue 3. `P`, and the now-playing box's own `+`, file the playing
+        // track - routinely neither the highlighted nor the queue-selected one.
+        let mut r = rig();
+        r.app.now_playing = Some(track(7, "Seven", "A"));
+        r.app.on_key(key('P'));
+        assert_eq!(r.app.mode, Mode::AddTo);
+        assert_eq!(r.app.add_track, Some(7), "the playing track");
+
+        let mut r2 = rig();
+        r2.app.now_playing = Some(track(7, "Seven", "A"));
+        r2.app.dispatch(Hit::AddNowPlaying);
+        assert_eq!(r2.app.add_track, Some(7), "the control runs the same thing");
     }
 
     #[test]

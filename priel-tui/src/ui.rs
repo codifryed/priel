@@ -64,6 +64,10 @@ const WIDE_COLS: u16 = 120;
 /// more.
 const QUEUE_COLS: u16 = 36;
 
+/// Cells reserved at the right of each queue entry's title for its two per-row
+/// controls: a heart and a `+`, with a space before each.
+const QUEUE_ROW_CONTROLS: u16 = 4;
+
 /// The album cover, when it is drawn, is this many rows tall and twice that wide.
 ///
 /// A cell is one pixel wide and two tall, so `COVER_ROWS` rows is `2*COVER_ROWS`
@@ -955,7 +959,13 @@ const HELP_RIGHT: &[(&str, &[HelpRow])] = &[
         &[
             row(&[("N", Some(Hit::NewPlaylist))], "new playlist"),
             row(&[("R", Some(Hit::RenamePlaylist))], "rename this playlist"),
-            row(&[("a", Some(Hit::AddToPlaylist))], "add track to playlist"),
+            row(
+                &[
+                    ("a", Some(Hit::AddToPlaylist)),
+                    ("P", Some(Hit::AddNowPlaying)),
+                ],
+                "add selected / playing track",
+            ),
             row(
                 &[("X", Some(Hit::RemoveSelected))],
                 "delete playlist / track",
@@ -2917,8 +2927,13 @@ fn play_state(app: &App) -> &'static str {
     }
 }
 
-/// The favourite control for the playing track, pushed onto whichever bar is
-/// being laid out. Nothing playing means nothing to keep, so no button.
+/// The playing track's own controls - keep it, and file it into a playlist -
+/// pushed onto whichever bar is being laid out. Nothing playing means nothing to
+/// act on, so no buttons.
+///
+/// Separate from the list's `[f]`/`[a]` for the reason [`Hit::FavoriteNowPlaying`]
+/// gives: the row under the cursor and the track in the speakers are routinely
+/// different, and each has to be reachable on its own.
 fn push_heart(bar: &mut ControlBar, app: &App, t: &Theme) {
     if app.now_playing.is_none() {
         return;
@@ -2932,6 +2947,7 @@ fn push_heart(bar: &mut ControlBar, app: &App, t: &Theme) {
         Hit::FavoriteNowPlaying,
         heart_style(kept, t),
     );
+    bar.button("+ ", Hit::AddNowPlaying, t.control());
 }
 
 /// The bar and the two times: elapsed pinned left, length pinned right, bar
@@ -3146,73 +3162,152 @@ fn queue_column(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let width = inner.width as usize;
-    let playing_row = app.playing_row();
+    let controls = inner.width >= QUEUE_ROW_CONTROLS + 4;
+    // Each entry carries two controls at the right of its title - a heart that
+    // keeps or drops the track and a `+` that files it into a playlist - so a
+    // queue track (one that just played, say) can be acted on without leaving the
+    // queue. See `draw_queue_entry`.
+    let layout = QueueLayout {
+        inner,
+        rows,
+        width,
+        title_width: if controls {
+            width.saturating_sub(QUEUE_ROW_CONTROLS as usize)
+        } else {
+            width
+        },
+        controls,
+        playing_row: app.playing_row(),
+        focused,
+        t,
+    };
     for (i, row) in (app.queue_offset..app.queue.len()).enumerate() {
         let title_y = i * QUEUE_ROWS_PER_ENTRY;
         if title_y >= rows {
             break;
         }
-        let Some(entry) = app.queue_at(row).and_then(|index| app.queue.get(index)) else {
+        if !draw_queue_entry(f, app, row, title_y, &layout) {
             break;
-        };
-        let lead = queue_marks(app, row);
-        let line = trunc(&format!("{lead}{}", entry.title), width);
-        // The cursor owns the row it is on, exactly as it does in the browse
-        // list: a row that was both the cursor and the one in the speakers
-        // would otherwise be asked to wear two foregrounds.
-        let style = if row == app.queue_selected {
-            t.cursor(focused)
-        } else if row == playing_row {
-            t.on(t.active)
-        } else if row < playing_row {
-            t.on(t.faint)
-        } else {
-            t.on(t.text)
-        };
-        f.render_widget(
-            Paragraph::new(line).style(style),
-            Rect {
-                x: inner.x,
-                y: inner.y + title_y as u16,
-                width: inner.width,
-                height: 1,
-            },
-        );
-        // The artist, one row down and one cell in past the title, so the pair
-        // reads as one entry by its shape and not by its colour alone - the same
-        // rule that keeps the focus ring legible without hue. Dropped where the
-        // column has run out of rows for it.
-        let artist_y = title_y + 1;
-        if artist_y >= rows {
-            continue;
         }
-        let artist_style = if row == app.queue_selected {
-            // The whole entry stays on the cursor's backing so it reads as one
-            // selected block; the artist is dimmed within it rather than lifted
-            // onto the plain surface, which would split the highlight in two.
-            t.cursor(focused).add_modifier(Modifier::DIM)
-        } else {
-            t.on(t.faint)
-        };
-        let names = if entry.artists.is_empty() {
-            entry.artist.clone()
-        } else {
-            entry.artists.join(", ")
-        };
-        // Aligned one cell past the title's first character: the two lead cells
-        // are the title's alone, and the extra space nests the artist under it.
-        let indent = " ".repeat(lead.chars().count() + 1);
-        let artist_line = trunc(&format!("{indent}{names}"), width);
-        f.render_widget(
-            Paragraph::new(artist_line).style(artist_style),
-            Rect {
-                x: inner.x,
-                y: inner.y + artist_y as u16,
-                width: inner.width,
-                height: 1,
-            },
-        );
     }
+}
+
+/// The layout facts a queue entry is drawn against, gathered once so
+/// [`draw_queue_entry`] takes one context rather than a fistful of arguments.
+struct QueueLayout {
+    inner: Rect,
+    rows: usize,
+    width: usize,
+    title_width: usize,
+    controls: bool,
+    playing_row: usize,
+    focused: bool,
+    t: Theme,
+}
+
+/// Draw one queue entry at display `row`: the title row with its per-row heart
+/// and add controls, and the artist row beneath. Returns `false` when the row has
+/// no entry, so the caller stops.
+///
+/// **A click on the heart or the `+` acts on this row; a click anywhere else on
+/// it still selects or plays it** - the one place in priel a second clickable
+/// target shares a row, chosen for the queue because keeping or filing a track
+/// that just played is worth the extra glyphs.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "row index is bounded by the rect height, itself a u16"
+)]
+fn draw_queue_entry(
+    f: &mut Frame,
+    app: &mut App,
+    row: usize,
+    title_y: usize,
+    l: &QueueLayout,
+) -> bool {
+    // Owned copies up front, so the queue borrow ends before the per-row hit boxes
+    // are pushed - which needs `app` mutably.
+    let Some(entry) = app.queue_at(row).and_then(|index| app.queue.get(index)) else {
+        return false;
+    };
+    let entry_id = entry.id;
+    let title = entry.title.clone();
+    let names = if entry.artists.is_empty() {
+        entry.artist.clone()
+    } else {
+        entry.artists.join(", ")
+    };
+    let lead = queue_marks(app, row);
+    let t = l.t;
+    // The cursor owns the row it is on, exactly as it does in the browse list: a
+    // row that was both the cursor and the one in the speakers would otherwise be
+    // asked to wear two foregrounds.
+    let style = if row == app.queue_selected {
+        t.cursor(l.focused)
+    } else if row == l.playing_row {
+        t.on(t.active)
+    } else if row < l.playing_row {
+        t.on(t.faint)
+    } else {
+        t.on(t.text)
+    };
+    let y = l.inner.y + title_y as u16;
+    f.render_widget(
+        Paragraph::new(trunc(&format!("{lead}{title}"), l.title_width)).style(style),
+        Rect {
+            x: l.inner.x,
+            y,
+            width: l.inner.width,
+            height: 1,
+        },
+    );
+    if l.controls {
+        // The heart shows the kept state by its shape, filled or hollow, like the
+        // browse-list one; both controls carry the row's own backing so the cursor
+        // and playing tints reach across them.
+        let heart_rect = Rect {
+            x: l.inner.x + l.inner.width - 3,
+            y,
+            width: 1,
+            height: 1,
+        };
+        let add_rect = Rect {
+            x: l.inner.x + l.inner.width - 1,
+            y,
+            width: 1,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(heart(app.is_favorite(entry_id))).style(style),
+            heart_rect,
+        );
+        f.render_widget(Paragraph::new("+").style(style), add_rect);
+        app.hits.push((heart_rect, Hit::FavoriteQueueRow(row)));
+        app.hits.push((add_rect, Hit::AddQueueRow(row)));
+    }
+    // The artist, one row down and one cell in past the title, so the pair reads
+    // as one entry by its shape and not its colour alone. Dropped where the column
+    // has run out of rows for it.
+    let artist_y = title_y + 1;
+    if artist_y >= l.rows {
+        return true;
+    }
+    let artist_style = if row == app.queue_selected {
+        t.cursor(l.focused).add_modifier(Modifier::DIM)
+    } else {
+        t.on(t.faint)
+    };
+    let indent = " ".repeat(lead.chars().count() + 1);
+    let artist_line = trunc(&format!("{indent}{names}"), l.width);
+    f.render_widget(
+        Paragraph::new(artist_line).style(artist_style),
+        Rect {
+            x: l.inner.x,
+            y: l.inner.y + artist_y as u16,
+            width: l.inner.width,
+            height: 1,
+        },
+    );
+    true
 }
 
 /// One entry in the bottom keyboard reference.
@@ -5008,7 +5103,8 @@ mod tests {
         click_hit(&mut sc.app, Hit::FavoriteNowPlaying);
         assert!(!sc.app.is_favorite(1), "the click ran the action");
         assert!(
-            text(&mut sc.app, 100, 20).contains("\u{2661} Playing"),
+            // The add-to-playlist control sits between the heart and the title.
+            text(&mut sc.app, 100, 20).contains("\u{2661} + Playing"),
             "and the glyph followed it"
         );
     }
@@ -8749,7 +8845,13 @@ mod tests {
         queue_rows(app, w, h)
             .into_iter()
             .step_by(QUEUE_ROWS_PER_ENTRY)
-            .map(|r| r.trim_start_matches(['♪', '~', ' ']).to_string())
+            .map(|r| {
+                // Off the front: the played/radio marks. Off the back: the per-row
+                // heart and add controls.
+                r.trim_start_matches(['♪', '~', ' '])
+                    .trim_end_matches([' ', '♥', '♡', '+'])
+                    .to_string()
+            })
             .filter(|r| !r.is_empty())
             .collect()
     }
