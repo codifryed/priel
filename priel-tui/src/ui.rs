@@ -1551,12 +1551,7 @@ fn setup_step_view(
             body.push(styled(format!("Written to {path}."), t.text));
             body.push(Line::default());
             body.push(styled(
-                match what {
-                    SetupWhat::Reserve { .. } => {
-                        "PipeWire has to restart to hand the card over.".to_string()
-                    }
-                    _ => "PipeWire has to restart to use the new rates.".to_string(),
-                },
+                format!("PipeWire has to restart to {}.", what.restart_promise()),
                 t.muted,
             ));
             vec![

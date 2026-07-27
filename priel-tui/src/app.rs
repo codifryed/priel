@@ -490,6 +490,29 @@ pub(crate) enum SetupWhat {
     ClearPin { at_hz: u32 },
 }
 
+impl SetupWhat {
+    /// What restarting the sound server will make happen, for the sentence that
+    /// offers the restart and the one that reports declining it.
+    ///
+    /// Here rather than at the two call sites because those sentences are a
+    /// promise: an action whose overlay offered the restart for one reason and
+    /// whose notice named another would have made it twice, differently.
+    pub(crate) fn restart_promise(&self) -> &'static str {
+        match self {
+            Self::Reserve { .. } => "hand the card over",
+            Self::Rates { .. } | Self::ClearPin { .. } => "use the new rates",
+        }
+    }
+
+    /// What is true once the restart has happened.
+    pub(crate) fn restart_done(&self) -> &'static str {
+        match self {
+            Self::Reserve { .. } => "the card is priel's to open",
+            Self::Rates { .. } | Self::ClearPin { .. } => "the new rates are live",
+        }
+    }
+}
+
 /// Why the "set up audio" offer is being made, which decides what the preview
 /// may say.
 ///
@@ -5191,7 +5214,8 @@ impl App {
                 }
                 KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc | KeyCode::Enter => {
                     self.notice = Some(format!(
-                        "Written to {path}. Restart PipeWire to use the new rates."
+                        "Written to {path}. Restart PipeWire to {}.",
+                        setup.what.restart_promise()
                     ));
                     self.setup = None;
                     self.mode = Mode::Normal;
@@ -5273,9 +5297,13 @@ impl App {
         ) {
             return;
         }
+        let done = self
+            .setup
+            .as_ref()
+            .map_or("the new rates are live", |s| s.what.restart_done());
         self.setup_step(match result {
             Ok(()) => SetupStep::Done {
-                message: "Done. PipeWire restarted; the new rates are live.".to_string(),
+                message: format!("Done. PipeWire restarted; {done}."),
             },
             Err(e) => SetupStep::Done {
                 message: format!(
@@ -10164,6 +10192,48 @@ mod tests {
                     if card_name == "alsa_card.usb-Studio_DAC-00"
             ),
             "the request names the card the graph named"
+        );
+    }
+
+    #[test]
+    fn the_restart_promises_what_the_change_it_follows_actually_does() {
+        // Goal: the restart step is shared by both drop-ins, and it used to
+        // promise new rates whichever one had been written. A sentence offering
+        // the restart for one reason, above a notice naming another, is the
+        // promise made twice and differently.
+        let mut graph = chain();
+        graph.holder = DeviceHolder::Server(HeldDevice {
+            sink: "Studio DAC".into(),
+            opened_by: Some("wireplumber".into()),
+            pcm: Some("hw:2,0".into()),
+            card_name: Some("alsa_card.usb-Studio_DAC-00".into()),
+        });
+        let mut r = playing_hires(graph);
+        r.app.on_key(key('R'));
+        r.app.on_key(key('y'));
+        r.to_app
+            .send(FromWorker::AudioSetUp(Ok(
+                "/tmp/99-priel-reserve.conf".into()
+            )))
+            .expect("send");
+        r.app.drain_worker();
+        assert!(
+            matches!(
+                r.app.setup.as_ref().map(|s| &s.step),
+                Some(SetupStep::Restart { .. })
+            ),
+            "a drop-in landed, so the restart is offered"
+        );
+
+        r.app.on_key(key('n'));
+        let notice = r.app.notice.as_deref().expect("a notice is left behind");
+        assert!(
+            notice.contains("hand the card over"),
+            "the notice says what the restart would do here: {notice}"
+        );
+        assert!(
+            !notice.contains("rates"),
+            "and not what the other drop-in does: {notice}"
         );
     }
 
