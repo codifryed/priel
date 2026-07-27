@@ -434,26 +434,60 @@ pub enum Mode {
     AddTo,       // choosing which playlist a track goes into; modal
 }
 
-/// The "set up audio" flow, from the confirm to the outcome.
+/// A change to the sound server, from the confirm to the outcome.
 ///
-/// Held only while the overlay is up. The rates were settled the moment it
-/// opened - from the graph that was already read - so nothing here reaches back
-/// into the graph: what the preview shows and what the worker writes are the one
-/// list, decided once. The step is a small state machine the overlay renders and
-/// the keys advance, and the two `Writing`/`Restarting` steps are the ones with
-/// a request in flight, where a keystroke does nothing but wait.
+/// Held only while the overlay is up. What would change was settled the moment
+/// it opened - from the graph that was already read - so nothing here reaches
+/// back into the graph: what the preview shows and what the worker does are the
+/// one decision, made once. The step is a small state machine the overlay
+/// renders and the keys advance, and the steps with a request in flight are the
+/// ones where a keystroke does nothing but wait.
+///
+/// **One flow for every action, not one per action.** All of them ask before
+/// they touch anything, all of them report what came of it, and two of the three
+/// land a drop-in that a restart has to pick up. Giving each its own struct,
+/// overlay and step machine would be three copies of that shape drifting apart -
+/// and the confirm is the part that must never be the one that drifts.
 pub(crate) struct Setup {
-    /// The rates being added. Kept apart from the whole list only to name them
-    /// in the sentence; it is what the offer was about.
-    pub(crate) adding_hz: Vec<u32>,
-    /// Which of the two findings the offer came from, so the preview can say
-    /// what is true without claiming what was never read.
-    pub(crate) reason: SetupReason,
-    /// The whole list the drop-in would permit: everything already permitted
-    /// plus [`Self::adding_hz`]. This is what is written, because a later drop-in
-    /// replaces the property rather than adding to it.
-    pub(crate) allowed_hz: Vec<u32>,
+    /// What this flow would do, and everything needed to describe and perform
+    /// it. Settled at the confirm and never recomputed.
+    pub(crate) what: SetupWhat,
     pub(crate) step: SetupStep,
+}
+
+/// What a [`Setup`] flow would change.
+///
+/// Each variant carries what its preview needs to say and what its request
+/// needs to send, so the sentence a listener approves and the change that
+/// happens cannot be computed from different readings of the graph.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum SetupWhat {
+    /// Permit sample rates the server is not set to use, by writing priel's own
+    /// `pipewire.conf.d` drop-in.
+    Rates {
+        /// The rates being added. Kept apart from the whole list only to name
+        /// them in the sentence; it is what the offer was about.
+        adding_hz: Vec<u32>,
+        /// Which finding the offer came from, so the preview can say what is
+        /// true without claiming what was never read.
+        reason: SetupReason,
+        /// The whole list the drop-in would permit: everything already permitted
+        /// plus `adding_hz`. This is what is written, because a later drop-in
+        /// replaces the property rather than adding to it.
+        allowed_hz: Vec<u32>,
+    },
+    /// Stop the session manager claiming the card, by writing priel's own
+    /// `wireplumber.conf.d` drop-in. The one change here that takes something
+    /// away from the rest of the machine, which is why its preview says so.
+    Reserve {
+        card_name: String,
+        /// What the card is called on screen, for a sentence that names the
+        /// device rather than its ALSA identifier.
+        device: String,
+    },
+    /// Clear `clock.force-rate`, which holds the whole graph at one rate. The
+    /// only one of the three that writes no file and needs no restart.
+    ClearPin { at_hz: u32 },
 }
 
 /// Why the "set up audio" offer is being made, which decides what the preview
@@ -2771,6 +2805,7 @@ impl App {
                 FromWorker::AudioSetUp(result) => self.on_audio_set_up(result),
                 FromWorker::AudioRestarted(result) => self.on_audio_restarted(result),
                 FromWorker::BtCodecSwitched(result) => self.on_bt_codec_switched(result),
+                FromWorker::RatePinCleared(result) => self.on_rate_pin_cleared(result),
                 // The clock read at track start: hand it to the player, where the
                 // verdict falls back to it when there is no ALSA readout.
                 FromWorker::OutputClock(clock) => self.player.set_clock(clock),
@@ -4963,6 +4998,12 @@ impl App {
             // supports. Does nothing when there is none, exactly as the footer
             // key that fires it is only shown when there is.
             KeyCode::Char('C') => self.begin_codec_switch(),
+            // Offer to clear the rate pin that is holding the graph off this
+            // track's rate, and to reserve the card the sound server is holding.
+            // Both do nothing when they do not apply, like the two above: the
+            // action rows that fire them are shown on exactly that condition.
+            KeyCode::Char('P') => self.begin_clear_pin(),
+            KeyCode::Char('R') => self.begin_reserve(),
             _ => {}
         }
         self.dirty = true;
@@ -5027,14 +5068,97 @@ impl App {
         let Some((adding_hz, reason, allowed_hz)) = self.setup_targets() else {
             return;
         };
-        self.setup = Some(Setup {
+        self.begin_apply(SetupWhat::Rates {
             adding_hz,
             reason,
             allowed_hz,
+        });
+    }
+
+    /// The card the sound server is holding that priel could reserve, and what
+    /// to call it on screen.
+    ///
+    /// `None` unless the server holds an ALSA card *and* the dump names it: a
+    /// rule matching a name priel guessed at would disable a device that was
+    /// working, which is the reason the report has always refused to invent one.
+    fn reserve_target(&self) -> Option<(String, String)> {
+        let Some(Ok(graph)) = &self.audio_graph else {
+            return None;
+        };
+        let DeviceHolder::Server(held) = &graph.holder else {
+            return None;
+        };
+        Some((held.card_name.clone()?, held.sink.clone()))
+    }
+
+    /// Open the reserve preview, or do nothing when there is no card to reserve.
+    fn begin_reserve(&mut self) {
+        let Some((card_name, device)) = self.reserve_target() else {
+            return;
+        };
+        self.begin_apply(SetupWhat::Reserve { card_name, device });
+    }
+
+    /// The rate the graph is pinned to, when a pin is what is holding this track
+    /// off its own rate.
+    ///
+    /// Read from the advice rather than from `forced_hz` directly, so the offer
+    /// appears exactly where the report says the pin is the problem - a pin set
+    /// to the rate the track wants is doing no harm and gets no offer.
+    fn pin_target(&self) -> Option<u32> {
+        let Some(Ok(graph)) = &self.audio_graph else {
+            return None;
+        };
+        let track_rate_hz = self.status.decoded_format(self.now_meta.bit_depth).rate_hz;
+        match graph.rate_advice(track_rate_hz, self.status.observed_output_rate()) {
+            RateAdvice::Pinned { at_hz } => Some(at_hz),
+            _ => None,
+        }
+    }
+
+    /// Open the clear-the-pin preview, or do nothing when there is no pin.
+    fn begin_clear_pin(&mut self) {
+        let Some(at_hz) = self.pin_target() else {
+            return;
+        };
+        self.begin_apply(SetupWhat::ClearPin { at_hz });
+    }
+
+    /// Put one change up for approval. The one way into the flow, so every
+    /// action asks before it touches anything.
+    fn begin_apply(&mut self, what: SetupWhat) {
+        self.setup = Some(Setup {
+            what,
             step: SetupStep::Confirm,
         });
         self.mode = Mode::SetupAudio;
         self.dirty = true;
+    }
+
+    /// The request one approved change sends, and the step it waits in.
+    ///
+    /// Beside the flow it belongs to rather than inside the key handler, so what
+    /// each action *does* is one place to read next to what its preview *says*.
+    fn approved(what: &SetupWhat) -> (ToWorker, SetupStep) {
+        match what {
+            SetupWhat::Rates { allowed_hz, .. } => (
+                ToWorker::SetUpAudio {
+                    allowed_hz: allowed_hz.clone(),
+                },
+                SetupStep::Writing,
+            ),
+            SetupWhat::Reserve { card_name, .. } => (
+                ToWorker::ReserveCard {
+                    card_name: card_name.clone(),
+                },
+                SetupStep::Writing,
+            ),
+            // No file and no restart: the pin is live metadata. It waits in the
+            // same in-flight step as the other two - one state for "a request is
+            // out", with the overlay taking its words from `what` - and its
+            // reply ends the flow rather than offering a restart.
+            SetupWhat::ClearPin { .. } => (ToWorker::ClearRatePin, SetupStep::Writing),
+        }
     }
 
     /// The "set up audio" overlay: a preview to approve, then the write, then the
@@ -5048,9 +5172,9 @@ impl App {
         match &setup.step {
             SetupStep::Confirm => match key.code {
                 KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-                    let allowed_hz = setup.allowed_hz.clone();
-                    self.setup_step(SetupStep::Writing);
-                    self.ask(ToWorker::SetUpAudio { allowed_hz });
+                    let (request, step) = Self::approved(&setup.what);
+                    self.setup_step(step);
+                    self.ask(request);
                 }
                 KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {
                     // Back to the report it was opened from, not out of it: the
@@ -5093,12 +5217,16 @@ impl App {
 
     /// The drop-in was written, or not. Only a flow still waiting on the write
     /// moves - a reply that outlived its overlay is dropped, as everywhere here.
+    ///
+    /// The flow is matched on what it is doing as well as which step it is in.
+    /// One in-flight step now serves all three actions, and a reply that belongs
+    /// to another of them must not advance this one.
     fn on_audio_set_up(&mut self, result: Result<String, String>) {
         if !matches!(
             &self.setup,
             Some(Setup {
                 step: SetupStep::Writing,
-                ..
+                what: SetupWhat::Rates { .. } | SetupWhat::Reserve { .. },
             })
         ) {
             return;
@@ -5107,6 +5235,27 @@ impl App {
             Ok(path) => SetupStep::Restart { path },
             Err(e) => SetupStep::Done {
                 message: format!("Could not write it: {e}"),
+            },
+        });
+        self.dirty = true;
+    }
+
+    /// The rate pin was cleared, or not. The end of that flow either way: the
+    /// pin is live metadata, so there is no file to restart anything for.
+    fn on_rate_pin_cleared(&mut self, result: Result<(), String>) {
+        if !matches!(
+            &self.setup,
+            Some(Setup {
+                step: SetupStep::Writing,
+                what: SetupWhat::ClearPin { .. },
+            })
+        ) {
+            return;
+        }
+        self.setup_step(SetupStep::Done {
+            message: match result {
+                Ok(()) => "Done. The pin is cleared and takes effect now.".to_string(),
+                Err(e) => format!("Could not clear it: {e}"),
             },
         });
         self.dirty = true;
@@ -5222,6 +5371,20 @@ impl App {
                 KeyCode::Char('C'),
                 "switch codec",
                 format!("to {}", crate::ui::codec_label(&better)),
+            ));
+        }
+        if let Some(at_hz) = self.pin_target() {
+            rows.push(action(
+                KeyCode::Char('P'),
+                "clear the rate pin",
+                format!("held at {}", crate::ui::fmt_khz(at_hz)),
+            ));
+        }
+        if let Some((_, device)) = self.reserve_target() {
+            rows.push(action(
+                KeyCode::Char('R'),
+                "reserve the device",
+                format!("take {device} off the server"),
             ));
         }
         if rows.len() == before {
@@ -9882,10 +10045,18 @@ mod tests {
 
         r.app.on_key(key('A'));
         let setup = r.app.setup.as_ref().expect("a flow is up");
-        assert_eq!(setup.adding_hz, vec![HIRES_TRACK_RATE_HZ]);
+        let SetupWhat::Rates {
+            adding_hz,
+            allowed_hz,
+            ..
+        } = &setup.what
+        else {
+            panic!("the rates flow should be up, not {:?}", setup.what);
+        };
+        assert_eq!(adding_hz, &vec![HIRES_TRACK_RATE_HZ]);
         assert_eq!(
-            setup.allowed_hz,
-            vec![44_100, 48_000],
+            allowed_hz,
+            &vec![44_100, 48_000],
             "everything permitted, plus the rate this track needs"
         );
     }
@@ -9907,6 +10078,115 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_graph_is_offered_the_one_change_that_helps_it() {
+        // Goal: `clock.force-rate` holds the whole graph at one rate and the
+        // permitted list is not consulted at all, so the rates drop-in would
+        // change nothing here. The report has always said so and left the reader
+        // to run `pw-metadata` themselves; this is that sentence with a key
+        // behind it. The offer follows the advice, so a pin set to the rate the
+        // track wants - doing no harm - is not offered anything.
+        let mut graph = chain_clocked(&[44_100, 48_000], 48_000);
+        graph.clock.forced_hz = Some(48_000);
+        let mut r = playing_hires(graph);
+        assert_eq!(r.app.pin_target(), Some(48_000));
+        let text = overlay_text(&r.app);
+        assert!(text.contains("clear the rate pin"), "the offer: {text}");
+
+        r.app.on_key(key('P'));
+        assert_eq!(r.app.mode, Mode::SetupAudio);
+        let setup = r.app.setup.as_ref().expect("a flow is up");
+        assert_eq!(setup.what, SetupWhat::ClearPin { at_hz: 48_000 });
+
+        // Confirming runs the command and waits; no file is written, so the
+        // reply ends the flow rather than offering a restart.
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        assert!(
+            matches!(requests(&r).as_slice(), [ToWorker::ClearRatePin]),
+            "the request goes out"
+        );
+        r.to_app
+            .send(FromWorker::RatePinCleared(Ok(())))
+            .expect("send");
+        r.app.drain_worker();
+        match r.app.setup.as_ref().map(|s| &s.step) {
+            Some(SetupStep::Done { message }) => {
+                assert!(message.contains("cleared"), "{message}");
+            }
+            other => panic!("the flow should be done, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pin_on_the_tracks_own_rate_is_not_offered_anything() {
+        // Goal: a pin is only a problem where it is holding the track off its
+        // rate. Offering to clear one that is doing no harm would be a change
+        // made for its own sake, and it would take rate-following away.
+        let mut graph = chain_clocked(&[44_100, 48_000], 44_100);
+        graph.clock.forced_hz = Some(HIRES_TRACK_RATE_HZ);
+        let r = playing_hires(graph);
+        assert_eq!(r.app.pin_target(), None);
+        assert!(!overlay_text(&r.app).contains("clear the rate pin"));
+    }
+
+    #[test]
+    fn the_card_the_server_holds_can_be_reserved_and_the_cost_is_stated_first() {
+        // Goal: the last of the report's prose-only changes. It is also the one
+        // that takes something away from the rest of the machine, so the confirm
+        // says that before it says anything else - the file outlives the screen
+        // that explained it.
+        let mut graph = chain();
+        graph.holder = DeviceHolder::Server(HeldDevice {
+            sink: "Studio DAC".into(),
+            opened_by: Some("wireplumber".into()),
+            pcm: Some("hw:2,0".into()),
+            card_name: Some("alsa_card.usb-Studio_DAC-00".into()),
+        });
+        let mut r = playing_hires(graph);
+        let text = overlay_text(&r.app);
+        assert!(text.contains("reserve the device"), "the offer: {text}");
+
+        r.app.on_key(key('R'));
+        let setup = r.app.setup.as_ref().expect("a flow is up");
+        assert_eq!(
+            setup.what,
+            SetupWhat::Reserve {
+                card_name: "alsa_card.usb-Studio_DAC-00".into(),
+                device: "Studio DAC".into(),
+            }
+        );
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        assert!(
+            matches!(
+                requests(&r).as_slice(),
+                [ToWorker::ReserveCard { card_name }]
+                    if card_name == "alsa_card.usb-Studio_DAC-00"
+            ),
+            "the request names the card the graph named"
+        );
+    }
+
+    #[test]
+    fn a_card_the_graph_cannot_name_is_never_reserved() {
+        // Goal: the rule the report has always kept - a rule matching a name
+        // priel guessed at would disable a device that was working. No name, no
+        // offer, and the section above still says why.
+        let mut graph = chain();
+        graph.holder = DeviceHolder::Server(HeldDevice {
+            sink: "Studio DAC".into(),
+            opened_by: None,
+            pcm: None,
+            card_name: None,
+        });
+        let mut r = playing_hires(graph);
+        assert_eq!(r.app.reserve_target(), None);
+        assert!(!overlay_text(&r.app).contains("reserve the device"));
+        r.app.on_key(key('R'));
+        assert_eq!(r.app.mode, Mode::Graph, "the key does nothing here");
+    }
+
+    #[test]
     fn the_setup_key_opens_the_preview_with_the_whole_list_to_permit() {
         // Goal: A opens the confirm, and the list it would write is everything
         // already permitted plus the device's blocked rates - added, never
@@ -9916,8 +10196,16 @@ mod tests {
         assert_eq!(r.app.mode, Mode::SetupAudio);
         let setup = r.app.setup.as_ref().expect("a flow is up");
         assert_eq!(setup.step, SetupStep::Confirm);
-        assert_eq!(setup.adding_hz, vec![88_200, 176_400]);
-        assert_eq!(setup.allowed_hz, vec![44_100, 48_000, 88_200, 176_400]);
+        let SetupWhat::Rates {
+            adding_hz,
+            allowed_hz,
+            ..
+        } = &setup.what
+        else {
+            panic!("the rates flow should be up, not {:?}", setup.what);
+        };
+        assert_eq!(adding_hz, &vec![88_200, 176_400]);
+        assert_eq!(allowed_hz, &vec![44_100, 48_000, 88_200, 176_400]);
     }
 
     #[test]

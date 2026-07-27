@@ -16,19 +16,25 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Permitting the rates a DAC can do, by writing priel's own `PipeWire` drop-in.
+//! The changes priel can make to the sound server on the listener's behalf.
 //!
-//! This is the one action that reaches outside priel's own files, and it is kept
-//! to the narrowest shape that can: priel writes a single file it is the sole
-//! author of - [`RATES_CONF`] under the user's `pipewire.conf.d` - and never
-//! edits the sound server's configuration or one the listener wrote. Dropping a
-//! file into that directory is how the server is meant to be configured, so this
-//! is priel managing its own file, not priel editing another program's.
+//! These are the actions that reach outside priel's own files, and they are kept
+//! to the narrowest shape that can. **priel only ever writes files it is the
+//! sole author of** - [`RATES_CONF`] under the user's `pipewire.conf.d` and
+//! [`RESERVE_CONF`] under their `wireplumber.conf.d` - and never edits the sound
+//! server's own configuration or one the listener wrote. Dropping a file into
+//! those directories is how each is meant to be configured, so this is priel
+//! managing its own files, not priel editing another program's.
 //!
-//! The content is a pure function of the rate list ([`rates_conf_text`]), and
-//! the list itself is a pure function of what is permitted now and what the
-//! device can do that is not ([`desired_allowed_hz`]) - so the preview a
-//! listener approves and the bytes that land are computed the same way, once.
+//! Every content here is a pure function of what it is given
+//! ([`rates_conf_text`], [`reserve_conf_text`]) and every command is a pure
+//! function that can be read without being run ([`restart_argv`],
+//! [`clear_pin_argv`], [`switch_argv`]) - so the preview a listener approves and
+//! what actually happens are computed the same way, once.
+//!
+//! The one change that is not a file is [`clear_rate_pin`]: `clock.force-rate`
+//! is live metadata rather than configuration, so it is set back to zero and
+//! takes effect at once, with no restart and nothing left behind to delete.
 
 use std::env;
 use std::ffi::OsString;
@@ -40,7 +46,8 @@ use crate::run::{self, RunError};
 /// How long the sound-server restart gets before priel stops waiting on it.
 const RESTART_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The drop-in priel writes, and the only file it ever writes here.
+/// The drop-in priel writes into the server's own configuration directory, and
+/// the only file it writes there.
 ///
 /// `99-` so it sorts last and its `allowed-rates` wins over an earlier drop-in
 /// (the server takes the last value of a property, not the union), which is why
@@ -144,14 +151,124 @@ pub fn restart_pipewire() -> Result<(), String> {
     let (cmd, args) = restart_argv();
     run::capture(cmd, &args, RESTART_TIMEOUT)
         .map(|_| ())
-        .map_err(|e| match e {
-            RunError::NotFound => "systemctl was not found".to_string(),
-            RunError::TimedOut => "the restart did not finish in time".to_string(),
-            RunError::Spawn(why) => format!("the restart could not be started: {why}"),
-            RunError::Failed(Some(code)) => format!("the restart exited with status {code}"),
-            RunError::Failed(None) => "the restart was killed by a signal".to_string(),
-            RunError::Unreadable => "the restart output could not be read".to_string(),
-        })
+        .map_err(|e| why(cmd, "the restart", e))
+}
+
+/// One failed child process, as a sentence naming what was being attempted.
+///
+/// Shared by every command priel runs at the sound server, so a new one cannot
+/// arrive with a different vocabulary for the same six failures. `program` is
+/// named only where the binary itself is missing, which is the one failure the
+/// listener fixes by installing something; the rest read better as what priel
+/// was doing.
+fn why(program: &str, noun: &str, e: RunError) -> String {
+    match e {
+        RunError::NotFound => format!("{program} was not found"),
+        RunError::TimedOut => format!("{noun} did not finish in time"),
+        RunError::Spawn(reason) => format!("{noun} could not be started: {reason}"),
+        RunError::Failed(Some(code)) => format!("{noun} exited with status {code}"),
+        RunError::Failed(None) => format!("{noun} was killed by a signal"),
+        RunError::Unreadable => format!("{noun} output could not be read"),
+    }
+}
+
+/// The drop-in that stops the sound server claiming one card, and the only other
+/// file priel writes.
+///
+/// `99-` for the same reason as [`RATES_CONF`], and priel's own name in it for
+/// the same reason too: anyone who finds it knows what put it there, and
+/// deleting it is how the card goes back to the server.
+pub const RESERVE_CONF: &str = "99-priel-reserve.conf";
+
+/// The contents of priel's reservation drop-in for one card.
+///
+/// The rule is the one the report has always printed, so what a listener was
+/// told to write by hand and what priel writes are the same bytes. It opens by
+/// saying what it costs, because the file outlives the screen that explained it:
+/// nothing else on the machine can play through the card while it is in place.
+#[must_use]
+pub fn reserve_conf_text(card_name: &str) -> String {
+    format!(
+        "# Written by priel: keeps the sound server from claiming this card, so\n\
+         # priel can open it directly and play bit-perfect. Nothing else on this\n\
+         # machine can play through it while this file is here. Safe to delete.\n\
+         monitor.alsa.rules = [\n  \
+         {{\n    \
+         matches = [\n      \
+         {{ device.name = \"{card_name}\" }}\n    \
+         ]\n    \
+         actions = {{ update-props = {{ device.disabled = true }} }}\n  \
+         }}\n\
+         ]\n"
+    )
+}
+
+/// The directory priel's reservation drop-in belongs in: the user's
+/// `wireplumber.conf.d`.
+///
+/// The session manager reads it, not the server, so it is a different directory
+/// from [`conf_dir`] - and the rule would be ignored in the other one.
+#[must_use]
+pub fn reserve_conf_dir() -> Option<PathBuf> {
+    reserve_conf_dir_from(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME"))
+}
+
+/// [`reserve_conf_dir`] over its two inputs, table-testable like
+/// [`conf_dir_from`].
+fn reserve_conf_dir_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let base = xdg
+        .filter(|x| !x.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("wireplumber").join("wireplumber.conf.d"))
+}
+
+/// Write priel's reservation drop-in for `card_name` into `dir`, and return the
+/// path written.
+///
+/// `dir` is passed in and never resolved from a global here, so a test writes to
+/// a directory it made and never to a real home - the rule the whole crate keeps.
+///
+/// # Errors
+///
+/// The `std::io::Error` from creating the directory or writing the file.
+pub fn write_reserve(dir: &Path, card_name: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(RESERVE_CONF);
+    std::fs::write(&path, reserve_conf_text(card_name))?;
+    Ok(path)
+}
+
+/// The command that clears the sound server's rate pin, as a program and its
+/// arguments.
+///
+/// Pure, so what would run can be checked without running it. `clock.force-rate`
+/// holds the whole graph at one rate and the permitted list is not consulted at
+/// all, so this is the only change that helps there - extending a list the
+/// server has stopped reading does nothing. Zero is how the setting is spelled
+/// off; there is no separate delete.
+#[must_use]
+pub fn clear_pin_argv() -> (&'static str, [&'static str; 5]) {
+    (
+        "pw-metadata",
+        ["-n", "settings", "0", "clock.force-rate", "0"],
+    )
+}
+
+/// Clear the sound server's rate pin. Blocking, so it runs off the UI thread.
+///
+/// Takes effect immediately - the setting is live metadata rather than a file,
+/// so unlike the two drop-ins this needs no restart.
+///
+/// # Errors
+///
+/// A human-readable reason when `pw-metadata` is missing, is killed, fails, or
+/// does not finish in time.
+pub fn clear_rate_pin() -> Result<(), String> {
+    let (cmd, args) = clear_pin_argv();
+    run::capture(cmd, &args, RESTART_TIMEOUT)
+        .map(|_| ())
+        .map_err(|e| why(cmd, "clearing the pin", e))
 }
 
 /// The command that switches a Bluetooth device's A2DP profile, as a program and
@@ -188,14 +305,7 @@ pub fn switch_bt_codec(device_id: u32, profile_index: u32) -> Result<(), String>
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run::capture(cmd, &args, RESTART_TIMEOUT)
         .map(|_| ())
-        .map_err(|e| match e {
-            RunError::NotFound => "wpctl was not found".to_string(),
-            RunError::TimedOut => "the switch did not finish in time".to_string(),
-            RunError::Spawn(why) => format!("the switch could not be started: {why}"),
-            RunError::Failed(Some(code)) => format!("the switch exited with status {code}"),
-            RunError::Failed(None) => "the switch was killed by a signal".to_string(),
-            RunError::Unreadable => "the switch output could not be read".to_string(),
-        })
+        .map_err(|e| why(cmd, "the switch", e))
 }
 
 #[cfg(test)]
@@ -293,6 +403,58 @@ mod tests {
         assert_eq!(cmd, "systemctl");
         assert!(args.contains(&"--user"), "user scope, nothing system-wide");
         assert!(args.contains(&"pipewire") && args.contains(&"wireplumber"));
+    }
+
+    #[test]
+    fn the_reservation_rule_is_the_one_the_report_prints() {
+        // Goal: what a listener was told to write by hand and what the key
+        // writes are the same bytes, in the directory the session manager reads
+        // - not the server's, where the rule would be silently ignored.
+        let text = super::reserve_conf_text("alsa_card.usb-Studio_DAC-00");
+        assert!(text.contains("monitor.alsa.rules"), "{text}");
+        assert!(
+            text.contains("device.name = \"alsa_card.usb-Studio_DAC-00\""),
+            "{text}"
+        );
+        assert!(text.contains("device.disabled = true"), "{text}");
+        assert!(text.contains("priel"), "says what wrote it: {text}");
+        assert!(
+            text.contains("Nothing else on this"),
+            "and what it costs, because the file outlives the screen: {text}"
+        );
+        assert_eq!(
+            super::reserve_conf_dir_from(None, Some("/home/u".into())),
+            Some(PathBuf::from(
+                "/home/u/.config/wireplumber/wireplumber.conf.d"
+            )),
+            "the session manager's directory, not the server's"
+        );
+    }
+
+    #[test]
+    fn writing_the_reservation_creates_the_directory_and_the_file() {
+        // Goal: the same rule the rates drop-in keeps - the bytes that land are
+        // the ones the preview showed, in a directory priel was told to write,
+        // which in a test is a temporary one it made and never a real home.
+        let dir = std::env::temp_dir().join(format!("priel-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = super::write_reserve(&dir, "alsa_card.usb-x").expect("write");
+        assert_eq!(path, dir.join(super::RESERVE_CONF));
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert!(body.contains("alsa_card.usb-x"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_the_pin_sets_the_forced_rate_back_to_zero() {
+        // Goal: a pin holds the whole graph at one rate and the permitted list
+        // is not consulted at all, so extending that list changes nothing and
+        // this is the only thing that helps. Zero is how the setting is spelled
+        // off - there is no separate delete - and it is live metadata, so no
+        // file is written and no restart is needed.
+        let (cmd, args) = super::clear_pin_argv();
+        assert_eq!(cmd, "pw-metadata");
+        assert_eq!(args, ["-n", "settings", "0", "clock.force-rate", "0"]);
     }
 
     #[test]

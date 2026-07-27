@@ -30,7 +30,7 @@ use priel_player::{Alteration, Fidelity, Link, OutputAccess, StreamVolume, Verdi
 
 use crate::app::{
     App, CodecStep, Focus, GraphRow, GraphRowKind, Hit, Mode, QUEUE_ROWS_PER_ENTRY, Repeat,
-    SetupReason, SetupStep, View,
+    SetupReason, SetupStep, SetupWhat, View,
 };
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
@@ -1400,30 +1400,28 @@ fn key_label(code: KeyCode) -> String {
     }
 }
 
-/// The body lines and footer keys of the setup overlay for one step.
+/// What the confirm step says, and the file it would write, for one action.
 ///
-/// Split out so [`setup_overlay`] is just the box around it, and so what each
-/// step says is one place to read. The preview reads only the settled rates and
-/// the config path - never the graph again.
-fn setup_step_view(
-    step: &SetupStep,
-    adding: &[u32],
-    reason: SetupReason,
-    allowed: &[u32],
-    t: &Theme,
-) -> (Vec<Line<'static>>, Vec<Foot>) {
+/// Every action previews the same three things - what was found, which file
+/// priel would write, and the exact bytes - so a listener reads one shape
+/// whatever they are approving. The pin is the exception on both counts: it
+/// writes nothing, so it answers `None` for the file and says what it will run
+/// instead.
+fn confirm_view(what: &SetupWhat, t: &Theme) -> Vec<Line<'static>> {
     let styled = |s: String, c| Line::from(Span::styled(s, Style::default().fg(c)));
-    let mut body: Vec<Line<'static>> = Vec::new();
-    let footer = match step {
-        SetupStep::Confirm => {
-            let path = priel_player::setup::conf_dir().map_or_else(
-                || "(priel could not find your config directory)".to_string(),
-                |d| {
-                    d.join(priel_player::setup::RATES_CONF)
-                        .display()
-                        .to_string()
-                },
-            );
+    let file = |dir: Option<std::path::PathBuf>, name: &str| {
+        dir.map_or_else(
+            || "(priel could not find your config directory)".to_string(),
+            |d| d.join(name).display().to_string(),
+        )
+    };
+    let mut body = Vec::new();
+    let (path, contents) = match what {
+        SetupWhat::Rates {
+            adding_hz,
+            reason,
+            allowed_hz,
+        } => {
             // What may be said depends on what was read. The device's rates come
             // from the kernel, so that sentence can claim what the hardware
             // does; a rate the server refused is known only from the server's
@@ -1434,44 +1432,131 @@ fn setup_step_view(
                 match reason {
                     SetupReason::DeviceRates => format!(
                         "Your DAC can do {} rate{} PipeWire is not using: {}.",
-                        adding.len(),
-                        if adding.len() == 1 { "" } else { "s" },
-                        fmt_khz_list(adding)
+                        adding_hz.len(),
+                        if adding_hz.len() == 1 { "" } else { "s" },
+                        fmt_khz_list(adding_hz)
                     ),
                     SetupReason::ThisTrack => format!(
                         "This track plays at {}, which PipeWire is not set to use.",
-                        fmt_khz_list(adding)
+                        fmt_khz_list(adding_hz)
                     ),
                 },
                 t.text,
             ));
+            (
+                Some(file(
+                    priel_player::setup::conf_dir(),
+                    priel_player::setup::RATES_CONF,
+                )),
+                priel_player::setup::rates_conf_text(allowed_hz),
+            )
+        }
+        SetupWhat::Reserve { card_name, device } => {
+            body.push(styled(
+                format!("The sound server is holding {device} and mixing into it."),
+                t.text,
+            ));
+            body.push(Line::default());
+            // The cost, in the strongest words the box has, because this is the
+            // one action that takes something away from the rest of the machine
+            // - and the only one whose consequence is not obvious from its name.
+            body.push(styled(
+                "Nothing else on this machine will be able to play through it.".to_string(),
+                t.verdict_altered,
+            ));
+            (
+                Some(file(
+                    priel_player::setup::reserve_conf_dir(),
+                    priel_player::setup::RESERVE_CONF,
+                )),
+                priel_player::setup::reserve_conf_text(card_name),
+            )
+        }
+        SetupWhat::ClearPin { at_hz } => {
+            body.push(styled(
+                format!(
+                    "PipeWire is pinned to {}, whatever its permitted list says.",
+                    fmt_khz(*at_hz)
+                ),
+                t.text,
+            ));
+            let (cmd, args) = priel_player::setup::clear_pin_argv();
             body.push(Line::default());
             body.push(styled(
-                "priel will write this file \u{2014} its own; nothing else is touched:".to_string(),
+                "priel will run this. It writes no file and takes effect now:".to_string(),
                 t.muted,
             ));
-            body.push(styled(format!("  {path}"), t.accent));
-            body.push(Line::default());
-            for conf in priel_player::setup::rates_conf_text(allowed).lines() {
-                body.push(styled(format!("  {conf}"), t.faint));
-            }
+            body.push(styled(format!("  {cmd} {}", args.join(" ")), t.accent));
+            (None, String::new())
+        }
+    };
+    if let Some(path) = path {
+        body.push(Line::default());
+        body.push(styled(
+            "priel will write this file \u{2014} its own; nothing else is touched:".to_string(),
+            t.muted,
+        ));
+        body.push(styled(format!("  {path}"), t.accent));
+        body.push(Line::default());
+        for line in contents.lines() {
+            body.push(styled(format!("  {line}"), t.faint));
+        }
+    }
+    body
+}
+
+/// The body lines and footer keys of the setup overlay for one step.
+///
+/// Split out so [`setup_overlay`] is just the box around it, and so what each
+/// step says is one place to read. The preview reads only what the flow settled
+/// when it opened - never the graph again.
+fn setup_step_view(
+    step: &SetupStep,
+    what: &SetupWhat,
+    t: &Theme,
+) -> (Vec<Line<'static>>, Vec<Foot>) {
+    let styled = |s: String, c| Line::from(Span::styled(s, Style::default().fg(c)));
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let footer = match step {
+        SetupStep::Confirm => {
+            body.extend(confirm_view(what, t));
             vec![
                 Foot::Text("  ["),
                 Foot::Key("y", KeyCode::Char('y')),
-                Foot::Text("] write it   ["),
+                Foot::Text(match what {
+                    // The verb is the one the action uses, so the key that ends
+                    // the confirm names what it is about to do rather than
+                    // describing every action as writing something.
+                    SetupWhat::ClearPin { .. } => "] clear it   [",
+                    _ => "] write it   [",
+                }),
                 Foot::Key("n", KeyCode::Char('n')),
                 Foot::Text("] cancel"),
             ]
         }
+        // One in-flight step for all three actions, taking its words from what
+        // is in flight - a second waiting state would be a second thing to keep
+        // in step with the requests.
         SetupStep::Writing => {
-            body.push(styled("Writing\u{2026}".to_string(), t.muted));
+            body.push(styled(
+                match what {
+                    SetupWhat::ClearPin { .. } => "Clearing the pin\u{2026}".to_string(),
+                    _ => "Writing\u{2026}".to_string(),
+                },
+                t.muted,
+            ));
             Vec::new()
         }
         SetupStep::Restart { path } => {
             body.push(styled(format!("Written to {path}."), t.text));
             body.push(Line::default());
             body.push(styled(
-                "PipeWire has to restart to use the new rates.".to_string(),
+                match what {
+                    SetupWhat::Reserve { .. } => {
+                        "PipeWire has to restart to hand the card over.".to_string()
+                    }
+                    _ => "PipeWire has to restart to use the new rates.".to_string(),
+                },
                 t.muted,
             ));
             vec![
@@ -1604,13 +1689,11 @@ fn setup_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     // Cloned so the frame below is free to borrow `app` mutably; the preview is
     // settled, so a copy cannot go stale under it.
     let step = setup.step.clone();
-    let adding = setup.adding_hz.clone();
-    let reason = setup.reason;
-    let allowed = setup.allowed_hz.clone();
+    let what = setup.what.clone();
     let t = app.theme();
     app.hits.clear();
 
-    let (body, footer) = setup_step_view(&step, &adding, reason, &allowed, &t);
+    let (body, footer) = setup_step_view(&step, &what, &t);
 
     let width = overlay_width(area, OVERLAY_MEDIUM);
     let body_h = u16::try_from(body.len()).unwrap_or(u16::MAX);
