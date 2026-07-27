@@ -5853,6 +5853,65 @@ mod tests {
     }
 
     #[test]
+    fn a_resampling_bluetooth_link_reads_as_one_report_start_to_finish() {
+        // Goal: the whole of what was wrong, on one screen. The verdict said
+        // "≈ bluetooth (aptX HD)" in yellow - an accepted limit, nothing to do -
+        // directly above a clock section saying the rate was not permitted, a
+        // device readout at a rate the chain below it contradicted, and a
+        // configuration change with no way to make it. Each half is tested on
+        // its own; this is the one that would have caught the combination.
+        let mut sc = screen();
+        sc.app.status.loaded = true;
+        sc.app.status.playing = true;
+        sc.app.status.volume = 100.0;
+        sc.app.status.in_sample_rate = 44_100;
+        sc.app.status.in_format = "s16".into();
+        sc.app.status.sample_rate = 44_100;
+        sc.app.status.out_format = "s16".into();
+        sc.app.now_meta.bit_depth = 16;
+        sc.app.status.bt_codec = Some("aptx_hd".into());
+        // The link really is clocked away from the track here, and the sink node
+        // says so - which is what makes this a resample rather than the false
+        // alarm the global clock alone used to raise.
+        sc.app.status.sink_rate_hz = Some(48_000);
+        with_chain(
+            &mut sc,
+            AudioGraph {
+                path: vec![
+                    node("mpv", NodeRole::Stream, 44_100, "S16LE"),
+                    node("Px7 S3", NodeRole::Device, 48_000, "S24LE"),
+                ],
+                clock: ClockRates {
+                    allowed_hz: Some(vec![48_000]),
+                    current_hz: Some(48_000),
+                    forced_hz: None,
+                },
+                bt_codec: Some("aptx_hd".into()),
+                ..AudioGraph::default()
+            },
+        );
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 44);
+
+        assert!(
+            out.contains("⚠ resampled → bluetooth (aptX HD)"),
+            "the verdict names both losses, worst first: {out}"
+        );
+        assert!(
+            out.contains("48 kHz") && !out.contains("OUT S16 · 44.1 kHz"),
+            "the device readout agrees with the sink node: {out}"
+        );
+        assert!(
+            out.contains("not permitted"),
+            "the clock explains it, since the sink confirms the rate moved: {out}"
+        );
+        assert!(
+            out.contains("[A] set up audio"),
+            "and the change is offered, not merely printed: {out}"
+        );
+    }
+
+    #[test]
     fn the_report_says_there_is_nothing_to_do_rather_than_going_quiet() {
         // Goal: the section is always on screen, so its emptiness is a finding
         // rather than an absence - and a listener who has seen it once knows
