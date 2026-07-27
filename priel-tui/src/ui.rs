@@ -26,11 +26,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use std::fmt::Write as _;
 
 use priel_player::graph::{SinkStage, SinkVolume};
-use priel_player::{Alteration, Fidelity, OutputAccess, StreamVolume, Verdict};
+use priel_player::{Alteration, Fidelity, Link, OutputAccess, StreamVolume, Verdict};
 
 use crate::app::{
     App, CodecStep, Focus, GraphRow, GraphRowKind, Hit, Mode, QUEUE_ROWS_PER_ENTRY, Repeat,
-    SetupStep, View,
+    SetupReason, SetupStep, SetupWhat, View,
 };
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
@@ -1249,15 +1249,31 @@ fn graph_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let end = start
         .saturating_add(usize::from(body.height))
         .min(rows.len());
-    let lines: Vec<Line> = rows[start..end]
-        .iter()
-        .map(|r| graph_line(r, body.width, &t))
-        .collect();
+    // The actions in the body are the buttons, so their hit boxes come out of
+    // the same walk that paints them - like every other control here. A row too
+    // far down to be on screen registers nothing, because it was not drawn.
+    let mut lines: Vec<Line> = Vec::with_capacity(end.saturating_sub(start));
+    for (offset, row) in rows[start..end].iter().enumerate() {
+        let y = body
+            .y
+            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+        let rect = Rect {
+            y,
+            height: 1,
+            ..body
+        };
+        lines.push(match row.kind {
+            GraphRowKind::Action(code) => action_line(row, code, rect, &t, &mut app.hits),
+            _ => graph_line(row, body.width, &t),
+        });
+    }
     f.render_widget(Paragraph::new(lines), body);
 
-    // The "set up audio" key is offered only when there is something to add, and
-    // it is a real footer key so a click on it runs the same action the key
-    // does - the overlay's whole mouse/keyboard parity comes for free that way.
+    // Navigation and the way out, and nothing else: the actions moved into the
+    // body, where they sit beside the finding each one answers. Printing them
+    // here as well would be two places to keep in step, and on a narrow terminal
+    // this row drops what does not fit - which is how an offer would go missing
+    // from the one screen that exists to say what can be done.
     let footer_rect = Rect {
         y: inner.y + inner.height.saturating_sub(1),
         height: 1,
@@ -1274,14 +1290,6 @@ fn graph_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         Foot::Key("G", KeyCode::Char('G')),
         Foot::Text(" top / bottom \u{b7} "),
     ];
-    if app.setup_available() {
-        footer.push(Foot::Key("A", KeyCode::Char('A')));
-        footer.push(Foot::Text(" set up audio \u{b7} "));
-    }
-    if app.codec_switch_available() {
-        footer.push(Foot::Key("C", KeyCode::Char('C')));
-        footer.push(Foot::Text(" switch codec \u{b7} "));
-    }
     footer.extend([
         Foot::Key("D", KeyCode::Char('D')),
         Foot::Text(", "),
@@ -1315,7 +1323,13 @@ fn graph_line(row: &GraphRow, width: u16, t: &Theme) -> Line<'static> {
             Style::default().fg(t.verdict_altered),
         ),
         GraphRowKind::Link => (Style::default().fg(t.faint), Style::default().fg(t.faint)),
-        GraphRowKind::Note => (Style::default().fg(t.muted), Style::default().fg(t.muted)),
+        // An action reaching here has no hit box, so it would print as a key
+        // that cannot be clicked - the dead control `overlay_footer` exists to
+        // stop. `graph_overlay` routes them to `action_line` instead; this arm
+        // is only what the compiler needs to know the match is total.
+        GraphRowKind::Note | GraphRowKind::Action(_) => {
+            (Style::default().fg(t.muted), Style::default().fg(t.muted))
+        }
     };
     let label = Span::styled(row.label.clone(), label_style);
     if row.detail.is_empty() {
@@ -1332,65 +1346,212 @@ fn graph_line(row: &GraphRow, width: u16, t: &Theme) -> Line<'static> {
     Line::from(vec![label, Span::raw(" ".repeat(gap)), detail])
 }
 
+/// One action row: `[A] set up audio`, with the key itself as the button.
+///
+/// Built with a [`ControlBar`] like every other control, so the hit box comes
+/// out of the same left-to-right walk that lays out the spans and cannot drift
+/// from what was painted. The hit is [`Hit::Key`], so the click runs the key
+/// handler rather than a second implementation of the action.
+///
+/// The bracketed spelling is the bottom row's, deliberately: `[q] quit` down
+/// there is a button, and a reader who has learnt that reads these the same way.
+fn action_line(
+    row: &GraphRow,
+    code: KeyCode,
+    area: Rect,
+    t: &Theme,
+    hits: &mut Vec<(Rect, Hit)>,
+) -> Line<'static> {
+    let mut bar = ControlBar::new(area);
+    bar.label("    [", Style::default().fg(t.faint));
+    bar.button(
+        key_label(code),
+        Hit::Key(code),
+        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+    );
+    bar.label("] ", Style::default().fg(t.faint));
+    bar.label(row.label.clone(), Style::default().fg(t.text));
+    // The right column, if it still fits: what this action would change. Dropped
+    // rather than wrapped on a narrow box, exactly as the readings above are
+    // clipped - the label is the part that has to survive.
+    if !row.detail.is_empty() {
+        let detail = Span::styled(row.detail.clone(), Style::default().fg(t.muted));
+        let width = u16::try_from(detail.width()).unwrap_or(u16::MAX);
+        // One cell short of the edge, so it does not sit against the border.
+        if let Some(gap) = bar.remaining().checked_sub(width.saturating_add(2)) {
+            bar.label(
+                " ".repeat(usize::from(gap).saturating_add(1)),
+                Style::default(),
+            );
+            bar.label(detail.content.into_owned(), detail.style);
+        }
+    }
+    hits.append(&mut bar.hits);
+    Line::from(bar.spans)
+}
+
+/// How a key prints in an action row, matching the bottom row's spelling.
+fn key_label(code: KeyCode) -> String {
+    match code {
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// What the confirm step says, and the file it would write, for one action.
+///
+/// Every action previews the same three things - what was found, which file
+/// priel would write, and the exact bytes - so a listener reads one shape
+/// whatever they are approving. The pin is the exception on both counts: it
+/// writes nothing, so it answers `None` for the file and says what it will run
+/// instead.
+fn confirm_view(what: &SetupWhat, t: &Theme) -> Vec<Line<'static>> {
+    let styled = |s: String, c| Line::from(Span::styled(s, Style::default().fg(c)));
+    let file = |dir: Option<std::path::PathBuf>, name: &str| {
+        dir.map_or_else(
+            || "(priel could not find your config directory)".to_string(),
+            |d| d.join(name).display().to_string(),
+        )
+    };
+    let mut body = Vec::new();
+    let (path, contents) = match what {
+        SetupWhat::Rates {
+            adding_hz,
+            reason,
+            allowed_hz,
+        } => {
+            // What may be said depends on what was read. The device's rates come
+            // from the kernel, so that sentence can claim what the hardware
+            // does; a rate the server refused is known only from the server's
+            // own setting, and a sink whose rates were never read - every
+            // Bluetooth and network sink - must not be described as capable of
+            // anything on the strength of it.
+            body.push(styled(
+                match reason {
+                    SetupReason::DeviceRates => format!(
+                        "Your DAC can do {} rate{} PipeWire is not using: {}.",
+                        adding_hz.len(),
+                        if adding_hz.len() == 1 { "" } else { "s" },
+                        fmt_khz_list(adding_hz)
+                    ),
+                    SetupReason::ThisTrack => format!(
+                        "This track plays at {}, which PipeWire is not set to use.",
+                        fmt_khz_list(adding_hz)
+                    ),
+                },
+                t.text,
+            ));
+            (
+                Some(file(
+                    priel_player::setup::conf_dir(),
+                    priel_player::setup::RATES_CONF,
+                )),
+                priel_player::setup::rates_conf_text(allowed_hz),
+            )
+        }
+        SetupWhat::Reserve { card_name, device } => {
+            body.push(styled(
+                format!("The sound server is holding {device} and mixing into it."),
+                t.text,
+            ));
+            body.push(Line::default());
+            // The cost, in the strongest words the box has, because this is the
+            // one action that takes something away from the rest of the machine
+            // - and the only one whose consequence is not obvious from its name.
+            body.push(styled(
+                "Nothing else on this machine will be able to play through it.".to_string(),
+                t.verdict_altered,
+            ));
+            (
+                Some(file(
+                    priel_player::setup::reserve_conf_dir(),
+                    priel_player::setup::RESERVE_CONF,
+                )),
+                priel_player::setup::reserve_conf_text(card_name),
+            )
+        }
+        SetupWhat::ClearPin { at_hz } => {
+            body.push(styled(
+                format!(
+                    "PipeWire is pinned to {}, whatever its permitted list says.",
+                    fmt_khz(*at_hz)
+                ),
+                t.text,
+            ));
+            let (cmd, args) = priel_player::setup::clear_pin_argv();
+            body.push(Line::default());
+            body.push(styled(
+                "priel will run this. It writes no file and takes effect now:".to_string(),
+                t.muted,
+            ));
+            body.push(styled(format!("  {cmd} {}", args.join(" ")), t.accent));
+            (None, String::new())
+        }
+    };
+    if let Some(path) = path {
+        body.push(Line::default());
+        body.push(styled(
+            "priel will write this file \u{2014} its own; nothing else is touched:".to_string(),
+            t.muted,
+        ));
+        body.push(styled(format!("  {path}"), t.accent));
+        body.push(Line::default());
+        for line in contents.lines() {
+            body.push(styled(format!("  {line}"), t.faint));
+        }
+    }
+    body
+}
+
 /// The body lines and footer keys of the setup overlay for one step.
 ///
 /// Split out so [`setup_overlay`] is just the box around it, and so what each
-/// step says is one place to read. The preview reads only the settled rates and
-/// the config path - never the graph again.
+/// step says is one place to read. The preview reads only what the flow settled
+/// when it opened - never the graph again.
 fn setup_step_view(
     step: &SetupStep,
-    adding: &[u32],
-    allowed: &[u32],
+    what: &SetupWhat,
     t: &Theme,
 ) -> (Vec<Line<'static>>, Vec<Foot>) {
     let styled = |s: String, c| Line::from(Span::styled(s, Style::default().fg(c)));
     let mut body: Vec<Line<'static>> = Vec::new();
     let footer = match step {
         SetupStep::Confirm => {
-            let path = priel_player::setup::conf_dir().map_or_else(
-                || "(priel could not find your config directory)".to_string(),
-                |d| {
-                    d.join(priel_player::setup::RATES_CONF)
-                        .display()
-                        .to_string()
-                },
-            );
-            body.push(styled(
-                format!(
-                    "Your DAC can do {} rate{} PipeWire is not using: {}.",
-                    adding.len(),
-                    if adding.len() == 1 { "" } else { "s" },
-                    fmt_khz_list(adding)
-                ),
-                t.text,
-            ));
-            body.push(Line::default());
-            body.push(styled(
-                "priel will write this file \u{2014} its own; nothing else is touched:".to_string(),
-                t.muted,
-            ));
-            body.push(styled(format!("  {path}"), t.accent));
-            body.push(Line::default());
-            for conf in priel_player::setup::rates_conf_text(allowed).lines() {
-                body.push(styled(format!("  {conf}"), t.faint));
-            }
+            body.extend(confirm_view(what, t));
             vec![
                 Foot::Text("  ["),
                 Foot::Key("y", KeyCode::Char('y')),
-                Foot::Text("] write it   ["),
+                Foot::Text(match what {
+                    // The verb is the one the action uses, so the key that ends
+                    // the confirm names what it is about to do rather than
+                    // describing every action as writing something.
+                    SetupWhat::ClearPin { .. } => "] clear it   [",
+                    _ => "] write it   [",
+                }),
                 Foot::Key("n", KeyCode::Char('n')),
                 Foot::Text("] cancel"),
             ]
         }
+        // One in-flight step for all three actions, taking its words from what
+        // is in flight - a second waiting state would be a second thing to keep
+        // in step with the requests.
         SetupStep::Writing => {
-            body.push(styled("Writing\u{2026}".to_string(), t.muted));
+            body.push(styled(
+                match what {
+                    SetupWhat::ClearPin { .. } => "Clearing the pin\u{2026}".to_string(),
+                    _ => "Writing\u{2026}".to_string(),
+                },
+                t.muted,
+            ));
             Vec::new()
         }
         SetupStep::Restart { path } => {
             body.push(styled(format!("Written to {path}."), t.text));
             body.push(Line::default());
             body.push(styled(
-                "PipeWire has to restart to use the new rates.".to_string(),
+                format!("PipeWire has to restart to {}.", what.restart_promise()),
                 t.muted,
             ));
             vec![
@@ -1523,12 +1684,11 @@ fn setup_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     // Cloned so the frame below is free to borrow `app` mutably; the preview is
     // settled, so a copy cannot go stale under it.
     let step = setup.step.clone();
-    let adding = setup.adding_hz.clone();
-    let allowed = setup.allowed_hz.clone();
+    let what = setup.what.clone();
     let t = app.theme();
     app.hits.clear();
 
-    let (body, footer) = setup_step_view(&step, &adding, &allowed, &t);
+    let (body, footer) = setup_step_view(&step, &what, &t);
 
     let width = overlay_width(area, OVERLAY_MEDIUM);
     let body_h = u16::try_from(body.len()).unwrap_or(u16::MAX);
@@ -3635,20 +3795,24 @@ fn verdict_badge(app: &App) -> (String, Color) {
     let improvable = app.bt_improvable();
     (
         verdict_words(verdict, app.status.bt_codec.as_deref(), improvable),
-        verdict_colour(verdict.fidelity, improvable, &app.theme()),
+        verdict_colour(verdict, improvable, &app.theme()),
     )
 }
 
 /// The verdict in words, shared by the row and the report so the two cannot
 /// come to different conclusions about one moment.
 ///
-/// `bt_codec` names the Bluetooth codec for the [`Fidelity::Bluetooth`] grade -
-/// it is carried in the status rather than the grade so [`Fidelity`] stays
-/// `Copy`, and folded into the word here. `bt_improvable` is whether a better
-/// codec is available - `Some(false)` on the best the device offers,
-/// `Some(true)` when a better one exists, `None` when it cannot be told - and
-/// picks the glyph: the near mark on the best (nothing left to do), the altered
+/// `bt_codec` names the codec for a [`Link::Bluetooth`] verdict - it is carried
+/// in the status rather than the verdict so [`Verdict`] stays `Copy`, and folded
+/// into the words here. `bt_improvable` is whether a better codec is available -
+/// `Some(false)` on the best the device offers, `Some(true)` when a better one
+/// exists, `None` when it cannot be told - and picks the glyph over an otherwise
+/// intact stream: the near mark on the best (nothing left to do), the altered
 /// mark otherwise.
+///
+/// Where the stream was *also* rebuilt, both findings are named, in the order
+/// the samples meet them. That is the whole point of the link being a field of
+/// its own: a verdict that could say only one of the two said the smaller one.
 pub(crate) fn verdict_words(
     verdict: Verdict,
     bt_codec: Option<&str>,
@@ -3659,9 +3823,11 @@ pub(crate) fn verdict_words(
     } else {
         "✓"
     };
-    match verdict.fidelity {
-        Fidelity::Unknown => String::new(),
-        Fidelity::BitPerfect => format!("{tick} bit-perfect"),
+    // The mark and the word are kept apart because the link below can override
+    // the mark while leaving the word exactly as it was.
+    let (mark, word) = match verdict.fidelity {
+        Fidelity::Unknown => return String::new(),
+        Fidelity::BitPerfect => (tick, "bit-perfect"),
         // Every level change reads the same, whichever stage made it. Naming
         // the stage here would need the width the row does not have, and the
         // report's volume section is where the three of them are laid out side
@@ -3671,26 +3837,40 @@ pub(crate) fn verdict_words(
             Alteration::VolumeScaled
             | Alteration::ServerVolumeScaled
             | Alteration::SinkVolumeScaled,
-        ) => "≈ near bit-perfect".to_string(),
-        Fidelity::Altered(Alteration::Resampled) => "⚠ resampled".to_string(),
-        Fidelity::Altered(Alteration::Truncated) => "⚠ truncated".to_string(),
-        // A Bluetooth link is a rebuilt (lossy) sample stream, so it is never
-        // bit-perfect. But on the best codec the device offers there is nothing
-        // left to do, so it takes the near mark (and, via `verdict_colour`,
-        // yellow); on a lesser codec, or when priel cannot tell, it takes the
-        // altered mark and red because a better codec can be chosen. The glyph
-        // and the colour stay in the same family either way.
-        Fidelity::Bluetooth => {
-            let glyph = if bt_improvable == Some(false) {
-                "≈"
-            } else {
-                "⚠"
-            };
-            match bt_codec {
-                Some(codec) => format!("{glyph} bluetooth ({})", codec_label(codec)),
-                None => format!("{glyph} bluetooth"),
-            }
-        }
+        ) => ("≈", "near bit-perfect"),
+        Fidelity::Altered(Alteration::Resampled) => ("⚠", "resampled"),
+        Fidelity::Altered(Alteration::Truncated) => ("⚠", "truncated"),
+    };
+    let Some(Link::Bluetooth) = verdict.link else {
+        return format!("{mark} {word}");
+    };
+    // A Bluetooth link re-encodes every sample, so it is never bit-perfect. On
+    // the best codec the device offers there is nothing left to do, so it takes
+    // the near mark (and, via `verdict_colour`, yellow); on a lesser codec, or
+    // when priel cannot tell, it takes the altered mark and red, because a
+    // better codec can be chosen. A stream that was *also* rebuilt above the
+    // link takes the altered mark whatever the codec standing - that is the
+    // worse of the two findings, and the one something can be done about.
+    let rebuilt = verdict.fidelity.alteration().is_some();
+    let glyph = if !rebuilt && bt_improvable == Some(false) {
+        "≈"
+    } else {
+        "⚠"
+    };
+    let link = match bt_codec {
+        Some(codec) => format!("bluetooth ({})", codec_label(codec)),
+        None => "bluetooth".to_string(),
+    };
+    if rebuilt {
+        // Both findings, in the order the samples meet them: what rebuilt the
+        // stream, then what carries what is left of it. A link named on its own
+        // here read as "the codec is the only loss", which is the overstatement
+        // that put a resample behind a yellow badge.
+        format!("{glyph} {word} \u{2192} {link}")
+    } else {
+        // A clean stream adds nothing: the link is the whole finding, and this
+        // is the wording that was on screen before the two were separated.
+        format!("{glyph} {link}")
     }
 }
 
@@ -3741,21 +3921,31 @@ pub(crate) fn codec_rank(id: &str) -> u32 {
 /// The colour that goes with a grade. Never the only carrier of a meaning: the
 /// glyph in front of each word says the same thing on a monochrome terminal.
 ///
-/// `bt_improvable` colours the Bluetooth grade by whether anything can be done
-/// about it: yellow on the best codec the device offers (an accepted, inherent
-/// limit, like a level change), red when a better one is available or cannot be
-/// told (actionable). Green stays reserved for bit-perfect.
-fn verdict_colour(fidelity: Fidelity, bt_improvable: Option<bool>, t: &Theme) -> Color {
-    match fidelity {
+/// `bt_improvable` colours a link by whether anything can be done about it:
+/// yellow on the best codec the device offers (an accepted, inherent limit, like
+/// a level change), red when a better one is available or cannot be told
+/// (actionable). Green stays reserved for bit-perfect.
+///
+/// **A rebuilt sample stream is red whatever carries it.** The link is graded
+/// only where the stream above it is intact: a resample under a Bluetooth link
+/// is still a resample, and colouring it by the codec's standing reported the
+/// smaller of two findings - the one nothing can be done about - as though it
+/// were the whole of the answer.
+fn verdict_colour(verdict: Verdict, bt_improvable: Option<bool>, t: &Theme) -> Color {
+    match verdict.fidelity {
         Fidelity::Unknown => t.verdict_unknown,
-        Fidelity::BitPerfect => t.verdict_clean,
-        // On the best codec the device has, a Bluetooth link is as good as it
-        // gets - yellow. On a lesser one, or when priel cannot tell, red - the
-        // same red a resample or a truncation gets, all rebuilt sample streams.
-        Fidelity::Bluetooth if bt_improvable == Some(false) => t.verdict_near,
-        Fidelity::Bluetooth | Fidelity::Altered(Alteration::Resampled | Alteration::Truncated) => {
-            t.verdict_altered
+        // Checked before the link, and this is the whole of the ordering rule.
+        Fidelity::Altered(Alteration::Resampled | Alteration::Truncated) => t.verdict_altered,
+        // On the best codec the device has, a link is as good as it gets -
+        // yellow. On a lesser one, or when priel cannot tell, red.
+        _ if verdict.link.is_some() => {
+            if bt_improvable == Some(false) {
+                t.verdict_near
+            } else {
+                t.verdict_altered
+            }
         }
+        Fidelity::BitPerfect => t.verdict_clean,
         // Every level change, whichever stage made it and whichever grade it
         // arrived under.
         Fidelity::NearBitPerfect(_) | Fidelity::Altered(_) => t.verdict_near,
@@ -4115,7 +4305,7 @@ mod tests {
         AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, HeldDevice, NodeRole,
         SinkLevels, SinkVolume,
     };
-    use priel_player::{Evidence, Fidelity, Verdict};
+    use priel_player::{Alteration, Evidence, Fidelity, Link, Verdict};
     use ratatui::layout::Rect;
     use ratatui::style::Color;
     use ratatui::style::Style;
@@ -5492,7 +5682,11 @@ mod tests {
         with_chain(
             &mut sc,
             AudioGraph {
-                path: vec![node("Studio DAC", NodeRole::Device, 352_800, "S32LE")],
+                // The sink is where the server's refusal leaves it - on the
+                // graph's own rate, not on the track's. A sink sitting at a rate
+                // the list does not permit is not a machine that exists, and the
+                // report believes the node over the list.
+                path: vec![node("Studio DAC", NodeRole::Device, 48_000, "S32LE")],
                 clock: ClockRates {
                     allowed_hz: Some(vec![
                         44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 384_000, 705_600, 768_000,
@@ -5611,17 +5805,124 @@ mod tests {
 
     #[test]
     fn the_report_offers_set_up_audio_as_a_clickable_key_when_rates_are_blocked() {
-        // Goal: the offer is a real footer key, so a click on it runs the same
-        // action the key does - the parity every control in priel keeps. It is
-        // shown only when there is something to add.
+        // Goal: the offer is a real button in the body, so a click on it runs
+        // the same action the key does - the parity every control in priel
+        // keeps. It is shown only when there is something to add.
         let mut sc = screen();
         with_chain(&mut sc, blocked_chain());
         sc.app.mode = Mode::Graph;
         let out = text(&mut sc.app, 100, 40);
         assert!(out.contains("Your DAC can also do"), "the reason: {out}");
-        assert!(out.contains("set up audio"), "the offer: {out}");
+        assert!(out.contains("[A] set up audio"), "the offer: {out}");
         click_hit(&mut sc.app, Hit::Key(KeyCode::Char('A')));
         assert_eq!(sc.app.mode, Mode::SetupAudio, "the click opens the confirm");
+    }
+
+    #[test]
+    fn the_actions_are_in_the_body_and_never_also_in_the_footer() {
+        // Goal: one place, for the reason the bottom row already teaches. That
+        // row drops what does not fit as the terminal narrows, so an offer
+        // printed there goes missing exactly when the box is tight - off the one
+        // screen that exists to say what can be done about the finding above it.
+        // The footer keeps navigation and the way out, which are the two things
+        // an overlay must never lose.
+        let mut sc = screen();
+        with_chain(&mut sc, blocked_chain());
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 40);
+        let footer = out
+            .lines()
+            .find(|l| l.contains("to close"))
+            .expect("the footer is drawn")
+            .to_string();
+        assert!(
+            !footer.contains("set up audio"),
+            "the action is not repeated in the footer: {footer}"
+        );
+        assert!(footer.contains("scroll"), "navigation stays: {footer}");
+        assert_eq!(
+            out.matches("set up audio").count(),
+            1,
+            "and the offer is on screen exactly once: {out}"
+        );
+    }
+
+    #[test]
+    fn a_resampling_bluetooth_link_reads_as_one_report_start_to_finish() {
+        // Goal: the whole of what was wrong, on one screen. The verdict said
+        // "≈ bluetooth (aptX HD)" in yellow - an accepted limit, nothing to do -
+        // directly above a clock section saying the rate was not permitted, a
+        // device readout at a rate the chain below it contradicted, and a
+        // configuration change with no way to make it. Each half is tested on
+        // its own; this is the one that would have caught the combination.
+        let mut sc = screen();
+        sc.app.status.loaded = true;
+        sc.app.status.playing = true;
+        sc.app.status.volume = 100.0;
+        sc.app.status.in_sample_rate = 44_100;
+        sc.app.status.in_format = "s16".into();
+        sc.app.status.sample_rate = 44_100;
+        sc.app.status.out_format = "s16".into();
+        sc.app.now_meta.bit_depth = 16;
+        sc.app.status.bt_codec = Some("aptx_hd".into());
+        // The link really is clocked away from the track here, and the sink node
+        // says so - which is what makes this a resample rather than the false
+        // alarm the global clock alone used to raise.
+        sc.app.status.sink_rate_hz = Some(48_000);
+        with_chain(
+            &mut sc,
+            AudioGraph {
+                path: vec![
+                    node("mpv", NodeRole::Stream, 44_100, "S16LE"),
+                    node("Px7 S3", NodeRole::Device, 48_000, "S24LE"),
+                ],
+                clock: ClockRates {
+                    allowed_hz: Some(vec![48_000]),
+                    current_hz: Some(48_000),
+                    forced_hz: None,
+                },
+                bt_codec: Some("aptx_hd".into()),
+                ..AudioGraph::default()
+            },
+        );
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 44);
+
+        assert!(
+            out.contains("⚠ resampled → bluetooth (aptX HD)"),
+            "the verdict names both losses, worst first: {out}"
+        );
+        assert!(
+            out.contains("48 kHz") && !out.contains("OUT S16 · 44.1 kHz"),
+            "the device readout agrees with the sink node: {out}"
+        );
+        assert!(
+            out.contains("not permitted"),
+            "the clock explains it, since the sink confirms the rate moved: {out}"
+        );
+        assert!(
+            out.contains("[A] set up audio"),
+            "and the change is offered, not merely printed: {out}"
+        );
+    }
+
+    #[test]
+    fn the_report_says_there_is_nothing_to_do_rather_than_going_quiet() {
+        // Goal: the section is always on screen, so its emptiness is a finding
+        // rather than an absence - and a listener who has seen it once knows
+        // where to look next time.
+        let mut sc = screen();
+        with_chain(
+            &mut sc,
+            AudioGraph {
+                path: vec![node("Studio DAC", NodeRole::Device, 44_100, "S32LE")],
+                ..AudioGraph::default()
+            },
+        );
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 40);
+        assert!(out.contains("Actions"), "{out}");
+        assert!(out.contains("nothing to change here"), "{out}");
     }
 
     fn bt_improvable_chain() -> AudioGraph {
@@ -7309,17 +7610,26 @@ mod tests {
         assert_eq!(codec_label("some_new_codec"), "SOME NEW CODEC");
     }
 
+    /// A verdict over a link, with the sample stream in whatever state.
+    fn linked(fidelity: Fidelity) -> Verdict {
+        Verdict {
+            fidelity,
+            link: Some(Link::Bluetooth),
+            evidence: Evidence::Complete,
+        }
+    }
+
     #[test]
     fn a_bluetooth_verdict_names_the_link_and_the_codec() {
         // Goal: the distinct grade the listener sees - unmistakably a Bluetooth
         // link, with the codec its sound quality rests on.
-        let verdict = Verdict {
-            fidelity: Fidelity::Bluetooth,
-            evidence: Evidence::Complete,
-        };
-        let words = verdict_words(verdict, Some("aptx_hd"), Some(false));
+        let words = verdict_words(linked(Fidelity::BitPerfect), Some("aptx_hd"), Some(false));
         assert!(words.contains("bluetooth"), "names the link: {words}");
         assert!(words.contains("aptX HD"), "names the codec: {words}");
+        assert!(
+            !words.contains("bit-perfect"),
+            "and never calls a re-encoded link bit-perfect: {words}"
+        );
     }
 
     #[test]
@@ -7328,10 +7638,7 @@ mod tests {
         // is nothing to do, so the near mark and yellow; a better codec available
         // (or unknown) is actionable, so the altered mark and red. Green stays
         // for bit-perfect.
-        let verdict = Verdict {
-            fidelity: Fidelity::Bluetooth,
-            evidence: Evidence::Complete,
-        };
+        let verdict = linked(Fidelity::BitPerfect);
         let t = crate::theme::Theme::default();
 
         // Best available: near glyph, yellow.
@@ -7340,10 +7647,7 @@ mod tests {
             best.starts_with('≈'),
             "best codec takes the near mark: {best}"
         );
-        assert_eq!(
-            verdict_colour(Fidelity::Bluetooth, Some(false), &t),
-            t.verdict_near
-        );
+        assert_eq!(verdict_colour(verdict, Some(false), &t), t.verdict_near);
 
         // A better one available: altered glyph, red.
         let worse = verdict_words(verdict, Some("sbc"), Some(true));
@@ -7351,16 +7655,51 @@ mod tests {
             worse.starts_with('⚠'),
             "a lesser codec takes the altered mark: {worse}"
         );
-        assert_eq!(
-            verdict_colour(Fidelity::Bluetooth, Some(true), &t),
-            t.verdict_altered
-        );
+        assert_eq!(verdict_colour(verdict, Some(true), &t), t.verdict_altered);
 
         // Unknown availability is treated as improvable - priel cannot call it best.
-        assert_eq!(
-            verdict_colour(Fidelity::Bluetooth, None, &t),
-            t.verdict_altered
+        assert_eq!(verdict_colour(verdict, None, &t), t.verdict_altered);
+    }
+
+    #[test]
+    fn a_resample_under_a_link_is_red_and_named_whatever_the_codec_standing() {
+        // Goal: the finding the link used to swallow. A stream rebuilt above the
+        // link is the worse of the two losses and the one something can be done
+        // about, so it decides both the word and the colour - even on the best
+        // codec the device offers, which is the case that read as an accepted
+        // yellow limit while the graph was quietly resampling.
+        let t = crate::theme::Theme::default();
+        let verdict = linked(Fidelity::Altered(Alteration::Resampled));
+
+        let words = verdict_words(verdict, Some("aptx_hd"), Some(false));
+        assert!(words.starts_with('⚠'), "the altered mark: {words}");
+        assert!(
+            words.contains("resampled"),
+            "names what was rebuilt: {words}"
         );
+        assert!(
+            words.contains("bluetooth (aptX HD)"),
+            "and still names what carries it: {words}"
+        );
+        assert_eq!(
+            verdict_colour(verdict, Some(false), &t),
+            t.verdict_altered,
+            "red, though the codec is the best on offer"
+        );
+
+        // A truncation reads the same way, and a level change does not: only a
+        // rebuilt sample stream outranks the link.
+        assert!(
+            verdict_words(linked(Fidelity::Altered(Alteration::Truncated)), None, None)
+                .contains("truncated")
+        );
+        let scaled = linked(Fidelity::NearBitPerfect(Alteration::VolumeScaled));
+        assert_eq!(
+            verdict_words(scaled, Some("aptx_hd"), Some(false)),
+            "≈ bluetooth (aptX HD)",
+            "the link is the whole finding where nothing was rebuilt"
+        );
+        assert_eq!(verdict_colour(scaled, Some(false), &t), t.verdict_near);
     }
 
     #[test]

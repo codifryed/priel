@@ -202,6 +202,18 @@ pub enum ToWorker {
     SetUpAudio {
         allowed_hz: Vec<u32>,
     },
+    /// Write priel's own `wireplumber.conf.d` drop-in so the session manager
+    /// stops claiming `card_name`, leaving the card for priel to open directly.
+    /// Touches the filesystem like [`ToWorker::SetUpAudio`], and answers with the
+    /// same reply, because what happens next - the restart that makes a drop-in
+    /// take effect - is the same for both.
+    ReserveCard {
+        card_name: String,
+    },
+    /// Clear the sound server's `clock.force-rate` pin, which holds the whole
+    /// graph at one rate whatever the permitted list says. Waits on
+    /// `pw-metadata`, so it is here. The reply is [`FromWorker::RatePinCleared`].
+    ClearRatePin,
     /// Restart the user's sound server so a freshly written drop-in takes effect.
     /// Waits on a subprocess. The reply is [`FromWorker::AudioRestarted`].
     RestartAudio,
@@ -438,6 +450,10 @@ pub enum FromWorker {
     /// The Bluetooth codec was switched, or the reason it was not. `Err` carries
     /// a reason already fit to show.
     BtCodecSwitched(Result<(), String>),
+    /// The rate pin was cleared, or the reason it was not. No restart follows
+    /// this one - the pin is live metadata rather than a file - so unlike
+    /// [`FromWorker::AudioSetUp`] this reply is the end of the flow.
+    RatePinCleared(Result<(), String>),
     /// One page of the listing a queue is being filled from.
     ///
     /// Carries the source it answers for, so a page for a queue the listener has
@@ -632,6 +648,25 @@ fn set_up_audio(allowed_hz: &[u32]) -> FromWorker {
     };
     if let Err(e) = &done {
         log::info!("set up audio: {e}");
+    }
+    FromWorker::AudioSetUp(done)
+}
+
+/// Write priel's reservation drop-in - and only that file - into the user's
+/// session-manager config.
+///
+/// The same shape as [`set_up_audio`], and it answers with the same reply on
+/// purpose: both land a drop-in that a restart has to pick up, so the flow after
+/// them is one flow rather than two that have to be kept in step.
+fn reserve_card(card_name: &str) -> FromWorker {
+    let done = match setup::reserve_conf_dir() {
+        Some(dir) => setup::write_reserve(&dir, card_name)
+            .map(|path| path.display().to_string())
+            .map_err(|e| e.to_string()),
+        None => Err("priel could not find your config directory".to_string()),
+    };
+    if let Err(e) = &done {
+        log::info!("reserve card: {e}");
     }
     FromWorker::AudioSetUp(done)
 }
@@ -867,6 +902,8 @@ fn serve(
         // config directory. Filesystem work, so it is here and not on the render
         // thread, and it always answers so the overlay can move on.
         ToWorker::SetUpAudio { allowed_hz } => set_up_audio(&allowed_hz),
+        ToWorker::ReserveCard { card_name } => reserve_card(&card_name),
+        ToWorker::ClearRatePin => FromWorker::RatePinCleared(setup::clear_rate_pin()),
         // Restart the user's sound server. Waits on `systemctl`, so it too is
         // here and not on the UI thread.
         ToWorker::RestartAudio => FromWorker::AudioRestarted(setup::restart_pipewire()),
@@ -1791,6 +1828,7 @@ mod tests {
             FromWorker::AudioSetUp(_) => "AudioSetUp",
             FromWorker::AudioRestarted(_) => "AudioRestarted",
             FromWorker::BtCodecSwitched(_) => "BtCodecSwitched",
+            FromWorker::RatePinCleared(_) => "RatePinCleared",
             FromWorker::PlaylistCreated(_) => "PlaylistCreated",
             FromWorker::PlaylistDeleted { .. } => "PlaylistDeleted",
             FromWorker::PlaylistTrackRemoved { .. } => "PlaylistTrackRemoved",

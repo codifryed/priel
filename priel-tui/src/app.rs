@@ -434,24 +434,104 @@ pub enum Mode {
     AddTo,       // choosing which playlist a track goes into; modal
 }
 
-/// The "set up audio" flow, from the confirm to the outcome.
+/// A change to the sound server, from the confirm to the outcome.
 ///
-/// Held only while the overlay is up. The rates were settled the moment it
-/// opened - from the graph that was already read - so nothing here reaches back
-/// into the graph: what the preview shows and what the worker writes are the one
-/// list, decided once. The step is a small state machine the overlay renders and
-/// the keys advance, and the two `Writing`/`Restarting` steps are the ones with
-/// a request in flight, where a keystroke does nothing but wait.
+/// Held only while the overlay is up. What would change was settled the moment
+/// it opened - from the graph that was already read - so nothing here reaches
+/// back into the graph: what the preview shows and what the worker does are the
+/// one decision, made once. The step is a small state machine the overlay
+/// renders and the keys advance, and the steps with a request in flight are the
+/// ones where a keystroke does nothing but wait.
+///
+/// **One flow for every action, not one per action.** All of them ask before
+/// they touch anything, all of them report what came of it, and two of the three
+/// land a drop-in that a restart has to pick up. Giving each its own struct,
+/// overlay and step machine would be three copies of that shape drifting apart -
+/// and the confirm is the part that must never be the one that drifts.
 pub(crate) struct Setup {
-    /// The rates being added - the device's, that the server was blocking. Kept
-    /// apart from the whole list only to name them in the sentence; it is what
-    /// the offer was about.
-    pub(crate) adding_hz: Vec<u32>,
-    /// The whole list the drop-in would permit: everything already permitted
-    /// plus [`Self::adding_hz`]. This is what is written, because a later drop-in
-    /// replaces the property rather than adding to it.
-    pub(crate) allowed_hz: Vec<u32>,
+    /// What this flow would do, and everything needed to describe and perform
+    /// it. Settled at the confirm and never recomputed.
+    pub(crate) what: SetupWhat,
     pub(crate) step: SetupStep,
+}
+
+/// What a [`Setup`] flow would change.
+///
+/// Each variant carries what its preview needs to say and what its request
+/// needs to send, so the sentence a listener approves and the change that
+/// happens cannot be computed from different readings of the graph.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum SetupWhat {
+    /// Permit sample rates the server is not set to use, by writing priel's own
+    /// `pipewire.conf.d` drop-in.
+    Rates {
+        /// The rates being added. Kept apart from the whole list only to name
+        /// them in the sentence; it is what the offer was about.
+        adding_hz: Vec<u32>,
+        /// Which finding the offer came from, so the preview can say what is
+        /// true without claiming what was never read.
+        reason: SetupReason,
+        /// The whole list the drop-in would permit: everything already permitted
+        /// plus `adding_hz`. This is what is written, because a later drop-in
+        /// replaces the property rather than adding to it.
+        allowed_hz: Vec<u32>,
+    },
+    /// Stop the session manager claiming the card, by writing priel's own
+    /// `wireplumber.conf.d` drop-in. The one change here that takes something
+    /// away from the rest of the machine, which is why its preview says so.
+    Reserve {
+        card_name: String,
+        /// What the card is called on screen, for a sentence that names the
+        /// device rather than its ALSA identifier.
+        device: String,
+    },
+    /// Clear `clock.force-rate`, which holds the whole graph at one rate. The
+    /// only one of the three that writes no file and needs no restart.
+    ClearPin { at_hz: u32 },
+}
+
+impl SetupWhat {
+    /// What restarting the sound server will make happen, for the sentence that
+    /// offers the restart and the one that reports declining it.
+    ///
+    /// Here rather than at the two call sites because those sentences are a
+    /// promise: an action whose overlay offered the restart for one reason and
+    /// whose notice named another would have made it twice, differently.
+    pub(crate) fn restart_promise(&self) -> &'static str {
+        match self {
+            Self::Reserve { .. } => "hand the card over",
+            Self::Rates { .. } | Self::ClearPin { .. } => "use the new rates",
+        }
+    }
+
+    /// What is true once the restart has happened.
+    pub(crate) fn restart_done(&self) -> &'static str {
+        match self {
+            Self::Reserve { .. } => "the card is priel's to open",
+            Self::Rates { .. } | Self::ClearPin { .. } => "the new rates are live",
+        }
+    }
+}
+
+/// Why the "set up audio" offer is being made, which decides what the preview
+/// may say.
+///
+/// The two are not interchangeable and the difference is a claim about the
+/// hardware. The device's rates are read from the kernel, so that sentence may
+/// say what the device can do; a rate the clock refused is known only from the
+/// server's own setting, and a sink whose rates were never read must not be
+/// described as capable of anything.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SetupReason {
+    /// The device supports rates the server is not permitted to use, read from
+    /// /proc/asound. True whether or not this track needed them, which is what
+    /// makes the setup a thing done once rather than per track.
+    DeviceRates,
+    /// The server refused the rate this track plays at. The only source of the
+    /// offer wherever the device's rates could not be read - a Bluetooth or
+    /// network sink names no ALSA card - and so the case that had advice printed
+    /// for it and no way to act on it.
+    ThisTrack,
 }
 
 /// Where the "set up audio" flow has got to.
@@ -509,6 +589,16 @@ pub enum GraphRowKind {
     Link,
     /// Prose: what is being waited for, or why there is nothing to show.
     Note,
+    /// Something that can be done about what the report found, and the key that
+    /// does it.
+    ///
+    /// The key travels in the row because the row *is* the button: the renderer
+    /// registers a hit box over the key it paints and the hit is
+    /// [`Hit::Key`], so a click and a press go through the one handler. A
+    /// separate list of clickable actions beside the printed ones is the drift
+    /// this avoids - and it is why the report can say what to do without a
+    /// second implementation of doing it.
+    Action(KeyCode),
 }
 
 /// How the active Bluetooth codec stands against what the device offers.
@@ -2717,6 +2807,10 @@ impl App {
                     // codec already known.
                     if let Ok(graph) = &read {
                         self.player.set_bt_codec(graph.bt_codec.clone());
+                        // The sink node's own negotiated rate rides the same
+                        // reads, and outranks the clock as the output rate the
+                        // verdict is made on - see `effective_output`.
+                        self.player.set_sink_rate(graph.sink_rate_hz());
                     }
                     self.audio_graph = Some(read);
                     // The reply can be longer than the request that opened the
@@ -2734,6 +2828,7 @@ impl App {
                 FromWorker::AudioSetUp(result) => self.on_audio_set_up(result),
                 FromWorker::AudioRestarted(result) => self.on_audio_restarted(result),
                 FromWorker::BtCodecSwitched(result) => self.on_bt_codec_switched(result),
+                FromWorker::RatePinCleared(result) => self.on_rate_pin_cleared(result),
                 // The clock read at track start: hand it to the player, where the
                 // verdict falls back to it when there is no ALSA readout.
                 FromWorker::OutputClock(clock) => self.player.set_clock(clock),
@@ -4926,6 +5021,12 @@ impl App {
             // supports. Does nothing when there is none, exactly as the footer
             // key that fires it is only shown when there is.
             KeyCode::Char('C') => self.begin_codec_switch(),
+            // Offer to clear the rate pin that is holding the graph off this
+            // track's rate, and to reserve the card the sound server is holding.
+            // Both do nothing when they do not apply, like the two above: the
+            // action rows that fire them are shown on exactly that condition.
+            KeyCode::Char('P') => self.begin_clear_pin(),
+            KeyCode::Char('R') => self.begin_reserve(),
             _ => {}
         }
         self.dirty = true;
@@ -4935,32 +5036,47 @@ impl App {
         self.graph_rows().len().saturating_sub(1)
     }
 
-    /// The rates the device can do that the server is not set to use, and the
-    /// whole list a drop-in would permit, from the graph that is already read.
+    /// The rates the server is not set to use that it should be, why, and the
+    /// whole list a drop-in would permit - from the graph that is already read.
     ///
-    /// `None` when there is no graph or nothing is blocked - the one case the
-    /// "set up audio" offer is not made, so the key and the footer that reach it
-    /// answer with nothing rather than an empty file.
-    fn setup_targets(&self) -> Option<(Vec<u32>, Vec<u32>)> {
+    /// **Two sources, because the report gives two reasons.** The device's own
+    /// rates are read from /proc/asound and are the reason to set this up once
+    /// rather than per track; the rate *this track* needs and the server refused
+    /// is decided from the clock alone. Hanging the offer on the first alone is
+    /// what left the second unactionable: a Bluetooth or network sink names no
+    /// ALSA card, so its rates are never known, and the report printed the file
+    /// to write while offering no key that writes it.
+    ///
+    /// `None` when there is no graph or neither source has anything to add, so
+    /// the key and the footer that reach it answer with nothing rather than an
+    /// empty file. The track's rate is taken only from
+    /// [`AudioGraph::rate_advice`](priel_player::graph::AudioGraph::rate_advice)
+    /// and the same observation the report reads, so the offer cannot appear
+    /// over a section that says there is nothing to change.
+    fn setup_targets(&self) -> Option<(Vec<u32>, SetupReason, Vec<u32>)> {
         let Some(Ok(graph)) = &self.audio_graph else {
             return None;
         };
-        let blocked = graph.blocked_supported_hz();
-        if blocked.is_empty() {
+        let mut adding = graph.blocked_supported_hz();
+        let reason = if adding.is_empty() {
+            SetupReason::ThisTrack
+        } else {
+            SetupReason::DeviceRates
+        };
+        let track_rate_hz = self.status.decoded_format(self.now_meta.bit_depth).rate_hz;
+        if let RateAdvice::Missing { .. } =
+            graph.rate_advice(track_rate_hz, self.status.observed_output_rate())
+        {
+            adding.push(track_rate_hz);
+            adding.sort_unstable();
+            adding.dedup();
+        }
+        if adding.is_empty() {
             return None;
         }
         let permitted = graph.clock.permitted_hz().unwrap_or_default();
-        let allowed = priel_player::setup::desired_allowed_hz(&permitted, &blocked);
-        Some((blocked, allowed))
-    }
-
-    /// Whether the "set up audio" offer applies right now.
-    ///
-    /// What the graph overlay's footer key hangs on, so the offer and the action
-    /// behind it agree about when there is anything to do.
-    #[must_use]
-    pub fn setup_available(&self) -> bool {
-        self.setup_targets().is_some()
+        let allowed = priel_player::setup::desired_allowed_hz(&permitted, &adding);
+        Some((adding, reason, allowed))
     }
 
     /// The "set up audio" flow while its overlay is up, for the renderer to draw.
@@ -4972,16 +5088,100 @@ impl App {
     /// Open the "set up audio" preview, or do nothing when there is nothing to
     /// add. The rates are settled here, once, from the graph already read.
     fn begin_setup(&mut self) {
-        let Some((adding_hz, allowed_hz)) = self.setup_targets() else {
+        let Some((adding_hz, reason, allowed_hz)) = self.setup_targets() else {
             return;
         };
-        self.setup = Some(Setup {
+        self.begin_apply(SetupWhat::Rates {
             adding_hz,
+            reason,
             allowed_hz,
+        });
+    }
+
+    /// The card the sound server is holding that priel could reserve, and what
+    /// to call it on screen.
+    ///
+    /// `None` unless the server holds an ALSA card *and* the dump names it: a
+    /// rule matching a name priel guessed at would disable a device that was
+    /// working, which is the reason the report has always refused to invent one.
+    fn reserve_target(&self) -> Option<(String, String)> {
+        let Some(Ok(graph)) = &self.audio_graph else {
+            return None;
+        };
+        let DeviceHolder::Server(held) = &graph.holder else {
+            return None;
+        };
+        Some((held.card_name.clone()?, held.sink.clone()))
+    }
+
+    /// Open the reserve preview, or do nothing when there is no card to reserve.
+    fn begin_reserve(&mut self) {
+        let Some((card_name, device)) = self.reserve_target() else {
+            return;
+        };
+        self.begin_apply(SetupWhat::Reserve { card_name, device });
+    }
+
+    /// The rate the graph is pinned to, when a pin is what is holding this track
+    /// off its own rate.
+    ///
+    /// Read from the advice rather than from `forced_hz` directly, so the offer
+    /// appears exactly where the report says the pin is the problem - a pin set
+    /// to the rate the track wants is doing no harm and gets no offer.
+    fn pin_target(&self) -> Option<u32> {
+        let Some(Ok(graph)) = &self.audio_graph else {
+            return None;
+        };
+        let track_rate_hz = self.status.decoded_format(self.now_meta.bit_depth).rate_hz;
+        match graph.rate_advice(track_rate_hz, self.status.observed_output_rate()) {
+            RateAdvice::Pinned { at_hz } => Some(at_hz),
+            _ => None,
+        }
+    }
+
+    /// Open the clear-the-pin preview, or do nothing when there is no pin.
+    fn begin_clear_pin(&mut self) {
+        let Some(at_hz) = self.pin_target() else {
+            return;
+        };
+        self.begin_apply(SetupWhat::ClearPin { at_hz });
+    }
+
+    /// Put one change up for approval. The one way into the flow, so every
+    /// action asks before it touches anything.
+    fn begin_apply(&mut self, what: SetupWhat) {
+        self.setup = Some(Setup {
+            what,
             step: SetupStep::Confirm,
         });
         self.mode = Mode::SetupAudio;
         self.dirty = true;
+    }
+
+    /// The request one approved change sends, and the step it waits in.
+    ///
+    /// Beside the flow it belongs to rather than inside the key handler, so what
+    /// each action *does* is one place to read next to what its preview *says*.
+    fn approved(what: &SetupWhat) -> (ToWorker, SetupStep) {
+        match what {
+            SetupWhat::Rates { allowed_hz, .. } => (
+                ToWorker::SetUpAudio {
+                    allowed_hz: allowed_hz.clone(),
+                },
+                SetupStep::Writing,
+            ),
+            SetupWhat::Reserve { card_name, .. } => (
+                ToWorker::ReserveCard {
+                    card_name: card_name.clone(),
+                },
+                SetupStep::Writing,
+            ),
+            // No file and no restart: the pin is live metadata. It waits in the
+            // same in-flight step as the other two - one state for "a request is
+            // out", with the overlay taking its words from `what` - and its
+            // reply ends the flow rather than offering a restart.
+            SetupWhat::ClearPin { .. } => (ToWorker::ClearRatePin, SetupStep::Writing),
+        }
     }
 
     /// The "set up audio" overlay: a preview to approve, then the write, then the
@@ -4995,9 +5195,9 @@ impl App {
         match &setup.step {
             SetupStep::Confirm => match key.code {
                 KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-                    let allowed_hz = setup.allowed_hz.clone();
-                    self.setup_step(SetupStep::Writing);
-                    self.ask(ToWorker::SetUpAudio { allowed_hz });
+                    let (request, step) = Self::approved(&setup.what);
+                    self.setup_step(step);
+                    self.ask(request);
                 }
                 KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {
                     // Back to the report it was opened from, not out of it: the
@@ -5014,7 +5214,8 @@ impl App {
                 }
                 KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc | KeyCode::Enter => {
                     self.notice = Some(format!(
-                        "Written to {path}. Restart PipeWire to use the new rates."
+                        "Written to {path}. Restart PipeWire to {}.",
+                        setup.what.restart_promise()
                     ));
                     self.setup = None;
                     self.mode = Mode::Normal;
@@ -5040,12 +5241,16 @@ impl App {
 
     /// The drop-in was written, or not. Only a flow still waiting on the write
     /// moves - a reply that outlived its overlay is dropped, as everywhere here.
+    ///
+    /// The flow is matched on what it is doing as well as which step it is in.
+    /// One in-flight step now serves all three actions, and a reply that belongs
+    /// to another of them must not advance this one.
     fn on_audio_set_up(&mut self, result: Result<String, String>) {
         if !matches!(
             &self.setup,
             Some(Setup {
                 step: SetupStep::Writing,
-                ..
+                what: SetupWhat::Rates { .. } | SetupWhat::Reserve { .. },
             })
         ) {
             return;
@@ -5054,6 +5259,27 @@ impl App {
             Ok(path) => SetupStep::Restart { path },
             Err(e) => SetupStep::Done {
                 message: format!("Could not write it: {e}"),
+            },
+        });
+        self.dirty = true;
+    }
+
+    /// The rate pin was cleared, or not. The end of that flow either way: the
+    /// pin is live metadata, so there is no file to restart anything for.
+    fn on_rate_pin_cleared(&mut self, result: Result<(), String>) {
+        if !matches!(
+            &self.setup,
+            Some(Setup {
+                step: SetupStep::Writing,
+                what: SetupWhat::ClearPin { .. },
+            })
+        ) {
+            return;
+        }
+        self.setup_step(SetupStep::Done {
+            message: match result {
+                Ok(()) => "Done. The pin is cleared and takes effect now.".to_string(),
+                Err(e) => format!("Could not clear it: {e}"),
             },
         });
         self.dirty = true;
@@ -5071,9 +5297,13 @@ impl App {
         ) {
             return;
         }
+        let done = self
+            .setup
+            .as_ref()
+            .map_or("the new rates are live", |s| s.what.restart_done());
         self.setup_step(match result {
             Ok(()) => SetupStep::Done {
-                message: "Done. PipeWire restarted; the new rates are live.".to_string(),
+                message: format!("Done. PipeWire restarted; {done}."),
             },
             Err(e) => SetupStep::Done {
                 message: format!(
@@ -5110,7 +5340,15 @@ impl App {
                 // server was never permitted to use is refused before any node
                 // on the path sees a sample, which is how the chain can diverge
                 // nowhere and something still move.
-                rows.extend(clock_rows(&g.clock, &g.supported_hz, source));
+                // The ranked observation, not the sink node alone: an ALSA
+                // readout beats the graph, and the advice has to read the same
+                // evidence the verdict above it was made on.
+                rows.extend(clock_rows(
+                    &g.clock,
+                    &g.supported_hz,
+                    source,
+                    &g.rate_advice(source.rate_hz, self.status.observed_output_rate()),
+                ));
                 // Last, because it is the one section that is true whatever the
                 // rest of them found: a chain that alters nothing is still a
                 // chain the sound server owns and can reshape when the next
@@ -5124,6 +5362,61 @@ impl App {
                 device: self.status.audio_device.clone(),
             })),
             None | Some(Err(_)) => {}
+        }
+        rows.extend(self.action_rows());
+        rows
+    }
+
+    /// What can be done about what the report found, and the keys that do it.
+    ///
+    /// **Always drawn, and it says so when nothing applies.** Every other
+    /// section here is silent where it has nothing to report, by the rule that
+    /// advice printed over a working setup teaches the reader to ignore it. This
+    /// one is the exception on purpose: an action that appears only when it is
+    /// needed cannot be found before it is needed, and the report was telling
+    /// people to edit configuration files while the key that would do it sat
+    /// unmentioned. A heading that is always there, with one line saying there
+    /// is nothing to change, is what makes its absence the rest of the time mean
+    /// something.
+    ///
+    /// The listed actions are still conditional - a greyed-out row of everything
+    /// priel could theoretically do would be the noise this file argues against,
+    /// with a mouse target attached. Each row carries the key that runs it and
+    /// nothing else does: what is offered here, what the key handler accepts and
+    /// what the request sends are all decided by the same `*_target` methods.
+    fn action_rows(&self) -> Vec<GraphRow> {
+        let mut rows = vec![note(""), note("  Actions")];
+        let before = rows.len();
+        if let Some((adding_hz, _, _)) = self.setup_targets() {
+            rows.push(action(
+                KeyCode::Char('A'),
+                "set up audio",
+                format!("permit {}", crate::ui::fmt_khz_list(&adding_hz)),
+            ));
+        }
+        if let Some((_, _, better)) = self.codec_switch_target() {
+            rows.push(action(
+                KeyCode::Char('C'),
+                "switch codec",
+                format!("to {}", crate::ui::codec_label(&better)),
+            ));
+        }
+        if let Some(at_hz) = self.pin_target() {
+            rows.push(action(
+                KeyCode::Char('P'),
+                "clear the rate pin",
+                format!("held at {}", crate::ui::fmt_khz(at_hz)),
+            ));
+        }
+        if let Some((_, device)) = self.reserve_target() {
+            rows.push(action(
+                KeyCode::Char('R'),
+                "reserve the device",
+                format!("take {device} off the server"),
+            ));
+        }
+        if rows.len() == before {
+            rows.push(note("    nothing to change here"));
         }
         rows
     }
@@ -5188,13 +5481,6 @@ impl App {
             .find(|p| p.codec == better)?
             .profile_index;
         Some((device_id, profile_index, better))
-    }
-
-    /// Whether the "switch codec" offer applies right now - what the report's
-    /// footer key hangs on, so the offer and the action behind it agree.
-    #[must_use]
-    pub fn codec_switch_available(&self) -> bool {
-        self.codec_switch_target().is_some()
     }
 
     /// The "switch codec" flow while its overlay is up, for the renderer to draw.
@@ -6359,8 +6645,11 @@ const RATES_PER_ROW: usize = 8;
 
 /// What the server may clock at, whether this track fits, and what to change.
 ///
-/// Pure, like `path_rows`: the decision arrives already made from
-/// `ClockRates::advise` and this only lays it out.
+/// Pure, like `path_rows`: the decision arrives already made - from
+/// `AudioGraph::rate_advice`, which weighs the server's published setting
+/// against what the sink is observed running at - and this only lays it out.
+/// That is why `advice` is a parameter rather than something computed here: the
+/// clock alone cannot see the node that can overturn it.
 ///
 /// Silent when the dump published no setting *and* nothing is playing, by the
 /// same rule the blame sentence follows - there is no question and no answer,
@@ -6368,12 +6657,16 @@ const RATES_PER_ROW: usize = 8;
 /// is enough to be worth a row: what the server permits is a fact about the
 /// machine even between tracks, and an unreadable setting is worth admitting
 /// once there is a rate it would have been compared against.
-fn clock_rows(clock: &ClockRates, supported_hz: &[u32], source: SourceFormat) -> Vec<GraphRow> {
+fn clock_rows(
+    clock: &ClockRates,
+    supported_hz: &[u32],
+    source: SourceFormat,
+    advice: &RateAdvice,
+) -> Vec<GraphRow> {
     let permitted_hz = clock.permitted_hz();
     if permitted_hz.is_none() && source.rate_hz == 0 {
         return Vec::new();
     }
-    let advice = clock.advise(source.rate_hz, supported_hz);
     let mut rows = vec![note(""), note("  Server clock")];
 
     match permitted_hz.as_deref() {
@@ -6503,6 +6796,18 @@ fn reading(label: &str, detail: String) -> GraphRow {
         label: label.to_string(),
         detail,
         kind: GraphRowKind::Note,
+    }
+}
+
+/// One action row: what it does, what it would change, and the key that runs it.
+///
+/// The label is the imperative the footer used to print, kept word for word so
+/// the action reads the same wherever it is offered.
+fn action(key: KeyCode, label: &str, detail: String) -> GraphRow {
+    GraphRow {
+        label: label.to_string(),
+        detail,
+        kind: GraphRowKind::Action(key),
     }
 }
 
@@ -8802,7 +9107,7 @@ mod tests {
         let mut r = rig();
         on_a_lesser_codec(&mut r);
         r.app.status.bt_codec = Some("aptx_hd".into());
-        assert!(!r.app.codec_switch_available());
+        assert!(r.app.codec_switch_target().is_none());
         r.app.on_key(key('C'));
         assert_eq!(r.app.mode, Mode::Graph, "still the report, no switch flow");
         assert!(r.app.codec_switch.is_none());
@@ -9325,9 +9630,9 @@ mod tests {
         r.app.status.loaded = true;
         r.app.status.playing = true;
         r.app.status.volume = 100.0;
-        r.app.status.in_sample_rate = 44_100;
+        r.app.status.in_sample_rate = HIRES_TRACK_RATE_HZ;
         r.app.status.in_format = "s32".into();
-        r.app.status.sample_rate = 44_100;
+        r.app.status.sample_rate = HIRES_TRACK_RATE_HZ;
         r.app.status.out_format = "s32".into();
         r.app.now_meta.bit_depth = 24;
         r.app.on_key(key('D'));
@@ -9480,8 +9785,23 @@ mod tests {
             current_hz: Some(current_hz),
             forced_hz: None,
         };
+        // And the sink lands where that clock leaves it: on the track's own rate
+        // when the server may switch to it, and on the rate the graph is held at
+        // when it may not. A fixture whose sink sat at a rate the server refuses
+        // is not a machine that exists - and it is the one shape that hides the
+        // advice, because `rate_advice` believes the node over the global list.
+        if let (Some(sink), Some(rate_hz)) = (
+            g.path.last_mut(),
+            g.clock.output_rate_for(HIRES_TRACK_RATE_HZ),
+        ) {
+            sink.rate_hz = Some(rate_hz);
+        }
         g
     }
+
+    /// The rate every `playing_hires` fixture decodes at, named so the chain the
+    /// clock is applied to and the track it is judged against cannot drift.
+    const HIRES_TRACK_RATE_HZ: u32 = 44_100;
 
     #[test]
     fn a_rate_the_server_may_not_use_is_named_with_the_change_that_would_add_it() {
@@ -9518,6 +9838,76 @@ mod tests {
             "and where it goes: {text}"
         );
         assert!(text.contains("Restart the sound server"), "{text}");
+    }
+
+    #[test]
+    fn a_resample_under_a_link_is_still_attributed_to_the_node_that_did_it() {
+        // Goal: the second thing the swallowed grade cost. The chain is only
+        // asked to name a culprit for an alteration the verdict admits to, so
+        // grading a Bluetooth output by its codec alone left the report with no
+        // accused node either - the reader was shown a chain, a rate that moved
+        // inside it, and nothing joining the two.
+        let mut graph = chain();
+        graph.bt_codec = Some("aptx_hd".into());
+        if let Some(sink) = graph.path.last_mut() {
+            sink.rate_hz = Some(48_000);
+        }
+        let mut r = playing_hires(graph);
+        r.app.status.bt_codec = Some("aptx_hd".into());
+        r.app.status.sink_rate_hz = Some(48_000);
+
+        let text = overlay_text(&r.app);
+        assert!(
+            r.app
+                .graph_rows()
+                .iter()
+                .any(|row| row.kind == GraphRowKind::Culprit),
+            "the node that moved the rate is marked: {text}"
+        );
+        assert!(
+            crate::ui::verdict_words(r.app.verdict(), Some("aptx_hd"), r.app.bt_improvable())
+                .contains("resampled"),
+            "and the verdict says so too: {text}"
+        );
+    }
+
+    #[test]
+    fn a_link_running_at_the_tracks_rate_is_not_accused_by_the_global_clock() {
+        // Goal: the report contradicting itself. A Bluetooth sink has no ALSA
+        // readout, so the server's *global* `allowed-rates` stood in for the
+        // output rate - but that list governs the driver rate of an ALSA sink,
+        // and a bluez sink is its own driver at the rate it negotiated with the
+        // device. The result was a box that said the output was at 48 kHz and
+        // the rate "not permitted", directly above a chain in which every node
+        // said 44.1 kHz. The node is the direct reading and it wins.
+        let mut graph = chain_clocked(&[48_000], 48_000);
+        for node in &mut graph.path {
+            node.rate_hz = Some(HIRES_TRACK_RATE_HZ);
+        }
+        graph.bt_codec = Some("aptx_hd".into());
+        let mut r = playing_hires(graph);
+        r.app.status.bt_codec = Some("aptx_hd".into());
+        r.app.status.sink_rate_hz = Some(HIRES_TRACK_RATE_HZ);
+        r.app.status.clock = Some(ClockRates {
+            allowed_hz: Some(vec![48_000]),
+            current_hz: Some(48_000),
+            forced_hz: None,
+        });
+
+        let text = overlay_text(&r.app);
+        assert!(
+            !text.contains("not permitted"),
+            "the link is running at it, whatever the global list names: {text}"
+        );
+        assert!(
+            !text.contains("allowed-rates"),
+            "so there is no configuration change to advise: {text}"
+        );
+        assert_eq!(
+            r.app.status.effective_output().0,
+            HIRES_TRACK_RATE_HZ,
+            "and the device readout agrees with the chain below it"
+        );
     }
 
     #[test]
@@ -9563,7 +9953,7 @@ mod tests {
         let text = overlay_text(&r.app);
         assert!(text.contains("Your DAC can also do"), "{text}");
         assert!(text.contains("88.2"), "{text}");
-        assert!(r.app.setup_available(), "and the offer applies");
+        assert!(r.app.setup_targets().is_some(), "and the offer applies");
     }
 
     #[test]
@@ -9571,7 +9961,7 @@ mod tests {
         // Goal: a device whose rates are all permitted has nothing to set up, and
         // the key that would do it does nothing.
         let mut r = playing_hires(chain_clocked(&[44_100, 48_000], 48_000));
-        assert!(!r.app.setup_available());
+        assert!(r.app.setup_targets().is_none());
         r.app.on_key(key('A'));
         assert_eq!(r.app.mode, Mode::Graph, "the key does nothing here");
         assert!(r.app.setup.is_none());
@@ -9590,7 +9980,10 @@ mod tests {
             text.contains("already permitted"),
             "the report confirms the config is complete: {text}"
         );
-        assert!(!r.app.setup_available(), "and there is nothing to add");
+        assert!(
+            r.app.setup_targets().is_none(),
+            "and there is nothing to add"
+        );
     }
 
     #[test]
@@ -9608,6 +10001,262 @@ mod tests {
     }
 
     #[test]
+    fn the_report_always_ends_by_saying_what_can_be_done_about_it() {
+        // Goal: an action that appears only when it is needed cannot be found
+        // before it is needed. Every other section here goes quiet when it has
+        // nothing to report; this one says so instead, which is what makes a
+        // short list mean "nothing to change" rather than "nothing was looked
+        // for". The report was telling people to edit configuration files while
+        // the key that writes them went unmentioned.
+        let clean = playing_hires(chain_clocked(&[44_100, 48_000], 48_000));
+        let text = overlay_text(&clean.app);
+        assert!(
+            text.contains("Actions"),
+            "the heading is always there: {text}"
+        );
+        assert!(text.contains("nothing to change"), "and says so: {text}");
+        assert!(
+            !clean
+                .app
+                .graph_rows()
+                .iter()
+                .any(|row| matches!(row.kind, GraphRowKind::Action(_))),
+            "with no action rows under it: {text}"
+        );
+    }
+
+    #[test]
+    fn an_action_row_carries_the_key_that_runs_it_and_what_it_would_change() {
+        // Goal: the row is the button. The key travels in the row so the
+        // renderer can register a hit box over what it painted, and the detail
+        // says what pressing it would do - an action whose effect is only
+        // discoverable by running it is not an offer.
+        let r = playing_hires(chain_with_blocked());
+        let rows = r.app.graph_rows();
+        let row = rows
+            .iter()
+            .find(|row| row.kind == GraphRowKind::Action(KeyCode::Char('A')))
+            .expect("the rate setup is offered");
+        assert_eq!(row.label, "set up audio");
+        assert!(
+            row.detail.contains("88.2") && row.detail.contains("176.4"),
+            "what it would permit: {}",
+            row.detail
+        );
+    }
+
+    #[test]
+    fn the_offer_is_made_for_a_rate_the_server_refused_with_no_device_readout() {
+        // Goal: the gap between the advice and the action. `Missing` is decided
+        // from the clock alone, but the offer hung on the device's own rates -
+        // read from /proc/asound, and absent on every Bluetooth or network sink.
+        // So the report printed the file to write and the setting to put in it,
+        // and never offered the key that writes it: advice and action
+        // disagreeing about when there is something to do.
+        let mut r = playing_hires(chain_clocked(&[48_000], 48_000));
+        assert!(
+            r.app
+                .audio_graph
+                .as_ref()
+                .is_some_and(|g| g.as_ref().is_ok_and(|g| g.supported_hz.is_empty())),
+            "the premise: this sink's own rates could not be read"
+        );
+        let text = overlay_text(&r.app);
+        assert!(
+            text.contains("allowed-rates"),
+            "the advice is given: {text}"
+        );
+        assert!(
+            r.app.setup_targets().is_some(),
+            "so the offer applies too: {text}"
+        );
+
+        r.app.on_key(key('A'));
+        let setup = r.app.setup.as_ref().expect("a flow is up");
+        let SetupWhat::Rates {
+            adding_hz,
+            allowed_hz,
+            ..
+        } = &setup.what
+        else {
+            panic!("the rates flow should be up, not {:?}", setup.what);
+        };
+        assert_eq!(adding_hz, &vec![HIRES_TRACK_RATE_HZ]);
+        assert_eq!(
+            allowed_hz,
+            &vec![44_100, 48_000],
+            "everything permitted, plus the rate this track needs"
+        );
+    }
+
+    #[test]
+    fn the_offer_is_withdrawn_wherever_the_advice_is() {
+        // Goal: the invariant the two halves have to keep. The offer is made on
+        // exactly the reading the report is written from, so a report that says
+        // nothing to change cannot sit above a key that changes something.
+        let mut graph = chain_clocked(&[48_000], 48_000);
+        for node in &mut graph.path {
+            node.rate_hz = Some(HIRES_TRACK_RATE_HZ);
+        }
+        let mut r = playing_hires(graph);
+        r.app.status.sink_rate_hz = Some(HIRES_TRACK_RATE_HZ);
+        let text = overlay_text(&r.app);
+        assert!(!text.contains("allowed-rates"), "no advice: {text}");
+        assert!(r.app.setup_targets().is_none(), "and no offer: {text}");
+    }
+
+    #[test]
+    fn a_pinned_graph_is_offered_the_one_change_that_helps_it() {
+        // Goal: `clock.force-rate` holds the whole graph at one rate and the
+        // permitted list is not consulted at all, so the rates drop-in would
+        // change nothing here. The report has always said so and left the reader
+        // to run `pw-metadata` themselves; this is that sentence with a key
+        // behind it. The offer follows the advice, so a pin set to the rate the
+        // track wants - doing no harm - is not offered anything.
+        let mut graph = chain_clocked(&[44_100, 48_000], 48_000);
+        graph.clock.forced_hz = Some(48_000);
+        let mut r = playing_hires(graph);
+        assert_eq!(r.app.pin_target(), Some(48_000));
+        let text = overlay_text(&r.app);
+        assert!(text.contains("clear the rate pin"), "the offer: {text}");
+
+        r.app.on_key(key('P'));
+        assert_eq!(r.app.mode, Mode::SetupAudio);
+        let setup = r.app.setup.as_ref().expect("a flow is up");
+        assert_eq!(setup.what, SetupWhat::ClearPin { at_hz: 48_000 });
+
+        // Confirming runs the command and waits; no file is written, so the
+        // reply ends the flow rather than offering a restart.
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        assert!(
+            matches!(requests(&r).as_slice(), [ToWorker::ClearRatePin]),
+            "the request goes out"
+        );
+        r.to_app
+            .send(FromWorker::RatePinCleared(Ok(())))
+            .expect("send");
+        r.app.drain_worker();
+        match r.app.setup.as_ref().map(|s| &s.step) {
+            Some(SetupStep::Done { message }) => {
+                assert!(message.contains("cleared"), "{message}");
+            }
+            other => panic!("the flow should be done, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pin_on_the_tracks_own_rate_is_not_offered_anything() {
+        // Goal: a pin is only a problem where it is holding the track off its
+        // rate. Offering to clear one that is doing no harm would be a change
+        // made for its own sake, and it would take rate-following away.
+        let mut graph = chain_clocked(&[44_100, 48_000], 44_100);
+        graph.clock.forced_hz = Some(HIRES_TRACK_RATE_HZ);
+        let r = playing_hires(graph);
+        assert_eq!(r.app.pin_target(), None);
+        assert!(!overlay_text(&r.app).contains("clear the rate pin"));
+    }
+
+    #[test]
+    fn the_card_the_server_holds_can_be_reserved_and_the_cost_is_stated_first() {
+        // Goal: the last of the report's prose-only changes. It is also the one
+        // that takes something away from the rest of the machine, so the confirm
+        // says that before it says anything else - the file outlives the screen
+        // that explained it.
+        let mut graph = chain();
+        graph.holder = DeviceHolder::Server(HeldDevice {
+            sink: "Studio DAC".into(),
+            opened_by: Some("wireplumber".into()),
+            pcm: Some("hw:2,0".into()),
+            card_name: Some("alsa_card.usb-Studio_DAC-00".into()),
+        });
+        let mut r = playing_hires(graph);
+        let text = overlay_text(&r.app);
+        assert!(text.contains("reserve the device"), "the offer: {text}");
+
+        r.app.on_key(key('R'));
+        let setup = r.app.setup.as_ref().expect("a flow is up");
+        assert_eq!(
+            setup.what,
+            SetupWhat::Reserve {
+                card_name: "alsa_card.usb-Studio_DAC-00".into(),
+                device: "Studio DAC".into(),
+            }
+        );
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        assert!(
+            matches!(
+                requests(&r).as_slice(),
+                [ToWorker::ReserveCard { card_name }]
+                    if card_name == "alsa_card.usb-Studio_DAC-00"
+            ),
+            "the request names the card the graph named"
+        );
+    }
+
+    #[test]
+    fn the_restart_promises_what_the_change_it_follows_actually_does() {
+        // Goal: the restart step is shared by both drop-ins, and it used to
+        // promise new rates whichever one had been written. A sentence offering
+        // the restart for one reason, above a notice naming another, is the
+        // promise made twice and differently.
+        let mut graph = chain();
+        graph.holder = DeviceHolder::Server(HeldDevice {
+            sink: "Studio DAC".into(),
+            opened_by: Some("wireplumber".into()),
+            pcm: Some("hw:2,0".into()),
+            card_name: Some("alsa_card.usb-Studio_DAC-00".into()),
+        });
+        let mut r = playing_hires(graph);
+        r.app.on_key(key('R'));
+        r.app.on_key(key('y'));
+        r.to_app
+            .send(FromWorker::AudioSetUp(Ok(
+                "/tmp/99-priel-reserve.conf".into()
+            )))
+            .expect("send");
+        r.app.drain_worker();
+        assert!(
+            matches!(
+                r.app.setup.as_ref().map(|s| &s.step),
+                Some(SetupStep::Restart { .. })
+            ),
+            "a drop-in landed, so the restart is offered"
+        );
+
+        r.app.on_key(key('n'));
+        let notice = r.app.notice.as_deref().expect("a notice is left behind");
+        assert!(
+            notice.contains("hand the card over"),
+            "the notice says what the restart would do here: {notice}"
+        );
+        assert!(
+            !notice.contains("rates"),
+            "and not what the other drop-in does: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_card_the_graph_cannot_name_is_never_reserved() {
+        // Goal: the rule the report has always kept - a rule matching a name
+        // priel guessed at would disable a device that was working. No name, no
+        // offer, and the section above still says why.
+        let mut graph = chain();
+        graph.holder = DeviceHolder::Server(HeldDevice {
+            sink: "Studio DAC".into(),
+            opened_by: None,
+            pcm: None,
+            card_name: None,
+        });
+        let mut r = playing_hires(graph);
+        assert_eq!(r.app.reserve_target(), None);
+        assert!(!overlay_text(&r.app).contains("reserve the device"));
+        r.app.on_key(key('R'));
+        assert_eq!(r.app.mode, Mode::Graph, "the key does nothing here");
+    }
+
+    #[test]
     fn the_setup_key_opens_the_preview_with_the_whole_list_to_permit() {
         // Goal: A opens the confirm, and the list it would write is everything
         // already permitted plus the device's blocked rates - added, never
@@ -9617,8 +10266,16 @@ mod tests {
         assert_eq!(r.app.mode, Mode::SetupAudio);
         let setup = r.app.setup.as_ref().expect("a flow is up");
         assert_eq!(setup.step, SetupStep::Confirm);
-        assert_eq!(setup.adding_hz, vec![88_200, 176_400]);
-        assert_eq!(setup.allowed_hz, vec![44_100, 48_000, 88_200, 176_400]);
+        let SetupWhat::Rates {
+            adding_hz,
+            allowed_hz,
+            ..
+        } = &setup.what
+        else {
+            panic!("the rates flow should be up, not {:?}", setup.what);
+        };
+        assert_eq!(adding_hz, &vec![88_200, 176_400]);
+        assert_eq!(allowed_hz, &vec![44_100, 48_000, 88_200, 176_400]);
     }
 
     #[test]
@@ -9834,7 +10491,17 @@ mod tests {
         // The chain diverges nowhere and the hardware still moved, because the
         // server refused the rate before any node on the path saw a sample.
         // "Nothing on this path did it" is where the reader used to stop.
-        let mut r = playing_hires(chain_clocked(&[48_000], 48_000));
+        // Every node on the path agrees with the track - that is the premise -
+        // while the card underneath is clocked elsewhere. So the chain is put
+        // back on the track's rate after `chain_clocked` moved the sink to where
+        // the clock alone would leave it, and the ALSA readout below carries the
+        // whole finding. It also has to survive the deference: an observation
+        // that beats the graph must not be overturned by the graph.
+        let mut graph = chain_clocked(&[48_000], 48_000);
+        for node in &mut graph.path {
+            node.rate_hz = Some(HIRES_TRACK_RATE_HZ);
+        }
+        let mut r = playing_hires(graph);
         r.app.status.hw = Some(HwParams {
             card: "AUDIO".into(),
             rate: 48_000,

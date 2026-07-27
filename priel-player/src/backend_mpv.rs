@@ -179,6 +179,9 @@ struct Output {
     /// The Bluetooth codec of the output, as the frontend last read it from the
     /// graph. Published unchanged in the status; see [`crate::Cmd::SetBtCodec`].
     bt_codec: Option<String>,
+    /// The rate the graph's sink node negotiated, as the frontend last read it.
+    /// Published unchanged in the status; see [`crate::Cmd::SetSinkRate`].
+    sink_rate_hz: Option<u32>,
     /// Fetches fresh segment URLs when a signed one expires mid-track, handed to
     /// each segment download. `None` until the frontend sets it; see
     /// [`crate::Cmd::SetResolver`] and [`crate::SegmentResolver`].
@@ -769,6 +772,7 @@ pub fn spawn(
             judged: false,
             clock: None,
             bt_codec: None,
+            sink_rate_hz: None,
             resolver: None,
         };
         // The ALSA readout costs a handful of /proc reads, so it is refreshed on
@@ -1122,6 +1126,7 @@ fn handle_cmd(
         Cmd::SetExclusive(exclusive) => set_exclusive(mpv, output, exclusive),
         Cmd::SetClock(clock) => output.clock = clock,
         Cmd::SetBtCodec(codec) => output.bt_codec = codec,
+        Cmd::SetSinkRate(rate_hz) => output.sink_rate_hz = rate_hz,
         Cmd::SetResolver(resolver) => output.resolver = Some(resolver),
     }
     false
@@ -1544,6 +1549,7 @@ fn read_status(
         access,
         clock: output.clock.clone(),
         bt_codec: output.bt_codec.clone(),
+        sink_rate_hz: output.sink_rate_hz,
     }
 }
 
@@ -1632,6 +1638,7 @@ mod tests {
             judged: false,
             clock: None,
             bt_codec: None,
+            sink_rate_hz: None,
             resolver: None,
         }
     }
