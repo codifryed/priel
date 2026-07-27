@@ -2717,6 +2717,10 @@ impl App {
                     // codec already known.
                     if let Ok(graph) = &read {
                         self.player.set_bt_codec(graph.bt_codec.clone());
+                        // The sink node's own negotiated rate rides the same
+                        // reads, and outranks the clock as the output rate the
+                        // verdict is made on - see `effective_output`.
+                        self.player.set_sink_rate(graph.sink_rate_hz());
                     }
                     self.audio_graph = Some(read);
                     // The reply can be longer than the request that opened the
@@ -5110,7 +5114,15 @@ impl App {
                 // server was never permitted to use is refused before any node
                 // on the path sees a sample, which is how the chain can diverge
                 // nowhere and something still move.
-                rows.extend(clock_rows(&g.clock, &g.supported_hz, source));
+                // The ranked observation, not the sink node alone: an ALSA
+                // readout beats the graph, and the advice has to read the same
+                // evidence the verdict above it was made on.
+                rows.extend(clock_rows(
+                    &g.clock,
+                    &g.supported_hz,
+                    source,
+                    &g.rate_advice(source.rate_hz, self.status.observed_output_rate()),
+                ));
                 // Last, because it is the one section that is true whatever the
                 // rest of them found: a chain that alters nothing is still a
                 // chain the sound server owns and can reshape when the next
@@ -6359,8 +6371,11 @@ const RATES_PER_ROW: usize = 8;
 
 /// What the server may clock at, whether this track fits, and what to change.
 ///
-/// Pure, like `path_rows`: the decision arrives already made from
-/// `ClockRates::advise` and this only lays it out.
+/// Pure, like `path_rows`: the decision arrives already made - from
+/// `AudioGraph::rate_advice`, which weighs the server's published setting
+/// against what the sink is observed running at - and this only lays it out.
+/// That is why `advice` is a parameter rather than something computed here: the
+/// clock alone cannot see the node that can overturn it.
 ///
 /// Silent when the dump published no setting *and* nothing is playing, by the
 /// same rule the blame sentence follows - there is no question and no answer,
@@ -6368,12 +6383,16 @@ const RATES_PER_ROW: usize = 8;
 /// is enough to be worth a row: what the server permits is a fact about the
 /// machine even between tracks, and an unreadable setting is worth admitting
 /// once there is a rate it would have been compared against.
-fn clock_rows(clock: &ClockRates, supported_hz: &[u32], source: SourceFormat) -> Vec<GraphRow> {
+fn clock_rows(
+    clock: &ClockRates,
+    supported_hz: &[u32],
+    source: SourceFormat,
+    advice: &RateAdvice,
+) -> Vec<GraphRow> {
     let permitted_hz = clock.permitted_hz();
     if permitted_hz.is_none() && source.rate_hz == 0 {
         return Vec::new();
     }
-    let advice = clock.advise(source.rate_hz, supported_hz);
     let mut rows = vec![note(""), note("  Server clock")];
 
     match permitted_hz.as_deref() {
@@ -9325,9 +9344,9 @@ mod tests {
         r.app.status.loaded = true;
         r.app.status.playing = true;
         r.app.status.volume = 100.0;
-        r.app.status.in_sample_rate = 44_100;
+        r.app.status.in_sample_rate = HIRES_TRACK_RATE_HZ;
         r.app.status.in_format = "s32".into();
-        r.app.status.sample_rate = 44_100;
+        r.app.status.sample_rate = HIRES_TRACK_RATE_HZ;
         r.app.status.out_format = "s32".into();
         r.app.now_meta.bit_depth = 24;
         r.app.on_key(key('D'));
@@ -9480,8 +9499,23 @@ mod tests {
             current_hz: Some(current_hz),
             forced_hz: None,
         };
+        // And the sink lands where that clock leaves it: on the track's own rate
+        // when the server may switch to it, and on the rate the graph is held at
+        // when it may not. A fixture whose sink sat at a rate the server refuses
+        // is not a machine that exists - and it is the one shape that hides the
+        // advice, because `rate_advice` believes the node over the global list.
+        if let (Some(sink), Some(rate_hz)) = (
+            g.path.last_mut(),
+            g.clock.output_rate_for(HIRES_TRACK_RATE_HZ),
+        ) {
+            sink.rate_hz = Some(rate_hz);
+        }
         g
     }
+
+    /// The rate every `playing_hires` fixture decodes at, named so the chain the
+    /// clock is applied to and the track it is judged against cannot drift.
+    const HIRES_TRACK_RATE_HZ: u32 = 44_100;
 
     #[test]
     fn a_rate_the_server_may_not_use_is_named_with_the_change_that_would_add_it() {
@@ -9518,6 +9552,45 @@ mod tests {
             "and where it goes: {text}"
         );
         assert!(text.contains("Restart the sound server"), "{text}");
+    }
+
+    #[test]
+    fn a_link_running_at_the_tracks_rate_is_not_accused_by_the_global_clock() {
+        // Goal: the report contradicting itself. A Bluetooth sink has no ALSA
+        // readout, so the server's *global* `allowed-rates` stood in for the
+        // output rate - but that list governs the driver rate of an ALSA sink,
+        // and a bluez sink is its own driver at the rate it negotiated with the
+        // device. The result was a box that said the output was at 48 kHz and
+        // the rate "not permitted", directly above a chain in which every node
+        // said 44.1 kHz. The node is the direct reading and it wins.
+        let mut graph = chain_clocked(&[48_000], 48_000);
+        for node in &mut graph.path {
+            node.rate_hz = Some(HIRES_TRACK_RATE_HZ);
+        }
+        graph.bt_codec = Some("aptx_hd".into());
+        let mut r = playing_hires(graph);
+        r.app.status.bt_codec = Some("aptx_hd".into());
+        r.app.status.sink_rate_hz = Some(HIRES_TRACK_RATE_HZ);
+        r.app.status.clock = Some(ClockRates {
+            allowed_hz: Some(vec![48_000]),
+            current_hz: Some(48_000),
+            forced_hz: None,
+        });
+
+        let text = overlay_text(&r.app);
+        assert!(
+            !text.contains("not permitted"),
+            "the link is running at it, whatever the global list names: {text}"
+        );
+        assert!(
+            !text.contains("allowed-rates"),
+            "so there is no configuration change to advise: {text}"
+        );
+        assert_eq!(
+            r.app.status.effective_output().0,
+            HIRES_TRACK_RATE_HZ,
+            "and the device readout agrees with the chain below it"
+        );
     }
 
     #[test]
@@ -9834,7 +9907,17 @@ mod tests {
         // The chain diverges nowhere and the hardware still moved, because the
         // server refused the rate before any node on the path saw a sample.
         // "Nothing on this path did it" is where the reader used to stop.
-        let mut r = playing_hires(chain_clocked(&[48_000], 48_000));
+        // Every node on the path agrees with the track - that is the premise -
+        // while the card underneath is clocked elsewhere. So the chain is put
+        // back on the track's rate after `chain_clocked` moved the sink to where
+        // the clock alone would leave it, and the ALSA readout below carries the
+        // whole finding. It also has to survive the deference: an observation
+        // that beats the graph must not be overturned by the graph.
+        let mut graph = chain_clocked(&[48_000], 48_000);
+        for node in &mut graph.path {
+            node.rate_hz = Some(HIRES_TRACK_RATE_HZ);
+        }
+        let mut r = playing_hires(graph);
         r.app.status.hw = Some(HwParams {
             card: "AUDIO".into(),
             rate: 48_000,

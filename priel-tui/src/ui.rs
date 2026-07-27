@@ -5492,7 +5492,11 @@ mod tests {
         with_chain(
             &mut sc,
             AudioGraph {
-                path: vec![node("Studio DAC", NodeRole::Device, 352_800, "S32LE")],
+                // The sink is where the server's refusal leaves it - on the
+                // graph's own rate, not on the track's. A sink sitting at a rate
+                // the list does not permit is not a machine that exists, and the
+                // report believes the node over the list.
+                path: vec![node("Studio DAC", NodeRole::Device, 48_000, "S32LE")],
                 clock: ClockRates {
                     allowed_hz: Some(vec![
                         44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 384_000, 705_600, 768_000,

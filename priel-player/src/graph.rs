@@ -185,6 +185,52 @@ impl AudioGraph {
         blocked_rates(self.clock.permitted_hz().as_deref(), &self.supported_hz)
     }
 
+    /// The rate the node at the end of the chain negotiated, when it published
+    /// one.
+    ///
+    /// The direct reading of where the samples end up, and the one
+    /// [`ClockRates`] can only infer. It matters most exactly where there is no
+    /// ALSA readout to beat it: a Bluetooth sink is its own driver at the rate
+    /// bluez negotiated with the device, and the server's *global*
+    /// `clock.allowed-rates` does not govern it. Reading the global setting
+    /// there put a rate in the report that the chain below it contradicted.
+    ///
+    /// `None` when the chain reaches no device, or when the sink published no
+    /// rate this parser can read as one number - which is an absence, never a
+    /// rate to compare against.
+    #[must_use]
+    pub fn sink_rate_hz(&self) -> Option<u32> {
+        self.path
+            .last()
+            .filter(|n| n.role == NodeRole::Device)?
+            .rate_hz
+    }
+
+    /// Whether this track may be played at its own rate, given what the output
+    /// is *observed* running at.
+    ///
+    /// [`ClockRates::advise`] answers from the published setting, which is the
+    /// only evidence there is on most machines. Where the output is observed
+    /// running at the track's own rate, that outranks a list which does not name
+    /// it: the rate is evidently one this graph may use, and advising a
+    /// configuration change over it would send the reader to fix a setting that
+    /// was never in force here.
+    ///
+    /// `observed_hz` must be
+    /// [`PlaybackStatus::observed_output_rate`](crate::PlaybackStatus::observed_output_rate)
+    /// and never the sink node alone. That ranking is where an ALSA readout
+    /// beats the graph, and it is the case this deference must not swallow: a
+    /// card clocked away from the rate its own node negotiated is resampling,
+    /// the clock is what explains it, and the advice has to survive. `None` is
+    /// nothing observed, which overturns nothing.
+    #[must_use]
+    pub fn rate_advice(&self, track_rate_hz: u32, observed_hz: Option<u32>) -> RateAdvice {
+        if track_rate_hz > 0 && observed_hz == Some(track_rate_hz) {
+            return RateAdvice::Permitted;
+        }
+        self.clock.advise(track_rate_hz, &self.supported_hz)
+    }
+
     /// The ALSA card index of the sink at the end of the chain, when it has one.
     ///
     /// A server-held ALSA device names its PCM as `hw:N,M`, and `N` is the
@@ -2477,6 +2523,80 @@ mod tests {
                 "{clock:?} against {track_rate_hz} Hz"
             );
         }
+    }
+
+    #[test]
+    fn the_sinks_own_negotiated_rate_is_read_off_the_end_of_the_path() {
+        // Goal: the direct reading the clock only infers. The node at the end of
+        // the chain publishes the format it negotiated, and that is where the
+        // samples actually end up - so it is what the verdict should be made on
+        // wherever there is no ALSA readout to beat it. A sink that publishes no
+        // plain rate reports none rather than a guess.
+        assert_eq!(path_of(DUMP, PID).sink_rate_hz(), Some(44_100));
+        assert_eq!(
+            path_of(RESAMPLING, SYNTHETIC_PID).sink_rate_hz(),
+            Some(48_000),
+            "that chain's device is clocked away from the track, and says so"
+        );
+        assert_eq!(
+            AudioGraph::default().sink_rate_hz(),
+            None,
+            "a path that reaches no device has no rate to report"
+        );
+
+        // A device that published no rate at all is an absence, not a rate, and
+        // the difference is what decides whether the clock is consulted below.
+        let mut silent = path_of(DUMP, PID);
+        if let Some(sink) = silent.path.last_mut() {
+            sink.rate_hz = None;
+        }
+        assert_eq!(silent.sink_rate_hz(), None);
+    }
+
+    #[test]
+    fn the_advice_defers_to_the_rate_the_output_is_observed_running_at() {
+        // Goal: `allowed-rates` governs the driver rate of an ALSA sink. A
+        // Bluetooth sink is its own driver at the rate bluez negotiated with the
+        // device, so a global list that does not name that rate is not evidence
+        // of a resample the output itself denies - and sending the reader to
+        // edit a configuration file over it is advice about a setting that was
+        // never in force here.
+        let mut g = path_of(DUMP, PID);
+        g.clock = clock(Some(&[48_000]), Some(48_000));
+        assert_eq!(g.rate_advice(44_100, Some(44_100)), RateAdvice::Permitted);
+        assert_eq!(
+            g.clock.advise(44_100, &g.supported_hz),
+            RateAdvice::Missing {
+                proposed_hz: vec![44_100, 48_000]
+            },
+            "the clock alone would have advised a change, which is the point"
+        );
+    }
+
+    #[test]
+    fn the_advice_still_stands_where_the_output_is_not_running_at_the_tracks_rate() {
+        // Goal: the deference is to an observation that agrees with the track,
+        // never to the mere fact of having made one - and never to its absence.
+        // Every other answer leaves the clock as the evidence, or the case this
+        // whole section was written for would go quiet. The observation is the
+        // *ranked* one, so an ALSA readout contradicting the graph's own nodes
+        // keeps the advice alive: that card is resampling and this is what
+        // explains it.
+        let mut g = path_of(DUMP, PID);
+        g.clock = clock(Some(&[48_000]), Some(48_000));
+        let missing = RateAdvice::Missing {
+            proposed_hz: vec![44_100, 48_000],
+        };
+        assert_eq!(
+            g.rate_advice(44_100, Some(48_000)),
+            missing,
+            "clocked elsewhere"
+        );
+        assert_eq!(
+            g.rate_advice(44_100, None),
+            missing,
+            "nothing observed at all"
+        );
     }
 
     #[test]

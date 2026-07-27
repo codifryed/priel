@@ -123,6 +123,17 @@ pub struct PlaybackStatus {
     /// is where a resample it performed on our behalf would otherwise hide. See
     /// [`Self::effective_output`].
     pub clock: Option<crate::graph::ClockRates>,
+    /// The rate the sink node at the end of the graph negotiated, when it
+    /// published one.
+    ///
+    /// Threaded from the graph like [`Self::clock`], via
+    /// [`Player::set_sink_rate`], and it **outranks the clock**: see
+    /// [`Self::effective_output`]. Held across tracks rather than cleared with
+    /// each one, exactly as [`Self::bt_codec`] is - the reading comes from the
+    /// same graph reads, a link's negotiated rate does not usually move between
+    /// tracks, and dropping it would put the weaker reading back in charge for
+    /// the seconds until the next read.
+    pub sink_rate_hz: Option<u32>,
     /// The Bluetooth A2DP codec of the current output, or `None` when the output
     /// is not a Bluetooth link.
     ///
@@ -349,23 +360,57 @@ impl PlaybackStatus {
     ///
     /// Prefers the ALSA readout over what the audio server told mpv, because a
     /// server that resampled on our behalf still reports the rate we asked for.
+    ///
+    /// Four readings of the rate, strongest first, because each one below is
+    /// further from the samples than the one above it:
+    ///
+    /// 1. [`hw`](Self::hw) - the ALSA device itself, the only unmediated view.
+    /// 2. [`sink_rate_hz`](Self::sink_rate_hz) - what the node at the end of the
+    ///    graph negotiated. A direct reading of where the samples end up.
+    /// 3. [`clock`](Self::clock) - what the server's *global* clock settings say
+    ///    it may run at. An inference, and one that does not govern a sink which
+    ///    drives itself; it is here for the sinks that publish no rate at all.
+    /// 4. mpv's own `sample_rate` - only the rate priel handed over, which hides
+    ///    any resample performed below it.
+    ///
+    /// The format does not follow the rate down this list. It stays mpv's
+    /// wherever there is no ALSA readout, because a *narrowing* happens at the
+    /// first stage that does it: samples priel handed over as `s16` are not
+    /// restored by a sink that later widens them to `s24`, so the sink's own
+    /// width would be the flattering reading rather than the true one.
     #[must_use]
     pub fn effective_output(&self) -> (u32, &str) {
         // The ALSA readout is the truth when there is one.
         if let Some(h) = &self.hw {
             return (h.rate, h.format.as_str());
         }
-        // Without it, mpv's `sample_rate` is only the rate we handed the server,
-        // so it hides a resample the server did. The graph clock, when the
-        // frontend has read it, is the rate the output is really running at -
-        // the honest fallback for a Bluetooth or network sink.
-        let rate = self
-            .clock
-            .as_ref()
-            .and_then(|c| c.output_rate_for(self.in_sample_rate))
-            .filter(|&r| r > 0)
-            .unwrap_or(self.sample_rate);
+        let rate = self.observed_output_rate().unwrap_or(self.sample_rate);
         (rate, self.out_format.as_str())
+    }
+
+    /// The output rate as something downstream actually reported it, if anything
+    /// did: the first three rungs of the ladder above and never the fourth.
+    ///
+    /// mpv's own `sample_rate` is the rate priel *handed over*, which is an echo
+    /// of the input rather than an observation of the output - so reading it as
+    /// one would have the output agree with the track by construction, and
+    /// anything asking "is this rate evidently in use?" would always answer yes.
+    /// That is why this is separate from [`Self::effective_output`], which needs
+    /// a rate to display and takes the echo rather than showing nothing.
+    ///
+    /// `None` means nothing below priel said where the samples end up.
+    #[must_use]
+    pub fn observed_output_rate(&self) -> Option<u32> {
+        self.hw
+            .as_ref()
+            .map(|h| h.rate)
+            .or(self.sink_rate_hz)
+            .or_else(|| {
+                self.clock
+                    .as_ref()
+                    .and_then(|c| c.output_rate_for(self.in_sample_rate))
+            })
+            .filter(|&r| r > 0)
     }
 
     /// Is the output going straight to the hardware, with no sound server in
@@ -615,6 +660,10 @@ pub(crate) enum Cmd {
     /// `pw-dump` the player thread must not run, so it arrives as a command and
     /// is published unchanged in every status until the next one.
     SetBtCodec(Option<String>),
+    /// Carry the rate the graph's sink node negotiated into the status, read by
+    /// the frontend from the same graph reads as [`Cmd::SetBtCodec`]. It becomes
+    /// the output rate the verdict is made on wherever there is no ALSA readout.
+    SetSinkRate(Option<u32>),
     /// Give the player the callback it uses to fetch fresh segment URLs when a
     /// signed URL expires mid-track. See [`SegmentResolver`].
     SetResolver(SegmentResolver),
@@ -767,6 +816,16 @@ impl Player {
     /// bit-perfect - and `None` clears it when the output is not Bluetooth.
     pub fn set_bt_codec(&self, codec: Option<String>) {
         self.send(Cmd::SetBtCodec(codec));
+    }
+    /// Tell the player the rate the graph's sink node negotiated.
+    ///
+    /// Fire-and-forget like [`Self::set_clock`], and read from the same graph.
+    /// It outranks the clock as the output rate the verdict is made on - see
+    /// [`PlaybackStatus::effective_output`] - because the node says where the
+    /// samples end up and the clock only says what the server may run at.
+    /// `None` clears it, leaving the clock to stand in as before.
+    pub fn set_sink_rate(&self, rate_hz: Option<u32>) {
+        self.send(Cmd::SetSinkRate(rate_hz));
     }
     /// Give the player the callback that fetches fresh segment URLs when a
     /// signed URL expires mid-track.
@@ -1346,6 +1405,39 @@ mod tests {
         // With no codec the same status grades as before - here, the resample.
         s.bt_codec = None;
         assert_eq!(s.fidelity(16), Fidelity::Altered(Alteration::Resampled));
+    }
+
+    #[test]
+    fn the_sinks_own_rate_outranks_the_graph_clock() {
+        // Goal: with no ALSA readout the clock stood in for the output rate, but
+        // it is the graph's *global* setting - and a Bluetooth sink is its own
+        // driver at the rate bluez negotiated with the device. The sink node's
+        // own negotiated rate is a direct reading of where the samples end up,
+        // so it wins: a global list that does not name that rate is not evidence
+        // of a resample the node itself denies. Reading the weaker of two
+        // readings priel holds at once is what put a rate on screen that the
+        // chain below it contradicted.
+        let mut s = PlaybackStatus {
+            clock: Some(clock_at(&[48_000], 48_000)),
+            sink_rate_hz: Some(44_100),
+            ..playing(44_100, 44_100, "s16", "s16")
+        };
+        assert_eq!(s.effective_output(), (44_100, "s16"));
+
+        // Without the node's own reading the clock still stands in, as before.
+        s.sink_rate_hz = None;
+        assert_eq!(s.effective_output(), (48_000, "s16"));
+
+        // And the ALSA readout still beats both: it is the only unmediated view
+        // of the hardware there is.
+        s.sink_rate_hz = Some(44_100);
+        s.hw = Some(HwParams {
+            card: "DAC".into(),
+            rate: 96_000,
+            format: "S32_LE".into(),
+            channels: 2,
+        });
+        assert_eq!(s.effective_output(), (96_000, "S32_LE"));
     }
 
     #[test]
