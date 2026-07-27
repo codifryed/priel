@@ -638,7 +638,16 @@ impl RateAdvice {
             Self::Missing { proposed_hz } => {
                 let mut out = vec![
                     "This rate is not one the server is permitted to use.".to_string(),
-                    "Put this in ~/.config/pipewire/pipewire.conf.d/10-rates.conf:".to_string(),
+                    // The file priel writes itself, named from the one constant,
+                    // so the change made by hand and the change made by the key
+                    // land in the same place. Naming a different file taught the
+                    // reader to write a second drop-in that the first would then
+                    // silently override: the server takes the last value of the
+                    // property, not the union of them.
+                    format!(
+                        "Put this in ~/.config/pipewire/pipewire.conf.d/{}:",
+                        crate::setup::RATES_CONF
+                    ),
                     "  context.properties = {".to_string(),
                 ];
                 out.extend(allowed_rates_lines(proposed_hz));
@@ -2597,6 +2606,20 @@ mod tests {
             missing,
             "nothing observed at all"
         );
+    }
+
+    #[test]
+    fn the_advice_names_the_file_priel_writes_itself() {
+        // Goal: the prose and the key have to land in the same place. They named
+        // two different drop-ins, so a reader who followed the words wrote one
+        // file while the offer wrote another - and the server takes the last
+        // value of the property rather than the union of them, so whichever
+        // sorted later silently won and the other looked ignored.
+        let text = clock(Some(&[48_000]), Some(48_000))
+            .advise(44_100, &[])
+            .lines()
+            .join("\n");
+        assert!(text.contains(crate::setup::RATES_CONF), "{text}");
     }
 
     #[test]

@@ -30,7 +30,7 @@ use priel_player::{Alteration, Fidelity, Link, OutputAccess, StreamVolume, Verdi
 
 use crate::app::{
     App, CodecStep, Focus, GraphRow, GraphRowKind, Hit, Mode, QUEUE_ROWS_PER_ENTRY, Repeat,
-    SetupStep, View,
+    SetupReason, SetupStep, View,
 };
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
@@ -1340,6 +1340,7 @@ fn graph_line(row: &GraphRow, width: u16, t: &Theme) -> Line<'static> {
 fn setup_step_view(
     step: &SetupStep,
     adding: &[u32],
+    reason: SetupReason,
     allowed: &[u32],
     t: &Theme,
 ) -> (Vec<Line<'static>>, Vec<Foot>) {
@@ -1355,13 +1356,25 @@ fn setup_step_view(
                         .to_string()
                 },
             );
+            // What may be said depends on what was read. The device's rates come
+            // from the kernel, so that sentence can claim what the hardware
+            // does; a rate the server refused is known only from the server's
+            // own setting, and a sink whose rates were never read - every
+            // Bluetooth and network sink - must not be described as capable of
+            // anything on the strength of it.
             body.push(styled(
-                format!(
-                    "Your DAC can do {} rate{} PipeWire is not using: {}.",
-                    adding.len(),
-                    if adding.len() == 1 { "" } else { "s" },
-                    fmt_khz_list(adding)
-                ),
+                match reason {
+                    SetupReason::DeviceRates => format!(
+                        "Your DAC can do {} rate{} PipeWire is not using: {}.",
+                        adding.len(),
+                        if adding.len() == 1 { "" } else { "s" },
+                        fmt_khz_list(adding)
+                    ),
+                    SetupReason::ThisTrack => format!(
+                        "This track plays at {}, which PipeWire is not set to use.",
+                        fmt_khz_list(adding)
+                    ),
+                },
                 t.text,
             ));
             body.push(Line::default());
@@ -1524,11 +1537,12 @@ fn setup_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     // settled, so a copy cannot go stale under it.
     let step = setup.step.clone();
     let adding = setup.adding_hz.clone();
+    let reason = setup.reason;
     let allowed = setup.allowed_hz.clone();
     let t = app.theme();
     app.hits.clear();
 
-    let (body, footer) = setup_step_view(&step, &adding, &allowed, &t);
+    let (body, footer) = setup_step_view(&step, &adding, reason, &allowed, &t);
 
     let width = overlay_width(area, OVERLAY_MEDIUM);
     let body_h = u16::try_from(body.len()).unwrap_or(u16::MAX);

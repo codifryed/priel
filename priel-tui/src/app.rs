@@ -443,15 +443,38 @@ pub enum Mode {
 /// the keys advance, and the two `Writing`/`Restarting` steps are the ones with
 /// a request in flight, where a keystroke does nothing but wait.
 pub(crate) struct Setup {
-    /// The rates being added - the device's, that the server was blocking. Kept
-    /// apart from the whole list only to name them in the sentence; it is what
-    /// the offer was about.
+    /// The rates being added. Kept apart from the whole list only to name them
+    /// in the sentence; it is what the offer was about.
     pub(crate) adding_hz: Vec<u32>,
+    /// Which of the two findings the offer came from, so the preview can say
+    /// what is true without claiming what was never read.
+    pub(crate) reason: SetupReason,
     /// The whole list the drop-in would permit: everything already permitted
     /// plus [`Self::adding_hz`]. This is what is written, because a later drop-in
     /// replaces the property rather than adding to it.
     pub(crate) allowed_hz: Vec<u32>,
     pub(crate) step: SetupStep,
+}
+
+/// Why the "set up audio" offer is being made, which decides what the preview
+/// may say.
+///
+/// The two are not interchangeable and the difference is a claim about the
+/// hardware. The device's rates are read from the kernel, so that sentence may
+/// say what the device can do; a rate the clock refused is known only from the
+/// server's own setting, and a sink whose rates were never read must not be
+/// described as capable of anything.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SetupReason {
+    /// The device supports rates the server is not permitted to use, read from
+    /// /proc/asound. True whether or not this track needed them, which is what
+    /// makes the setup a thing done once rather than per track.
+    DeviceRates,
+    /// The server refused the rate this track plays at. The only source of the
+    /// offer wherever the device's rates could not be read - a Bluetooth or
+    /// network sink names no ALSA card - and so the case that had advice printed
+    /// for it and no way to act on it.
+    ThisTrack,
 }
 
 /// Where the "set up audio" flow has got to.
@@ -4939,23 +4962,47 @@ impl App {
         self.graph_rows().len().saturating_sub(1)
     }
 
-    /// The rates the device can do that the server is not set to use, and the
-    /// whole list a drop-in would permit, from the graph that is already read.
+    /// The rates the server is not set to use that it should be, why, and the
+    /// whole list a drop-in would permit - from the graph that is already read.
     ///
-    /// `None` when there is no graph or nothing is blocked - the one case the
-    /// "set up audio" offer is not made, so the key and the footer that reach it
-    /// answer with nothing rather than an empty file.
-    fn setup_targets(&self) -> Option<(Vec<u32>, Vec<u32>)> {
+    /// **Two sources, because the report gives two reasons.** The device's own
+    /// rates are read from /proc/asound and are the reason to set this up once
+    /// rather than per track; the rate *this track* needs and the server refused
+    /// is decided from the clock alone. Hanging the offer on the first alone is
+    /// what left the second unactionable: a Bluetooth or network sink names no
+    /// ALSA card, so its rates are never known, and the report printed the file
+    /// to write while offering no key that writes it.
+    ///
+    /// `None` when there is no graph or neither source has anything to add, so
+    /// the key and the footer that reach it answer with nothing rather than an
+    /// empty file. The track's rate is taken only from
+    /// [`AudioGraph::rate_advice`](priel_player::graph::AudioGraph::rate_advice)
+    /// and the same observation the report reads, so the offer cannot appear
+    /// over a section that says there is nothing to change.
+    fn setup_targets(&self) -> Option<(Vec<u32>, SetupReason, Vec<u32>)> {
         let Some(Ok(graph)) = &self.audio_graph else {
             return None;
         };
-        let blocked = graph.blocked_supported_hz();
-        if blocked.is_empty() {
+        let mut adding = graph.blocked_supported_hz();
+        let reason = if adding.is_empty() {
+            SetupReason::ThisTrack
+        } else {
+            SetupReason::DeviceRates
+        };
+        let track_rate_hz = self.status.decoded_format(self.now_meta.bit_depth).rate_hz;
+        if let RateAdvice::Missing { .. } =
+            graph.rate_advice(track_rate_hz, self.status.observed_output_rate())
+        {
+            adding.push(track_rate_hz);
+            adding.sort_unstable();
+            adding.dedup();
+        }
+        if adding.is_empty() {
             return None;
         }
         let permitted = graph.clock.permitted_hz().unwrap_or_default();
-        let allowed = priel_player::setup::desired_allowed_hz(&permitted, &blocked);
-        Some((blocked, allowed))
+        let allowed = priel_player::setup::desired_allowed_hz(&permitted, &adding);
+        Some((adding, reason, allowed))
     }
 
     /// Whether the "set up audio" offer applies right now.
@@ -4976,11 +5023,12 @@ impl App {
     /// Open the "set up audio" preview, or do nothing when there is nothing to
     /// add. The rates are settled here, once, from the graph already read.
     fn begin_setup(&mut self) {
-        let Some((adding_hz, allowed_hz)) = self.setup_targets() else {
+        let Some((adding_hz, reason, allowed_hz)) = self.setup_targets() else {
             return;
         };
         self.setup = Some(Setup {
             adding_hz,
+            reason,
             allowed_hz,
             step: SetupStep::Confirm,
         });
@@ -9709,6 +9757,55 @@ mod tests {
             text.contains("does not apply"),
             "the report explains rate setup is not applicable here: {text}"
         );
+    }
+
+    #[test]
+    fn the_offer_is_made_for_a_rate_the_server_refused_with_no_device_readout() {
+        // Goal: the gap between the advice and the action. `Missing` is decided
+        // from the clock alone, but the offer hung on the device's own rates -
+        // read from /proc/asound, and absent on every Bluetooth or network sink.
+        // So the report printed the file to write and the setting to put in it,
+        // and never offered the key that writes it: advice and action
+        // disagreeing about when there is something to do.
+        let mut r = playing_hires(chain_clocked(&[48_000], 48_000));
+        assert!(
+            r.app
+                .audio_graph
+                .as_ref()
+                .is_some_and(|g| g.as_ref().is_ok_and(|g| g.supported_hz.is_empty())),
+            "the premise: this sink's own rates could not be read"
+        );
+        let text = overlay_text(&r.app);
+        assert!(
+            text.contains("allowed-rates"),
+            "the advice is given: {text}"
+        );
+        assert!(r.app.setup_available(), "so the offer applies too: {text}");
+
+        r.app.on_key(key('A'));
+        let setup = r.app.setup.as_ref().expect("a flow is up");
+        assert_eq!(setup.adding_hz, vec![HIRES_TRACK_RATE_HZ]);
+        assert_eq!(
+            setup.allowed_hz,
+            vec![44_100, 48_000],
+            "everything permitted, plus the rate this track needs"
+        );
+    }
+
+    #[test]
+    fn the_offer_is_withdrawn_wherever_the_advice_is() {
+        // Goal: the invariant the two halves have to keep. The offer is made on
+        // exactly the reading the report is written from, so a report that says
+        // nothing to change cannot sit above a key that changes something.
+        let mut graph = chain_clocked(&[48_000], 48_000);
+        for node in &mut graph.path {
+            node.rate_hz = Some(HIRES_TRACK_RATE_HZ);
+        }
+        let mut r = playing_hires(graph);
+        r.app.status.sink_rate_hz = Some(HIRES_TRACK_RATE_HZ);
+        let text = overlay_text(&r.app);
+        assert!(!text.contains("allowed-rates"), "no advice: {text}");
+        assert!(!r.app.setup_available(), "and no offer: {text}");
     }
 
     #[test]
