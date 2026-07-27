@@ -1249,15 +1249,31 @@ fn graph_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let end = start
         .saturating_add(usize::from(body.height))
         .min(rows.len());
-    let lines: Vec<Line> = rows[start..end]
-        .iter()
-        .map(|r| graph_line(r, body.width, &t))
-        .collect();
+    // The actions in the body are the buttons, so their hit boxes come out of
+    // the same walk that paints them - like every other control here. A row too
+    // far down to be on screen registers nothing, because it was not drawn.
+    let mut lines: Vec<Line> = Vec::with_capacity(end.saturating_sub(start));
+    for (offset, row) in rows[start..end].iter().enumerate() {
+        let y = body
+            .y
+            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+        let rect = Rect {
+            y,
+            height: 1,
+            ..body
+        };
+        lines.push(match row.kind {
+            GraphRowKind::Action(code) => action_line(row, code, rect, &t, &mut app.hits),
+            _ => graph_line(row, body.width, &t),
+        });
+    }
     f.render_widget(Paragraph::new(lines), body);
 
-    // The "set up audio" key is offered only when there is something to add, and
-    // it is a real footer key so a click on it runs the same action the key
-    // does - the overlay's whole mouse/keyboard parity comes for free that way.
+    // Navigation and the way out, and nothing else: the actions moved into the
+    // body, where they sit beside the finding each one answers. Printing them
+    // here as well would be two places to keep in step, and on a narrow terminal
+    // this row drops what does not fit - which is how an offer would go missing
+    // from the one screen that exists to say what can be done.
     let footer_rect = Rect {
         y: inner.y + inner.height.saturating_sub(1),
         height: 1,
@@ -1274,14 +1290,6 @@ fn graph_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         Foot::Key("G", KeyCode::Char('G')),
         Foot::Text(" top / bottom \u{b7} "),
     ];
-    if app.setup_available() {
-        footer.push(Foot::Key("A", KeyCode::Char('A')));
-        footer.push(Foot::Text(" set up audio \u{b7} "));
-    }
-    if app.codec_switch_available() {
-        footer.push(Foot::Key("C", KeyCode::Char('C')));
-        footer.push(Foot::Text(" switch codec \u{b7} "));
-    }
     footer.extend([
         Foot::Key("D", KeyCode::Char('D')),
         Foot::Text(", "),
@@ -1315,7 +1323,13 @@ fn graph_line(row: &GraphRow, width: u16, t: &Theme) -> Line<'static> {
             Style::default().fg(t.verdict_altered),
         ),
         GraphRowKind::Link => (Style::default().fg(t.faint), Style::default().fg(t.faint)),
-        GraphRowKind::Note => (Style::default().fg(t.muted), Style::default().fg(t.muted)),
+        // An action reaching here has no hit box, so it would print as a key
+        // that cannot be clicked - the dead control `overlay_footer` exists to
+        // stop. `graph_overlay` routes them to `action_line` instead; this arm
+        // is only what the compiler needs to know the match is total.
+        GraphRowKind::Note | GraphRowKind::Action(_) => {
+            (Style::default().fg(t.muted), Style::default().fg(t.muted))
+        }
     };
     let label = Span::styled(row.label.clone(), label_style);
     if row.detail.is_empty() {
@@ -1330,6 +1344,60 @@ fn graph_line(row: &GraphRow, width: u16, t: &Theme) -> Line<'static> {
         .saturating_sub(label.width() + detail.width())
         .max(1);
     Line::from(vec![label, Span::raw(" ".repeat(gap)), detail])
+}
+
+/// One action row: `[A] set up audio`, with the key itself as the button.
+///
+/// Built with a [`ControlBar`] like every other control, so the hit box comes
+/// out of the same left-to-right walk that lays out the spans and cannot drift
+/// from what was painted. The hit is [`Hit::Key`], so the click runs the key
+/// handler rather than a second implementation of the action.
+///
+/// The bracketed spelling is the bottom row's, deliberately: `[q] quit` down
+/// there is a button, and a reader who has learnt that reads these the same way.
+fn action_line(
+    row: &GraphRow,
+    code: KeyCode,
+    area: Rect,
+    t: &Theme,
+    hits: &mut Vec<(Rect, Hit)>,
+) -> Line<'static> {
+    let mut bar = ControlBar::new(area);
+    bar.label("    [", Style::default().fg(t.faint));
+    bar.button(
+        key_label(code),
+        Hit::Key(code),
+        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+    );
+    bar.label("] ", Style::default().fg(t.faint));
+    bar.label(row.label.clone(), Style::default().fg(t.text));
+    // The right column, if it still fits: what this action would change. Dropped
+    // rather than wrapped on a narrow box, exactly as the readings above are
+    // clipped - the label is the part that has to survive.
+    if !row.detail.is_empty() {
+        let detail = Span::styled(row.detail.clone(), Style::default().fg(t.muted));
+        let width = u16::try_from(detail.width()).unwrap_or(u16::MAX);
+        // One cell short of the edge, so it does not sit against the border.
+        if let Some(gap) = bar.remaining().checked_sub(width.saturating_add(2)) {
+            bar.label(
+                " ".repeat(usize::from(gap).saturating_add(1)),
+                Style::default(),
+            );
+            bar.label(detail.content.into_owned(), detail.style);
+        }
+    }
+    hits.append(&mut bar.hits);
+    Line::from(bar.spans)
+}
+
+/// How a key prints in an action row, matching the bottom row's spelling.
+fn key_label(code: KeyCode) -> String {
+    match code {
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// The body lines and footer keys of the setup overlay for one step.
@@ -5659,17 +5727,65 @@ mod tests {
 
     #[test]
     fn the_report_offers_set_up_audio_as_a_clickable_key_when_rates_are_blocked() {
-        // Goal: the offer is a real footer key, so a click on it runs the same
-        // action the key does - the parity every control in priel keeps. It is
-        // shown only when there is something to add.
+        // Goal: the offer is a real button in the body, so a click on it runs
+        // the same action the key does - the parity every control in priel
+        // keeps. It is shown only when there is something to add.
         let mut sc = screen();
         with_chain(&mut sc, blocked_chain());
         sc.app.mode = Mode::Graph;
         let out = text(&mut sc.app, 100, 40);
         assert!(out.contains("Your DAC can also do"), "the reason: {out}");
-        assert!(out.contains("set up audio"), "the offer: {out}");
+        assert!(out.contains("[A] set up audio"), "the offer: {out}");
         click_hit(&mut sc.app, Hit::Key(KeyCode::Char('A')));
         assert_eq!(sc.app.mode, Mode::SetupAudio, "the click opens the confirm");
+    }
+
+    #[test]
+    fn the_actions_are_in_the_body_and_never_also_in_the_footer() {
+        // Goal: one place, for the reason the bottom row already teaches. That
+        // row drops what does not fit as the terminal narrows, so an offer
+        // printed there goes missing exactly when the box is tight - off the one
+        // screen that exists to say what can be done about the finding above it.
+        // The footer keeps navigation and the way out, which are the two things
+        // an overlay must never lose.
+        let mut sc = screen();
+        with_chain(&mut sc, blocked_chain());
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 40);
+        let footer = out
+            .lines()
+            .find(|l| l.contains("to close"))
+            .expect("the footer is drawn")
+            .to_string();
+        assert!(
+            !footer.contains("set up audio"),
+            "the action is not repeated in the footer: {footer}"
+        );
+        assert!(footer.contains("scroll"), "navigation stays: {footer}");
+        assert_eq!(
+            out.matches("set up audio").count(),
+            1,
+            "and the offer is on screen exactly once: {out}"
+        );
+    }
+
+    #[test]
+    fn the_report_says_there_is_nothing_to_do_rather_than_going_quiet() {
+        // Goal: the section is always on screen, so its emptiness is a finding
+        // rather than an absence - and a listener who has seen it once knows
+        // where to look next time.
+        let mut sc = screen();
+        with_chain(
+            &mut sc,
+            AudioGraph {
+                path: vec![node("Studio DAC", NodeRole::Device, 44_100, "S32LE")],
+                ..AudioGraph::default()
+            },
+        );
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 40);
+        assert!(out.contains("Actions"), "{out}");
+        assert!(out.contains("nothing to change here"), "{out}");
     }
 
     fn bt_improvable_chain() -> AudioGraph {

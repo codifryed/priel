@@ -532,6 +532,16 @@ pub enum GraphRowKind {
     Link,
     /// Prose: what is being waited for, or why there is nothing to show.
     Note,
+    /// Something that can be done about what the report found, and the key that
+    /// does it.
+    ///
+    /// The key travels in the row because the row *is* the button: the renderer
+    /// registers a hit box over the key it paints and the hit is
+    /// [`Hit::Key`], so a click and a press go through the one handler. A
+    /// separate list of clickable actions beside the printed ones is the drift
+    /// this avoids - and it is why the report can say what to do without a
+    /// second implementation of doing it.
+    Action(KeyCode),
 }
 
 /// How the active Bluetooth codec stands against what the device offers.
@@ -5005,15 +5015,6 @@ impl App {
         Some((adding, reason, allowed))
     }
 
-    /// Whether the "set up audio" offer applies right now.
-    ///
-    /// What the graph overlay's footer key hangs on, so the offer and the action
-    /// behind it agree about when there is anything to do.
-    #[must_use]
-    pub fn setup_available(&self) -> bool {
-        self.setup_targets().is_some()
-    }
-
     /// The "set up audio" flow while its overlay is up, for the renderer to draw.
     #[must_use]
     pub(crate) fn setup(&self) -> Option<&Setup> {
@@ -5185,6 +5186,47 @@ impl App {
             })),
             None | Some(Err(_)) => {}
         }
+        rows.extend(self.action_rows());
+        rows
+    }
+
+    /// What can be done about what the report found, and the keys that do it.
+    ///
+    /// **Always drawn, and it says so when nothing applies.** Every other
+    /// section here is silent where it has nothing to report, by the rule that
+    /// advice printed over a working setup teaches the reader to ignore it. This
+    /// one is the exception on purpose: an action that appears only when it is
+    /// needed cannot be found before it is needed, and the report was telling
+    /// people to edit configuration files while the key that would do it sat
+    /// unmentioned. A heading that is always there, with one line saying there
+    /// is nothing to change, is what makes its absence the rest of the time mean
+    /// something.
+    ///
+    /// The listed actions are still conditional - a greyed-out row of everything
+    /// priel could theoretically do would be the noise this file argues against,
+    /// with a mouse target attached. Each row carries the key that runs it and
+    /// nothing else does: what is offered here, what the key handler accepts and
+    /// what the request sends are all decided by the same `*_target` methods.
+    fn action_rows(&self) -> Vec<GraphRow> {
+        let mut rows = vec![note(""), note("  Actions")];
+        let before = rows.len();
+        if let Some((adding_hz, _, _)) = self.setup_targets() {
+            rows.push(action(
+                KeyCode::Char('A'),
+                "set up audio",
+                format!("permit {}", crate::ui::fmt_khz_list(&adding_hz)),
+            ));
+        }
+        if let Some((_, _, better)) = self.codec_switch_target() {
+            rows.push(action(
+                KeyCode::Char('C'),
+                "switch codec",
+                format!("to {}", crate::ui::codec_label(&better)),
+            ));
+        }
+        if rows.len() == before {
+            rows.push(note("    nothing to change here"));
+        }
         rows
     }
 
@@ -5248,13 +5290,6 @@ impl App {
             .find(|p| p.codec == better)?
             .profile_index;
         Some((device_id, profile_index, better))
-    }
-
-    /// Whether the "switch codec" offer applies right now - what the report's
-    /// footer key hangs on, so the offer and the action behind it agree.
-    #[must_use]
-    pub fn codec_switch_available(&self) -> bool {
-        self.codec_switch_target().is_some()
     }
 
     /// The "switch codec" flow while its overlay is up, for the renderer to draw.
@@ -6570,6 +6605,18 @@ fn reading(label: &str, detail: String) -> GraphRow {
         label: label.to_string(),
         detail,
         kind: GraphRowKind::Note,
+    }
+}
+
+/// One action row: what it does, what it would change, and the key that runs it.
+///
+/// The label is the imperative the footer used to print, kept word for word so
+/// the action reads the same wherever it is offered.
+fn action(key: KeyCode, label: &str, detail: String) -> GraphRow {
+    GraphRow {
+        label: label.to_string(),
+        detail,
+        kind: GraphRowKind::Action(key),
     }
 }
 
@@ -8869,7 +8916,7 @@ mod tests {
         let mut r = rig();
         on_a_lesser_codec(&mut r);
         r.app.status.bt_codec = Some("aptx_hd".into());
-        assert!(!r.app.codec_switch_available());
+        assert!(r.app.codec_switch_target().is_none());
         r.app.on_key(key('C'));
         assert_eq!(r.app.mode, Mode::Graph, "still the report, no switch flow");
         assert!(r.app.codec_switch.is_none());
@@ -9715,7 +9762,7 @@ mod tests {
         let text = overlay_text(&r.app);
         assert!(text.contains("Your DAC can also do"), "{text}");
         assert!(text.contains("88.2"), "{text}");
-        assert!(r.app.setup_available(), "and the offer applies");
+        assert!(r.app.setup_targets().is_some(), "and the offer applies");
     }
 
     #[test]
@@ -9723,7 +9770,7 @@ mod tests {
         // Goal: a device whose rates are all permitted has nothing to set up, and
         // the key that would do it does nothing.
         let mut r = playing_hires(chain_clocked(&[44_100, 48_000], 48_000));
-        assert!(!r.app.setup_available());
+        assert!(r.app.setup_targets().is_none());
         r.app.on_key(key('A'));
         assert_eq!(r.app.mode, Mode::Graph, "the key does nothing here");
         assert!(r.app.setup.is_none());
@@ -9742,7 +9789,10 @@ mod tests {
             text.contains("already permitted"),
             "the report confirms the config is complete: {text}"
         );
-        assert!(!r.app.setup_available(), "and there is nothing to add");
+        assert!(
+            r.app.setup_targets().is_none(),
+            "and there is nothing to add"
+        );
     }
 
     #[test]
@@ -9756,6 +9806,51 @@ mod tests {
         assert!(
             text.contains("does not apply"),
             "the report explains rate setup is not applicable here: {text}"
+        );
+    }
+
+    #[test]
+    fn the_report_always_ends_by_saying_what_can_be_done_about_it() {
+        // Goal: an action that appears only when it is needed cannot be found
+        // before it is needed. Every other section here goes quiet when it has
+        // nothing to report; this one says so instead, which is what makes a
+        // short list mean "nothing to change" rather than "nothing was looked
+        // for". The report was telling people to edit configuration files while
+        // the key that writes them went unmentioned.
+        let clean = playing_hires(chain_clocked(&[44_100, 48_000], 48_000));
+        let text = overlay_text(&clean.app);
+        assert!(
+            text.contains("Actions"),
+            "the heading is always there: {text}"
+        );
+        assert!(text.contains("nothing to change"), "and says so: {text}");
+        assert!(
+            !clean
+                .app
+                .graph_rows()
+                .iter()
+                .any(|row| matches!(row.kind, GraphRowKind::Action(_))),
+            "with no action rows under it: {text}"
+        );
+    }
+
+    #[test]
+    fn an_action_row_carries_the_key_that_runs_it_and_what_it_would_change() {
+        // Goal: the row is the button. The key travels in the row so the
+        // renderer can register a hit box over what it painted, and the detail
+        // says what pressing it would do - an action whose effect is only
+        // discoverable by running it is not an offer.
+        let r = playing_hires(chain_with_blocked());
+        let rows = r.app.graph_rows();
+        let row = rows
+            .iter()
+            .find(|row| row.kind == GraphRowKind::Action(KeyCode::Char('A')))
+            .expect("the rate setup is offered");
+        assert_eq!(row.label, "set up audio");
+        assert!(
+            row.detail.contains("88.2") && row.detail.contains("176.4"),
+            "what it would permit: {}",
+            row.detail
         );
     }
 
@@ -9780,7 +9875,10 @@ mod tests {
             text.contains("allowed-rates"),
             "the advice is given: {text}"
         );
-        assert!(r.app.setup_available(), "so the offer applies too: {text}");
+        assert!(
+            r.app.setup_targets().is_some(),
+            "so the offer applies too: {text}"
+        );
 
         r.app.on_key(key('A'));
         let setup = r.app.setup.as_ref().expect("a flow is up");
@@ -9805,7 +9903,7 @@ mod tests {
         r.app.status.sink_rate_hz = Some(HIRES_TRACK_RATE_HZ);
         let text = overlay_text(&r.app);
         assert!(!text.contains("allowed-rates"), "no advice: {text}");
-        assert!(!r.app.setup_available(), "and no offer: {text}");
+        assert!(r.app.setup_targets().is_none(), "and no offer: {text}");
     }
 
     #[test]
