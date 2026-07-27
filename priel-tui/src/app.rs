@@ -9555,6 +9555,37 @@ mod tests {
     }
 
     #[test]
+    fn a_resample_under_a_link_is_still_attributed_to_the_node_that_did_it() {
+        // Goal: the second thing the swallowed grade cost. The chain is only
+        // asked to name a culprit for an alteration the verdict admits to, so
+        // grading a Bluetooth output by its codec alone left the report with no
+        // accused node either - the reader was shown a chain, a rate that moved
+        // inside it, and nothing joining the two.
+        let mut graph = chain();
+        graph.bt_codec = Some("aptx_hd".into());
+        if let Some(sink) = graph.path.last_mut() {
+            sink.rate_hz = Some(48_000);
+        }
+        let mut r = playing_hires(graph);
+        r.app.status.bt_codec = Some("aptx_hd".into());
+        r.app.status.sink_rate_hz = Some(48_000);
+
+        let text = overlay_text(&r.app);
+        assert!(
+            r.app
+                .graph_rows()
+                .iter()
+                .any(|row| row.kind == GraphRowKind::Culprit),
+            "the node that moved the rate is marked: {text}"
+        );
+        assert!(
+            crate::ui::verdict_words(r.app.verdict(), Some("aptx_hd"), r.app.bt_improvable())
+                .contains("resampled"),
+            "and the verdict says so too: {text}"
+        );
+    }
+
+    #[test]
     fn a_link_running_at_the_tracks_rate_is_not_accused_by_the_global_clock() {
         // Goal: the report contradicting itself. A Bluetooth sink has no ALSA
         // readout, so the server's *global* `allowed-rates` stood in for the

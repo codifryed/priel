@@ -188,14 +188,26 @@ pub enum Fidelity {
     NearBitPerfect(Alteration),
     /// The sample stream itself is being rebuilt.
     Altered(Alteration),
-    /// The output is a Bluetooth A2DP link, which re-encodes every sample, so
-    /// nothing downstream is bit-perfect whatever the rate or depth.
-    ///
-    /// A grade of its own rather than an [`Altered`](Self::Altered) cause: the
-    /// loss is inherent to the link, not something the graph rebuilt and could
-    /// be asked to account for, and it is not a change a listener can undo from
-    /// here. The codec name is carried in [`PlaybackStatus::bt_codec`] and named
-    /// at the UI, so this stays a unit variant and [`Fidelity`] stays `Copy`.
+}
+
+/// A lossy transport the samples cross *below* the chain this can grade.
+///
+/// Beside [`Fidelity`] rather than inside it, and the distinction is the point:
+/// a link is a fact about what carries the samples, a fidelity is a fact about
+/// whether anything rebuilt them, and the two are independent. Folding the link
+/// into the grade made them exclusive, so a Bluetooth output could only ever
+/// report the link - and a resample under it was hidden behind a word that said
+/// the codec was the only loss. It also went missing from
+/// [`AudioGraph::attribute`](graph::AudioGraph::attribute), which is only asked
+/// to name a culprit for an alteration the grade admits to.
+///
+/// The codec name is carried in [`PlaybackStatus::bt_codec`] and named at the
+/// UI, so this stays a unit variant and [`Verdict`] stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// A Bluetooth A2DP link, which re-encodes every sample - so nothing beyond
+    /// it is bit-perfect whatever the rate or depth, and no setting here undoes
+    /// that. Choosing a better codec is the one thing that can be done about it.
     Bluetooth,
 }
 
@@ -216,15 +228,23 @@ impl Fidelity {
     }
 }
 
-/// A grade, and how much of the chain it was reached from.
+/// A grade, the transport it was reached over, and how much of the chain it was
+/// reached from.
 ///
-/// The two travel together because neither is usable alone. A grade with no
+/// The three travel together because none is usable alone. A grade with no
 /// account of what it rests on is the overstatement this indicator exists to
 /// avoid - today's tick already means "as far as I looked" and nothing says so -
-/// and an account with no grade is a diagnostic nobody asked for.
+/// and an account with no grade is a diagnostic nobody asked for. [`Link`] is
+/// here for the same reason and joined the other two later: a grade that could
+/// name either the rebuilt stream or the lossy link, but never both, reported
+/// the smaller of the two findings on the outputs that had both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Verdict {
     pub fidelity: Fidelity,
+    /// The lossy transport below the chain, when there is one. Independent of
+    /// [`Self::fidelity`]: a link does not excuse a resample and a clean stream
+    /// does not undo a link.
+    pub link: Option<Link>,
     pub evidence: Evidence,
 }
 
@@ -478,6 +498,7 @@ impl PlaybackStatus {
         let stage = sink.stage();
         Verdict {
             fidelity: self.graded(source_bits, stage),
+            link: self.bt_codec.as_ref().map(|_| Link::Bluetooth),
             evidence: self.evidence(stage),
         }
     }
@@ -559,14 +580,11 @@ impl PlaybackStatus {
             return Fidelity::Unknown;
         }
 
-        // A Bluetooth A2DP link re-encodes every sample, so nothing downstream
-        // is bit-perfect whatever the rate or depth. It outranks the rate,
-        // depth and volume grades below because it is the dominant, inherent
-        // loss; the codec name is carried in `bt_codec` and named at the UI.
-        if self.bt_codec.is_some() {
-            return Fidelity::Bluetooth;
-        }
-
+        // The link is deliberately not consulted here. It is reported beside
+        // this grade rather than in place of it - see `Link` - because a lossy
+        // transport does not excuse a resample the graph performed above it,
+        // and swallowing one behind the other is what let a rebuilt stream ride
+        // under a word that named only the codec.
         if out_rate != self.in_sample_rate {
             return Fidelity::Altered(Alteration::Resampled);
         }
@@ -1380,31 +1398,41 @@ mod tests {
     }
 
     #[test]
-    fn a_bluetooth_output_is_graded_by_its_codec_not_bit_perfect() {
-        // Goal: a Bluetooth A2DP link re-encodes every sample, so it can never
-        // be bit-perfect whatever the rate or depth. The codec's presence is the
-        // verdict, outranking the rate, depth and volume grades below it.
+    fn a_bluetooth_link_is_reported_beside_the_stream_grade_and_never_instead_of_it() {
+        // Goal: the link and the sample stream are findings about two different
+        // things - what carries the samples, and whether anything rebuilt them -
+        // so the verdict has to be able to say both. Grading the link *instead*
+        // of the stream put a resample behind a yellow badge that said the only
+        // loss was the codec, and hid it from the chain too: the attribution is
+        // only asked to name a culprit for an alteration the grade admits to.
         let mut s = PlaybackStatus {
             bt_codec: Some("aptx_hd".into()),
-            ..playing(44_100, 44_100, "s16", "s16") // otherwise bit-perfect
+            ..playing(44_100, 44_100, "s16", "s16") // otherwise clean
         };
+        let clean = s.verdict(16, &SinkVolume::Absent);
+        assert_eq!(clean.fidelity, Fidelity::BitPerfect, "nothing rebuilt it");
+        assert_eq!(clean.link, Some(Link::Bluetooth), "and the link is named");
+
+        // A resample below it is now visible rather than swallowed.
+        s.sink_rate_hz = Some(48_000);
+        let resampled = s.verdict(16, &SinkVolume::Absent);
         assert_eq!(
-            s.fidelity(16),
-            Fidelity::Bluetooth,
-            "an otherwise-clean link is still Bluetooth, not bit-perfect"
+            resampled.fidelity,
+            Fidelity::Altered(Alteration::Resampled),
+            "the stream was rebuilt and the link does not excuse it"
+        );
+        assert_eq!(resampled.link, Some(Link::Bluetooth), "both, not either");
+        assert_eq!(
+            s.fidelity(16).alteration(),
+            Some(Alteration::Resampled),
+            "so the chain is asked to name what did it"
         );
 
-        // It outranks a resample: the link loss dominates.
-        s.sample_rate = 48_000; // out != in
-        assert_eq!(
-            s.fidelity(16),
-            Fidelity::Bluetooth,
-            "the link loss dominates a resample"
-        );
-
-        // With no codec the same status grades as before - here, the resample.
+        // With no link the same status grades exactly as it did before.
         s.bt_codec = None;
-        assert_eq!(s.fidelity(16), Fidelity::Altered(Alteration::Resampled));
+        let wired = s.verdict(16, &SinkVolume::Absent);
+        assert_eq!(wired.fidelity, Fidelity::Altered(Alteration::Resampled));
+        assert_eq!(wired.link, None);
     }
 
     #[test]
@@ -1623,6 +1651,7 @@ mod tests {
             s.verdict(24, &sink_at(0.5)),
             Verdict {
                 fidelity: Fidelity::NearBitPerfect(Alteration::SinkVolumeScaled),
+                link: None,
                 evidence: Evidence::Complete,
             }
         );

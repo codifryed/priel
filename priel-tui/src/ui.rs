@@ -26,7 +26,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use std::fmt::Write as _;
 
 use priel_player::graph::{SinkStage, SinkVolume};
-use priel_player::{Alteration, Fidelity, OutputAccess, StreamVolume, Verdict};
+use priel_player::{Alteration, Fidelity, Link, OutputAccess, StreamVolume, Verdict};
 
 use crate::app::{
     App, CodecStep, Focus, GraphRow, GraphRowKind, Hit, Mode, QUEUE_ROWS_PER_ENTRY, Repeat,
@@ -3635,20 +3635,24 @@ fn verdict_badge(app: &App) -> (String, Color) {
     let improvable = app.bt_improvable();
     (
         verdict_words(verdict, app.status.bt_codec.as_deref(), improvable),
-        verdict_colour(verdict.fidelity, improvable, &app.theme()),
+        verdict_colour(verdict, improvable, &app.theme()),
     )
 }
 
 /// The verdict in words, shared by the row and the report so the two cannot
 /// come to different conclusions about one moment.
 ///
-/// `bt_codec` names the Bluetooth codec for the [`Fidelity::Bluetooth`] grade -
-/// it is carried in the status rather than the grade so [`Fidelity`] stays
-/// `Copy`, and folded into the word here. `bt_improvable` is whether a better
-/// codec is available - `Some(false)` on the best the device offers,
-/// `Some(true)` when a better one exists, `None` when it cannot be told - and
-/// picks the glyph: the near mark on the best (nothing left to do), the altered
+/// `bt_codec` names the codec for a [`Link::Bluetooth`] verdict - it is carried
+/// in the status rather than the verdict so [`Verdict`] stays `Copy`, and folded
+/// into the words here. `bt_improvable` is whether a better codec is available -
+/// `Some(false)` on the best the device offers, `Some(true)` when a better one
+/// exists, `None` when it cannot be told - and picks the glyph over an otherwise
+/// intact stream: the near mark on the best (nothing left to do), the altered
 /// mark otherwise.
+///
+/// Where the stream was *also* rebuilt, both findings are named, in the order
+/// the samples meet them. That is the whole point of the link being a field of
+/// its own: a verdict that could say only one of the two said the smaller one.
 pub(crate) fn verdict_words(
     verdict: Verdict,
     bt_codec: Option<&str>,
@@ -3659,9 +3663,11 @@ pub(crate) fn verdict_words(
     } else {
         "✓"
     };
-    match verdict.fidelity {
-        Fidelity::Unknown => String::new(),
-        Fidelity::BitPerfect => format!("{tick} bit-perfect"),
+    // The mark and the word are kept apart because the link below can override
+    // the mark while leaving the word exactly as it was.
+    let (mark, word) = match verdict.fidelity {
+        Fidelity::Unknown => return String::new(),
+        Fidelity::BitPerfect => (tick, "bit-perfect"),
         // Every level change reads the same, whichever stage made it. Naming
         // the stage here would need the width the row does not have, and the
         // report's volume section is where the three of them are laid out side
@@ -3671,26 +3677,40 @@ pub(crate) fn verdict_words(
             Alteration::VolumeScaled
             | Alteration::ServerVolumeScaled
             | Alteration::SinkVolumeScaled,
-        ) => "≈ near bit-perfect".to_string(),
-        Fidelity::Altered(Alteration::Resampled) => "⚠ resampled".to_string(),
-        Fidelity::Altered(Alteration::Truncated) => "⚠ truncated".to_string(),
-        // A Bluetooth link is a rebuilt (lossy) sample stream, so it is never
-        // bit-perfect. But on the best codec the device offers there is nothing
-        // left to do, so it takes the near mark (and, via `verdict_colour`,
-        // yellow); on a lesser codec, or when priel cannot tell, it takes the
-        // altered mark and red because a better codec can be chosen. The glyph
-        // and the colour stay in the same family either way.
-        Fidelity::Bluetooth => {
-            let glyph = if bt_improvable == Some(false) {
-                "≈"
-            } else {
-                "⚠"
-            };
-            match bt_codec {
-                Some(codec) => format!("{glyph} bluetooth ({})", codec_label(codec)),
-                None => format!("{glyph} bluetooth"),
-            }
-        }
+        ) => ("≈", "near bit-perfect"),
+        Fidelity::Altered(Alteration::Resampled) => ("⚠", "resampled"),
+        Fidelity::Altered(Alteration::Truncated) => ("⚠", "truncated"),
+    };
+    let Some(Link::Bluetooth) = verdict.link else {
+        return format!("{mark} {word}");
+    };
+    // A Bluetooth link re-encodes every sample, so it is never bit-perfect. On
+    // the best codec the device offers there is nothing left to do, so it takes
+    // the near mark (and, via `verdict_colour`, yellow); on a lesser codec, or
+    // when priel cannot tell, it takes the altered mark and red, because a
+    // better codec can be chosen. A stream that was *also* rebuilt above the
+    // link takes the altered mark whatever the codec standing - that is the
+    // worse of the two findings, and the one something can be done about.
+    let rebuilt = verdict.fidelity.alteration().is_some();
+    let glyph = if !rebuilt && bt_improvable == Some(false) {
+        "≈"
+    } else {
+        "⚠"
+    };
+    let link = match bt_codec {
+        Some(codec) => format!("bluetooth ({})", codec_label(codec)),
+        None => "bluetooth".to_string(),
+    };
+    if rebuilt {
+        // Both findings, in the order the samples meet them: what rebuilt the
+        // stream, then what carries what is left of it. A link named on its own
+        // here read as "the codec is the only loss", which is the overstatement
+        // that put a resample behind a yellow badge.
+        format!("{glyph} {word} \u{2192} {link}")
+    } else {
+        // A clean stream adds nothing: the link is the whole finding, and this
+        // is the wording that was on screen before the two were separated.
+        format!("{glyph} {link}")
     }
 }
 
@@ -3741,21 +3761,31 @@ pub(crate) fn codec_rank(id: &str) -> u32 {
 /// The colour that goes with a grade. Never the only carrier of a meaning: the
 /// glyph in front of each word says the same thing on a monochrome terminal.
 ///
-/// `bt_improvable` colours the Bluetooth grade by whether anything can be done
-/// about it: yellow on the best codec the device offers (an accepted, inherent
-/// limit, like a level change), red when a better one is available or cannot be
-/// told (actionable). Green stays reserved for bit-perfect.
-fn verdict_colour(fidelity: Fidelity, bt_improvable: Option<bool>, t: &Theme) -> Color {
-    match fidelity {
+/// `bt_improvable` colours a link by whether anything can be done about it:
+/// yellow on the best codec the device offers (an accepted, inherent limit, like
+/// a level change), red when a better one is available or cannot be told
+/// (actionable). Green stays reserved for bit-perfect.
+///
+/// **A rebuilt sample stream is red whatever carries it.** The link is graded
+/// only where the stream above it is intact: a resample under a Bluetooth link
+/// is still a resample, and colouring it by the codec's standing reported the
+/// smaller of two findings - the one nothing can be done about - as though it
+/// were the whole of the answer.
+fn verdict_colour(verdict: Verdict, bt_improvable: Option<bool>, t: &Theme) -> Color {
+    match verdict.fidelity {
         Fidelity::Unknown => t.verdict_unknown,
-        Fidelity::BitPerfect => t.verdict_clean,
-        // On the best codec the device has, a Bluetooth link is as good as it
-        // gets - yellow. On a lesser one, or when priel cannot tell, red - the
-        // same red a resample or a truncation gets, all rebuilt sample streams.
-        Fidelity::Bluetooth if bt_improvable == Some(false) => t.verdict_near,
-        Fidelity::Bluetooth | Fidelity::Altered(Alteration::Resampled | Alteration::Truncated) => {
-            t.verdict_altered
+        // Checked before the link, and this is the whole of the ordering rule.
+        Fidelity::Altered(Alteration::Resampled | Alteration::Truncated) => t.verdict_altered,
+        // On the best codec the device has, a link is as good as it gets -
+        // yellow. On a lesser one, or when priel cannot tell, red.
+        _ if verdict.link.is_some() => {
+            if bt_improvable == Some(false) {
+                t.verdict_near
+            } else {
+                t.verdict_altered
+            }
         }
+        Fidelity::BitPerfect => t.verdict_clean,
         // Every level change, whichever stage made it and whichever grade it
         // arrived under.
         Fidelity::NearBitPerfect(_) | Fidelity::Altered(_) => t.verdict_near,
@@ -4115,7 +4145,7 @@ mod tests {
         AudioGraph, ClockRates, DeviceHolder, GraphError, GraphNode, HeldDevice, NodeRole,
         SinkLevels, SinkVolume,
     };
-    use priel_player::{Evidence, Fidelity, Verdict};
+    use priel_player::{Alteration, Evidence, Fidelity, Link, Verdict};
     use ratatui::layout::Rect;
     use ratatui::style::Color;
     use ratatui::style::Style;
@@ -7313,17 +7343,26 @@ mod tests {
         assert_eq!(codec_label("some_new_codec"), "SOME NEW CODEC");
     }
 
+    /// A verdict over a link, with the sample stream in whatever state.
+    fn linked(fidelity: Fidelity) -> Verdict {
+        Verdict {
+            fidelity,
+            link: Some(Link::Bluetooth),
+            evidence: Evidence::Complete,
+        }
+    }
+
     #[test]
     fn a_bluetooth_verdict_names_the_link_and_the_codec() {
         // Goal: the distinct grade the listener sees - unmistakably a Bluetooth
         // link, with the codec its sound quality rests on.
-        let verdict = Verdict {
-            fidelity: Fidelity::Bluetooth,
-            evidence: Evidence::Complete,
-        };
-        let words = verdict_words(verdict, Some("aptx_hd"), Some(false));
+        let words = verdict_words(linked(Fidelity::BitPerfect), Some("aptx_hd"), Some(false));
         assert!(words.contains("bluetooth"), "names the link: {words}");
         assert!(words.contains("aptX HD"), "names the codec: {words}");
+        assert!(
+            !words.contains("bit-perfect"),
+            "and never calls a re-encoded link bit-perfect: {words}"
+        );
     }
 
     #[test]
@@ -7332,10 +7371,7 @@ mod tests {
         // is nothing to do, so the near mark and yellow; a better codec available
         // (or unknown) is actionable, so the altered mark and red. Green stays
         // for bit-perfect.
-        let verdict = Verdict {
-            fidelity: Fidelity::Bluetooth,
-            evidence: Evidence::Complete,
-        };
+        let verdict = linked(Fidelity::BitPerfect);
         let t = crate::theme::Theme::default();
 
         // Best available: near glyph, yellow.
@@ -7344,10 +7380,7 @@ mod tests {
             best.starts_with('≈'),
             "best codec takes the near mark: {best}"
         );
-        assert_eq!(
-            verdict_colour(Fidelity::Bluetooth, Some(false), &t),
-            t.verdict_near
-        );
+        assert_eq!(verdict_colour(verdict, Some(false), &t), t.verdict_near);
 
         // A better one available: altered glyph, red.
         let worse = verdict_words(verdict, Some("sbc"), Some(true));
@@ -7355,16 +7388,51 @@ mod tests {
             worse.starts_with('⚠'),
             "a lesser codec takes the altered mark: {worse}"
         );
-        assert_eq!(
-            verdict_colour(Fidelity::Bluetooth, Some(true), &t),
-            t.verdict_altered
-        );
+        assert_eq!(verdict_colour(verdict, Some(true), &t), t.verdict_altered);
 
         // Unknown availability is treated as improvable - priel cannot call it best.
-        assert_eq!(
-            verdict_colour(Fidelity::Bluetooth, None, &t),
-            t.verdict_altered
+        assert_eq!(verdict_colour(verdict, None, &t), t.verdict_altered);
+    }
+
+    #[test]
+    fn a_resample_under_a_link_is_red_and_named_whatever_the_codec_standing() {
+        // Goal: the finding the link used to swallow. A stream rebuilt above the
+        // link is the worse of the two losses and the one something can be done
+        // about, so it decides both the word and the colour - even on the best
+        // codec the device offers, which is the case that read as an accepted
+        // yellow limit while the graph was quietly resampling.
+        let t = crate::theme::Theme::default();
+        let verdict = linked(Fidelity::Altered(Alteration::Resampled));
+
+        let words = verdict_words(verdict, Some("aptx_hd"), Some(false));
+        assert!(words.starts_with('⚠'), "the altered mark: {words}");
+        assert!(
+            words.contains("resampled"),
+            "names what was rebuilt: {words}"
         );
+        assert!(
+            words.contains("bluetooth (aptX HD)"),
+            "and still names what carries it: {words}"
+        );
+        assert_eq!(
+            verdict_colour(verdict, Some(false), &t),
+            t.verdict_altered,
+            "red, though the codec is the best on offer"
+        );
+
+        // A truncation reads the same way, and a level change does not: only a
+        // rebuilt sample stream outranks the link.
+        assert!(
+            verdict_words(linked(Fidelity::Altered(Alteration::Truncated)), None, None)
+                .contains("truncated")
+        );
+        let scaled = linked(Fidelity::NearBitPerfect(Alteration::VolumeScaled));
+        assert_eq!(
+            verdict_words(scaled, Some("aptx_hd"), Some(false)),
+            "≈ bluetooth (aptX HD)",
+            "the link is the whole finding where nothing was rebuilt"
+        );
+        assert_eq!(verdict_colour(scaled, Some(false), &t), t.verdict_near);
     }
 
     #[test]
