@@ -133,6 +133,12 @@ fn cover_wanted(area: Rect, app: &App) -> bool {
 const OVERLAY_WIDE: u16 = 120;
 const OVERLAY_MEDIUM: u16 = 84;
 const OVERLAY_NARROW: u16 = 64;
+
+/// How the running version is spelled wherever it is shown.
+///
+/// One spelling, used in both places it appears, so a screenshot and an overlay
+/// cannot disagree about which build is on screen.
+const VERSION_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 /// Cells kept clear each side, so an overlay never touches the screen edge.
 const OVERLAY_MARGIN: u16 = 2;
 
@@ -2125,7 +2131,10 @@ fn help_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .style(t.surface())
         .border_style(Style::default().fg(t.accent))
-        .title(" Keyboard and mouse ");
+        // The version rides in the title because the bottom row can drop it on a
+        // narrow terminal, and a title is the one place on screen nothing else
+        // is competing for width.
+        .title(format!(" Keyboard and mouse \u{b7} {VERSION_TAG} "));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -2955,7 +2964,20 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
         .style(t.surface())
         .border_style(t.surface())
         .border_type(BorderType::Plain)
-        .title(" Now playing ");
+        .title(" Now playing ")
+        // The running version, in the one piece of chrome nothing competes for.
+        //
+        // Not on the keyboard row below, which was the obvious place and the
+        // wrong one: that row fills itself with optional hints until the width
+        // runs out, so on a 140-column terminal there were three cells left and
+        // the version would have been invisible exactly where there was most
+        // room for it. Reserving space for it there instead would have raised
+        // the width every later hint needs, which is how `[q]` once vanished.
+        //
+        // A border rather than a control: it is a fact about the binary, not an
+        // action, so it registers no hit box and the rule that every clickable
+        // thing has a key does not reach it.
+        .title_bottom(Line::from(format!(" {VERSION_TAG} ")).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -4046,26 +4068,33 @@ pub(crate) fn sink_volume_words(sink: &SinkVolume) -> String {
 }
 
 /// What the sink's level is doing to the audio, in plain terms, where that is
-/// worth a line.
+/// worth saying.
 ///
-/// The whole finding in one sentence, and the words are chosen so anyone can
-/// read them: what matters to a listener is whether the audio samples are being
+/// The whole finding in a sentence, and the words are chosen so anyone can read
+/// them: what matters to a listener is whether the audio samples are being
 /// changed, not the names of the two fields it was read from. `channelVolumes`
 /// is what a mixer sets and `softVolumes` is what the sound server actually
 /// multiplies by; on a real machine they disagree - a sink set to 30% whose
 /// software stage sits at unity, on a card with no volume control in ALSA at
 /// all - and only the second one can cost resolution.
-pub(crate) fn sink_volume_note(sink: &SinkVolume) -> Option<String> {
+///
+/// **Lines, not a line**, and broken to fit rather than left to the box. This
+/// was one long string in the report's right-hand column, where the readings
+/// live, and the report clips rather than wrapping - so on a real machine it ran
+/// off the edge and stopped at "or". Prose gets rows of its own here, the same
+/// way [`DeviceHolder::lines`](priel_player::graph::DeviceHolder::lines) and
+/// [`RateAdvice::lines`](priel_player::graph::RateAdvice::lines) already do.
+pub(crate) fn sink_volume_note(sink: &SinkVolume) -> Vec<String> {
     match sink.stage() {
         SinkStage::InSoftware { .. } => {
-            Some("the software is changing the audio samples".to_string())
+            vec!["The software is changing the audio samples.".to_string()]
         }
-        SinkStage::Elsewhere { .. } => Some(
-            "the audio samples are untouched; the level is set by your hardware, or not at all"
-                .to_string(),
-        ),
-        SinkStage::Silenced => Some("the software is silencing the audio".to_string()),
-        SinkStage::Absent | SinkStage::Unread | SinkStage::Unity => None,
+        SinkStage::Elsewhere { .. } => vec![
+            "The audio samples are untouched; the level is set by your".to_string(),
+            "hardware, or not at all.".to_string(),
+        ],
+        SinkStage::Silenced => vec!["The software is silencing the audio.".to_string()],
+        SinkStage::Absent | SinkStage::Unread | SinkStage::Unity => Vec::new(),
     }
 }
 
@@ -4291,10 +4320,11 @@ fn fmt_hms(secs: u32) -> String {
 mod tests {
     use super::{
         ControlBar, FOCUS_HINT, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, OVERLAY_MARGIN,
-        OVERLAY_MEDIUM, OVERLAY_NARROW, OVERLAY_WIDE, QUEUE_COLS, QUEUE_ROWS_PER_ENTRY, WIDE_COLS,
-        codec_label, hint_width, push_hints, render, verdict_colour, verdict_words,
+        OVERLAY_MEDIUM, OVERLAY_NARROW, OVERLAY_WIDE, QUEUE_COLS, QUEUE_ROWS_PER_ENTRY,
+        VERSION_TAG, WIDE_COLS, codec_label, hint_width, overlay_width, push_hints, render,
+        verdict_colour, verdict_words,
     };
-    use crate::app::{App, Click, CoverMode, Focus, Hit, Mode, View};
+    use crate::app::{App, Click, CoverMode, Focus, GraphRowKind, Hit, Mode, View};
     use crate::cli::ThemeName;
     use crate::theme::Theme;
     use crate::worker::{FromWorker, ToWorker};
@@ -4309,6 +4339,7 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Color;
     use ratatui::style::Style;
+    use ratatui::text::Span;
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::mpsc::{Receiver, Sender};
 
@@ -5663,6 +5694,125 @@ mod tests {
             rate_hz: Some(rate_hz),
             format: Some(format.into()),
             channels: Some(2),
+        }
+    }
+
+    /// A sink whose control is away from unity and whose software stage is not
+    /// the thing applying it - the reading that earns the volume explanation.
+    fn volume_set_elsewhere() -> AudioGraph {
+        AudioGraph {
+            path: vec![node("Px7 S3", NodeRole::Device, 44_100, "S24LE")],
+            // 0.216 is 0.6 cubed, so the mixer curve puts this on screen as a
+            // round 60% and the assertion below reads as the number a listener
+            // would see rather than as an artefact of the curve.
+            volume: SinkVolume::Read(SinkLevels {
+                set: vec![0.216, 0.216],
+                software: vec![1.0, 1.0],
+                silenced: false,
+            }),
+            ..AudioGraph::default()
+        }
+    }
+
+    #[test]
+    fn a_screenshot_carries_the_version_it_was_taken_of() {
+        // Goal: "which build?" is the first question asked of every report, and
+        // the answer only existed in the log file - so a screenshot, which is
+        // what people actually send, could not answer it.
+        let mut sc = screen();
+        let out = text(&mut sc.app, 140, 20);
+        assert!(out.contains(VERSION_TAG), "{out}");
+    }
+
+    #[test]
+    fn the_version_costs_the_keyboard_row_nothing() {
+        // Goal: the keyboard row was the obvious home for this and the wrong
+        // one. It fills itself with optional hints until the width runs out and
+        // drops them from the right, so a version printed there would be
+        // invisible on a wide terminal and would push a hint off a narrow one -
+        // which is how `[q]` once vanished. The border carries it instead, so
+        // the row is exactly what it was.
+        let mut sc = screen();
+        for w in [80, 96, 140] {
+            let out = text(&mut sc.app, w, 20);
+            assert!(out.contains("[q] quit"), "at {w}: {out}");
+            assert!(out.contains("[?] keys"), "at {w}: {out}");
+            assert!(out.contains(VERSION_TAG), "at {w}: {out}");
+        }
+    }
+
+    #[test]
+    fn the_reference_carries_the_version_where_the_box_is_covered() {
+        // Goal: the border is the version's home, and an overlay tall enough
+        // covers the box it is drawn on - so on a small terminal the reference
+        // is the whole of what is left to answer "which build?". Both spellings
+        // come from `VERSION_TAG`, so the two cannot come to disagree.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 60, 30);
+        assert!(
+            !out.contains("Now playing"),
+            "the overlay has covered the box that normally carries it: {out}"
+        );
+        assert!(out.contains(VERSION_TAG), "so the reference says it: {out}");
+    }
+
+    #[test]
+    fn the_volume_explanation_reaches_the_screen_whole() {
+        // Goal: on a real machine this ran off the right-hand edge and stopped
+        // at "or". It was being drawn in the right-hand column as though it
+        // were a reading, and the readings there are short by construction -
+        // a sentence is not, so the box cut it mid-clause and the listener was
+        // left with a finding that had no end.
+        let mut sc = screen();
+        with_chain(&mut sc, volume_set_elsewhere());
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 44);
+        assert!(
+            out.contains("60%"),
+            "the level itself is still a reading: {out}"
+        );
+        assert!(out.contains("audio samples are untouched"), "{out}");
+        assert!(
+            out.contains("not at all"),
+            "and the sentence has to finish: {out}"
+        );
+    }
+
+    #[test]
+    fn no_report_row_is_wider_than_the_box_it_is_drawn_in() {
+        // Goal: the guard the volume explanation needed. `graph_line` clips
+        // whatever overflows, so a row that does not fit loses its tail with
+        // nothing on screen to say it did - the worst failure a diagnostic
+        // screen has, because a half-sentence still reads as a whole one.
+        //
+        // Prose belongs on rows of its own, already broken to fit; the
+        // right-hand column is for readings. Action rows are exempt because
+        // `action_line` drops the detail rather than clipping it.
+        let mut sc = screen();
+        with_chain(&mut sc, volume_set_elsewhere());
+        sc.app.mode = Mode::Graph;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 44,
+        };
+        // What `graph_overlay` hands `graph_line`: the box less its two borders.
+        let cols = usize::from(overlay_width(area, OVERLAY_MEDIUM).saturating_sub(2));
+        for row in sc.app.graph_rows() {
+            if matches!(row.kind, GraphRowKind::Action(_)) {
+                continue;
+            }
+            let gap = usize::from(!row.detail.is_empty());
+            let used =
+                Span::raw(row.label.clone()).width() + gap + Span::raw(row.detail.clone()).width();
+            assert!(
+                used <= cols,
+                "{used} columns of {cols}: {:?} / {:?}",
+                row.label,
+                row.detail
+            );
         }
     }
 
