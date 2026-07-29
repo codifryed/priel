@@ -495,12 +495,29 @@ impl PlaybackStatus {
     /// track.
     #[must_use]
     pub fn verdict(&self, source_bits: u32, sink: &SinkVolume) -> Verdict {
-        let stage = sink.stage();
+        let stage = self.sink_stage(sink);
         Verdict {
             fidelity: self.graded(source_bits, stage),
             link: self.bt_codec.as_ref().map(|_| Link::Bluetooth),
             evidence: self.evidence(stage),
         }
+    }
+
+    /// What the sink's level is doing to the samples, judged the one way.
+    ///
+    /// The single route to [`SinkVolume::stage`], because that judgement needs
+    /// something the reading does not carry: whether this sink hands its level
+    /// to the device on the far end rather than applying it here. A Bluetooth
+    /// sink does - it sends the level over AVRCP and keeps only the remainder -
+    /// and every other sink publishes the very same pair of figures while the
+    /// server multiplies by them. See [`SinkLevels`](graph::SinkLevels).
+    ///
+    /// The link is the answer, so `bt_codec` is what decides it: the same field
+    /// the badge names the transport from, so the report cannot say the device
+    /// took the level while the badge says there is no device to take it.
+    #[must_use]
+    pub fn sink_stage(&self, sink: &SinkVolume) -> SinkStage {
+        sink.stage(self.bt_codec.is_some())
     }
 
     /// The grade with the sink folded in.
@@ -518,22 +535,27 @@ impl PlaybackStatus {
             SinkStage::InSoftware { .. } | SinkStage::Silenced => {
                 Fidelity::NearBitPerfect(Alteration::SinkVolumeScaled)
             }
+            // The device applying the level leaves these samples alone, which
+            // is the whole of what this grade is about. What the far end then
+            // does with it is the link's business, and the link is reported
+            // beside the grade rather than folded into it - see `Link`.
             SinkStage::Absent
             | SinkStage::Unread
             | SinkStage::Unity
-            | SinkStage::Elsewhere { .. } => graded,
+            | SinkStage::AtTheDevice { .. } => graded,
         }
     }
 
     /// Was there a stage that exists here and could not be read?
     ///
-    /// A control set away from unity that the server is not applying counts:
-    /// something is attenuating and this dump does not say what. That is a gap
-    /// in the evidence even though the server's own stage was read perfectly
-    /// well.
+    /// A level the device took is *not* one of them: it used to be, on the
+    /// reasoning that something was attenuating and the dump did not say what,
+    /// and the dump does say what - the sink published the share it kept. The
+    /// transport it went to is named beside the grade already, so marking it a
+    /// gap as well would put a question mark on the one chain that answered.
     fn evidence(&self, sink: SinkStage) -> Evidence {
         let unread = matches!(self.stream_volume(), StreamVolume::Unread)
-            || matches!(sink, SinkStage::Unread | SinkStage::Elsewhere { .. });
+            || matches!(sink, SinkStage::Unread);
         if unread {
             Evidence::Partial
         } else {
@@ -1663,12 +1685,19 @@ mod tests {
     }
 
     #[test]
-    fn a_sink_set_below_unity_that_the_server_is_not_applying_keeps_the_tick_and_marks_it() {
+    fn a_sink_set_below_unity_on_an_ordinary_output_is_the_server_multiplying() {
         // Goal: the reading measured on a real machine - the control at 2.7%
-        // with `softVolumes` at unity, on a card with no ALSA volume control at
-        // all. The server is multiplying nothing, so the samples are intact;
-        // where that 2.7% is applied is not in the dump, so the grade may not
-        // be handed out unqualified either.
+        // with `softVolumes` at unity, on a card publishing no ALSA volume
+        // control at all. This was a clean tick with a question mark beside it,
+        // on the reading that the server was multiplying nothing and priel
+        // could not see what was.
+        //
+        // Both halves were wrong. Nothing writes `softVolumes` on an ordinary
+        // sink, so `remap_volumes` pads it to unity per channel and the
+        // control is the gain - and with no mixer on that card, software was
+        // the only place left for it to have been applied. A
+        // `module-null-sink`, which has no hardware whatsoever, publishes the
+        // identical pair. About five bits were going missing under a tick.
         let s = through_server(96_000, 96_000);
         let measured = SinkVolume::Read(SinkLevels {
             set: vec![0.027_001, 0.027_001],
@@ -1676,9 +1705,45 @@ mod tests {
             silenced: false,
         });
         let v = s.verdict(24, &measured);
+        assert_eq!(
+            v.fidelity,
+            Fidelity::NearBitPerfect(Alteration::SinkVolumeScaled)
+        );
+        assert_eq!(
+            v.evidence,
+            Evidence::Complete,
+            "the stage was read, and read correctly - there is no gap to mark"
+        );
+    }
+
+    #[test]
+    fn the_same_reading_over_a_link_is_the_device_taking_the_level() {
+        // Goal: the one sink kind where `softVolumes` at unity means what it
+        // says. bluez sends the level to the headset over AVRCP and publishes
+        // only the share it kept, which for an evenly balanced pair is none of
+        // it - so the samples leaving this machine really are untouched.
+        //
+        // Told apart by what the sink is, never by the figures, which are
+        // identical to the case above. `bt_codec` is the same field the badge
+        // names the transport from, so the two cannot disagree about whether
+        // there is a device to have taken it.
+        let s = PlaybackStatus {
+            bt_codec: Some("aptx_hd".into()),
+            ..through_server(96_000, 96_000)
+        };
+        let measured = SinkVolume::Read(SinkLevels {
+            set: vec![0.027_001, 0.027_001],
+            software: vec![1.0, 1.0],
+            silenced: false,
+        });
+        let v = s.verdict(24, &measured);
         assert_eq!(v.fidelity, Fidelity::BitPerfect);
-        assert_eq!(v.evidence, Evidence::Partial);
-        assert!(v.needs_qualifying(), "the tick has to say what it rests on");
+        assert_eq!(v.link, Some(Link::Bluetooth), "and the link is named");
+        assert_eq!(
+            v.evidence,
+            Evidence::Complete,
+            "the sink said where the level went; a mark would contradict it"
+        );
     }
 
     #[test]

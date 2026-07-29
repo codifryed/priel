@@ -5640,16 +5640,21 @@ impl App {
     /// `applied`, which put a sentence in the column the box clips, and on a
     /// real machine it ran off the right-hand edge mid-clause.
     fn volume_rows(&self) -> Vec<GraphRow> {
+        // Judged once, by the player, and both rows built from that one answer -
+        // the reading alone cannot say whether the level was applied here or
+        // handed to the device, and two calls could come to two views of one
+        // moment.
+        let stage = self.status.sink_stage(&self.sink_volume);
         vec![
             note(""),
             note("  Volume"),
             reading("    priel", crate::ui::own_volume_words(self.status.volume)),
             reading("    stream", crate::ui::stream_volume_words(&self.status)),
-            reading("    sink", crate::ui::sink_volume_words(&self.sink_volume)),
+            reading("    sink", crate::ui::sink_volume_words(stage)),
         ]
         .into_iter()
         .chain(
-            crate::ui::sink_volume_note(&self.sink_volume)
+            crate::ui::sink_volume_note(stage)
                 .iter()
                 .map(|line| note(&format!("  {line}"))),
         )
@@ -9346,20 +9351,27 @@ mod tests {
         );
         assert!(out.contains("5 bits"), "what it cost: {out}");
         assert!(
-            out.contains("changing the audio samples"),
+            out.contains("applying this level to the samples"),
             "in plain terms, what it did: {out}"
+        );
+        assert!(
+            out.contains("further down the chain"),
+            "and what to do about it: {out}"
         );
     }
 
     #[test]
-    fn a_level_the_server_is_not_applying_is_shown_without_a_loss_it_did_not_cause() {
-        // Goal: the reading measured on a real machine, and the reason this
-        // needs two fields rather than one. The level is set to 30% and the
-        // software is multiplying nothing, so quoting 31 dB of loss there would
-        // invent a fault - and saying nothing at all would hide a level the
-        // listener plainly did set.
+    fn a_level_the_headphones_took_is_shown_without_a_loss_it_did_not_cause() {
+        // Goal: the one reading where a control away from unity costs nothing
+        // here. Over a Bluetooth link the level was sent to the headset and the
+        // sink published the share it kept - none of it - so quoting 31 dB of
+        // loss would invent a fault, and saying nothing at all would hide a
+        // level the listener plainly did set.
         let mut r = rig();
-        r.app.status = through_server();
+        r.app.status = PlaybackStatus {
+            bt_codec: Some("aptx_hd".into()),
+            ..through_server()
+        };
         let mut g = chain();
         g.volume = SinkVolume::Read(SinkLevels {
             set: vec![0.027_001, 0.027_001],
@@ -9374,8 +9386,46 @@ mod tests {
         assert!(out.contains("30%"), "the level is still shown: {out}");
         assert!(!out.contains("bits"), "no loss is claimed: {out}");
         assert!(
-            out.contains("audio samples are untouched"),
+            out.contains("samples leaving this machine are untouched"),
             "and the reader is told, plainly, why it costs nothing: {out}"
+        );
+        assert!(
+            out.contains("sent to the device"),
+            "naming where the level went, not guessing at hardware: {out}"
+        );
+    }
+
+    #[test]
+    fn the_same_level_on_a_wired_output_is_the_server_multiplying() {
+        // Goal: the correction. These are the identical two figures, and on
+        // anything but a link they mean the opposite - `softVolumes` is only
+        // written by the handful of sinks that split their level, so on an
+        // ordinary sink it reads unity by default and the control is the gain.
+        // This was reported as untouched and graded bit-perfect while five bits
+        // went missing, on the one screen that exists to catch exactly that.
+        let mut r = rig();
+        r.app.status = through_server();
+        let mut g = chain();
+        g.volume = SinkVolume::Read(SinkLevels {
+            set: vec![0.027_001, 0.027_001],
+            software: vec![1.0, 1.0],
+            silenced: false,
+        });
+        r.app.on_key(key('D'));
+        r.to_app.send(FromWorker::AudioGraph(Ok(g))).expect("send");
+        r.app.drain_worker();
+        let out = report(&r.app);
+
+        assert!(out.contains("30%"), "the level a mixer shows: {out}");
+        assert!(out.contains("5 bits"), "and what it is costing: {out}");
+        assert!(
+            !out.contains("untouched"),
+            "the samples are not untouched here: {out}"
+        );
+        assert_eq!(
+            r.app.verdict().fidelity,
+            Fidelity::NearBitPerfect(Alteration::SinkVolumeScaled),
+            "and the badge says so too"
         );
     }
 
@@ -9385,10 +9435,14 @@ mod tests {
         // left at 50% sits at 0.125 in the node - but every mixer (KDE, wpctl,
         // PulseAudio) shows the cube root of it. Printing the raw 0.125 as
         // "12.5%" is a figure no mixer shows and does not match the desktop; the
-        // cube root, "50%", is the number the listener actually set. The software
-        // is not applying it, so the samples are untouched and nothing is lost.
+        // cube root, "50%", is the number the listener actually set. Read over a
+        // link, where the device took the level and nothing here is lost, so the
+        // curve is the only thing under test.
         let mut r = rig();
-        r.app.status = through_server();
+        r.app.status = PlaybackStatus {
+            bt_codec: Some("aptx_hd".into()),
+            ..through_server()
+        };
         let mut g = chain();
         g.volume = SinkVolume::Read(SinkLevels {
             set: vec![0.125, 0.125],
@@ -9407,7 +9461,7 @@ mod tests {
             "the samples are untouched, no loss: {out}"
         );
         assert!(
-            out.contains("audio samples are untouched"),
+            out.contains("samples leaving this machine are untouched"),
             "and it says so plainly: {out}"
         );
     }

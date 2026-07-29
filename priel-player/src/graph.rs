@@ -59,10 +59,11 @@
 //! The fourth is the volume on that sink, which is the one stage nothing else
 //! can see: mpv reports its own stream's level and the device's own parameters
 //! say nothing about a mixer upstream of them. [`SinkVolume`] reads it and
-//! [`SinkVolume::stage`] judges it, and the reason it takes two fields to do so
-//! is the whole of the finding - `channelVolumes` is the control and
-//! `softVolumes` is what the server actually multiplies by, and on a real
-//! machine they disagree.
+//! [`SinkVolume::stage`] judges it. It takes two fields and a fact about the
+//! sink to do so, and which of the two fields is the gain is the whole of the
+//! finding: `softVolumes` is the server's share *only where the sink published
+//! one*, and on every other sink it reads unity while `channelVolumes` is what
+//! the samples are multiplied by. See [`SinkLevels`].
 //!
 //! [`NodeRole`] separates the hops that sit between the stream and the device,
 //! which is where a second application holding the device would show up.
@@ -299,23 +300,44 @@ pub enum SinkVolume {
 
 /// The two volume figures a sink publishes, which are not the same figure.
 ///
-/// This is the whole point of the reading. `channelVolumes` is the *control* -
-/// what a mixer shows and what the listener set - and says nothing about where
-/// it is applied. `softVolumes` is what the server's own conversion stage
-/// multiplies every sample by, and that is the only one that costs resolution.
+/// `channelVolumes` is the control - what a mixer shows and what the listener
+/// set. `PipeWire`'s own header calls it "the effective volume that is applied.
+/// It can result in a hardware volume and software volume (see softVolumes)".
+/// `softVolumes` is the part of it the server's conversion stage multiplies by,
+/// documented as "the volume applied in software, there might be a part applied
+/// in hardware".
 ///
-/// Measured on a real machine, they disagree: a USB DAC sink sat at
-/// `channelVolumes: [0.027, 0.027]` with `softVolumes: [1.0, 1.0]`, on a card
-/// exposing no ALSA volume control at all. The server was multiplying nothing;
-/// the control had been routed away from the software stage and, on that
-/// profile, to nothing at all. Reading only the first would have reported a
-/// 31 dB loss that was not happening, and reading only the second would have
-/// hidden the control entirely.
+/// **`softVolumes` only means anything when the sink itself set it**, and that
+/// is the trap this type existed to fall into. In `audioconvert.c` the software
+/// stage picks its gain with `have_soft_volume ? soft : channel`, and that flag
+/// is only raised by a sink writing `softVolumes` or `softMute`. Five components
+/// in the whole of `PipeWire` ever do: the ALSA ACP device, `bluez5`, the RAOP
+/// sink, the `PulseAudio` tunnel and the filter graph. Every other sink leaves
+/// it alone - and `remap_volumes` then pads it out to one entry per channel at
+/// `DEFAULT_VOLUME`, so it reads `[1.0, 1.0]` whatever the control says.
+///
+/// So `softVolumes: [1.0, 1.0]` beside a control away from unity does **not**
+/// mean the samples were left alone. It means the field is not in use and
+/// `channelVolumes` is the gain. Measured: a `module-null-sink`, which has no
+/// hardware of any kind to hand a level to, publishes exactly that pair - and so
+/// does a USB DAC on a profile exposing no ALSA volume control, which is the
+/// reading this was originally written from. The old conclusion, that the
+/// control had "gone somewhere this dump does not show", had the one remaining
+/// possibility backwards: on a card with no mixer control at all, software is
+/// the only place left for it to be.
+///
+/// The one reading that does mean untouched is a sink that hands its level to
+/// the device - `bluez5` divides the control by what it sent over AVRCP and
+/// publishes the remainder, so an evenly balanced pair comes back as exactly
+/// `1.0`. That case is told apart by what the sink *is*, not by this pair, which
+/// is why [`SinkVolume::stage`] has to be told.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SinkLevels {
-    /// `channelVolumes`, per channel: the value of the control.
+    /// `channelVolumes`, per channel: the value of the control, and the gain the
+    /// server applies unless the sink said otherwise beside it.
     pub set: Vec<f64>,
-    /// `softVolumes`, per channel: the factor the server's own stage applies.
+    /// `softVolumes`, per channel: the share the server's own stage applies, and
+    /// only meaningful where the sink set it. See the type's own docs.
     pub software: Vec<f64>,
     /// `softMute`: the server's own stage is passing silence, whatever the
     /// figures beside it say.
@@ -328,10 +350,9 @@ pub struct SinkLevels {
 /// than something only a live sound server can show - the same shape
 /// [`AudioGraph::attribute`] and [`ClockRates::advise`] already have.
 ///
-/// Two of the six arms are admissions rather than findings, and keeping them
-/// apart is the point. [`Absent`](Self::Absent) counts as fully evidenced;
-/// [`Unread`](Self::Unread) and [`Elsewhere`](Self::Elsewhere) are gaps, and
-/// what rests on them has to say so.
+/// One of the six arms is an admission rather than a finding, and keeping it
+/// apart is the point: [`Absent`](Self::Absent) counts as fully evidenced, and
+/// [`Unread`](Self::Unread) is a gap that what rests on it has to say so about.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SinkStage {
     /// There is no such stage here, so there is nothing it could have done.
@@ -351,14 +372,18 @@ pub enum SinkStage {
     /// The worst channel where they differ - the one that loses the most bits
     /// is the one the verdict has to be made on.
     InSoftware { gain: f64 },
-    /// Read: the control is away from unity and the server is *not* applying
-    /// it.
+    /// Read: the control is away from unity and the *device* is applying it, so
+    /// the samples leaving this machine are untouched.
     ///
-    /// Where it lands is not in this dump. A hardware mixer on the card would
-    /// take it and cost nothing; a profile that routes volume nowhere - which
-    /// is what was measured - drops it entirely. priel cannot tell those apart
-    /// from here, so it says so rather than picking the flattering one.
-    Elsewhere { set: f64 },
+    /// Only reachable on a link that hands its level to what is on the far end -
+    /// a Bluetooth sink sending the level over AVRCP and keeping the remainder,
+    /// which for an evenly balanced pair is none of it. Not something the two
+    /// figures can show on their own, which is why [`SinkVolume::stage`] is told
+    /// rather than left to guess; see [`SinkLevels`].
+    ///
+    /// What the far end then does with it is beyond anything priel can read, and
+    /// the report says so rather than calling it clean.
+    AtTheDevice { set: f64 },
 }
 
 /// How much attenuation costs a bit of resolution, in decibels.
@@ -430,31 +455,55 @@ fn worst(gains: &[f64]) -> Option<f64> {
     quietest.or(loudest)
 }
 
+/// A gain the server was found to be applying, as a stage.
+///
+/// Zero gets its own arm rather than a gain of nought, for the reason
+/// [`SinkStage::Silenced`] gives: silence has no decibel figure and no bit
+/// count, and `-inf dB` on screen is worse than a word.
+fn applied(gain: f64) -> SinkStage {
+    if gain <= 0.0 {
+        SinkStage::Silenced
+    } else {
+        SinkStage::InSoftware { gain }
+    }
+}
+
 impl SinkVolume {
     /// What this stage did to the samples.
     ///
-    /// Pure and table-tested. The order is what makes it honest: what the
-    /// server *applies* is decided first and from `softVolumes` alone, and the
-    /// control is only consulted to explain a stage that applied nothing.
+    /// Pure and table-tested. `delegates` says whether this sink is one that
+    /// hands its level to the device on the far end - which is the one thing the
+    /// two figures cannot show, and the thing the whole judgement turns on. See
+    /// [`SinkLevels`] for why, and [`PlaybackStatus::sink_stage`] for the caller
+    /// that answers it, so the report and the badge cannot disagree.
+    ///
+    /// [`PlaybackStatus::sink_stage`]: crate::PlaybackStatus::sink_stage
     #[must_use]
-    pub fn stage(&self) -> SinkStage {
+    pub fn stage(&self, delegates: bool) -> SinkStage {
         let levels = match self {
             Self::Absent => return SinkStage::Absent,
             Self::Unread => return SinkStage::Unread,
             Self::Read(levels) => levels,
         };
-        if levels.silenced || levels.software.contains(&0.0) {
+        if levels.silenced {
             return SinkStage::Silenced;
         }
+        // A software share the sink published for itself: it split the level and
+        // said how much it kept. Believed as written, whichever kind of sink it
+        // is - a Bluetooth pair with the channels at different levels lands here
+        // with the balance the headset could not take.
         if let Some(gain) = worst(&levels.software) {
-            return SinkStage::InSoftware { gain };
+            return applied(gain);
         }
-        // Nothing is being applied here. A control still away from unity has
-        // gone somewhere this dump does not name, which is a gap rather than a
-        // clean bill.
-        match worst(&levels.set) {
-            Some(set) => SinkStage::Elsewhere { set },
-            None => SinkStage::Unity,
+        // `softVolumes` reads unity. On a link that delegates, that is the
+        // finding: the device took all of it. On anything else the field is
+        // simply not in use, and the control is what the server multiplies by -
+        // reading it as "untouched" is what let a sink at 35% be graded
+        // bit-perfect while nine bits went missing.
+        match (worst(&levels.set), delegates) {
+            (None, _) => SinkStage::Unity,
+            (Some(set), true) => SinkStage::AtTheDevice { set },
+            (Some(gain), false) => applied(gain),
         }
     }
 }
@@ -3082,7 +3131,7 @@ mod tests {
         );
         let g = path_of(&unlinked, PID);
         assert_eq!(g.volume, SinkVolume::Absent);
-        assert_eq!(g.volume.stage(), SinkStage::Absent);
+        assert_eq!(g.volume.stage(false), SinkStage::Absent);
     }
 
     #[test]
@@ -3093,7 +3142,7 @@ mod tests {
         // a clean tick from data that was never there.
         let g = path_of(RESAMPLING, SYNTHETIC_PID);
         assert_eq!(g.volume, SinkVolume::Unread);
-        assert_eq!(g.volume.stage(), SinkStage::Unread);
+        assert_eq!(g.volume.stage(false), SinkStage::Unread);
     }
 
     #[test]
@@ -3119,7 +3168,7 @@ mod tests {
         ]"#;
         let g = path_of(dump, 42);
         assert_eq!(g.volume, levels(&[0.5, 0.5], &[0.5, 0.5]));
-        assert_eq!(g.volume.stage(), SinkStage::InSoftware { gain: 0.5 });
+        assert_eq!(g.volume.stage(false), SinkStage::InSoftware { gain: 0.5 });
     }
 
     #[test]
@@ -3130,26 +3179,29 @@ mod tests {
         // is not a stage that went unread, and a control set away from unity
         // that the server is *not* applying has gone somewhere this dump does
         // not show.
-        let cases: [(SinkVolume, SinkStage); 10] = [
-            (SinkVolume::Absent, SinkStage::Absent),
-            (SinkVolume::Unread, SinkStage::Unread),
+        let cases: [(SinkVolume, bool, SinkStage); 14] = [
+            (SinkVolume::Absent, false, SinkStage::Absent),
+            (SinkVolume::Unread, false, SinkStage::Unread),
             // Nothing set anywhere: the one arm that is a clean bill.
-            (levels(&[1.0, 1.0], &[1.0, 1.0]), SinkStage::Unity),
+            (levels(&[1.0, 1.0], &[1.0, 1.0]), false, SinkStage::Unity),
             // The server is multiplying. Costs resolution, whatever the control
             // says it was set to.
             (
                 levels(&[0.5, 0.5], &[0.5, 0.5]),
+                false,
                 SinkStage::InSoftware { gain: 0.5 },
             ),
             // Above unity multiplies every sample too; it is not a clean pass.
             (
                 levels(&[1.0, 1.0], &[1.5, 1.5]),
+                false,
                 SinkStage::InSoftware { gain: 1.5 },
             ),
             // Channels that disagree are graded on the worst of them, which is
             // the one that loses the most bits.
             (
                 levels(&[1.0, 0.25], &[1.0, 0.25]),
+                false,
                 SinkStage::InSoftware { gain: 0.25 },
             ),
             // One channel turned down and one turned up. Only the turned-down
@@ -3158,23 +3210,53 @@ mod tests {
             // channel and quote no loss at all.
             (
                 levels(&[0.5, 2.0], &[0.5, 2.0]),
+                false,
                 SinkStage::InSoftware { gain: 0.5 },
             ),
-            // The measured machine: set to 2.7% with the software stage at
-            // unity. The server is not touching the samples and priel cannot
-            // see what is.
+            // The measured machine, and the case this whole reading got wrong:
+            // set to 2.7% with `softVolumes` at unity, on a USB DAC whose card
+            // publishes no ALSA volume control at all. This was read as the
+            // server touching nothing. It is the opposite - the field is not in
+            // use, so the control *is* the software gain, and with no mixer on
+            // the card there was nowhere else for it to have gone. A
+            // `module-null-sink`, which has no hardware whatsoever, publishes
+            // the identical pair.
             (
                 levels(&[0.027_001, 0.027_001], &[1.0, 1.0]),
-                SinkStage::Elsewhere { set: 0.027_001 },
+                false,
+                SinkStage::InSoftware { gain: 0.027_001 },
             ),
+            // The same pair over a link that hands its level to the far end.
+            // Here unity means what it says: bluez divides the control by what
+            // it sent over AVRCP, and an evenly balanced pair comes back at
+            // exactly 1.0.
+            (
+                levels(&[0.027_001, 0.027_001], &[1.0, 1.0]),
+                true,
+                SinkStage::AtTheDevice { set: 0.027_001 },
+            ),
+            // A link that kept a share: the balance the device could not take is
+            // applied here, and is a finding like any other software gain.
+            (
+                levels(&[0.5, 0.25], &[1.0, 0.5]),
+                true,
+                SinkStage::InSoftware { gain: 0.5 },
+            ),
+            // A link at unity is still a clean bill; delegation changes nothing
+            // where there is no level to delegate.
+            (levels(&[1.0, 1.0], &[1.0, 1.0]), true, SinkStage::Unity),
+            // Turned fully down without the mute flag. Zero is silence whichever
+            // field carries it, and it keeps -inf off the screen.
+            (levels(&[0.0, 0.0], &[1.0, 1.0]), false, SinkStage::Silenced),
             // Silence is not a fidelity finding with a decibel figure attached;
-            // it is its own answer, and it keeps -inf off the screen.
+            // it is its own answer.
             (
                 SinkVolume::Read(SinkLevels {
                     set: vec![0.0, 0.0],
                     software: vec![0.0, 0.0],
                     silenced: true,
                 }),
+                false,
                 SinkStage::Silenced,
             ),
             // Muted with the volumes left at unity: still silence.
@@ -3184,11 +3266,16 @@ mod tests {
                     software: vec![1.0, 1.0],
                     silenced: true,
                 }),
+                false,
                 SinkStage::Silenced,
             ),
         ];
-        for (reading, expected) in cases {
-            assert_eq!(reading.stage(), expected, "reading {reading:?}");
+        for (reading, delegates, expected) in cases {
+            assert_eq!(
+                reading.stage(delegates),
+                expected,
+                "reading {reading:?} delegates {delegates}"
+            );
         }
     }
 

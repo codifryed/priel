@@ -25,7 +25,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use std::fmt::Write as _;
 
-use priel_player::graph::{SinkStage, SinkVolume};
+use priel_player::graph::SinkStage;
 use priel_player::{Alteration, Fidelity, Link, OutputAccess, StreamVolume, Verdict};
 
 use crate::app::{
@@ -4053,17 +4053,23 @@ pub(crate) fn stream_volume_words(s: &priel_player::PlaybackStatus) -> String {
 ///
 /// The figure shown is the one a mixer shows - the number the listener set, on
 /// the cube-root curve every desktop mixer uses (see [`mixer_pct`]) - and a loss
-/// is only ever quoted where the software was found to be applying it. Quoting
-/// 31 dB of loss against a level the software is not applying would invent a
-/// fault; showing nothing at all would hide a level that was plainly set.
-pub(crate) fn sink_volume_words(sink: &SinkVolume) -> String {
-    match sink.stage() {
+/// is only ever quoted where something on *this* machine is applying it. A level
+/// the headphones took costs nothing here, and quoting decibels against it would
+/// invent a fault; showing nothing at all would hide a level that was plainly
+/// set.
+///
+/// Takes the stage rather than the reading, because judging it needs a fact the
+/// reading does not carry - see [`PlaybackStatus::sink_stage`].
+///
+/// [`PlaybackStatus::sink_stage`]: priel_player::PlaybackStatus::sink_stage
+pub(crate) fn sink_volume_words(stage: SinkStage) -> String {
+    match stage {
         SinkStage::Absent => "none in this chain".to_string(),
         SinkStage::Unread => "unknown".to_string(),
         SinkStage::Unity => "100%".to_string(),
         SinkStage::Silenced => "muted".to_string(),
         SinkStage::InSoftware { gain } => sink_level_words(gain),
-        SinkStage::Elsewhere { set } => mixer_pct(set),
+        SinkStage::AtTheDevice { set } => mixer_pct(set),
     }
 }
 
@@ -4072,11 +4078,15 @@ pub(crate) fn sink_volume_words(sink: &SinkVolume) -> String {
 ///
 /// The whole finding in a sentence, and the words are chosen so anyone can read
 /// them: what matters to a listener is whether the audio samples are being
-/// changed, not the names of the two fields it was read from. `channelVolumes`
-/// is what a mixer sets and `softVolumes` is what the sound server actually
-/// multiplies by; on a real machine they disagree - a sink set to 30% whose
-/// software stage sits at unity, on a card with no volume control in ALSA at
-/// all - and only the second one can cost resolution.
+/// changed and what they can do about it, not the names of the fields it was
+/// read from.
+///
+/// The software arm carries the remedy, because there is one and it is not
+/// obvious: a sink at less than 100% costs bits that a level set further down
+/// the chain - on the amplifier, or on a DAC's own dial - does not. That is the
+/// difference between a control that rebuilds every sample and one that does
+/// not, and it is the single most useful thing this report can tell someone
+/// chasing a bit-perfect chain.
 ///
 /// **Lines, not a line**, and broken to fit rather than left to the box. This
 /// was one long string in the report's right-hand column, where the readings
@@ -4084,16 +4094,19 @@ pub(crate) fn sink_volume_words(sink: &SinkVolume) -> String {
 /// off the edge and stopped at "or". Prose gets rows of its own here, the same
 /// way [`DeviceHolder::lines`](priel_player::graph::DeviceHolder::lines) and
 /// [`RateAdvice::lines`](priel_player::graph::RateAdvice::lines) already do.
-pub(crate) fn sink_volume_note(sink: &SinkVolume) -> Vec<String> {
-    match sink.stage() {
-        SinkStage::InSoftware { .. } => {
-            vec!["The software is changing the audio samples.".to_string()]
-        }
-        SinkStage::Elsewhere { .. } => vec![
-            "The audio samples are untouched; the level is set by your".to_string(),
-            "hardware, or not at all.".to_string(),
+pub(crate) fn sink_volume_note(stage: SinkStage) -> Vec<String> {
+    match stage {
+        SinkStage::InSoftware { .. } => vec![
+            "The sound server is applying this level to the samples".to_string(),
+            "themselves. Setting the sink to 100% and using a level".to_string(),
+            "further down the chain - the amplifier, or the DAC's own".to_string(),
+            "dial - costs nothing.".to_string(),
         ],
-        SinkStage::Silenced => vec!["The software is silencing the audio.".to_string()],
+        SinkStage::AtTheDevice { .. } => vec![
+            "The samples leaving this machine are untouched: the level".to_string(),
+            "was sent to the device, which applies it itself.".to_string(),
+        ],
+        SinkStage::Silenced => vec!["The sound server is silencing the audio.".to_string()],
         SinkStage::Absent | SinkStage::Unread | SinkStage::Unity => Vec::new(),
     }
 }
@@ -5699,15 +5712,17 @@ mod tests {
 
     /// A sink whose control is away from unity and whose software stage is not
     /// the thing applying it - the reading that earns the volume explanation.
-    fn volume_set_elsewhere() -> AudioGraph {
+    /// A sink whose level the sound server is applying to the samples: the
+    /// reading that earns the longest of the volume explanations.
+    fn volume_in_software() -> AudioGraph {
         AudioGraph {
-            path: vec![node("Px7 S3", NodeRole::Device, 44_100, "S24LE")],
+            path: vec![node("Studio DAC", NodeRole::Device, 44_100, "S32LE")],
             // 0.216 is 0.6 cubed, so the mixer curve puts this on screen as a
             // round 60% and the assertion below reads as the number a listener
             // would see rather than as an artefact of the curve.
             volume: SinkVolume::Read(SinkLevels {
                 set: vec![0.216, 0.216],
-                software: vec![1.0, 1.0],
+                software: vec![0.216, 0.216],
                 silenced: false,
             }),
             ..AudioGraph::default()
@@ -5765,16 +5780,16 @@ mod tests {
         // a sentence is not, so the box cut it mid-clause and the listener was
         // left with a finding that had no end.
         let mut sc = screen();
-        with_chain(&mut sc, volume_set_elsewhere());
+        with_chain(&mut sc, volume_in_software());
         sc.app.mode = Mode::Graph;
         let out = text(&mut sc.app, 100, 44);
         assert!(
             out.contains("60%"),
             "the level itself is still a reading: {out}"
         );
-        assert!(out.contains("audio samples are untouched"), "{out}");
+        assert!(out.contains("applying this level to the samples"), "{out}");
         assert!(
-            out.contains("not at all"),
+            out.contains("costs nothing."),
             "and the sentence has to finish: {out}"
         );
     }
@@ -5790,7 +5805,7 @@ mod tests {
         // right-hand column is for readings. Action rows are exempt because
         // `action_line` drops the detail rather than clipping it.
         let mut sc = screen();
-        with_chain(&mut sc, volume_set_elsewhere());
+        with_chain(&mut sc, volume_in_software());
         sc.app.mode = Mode::Graph;
         let area = Rect {
             x: 0,
