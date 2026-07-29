@@ -953,9 +953,21 @@ fn init_mpv(mpv: &Mpv, config: &PlayerConfig) {
     }
     set_prop(mpv, "vid", "no");
     set_prop(mpv, "volume", 100i64);
-    // "weak" = gapless only when the format matches; a sample-rate change
-    // reinits the output (keeps playback bit-perfect). Do NOT force "yes".
+    // "weak" = a sample-rate change reinits the output, which is what keeps
+    // playback bit-perfect across a queue. Do NOT force "yes".
     set_prop(mpv, "gapless-audio", "weak");
+    // "weak" reinits on the *rate* and not on the *width*, which is the whole
+    // reason this line exists. mpv keeps the output it opened for the first
+    // track for as long as the rate holds, so a 24-bit track queued behind a
+    // 16-bit one at the same rate was being resampled down into the narrower
+    // output - silently, with no reinit to hear and nothing in the log.
+    //
+    // The fix is to open wide once rather than to guess per track: s32 holds
+    // anything the service serves, widening a narrower track is an exact
+    // shift, and the sound server converts back down to whatever the device
+    // takes. Do NOT drop this to follow the source's own width - that is the
+    // per-track decision `weak` has already been shown not to revisit.
+    set_prop(mpv, "audio-format", "s32");
 
     // Buffering bounds. This is a memory decision as much as a resilience one:
     // mpv holds demuxed packets per *playlist entry*, so with a preloaded next
@@ -2334,6 +2346,27 @@ mod tests {
                 != "no",
             "the stream is served without a seek callback, so in-track seeking \
              depends entirely on mpv's cache"
+        );
+    }
+
+    #[test]
+    fn the_output_is_wide_enough_for_whatever_the_queue_plays_next() {
+        // Goal: `gapless-audio=weak` reopens the audio output when the sample
+        // *rate* changes and not when the sample *width* does, so a 24-bit
+        // track queued behind a 16-bit one at the same rate inherits the
+        // narrower output and mpv resamples down into it. Measured on mpv
+        // 0.41 against a real PipeWire sink: a 16/44.1 file followed by a
+        // 24/44.1 file leaves the filter chain's output at s16 for both, and
+        // the second track is truncated with no reinit and no warning.
+        //
+        // Naming the widest integer container up front is what stops it. It
+        // costs nothing: widening a narrower track is an exact shift, and the
+        // rate - the axis `weak` does handle - is untouched.
+        let mpv = silent_mpv();
+        assert_eq!(
+            mpv.get_property::<String>("audio-format").unwrap(),
+            "s32",
+            "a narrower output truncates the next wider track in the queue"
         );
     }
 
