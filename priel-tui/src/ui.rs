@@ -133,6 +133,12 @@ fn cover_wanted(area: Rect, app: &App) -> bool {
 const OVERLAY_WIDE: u16 = 120;
 const OVERLAY_MEDIUM: u16 = 84;
 const OVERLAY_NARROW: u16 = 64;
+
+/// How the running version is spelled wherever it is shown.
+///
+/// One spelling, used in both places it appears, so a screenshot and an overlay
+/// cannot disagree about which build is on screen.
+const VERSION_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 /// Cells kept clear each side, so an overlay never touches the screen edge.
 const OVERLAY_MARGIN: u16 = 2;
 
@@ -2125,7 +2131,10 @@ fn help_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .style(t.surface())
         .border_style(Style::default().fg(t.accent))
-        .title(" Keyboard and mouse ");
+        // The version rides in the title because the bottom row can drop it on a
+        // narrow terminal, and a title is the one place on screen nothing else
+        // is competing for width.
+        .title(format!(" Keyboard and mouse \u{b7} {VERSION_TAG} "));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -2955,7 +2964,20 @@ fn now_playing(f: &mut Frame, app: &mut App, area: Rect) {
         .style(t.surface())
         .border_style(t.surface())
         .border_type(BorderType::Plain)
-        .title(" Now playing ");
+        .title(" Now playing ")
+        // The running version, in the one piece of chrome nothing competes for.
+        //
+        // Not on the keyboard row below, which was the obvious place and the
+        // wrong one: that row fills itself with optional hints until the width
+        // runs out, so on a 140-column terminal there were three cells left and
+        // the version would have been invisible exactly where there was most
+        // room for it. Reserving space for it there instead would have raised
+        // the width every later hint needs, which is how `[q]` once vanished.
+        //
+        // A border rather than a control: it is a fact about the binary, not an
+        // action, so it registers no hit box and the rule that every clickable
+        // thing has a key does not reach it.
+        .title_bottom(Line::from(format!(" {VERSION_TAG} ")).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -4298,8 +4320,9 @@ fn fmt_hms(secs: u32) -> String {
 mod tests {
     use super::{
         ControlBar, FOCUS_HINT, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, OVERLAY_MARGIN,
-        OVERLAY_MEDIUM, OVERLAY_NARROW, OVERLAY_WIDE, QUEUE_COLS, QUEUE_ROWS_PER_ENTRY, WIDE_COLS,
-        codec_label, hint_width, overlay_width, push_hints, render, verdict_colour, verdict_words,
+        OVERLAY_MEDIUM, OVERLAY_NARROW, OVERLAY_WIDE, QUEUE_COLS, QUEUE_ROWS_PER_ENTRY,
+        VERSION_TAG, WIDE_COLS, codec_label, hint_width, overlay_width, push_hints, render,
+        verdict_colour, verdict_words,
     };
     use crate::app::{App, Click, CoverMode, Focus, GraphRowKind, Hit, Mode, View};
     use crate::cli::ThemeName;
@@ -5689,6 +5712,49 @@ mod tests {
             }),
             ..AudioGraph::default()
         }
+    }
+
+    #[test]
+    fn a_screenshot_carries_the_version_it_was_taken_of() {
+        // Goal: "which build?" is the first question asked of every report, and
+        // the answer only existed in the log file - so a screenshot, which is
+        // what people actually send, could not answer it.
+        let mut sc = screen();
+        let out = text(&mut sc.app, 140, 20);
+        assert!(out.contains(VERSION_TAG), "{out}");
+    }
+
+    #[test]
+    fn the_version_costs_the_keyboard_row_nothing() {
+        // Goal: the keyboard row was the obvious home for this and the wrong
+        // one. It fills itself with optional hints until the width runs out and
+        // drops them from the right, so a version printed there would be
+        // invisible on a wide terminal and would push a hint off a narrow one -
+        // which is how `[q]` once vanished. The border carries it instead, so
+        // the row is exactly what it was.
+        let mut sc = screen();
+        for w in [80, 96, 140] {
+            let out = text(&mut sc.app, w, 20);
+            assert!(out.contains("[q] quit"), "at {w}: {out}");
+            assert!(out.contains("[?] keys"), "at {w}: {out}");
+            assert!(out.contains(VERSION_TAG), "at {w}: {out}");
+        }
+    }
+
+    #[test]
+    fn the_reference_carries_the_version_where_the_box_is_covered() {
+        // Goal: the border is the version's home, and an overlay tall enough
+        // covers the box it is drawn on - so on a small terminal the reference
+        // is the whole of what is left to answer "which build?". Both spellings
+        // come from `VERSION_TAG`, so the two cannot come to disagree.
+        let mut sc = screen();
+        sc.app.mode = Mode::Help;
+        let out = text(&mut sc.app, 60, 30);
+        assert!(
+            !out.contains("Now playing"),
+            "the overlay has covered the box that normally carries it: {out}"
+        );
+        assert!(out.contains(VERSION_TAG), "so the reference says it: {out}");
     }
 
     #[test]
