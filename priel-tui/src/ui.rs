@@ -4046,26 +4046,33 @@ pub(crate) fn sink_volume_words(sink: &SinkVolume) -> String {
 }
 
 /// What the sink's level is doing to the audio, in plain terms, where that is
-/// worth a line.
+/// worth saying.
 ///
-/// The whole finding in one sentence, and the words are chosen so anyone can
-/// read them: what matters to a listener is whether the audio samples are being
+/// The whole finding in a sentence, and the words are chosen so anyone can read
+/// them: what matters to a listener is whether the audio samples are being
 /// changed, not the names of the two fields it was read from. `channelVolumes`
 /// is what a mixer sets and `softVolumes` is what the sound server actually
 /// multiplies by; on a real machine they disagree - a sink set to 30% whose
 /// software stage sits at unity, on a card with no volume control in ALSA at
 /// all - and only the second one can cost resolution.
-pub(crate) fn sink_volume_note(sink: &SinkVolume) -> Option<String> {
+///
+/// **Lines, not a line**, and broken to fit rather than left to the box. This
+/// was one long string in the report's right-hand column, where the readings
+/// live, and the report clips rather than wrapping - so on a real machine it ran
+/// off the edge and stopped at "or". Prose gets rows of its own here, the same
+/// way [`DeviceHolder::lines`](priel_player::graph::DeviceHolder::lines) and
+/// [`RateAdvice::lines`](priel_player::graph::RateAdvice::lines) already do.
+pub(crate) fn sink_volume_note(sink: &SinkVolume) -> Vec<String> {
     match sink.stage() {
         SinkStage::InSoftware { .. } => {
-            Some("the software is changing the audio samples".to_string())
+            vec!["The software is changing the audio samples.".to_string()]
         }
-        SinkStage::Elsewhere { .. } => Some(
-            "the audio samples are untouched; the level is set by your hardware, or not at all"
-                .to_string(),
-        ),
-        SinkStage::Silenced => Some("the software is silencing the audio".to_string()),
-        SinkStage::Absent | SinkStage::Unread | SinkStage::Unity => None,
+        SinkStage::Elsewhere { .. } => vec![
+            "The audio samples are untouched; the level is set by your".to_string(),
+            "hardware, or not at all.".to_string(),
+        ],
+        SinkStage::Silenced => vec!["The software is silencing the audio.".to_string()],
+        SinkStage::Absent | SinkStage::Unread | SinkStage::Unity => Vec::new(),
     }
 }
 
@@ -4292,9 +4299,9 @@ mod tests {
     use super::{
         ControlBar, FOCUS_HINT, HELP_LEFT, HELP_RIGHT, HINTS, HINTS_ESSENTIAL, OVERLAY_MARGIN,
         OVERLAY_MEDIUM, OVERLAY_NARROW, OVERLAY_WIDE, QUEUE_COLS, QUEUE_ROWS_PER_ENTRY, WIDE_COLS,
-        codec_label, hint_width, push_hints, render, verdict_colour, verdict_words,
+        codec_label, hint_width, overlay_width, push_hints, render, verdict_colour, verdict_words,
     };
-    use crate::app::{App, Click, CoverMode, Focus, Hit, Mode, View};
+    use crate::app::{App, Click, CoverMode, Focus, GraphRowKind, Hit, Mode, View};
     use crate::cli::ThemeName;
     use crate::theme::Theme;
     use crate::worker::{FromWorker, ToWorker};
@@ -4309,6 +4316,7 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Color;
     use ratatui::style::Style;
+    use ratatui::text::Span;
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::mpsc::{Receiver, Sender};
 
@@ -5663,6 +5671,82 @@ mod tests {
             rate_hz: Some(rate_hz),
             format: Some(format.into()),
             channels: Some(2),
+        }
+    }
+
+    /// A sink whose control is away from unity and whose software stage is not
+    /// the thing applying it - the reading that earns the volume explanation.
+    fn volume_set_elsewhere() -> AudioGraph {
+        AudioGraph {
+            path: vec![node("Px7 S3", NodeRole::Device, 44_100, "S24LE")],
+            // 0.216 is 0.6 cubed, so the mixer curve puts this on screen as a
+            // round 60% and the assertion below reads as the number a listener
+            // would see rather than as an artefact of the curve.
+            volume: SinkVolume::Read(SinkLevels {
+                set: vec![0.216, 0.216],
+                software: vec![1.0, 1.0],
+                silenced: false,
+            }),
+            ..AudioGraph::default()
+        }
+    }
+
+    #[test]
+    fn the_volume_explanation_reaches_the_screen_whole() {
+        // Goal: on a real machine this ran off the right-hand edge and stopped
+        // at "or". It was being drawn in the right-hand column as though it
+        // were a reading, and the readings there are short by construction -
+        // a sentence is not, so the box cut it mid-clause and the listener was
+        // left with a finding that had no end.
+        let mut sc = screen();
+        with_chain(&mut sc, volume_set_elsewhere());
+        sc.app.mode = Mode::Graph;
+        let out = text(&mut sc.app, 100, 44);
+        assert!(
+            out.contains("60%"),
+            "the level itself is still a reading: {out}"
+        );
+        assert!(out.contains("audio samples are untouched"), "{out}");
+        assert!(
+            out.contains("not at all"),
+            "and the sentence has to finish: {out}"
+        );
+    }
+
+    #[test]
+    fn no_report_row_is_wider_than_the_box_it_is_drawn_in() {
+        // Goal: the guard the volume explanation needed. `graph_line` clips
+        // whatever overflows, so a row that does not fit loses its tail with
+        // nothing on screen to say it did - the worst failure a diagnostic
+        // screen has, because a half-sentence still reads as a whole one.
+        //
+        // Prose belongs on rows of its own, already broken to fit; the
+        // right-hand column is for readings. Action rows are exempt because
+        // `action_line` drops the detail rather than clipping it.
+        let mut sc = screen();
+        with_chain(&mut sc, volume_set_elsewhere());
+        sc.app.mode = Mode::Graph;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 44,
+        };
+        // What `graph_overlay` hands `graph_line`: the box less its two borders.
+        let cols = usize::from(overlay_width(area, OVERLAY_MEDIUM).saturating_sub(2));
+        for row in sc.app.graph_rows() {
+            if matches!(row.kind, GraphRowKind::Action(_)) {
+                continue;
+            }
+            let gap = usize::from(!row.detail.is_empty());
+            let used =
+                Span::raw(row.label.clone()).width() + gap + Span::raw(row.detail.clone()).width();
+            assert!(
+                used <= cols,
+                "{used} columns of {cols}: {:?} / {:?}",
+                row.label,
+                row.detail
+            );
         }
     }
 

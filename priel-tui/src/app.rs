@@ -5633,6 +5633,12 @@ impl App {
     /// ones that could not be read - a stage missing from this list would read
     /// as a stage at unity, which is the guess this whole section exists to
     /// stop.
+    ///
+    /// What the sink's level costs is a sentence rather than a reading, so it
+    /// goes on rows of its own at the section's own indent - the shape every
+    /// other explanation in this report already has. It was a `reading` labelled
+    /// `applied`, which put a sentence in the column the box clips, and on a
+    /// real machine it ran off the right-hand edge mid-clause.
     fn volume_rows(&self) -> Vec<GraphRow> {
         vec![
             note(""),
@@ -5644,7 +5650,8 @@ impl App {
         .into_iter()
         .chain(
             crate::ui::sink_volume_note(&self.sink_volume)
-                .map(|words| reading("    applied", words)),
+                .iter()
+                .map(|line| note(&format!("  {line}"))),
         )
         .collect()
     }
@@ -9367,7 +9374,7 @@ mod tests {
         assert!(out.contains("30%"), "the level is still shown: {out}");
         assert!(!out.contains("bits"), "no loss is claimed: {out}");
         assert!(
-            out.contains("the audio samples are untouched"),
+            out.contains("audio samples are untouched"),
             "and the reader is told, plainly, why it costs nothing: {out}"
         );
     }
@@ -9400,7 +9407,7 @@ mod tests {
             "the samples are untouched, no loss: {out}"
         );
         assert!(
-            out.contains("the audio samples are untouched"),
+            out.contains("audio samples are untouched"),
             "and it says so plainly: {out}"
         );
     }
