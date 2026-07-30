@@ -155,6 +155,20 @@ pub struct AudioGraph {
     /// then no capability claim is made from it. Filled in by [`probe`] rather
     /// than [`parse`], because it comes from the kernel and not from `pw-dump`.
     pub supported_hz: Vec<u32>,
+    /// The highest rate the sink at the end of the chain says it can be opened
+    /// at, from its `EnumFormat`.
+    ///
+    /// A second, weaker source than [`Self::supported_hz`], and deliberately not
+    /// a substitute for it. Every ALSA node publishes a rate *range*; only a
+    /// USB-Audio card publishes the exact list `/proc/asound` is read for. A
+    /// range says what a device tops out at and nothing about which rates
+    /// between the ends it will actually take, so it is reported and never
+    /// turned into a list - inventing the 44.1k and 48k families inside it would
+    /// put rates in the permitted list that the device may not support, which is
+    /// the whole thing the per-device rule exists to prevent.
+    ///
+    /// `None` when the node published no range this parser can read as one.
+    pub sink_ceiling_hz: Option<u32>,
     /// The A2DP link codec of the Bluetooth sink at the end of the chain, from
     /// `api.bluez5.codec` (e.g. `aptx_hd`). `None` for a non-Bluetooth sink. Read
     /// from the dump, so [`parse`] fills it - unlike [`Self::supported_hz`],
@@ -184,6 +198,21 @@ impl AudioGraph {
     #[must_use]
     pub fn blocked_supported_hz(&self) -> Vec<u32> {
         blocked_rates(self.clock.permitted_hz().as_deref(), &self.supported_hz)
+    }
+
+    /// What `PipeWire` calls the sink at the end of the chain, which is what a
+    /// session-manager rule has to match on.
+    ///
+    /// `node.name`, never the description: `audio.allowed-rates` is a *node*
+    /// property, and a card has one node per profile, so the card name would pin
+    /// rates on outputs nobody asked about and the description matches nothing
+    /// at all. `None` when the chain reaches no device, or when the dump named
+    /// it with an empty string - a rule matching neither is a file that lands
+    /// and silently does nothing.
+    #[must_use]
+    pub fn sink_node_name(&self) -> Option<&str> {
+        let last = self.path.last().filter(|n| n.role == NodeRole::Device)?;
+        Some(last.name.as_str()).filter(|n| !n.is_empty())
     }
 
     /// The rate the node at the end of the chain negotiated, when it published
@@ -1335,6 +1364,7 @@ pub fn parse(dump: &str, pid: u32) -> Result<AudioGraph, GraphError> {
         bt_codec: bt_codec_of(&objects, &path),
         bt_available: bt_available_of(&objects, &path),
         bt_device_id: bt_device_id_of(&objects, &path),
+        sink_ceiling_hz: sink_ceiling_of(&objects, &path),
         path,
         clock: clock_of(&objects),
         // The kernel names the device's rates, not `pw-dump`; `probe` fills this
@@ -1353,6 +1383,30 @@ fn bt_codec_of(objects: &[Value], path: &[GraphNode]) -> Option<String> {
     let sink = path.last().filter(|n| n.role == NodeRole::Device)?;
     let node = object_at(objects, "PipeWire:Interface:Node", sink.id)?;
     prop_str(node, "api.bluez5.codec").map(ToString::to_string)
+}
+
+/// The highest rate the sink at the end of the path says it can be opened at.
+///
+/// Read from `EnumFormat`, which is what a node advertises it *could* take, as
+/// against `Format`, which is what it settled on for the stream playing now. The
+/// highest across every entry, because a node publishes one per configuration
+/// and the ceiling is the best of them.
+///
+/// A rate here is a choice object rather than a number - `{"default": .., "min":
+/// .., "max": ..}` for a range, or `{"default": ..}` where there is only one -
+/// so the max is taken where there is one and the default stands in where there
+/// is not. `None` for anything else, which is an absence and never a zero.
+fn sink_ceiling_of(objects: &[Value], path: &[GraphNode]) -> Option<u32> {
+    let sink = path.last().filter(|n| n.role == NodeRole::Device)?;
+    let node = object_at(objects, "PipeWire:Interface:Node", sink.id)?;
+    node.pointer("/info/params/EnumFormat")?
+        .as_array()?
+        .iter()
+        .filter_map(|f| {
+            let rate = f.get("rate")?;
+            rate.get("max").and_then(as_u32).or_else(|| as_u32(rate))
+        })
+        .max()
 }
 
 /// The A2DP codecs the Bluetooth device at the end of the path offers.
@@ -1737,6 +1791,77 @@ mod tests {
             Ok(g) => g,
             Err(e) => panic!("the fixture should parse: {e}"),
         }
+    }
+
+    /// A chain ending at one sink, with whatever extra JSON that sink needs.
+    fn chain_to_sink(sink_extra: &str) -> String {
+        format!(
+            r#"[
+          {{"id": 1, "type": "PipeWire:Interface:Client",
+           "info": {{"props": {{"application.process.id": 42}}}}}},
+          {{"id": 2, "type": "PipeWire:Interface:Node",
+           "info": {{"props": {{"client.id": 1, "media.class": "Stream/Output/Audio",
+                              "node.name": "mpv"}}}}}},
+          {{"id": 3, "type": "PipeWire:Interface:Node",
+           "info": {{"props": {{"media.class": "Audio/Sink",
+                              "node.name": "alsa_output.usb-SMSL-00.pro-output-0"}}{sink_extra}}}}},
+          {{"id": 4, "type": "PipeWire:Interface:Link",
+           "info": {{"output-node-id": 2, "input-node-id": 3}}}}
+        ]"#
+        )
+    }
+
+    #[test]
+    fn the_sink_is_named_the_way_a_wireplumber_rule_has_to_match_it() {
+        // Goal: `audio.allowed-rates` is a node property, so the rule that sets
+        // it matches `node.name` - not the description a listener reads and not
+        // the card, which has one node per profile. A rule matching anything
+        // else is a file that lands and silently does nothing.
+        let g = path_of(&chain_to_sink(""), 42);
+        assert_eq!(
+            g.sink_node_name(),
+            Some("alsa_output.usb-SMSL-00.pro-output-0")
+        );
+    }
+
+    #[test]
+    fn a_chain_reaching_no_device_names_no_sink_to_pin() {
+        // Goal: the same rule the rest of this file keeps - nothing is claimed
+        // about a device that is not there. A stream linked to nothing has no
+        // node whose rates could be pinned, and offering to write one would put
+        // priel's name on a rule matching nothing.
+        let unlinked: String = chain_to_sink("").replace(
+            "\"PipeWire:Interface:Link\"",
+            "\"PipeWire:Interface:Other\"",
+        );
+        assert_eq!(path_of(&unlinked, 42).sink_node_name(), None);
+    }
+
+    #[test]
+    fn the_sink_ceiling_is_read_from_what_the_node_says_it_can_be_opened_at() {
+        // Goal: the rates a card advertises are read from /proc/asound, which
+        // only USB-Audio cards publish. Every ALSA node publishes an EnumFormat
+        // range, so a card whose exact rates cannot be read can still say what
+        // it tops out at rather than saying nothing at all.
+        //
+        // The highest across every entry: a node with more than one format
+        // advertises one per configuration, and the ceiling is the best of them.
+        let g = path_of(
+            &chain_to_sink(
+                r#", "params": {"EnumFormat": [
+                     {"rate": {"default": 48000, "min": 44100, "max": 192000}},
+                     {"rate": {"default": 48000, "min": 44100, "max": 384000}}]}"#,
+            ),
+            42,
+        );
+        assert_eq!(g.sink_ceiling_hz, Some(384_000));
+    }
+
+    #[test]
+    fn a_sink_that_advertises_no_range_claims_no_ceiling() {
+        // Goal: an absent EnumFormat is an absence, never a ceiling of zero and
+        // never a guess - the rule every other reading in this file follows.
+        assert_eq!(path_of(&chain_to_sink(""), 42).sink_ceiling_hz, None);
     }
 
     #[test]
