@@ -84,6 +84,22 @@ pub enum QueueSource {
     Search(String),
 }
 
+/// One output node and the rates it actually supports, for the drop-in that
+/// holds it to them.
+///
+/// The two halves of a "set up audio" pass answer different questions.
+/// `default.clock.allowed-rates` is one list for the whole graph - `PipeWire`
+/// has one clock - so it has to hold the union of every rate any device should
+/// run at, and it only ever grows as DACs come and go. This is what stops that
+/// union being applied to a DAC that cannot do it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DeviceRates {
+    /// `node.name` of the output, which is what a session-manager rule matches.
+    pub node_name: String,
+    /// The rates that node supports, read from the kernel and never inferred.
+    pub rates_hz: Vec<u32>,
+}
+
 /// A request for one page of a listing.
 ///
 /// Every one carries an explicit offset and limit, and the reply carries the
@@ -201,6 +217,14 @@ pub enum ToWorker {
     /// here. The reply is [`FromWorker::AudioSetUp`].
     SetUpAudio {
         allowed_hz: Vec<u32>,
+        /// The active output and the rates it actually supports, when they were
+        /// read. Writes a second drop-in holding that one node to its own rates.
+        ///
+        /// `None` where the device's exact rates are not known - a Bluetooth
+        /// sink, or any card without the USB-Audio descriptor they are read
+        /// from. A range is not a list, and a rule asserting rates priel did not
+        /// read would be the very thing this file exists to stop.
+        device: Option<DeviceRates>,
     },
     /// Write priel's own `wireplumber.conf.d` drop-in so the session manager
     /// stops claiming `card_name`, leaving the card for priel to open directly.
@@ -439,10 +463,15 @@ pub enum FromWorker {
     /// not be read - a background read, so a failure is silent, not a banner.
     /// The app hands it to the player, where the verdict falls back to it.
     OutputClock(Option<ClockRates>),
-    /// priel's rates drop-in was written, or the reason it was not. `Ok` carries
-    /// the path written, for the sentence that offers the restart; `Err` carries
-    /// a reason already fit to show.
-    AudioSetUp(Result<String, String>),
+    /// priel's drop-ins were written, or the reason they were not. `Ok` carries
+    /// every path written, for the sentence that offers the restart; `Err`
+    /// carries a reason already fit to show.
+    ///
+    /// A list rather than a path because a rates pass writes two files where it
+    /// can - the permitted list for the graph, and the rule holding this one
+    /// output to its own rates - and a listener who approved a preview showing
+    /// both should be told about both.
+    AudioSetUp(Result<Vec<String>, String>),
     /// The sound server was restarted, or the reason it was not. `Err` carries a
     /// reason already fit to show, so the interface can say the file landed but
     /// the restart did not.
@@ -639,17 +668,42 @@ fn removed(client: &mut Client, uuid: String, track_id: u64) -> FromWorker {
 ///
 /// Always answers, so the overlay is never left waiting: an `Err` carries a
 /// reason already fit to show.
-fn set_up_audio(allowed_hz: &[u32]) -> FromWorker {
-    let done = match setup::conf_dir() {
-        Some(dir) => setup::write_rates(&dir, allowed_hz)
-            .map(|path| path.display().to_string())
-            .map_err(|e| e.to_string()),
-        None => Err("priel could not find your config directory".to_string()),
-    };
+fn set_up_audio(allowed_hz: &[u32], device: Option<&DeviceRates>) -> FromWorker {
+    let done = write_rate_files(allowed_hz, device);
     if let Err(e) = &done {
         log::info!("set up audio: {e}");
     }
     FromWorker::AudioSetUp(done)
+}
+
+/// The two files a rates pass writes, in the order they are previewed.
+///
+/// The permitted list first, because it is the one that is always written and
+/// the one the graph reads; the per-device rule second, and only where the
+/// device's own rates were read. Either directory being unfindable stops the
+/// pass rather than half-doing it: a permitted list without the rule that scopes
+/// it is exactly the state this change exists to get out of.
+fn write_rate_files(
+    allowed_hz: &[u32],
+    device: Option<&DeviceRates>,
+) -> Result<Vec<String>, String> {
+    let dir = setup::conf_dir().ok_or("priel could not find your config directory")?;
+    let mut written = vec![
+        setup::write_rates(&dir, allowed_hz)
+            .map_err(|e| e.to_string())?
+            .display()
+            .to_string(),
+    ];
+    if let Some(d) = device {
+        let dir = setup::reserve_conf_dir().ok_or("priel could not find your config directory")?;
+        written.push(
+            setup::write_device_rates(&dir, &d.node_name, &d.rates_hz)
+                .map_err(|e| e.to_string())?
+                .display()
+                .to_string(),
+        );
+    }
+    Ok(written)
 }
 
 /// Write priel's reservation drop-in - and only that file - into the user's
@@ -661,7 +715,7 @@ fn set_up_audio(allowed_hz: &[u32]) -> FromWorker {
 fn reserve_card(card_name: &str) -> FromWorker {
     let done = match setup::reserve_conf_dir() {
         Some(dir) => setup::write_reserve(&dir, card_name)
-            .map(|path| path.display().to_string())
+            .map(|path| vec![path.display().to_string()])
             .map_err(|e| e.to_string()),
         None => Err("priel could not find your config directory".to_string()),
     };
@@ -901,7 +955,7 @@ fn serve(
         // Write priel's own drop-in - never another file - into the user's
         // config directory. Filesystem work, so it is here and not on the render
         // thread, and it always answers so the overlay can move on.
-        ToWorker::SetUpAudio { allowed_hz } => set_up_audio(&allowed_hz),
+        ToWorker::SetUpAudio { allowed_hz, device } => set_up_audio(&allowed_hz, device.as_ref()),
         ToWorker::ReserveCard { card_name } => reserve_card(&card_name),
         ToWorker::ClearRatePin => FromWorker::RatePinCleared(setup::clear_rate_pin()),
         // Restart the user's sound server. Waits on `systemctl`, so it too is

@@ -47,6 +47,7 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -83,21 +84,55 @@ pub fn desired_allowed_hz(permitted: &[u32], blocked_supported: &[u32]) -> Vec<u
 ///
 /// Opens with a line saying priel wrote it and that it is safe to delete, so
 /// anyone who finds the file knows what put it there and that removing it is
-/// harmless. The rates go on one line, spelled the way the server's own core
-/// object publishes them.
+/// harmless. The rates are spelled the way the server's own core object
+/// publishes them, and carried onto further lines once there are more than
+/// [`RATES_PER_LINE`] of them - see [`rate_list`].
 #[must_use]
 pub fn rates_conf_text(allowed_hz: &[u32]) -> String {
-    let rates = allowed_hz
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let rates = rate_list(allowed_hz, 4);
     format!(
         "# Written by priel: the sample rates your DAC supports, added to the\n\
          # sound server's permitted list so hi-res tracks play at their own rate\n\
          # rather than being resampled. Safe to delete; priel offers it again.\n\
-         context.properties = {{\n    default.clock.allowed-rates = [ {rates} ]\n}}\n"
+         context.properties = {{\n    default.clock.allowed-rates = {rates}\n}}\n"
     )
+}
+
+/// How many rates go on one line before the list is carried onto the next.
+///
+/// The same figure the report's own rate rows use, for the same reason: the
+/// preview shows these files whole and clips rather than wrapping, and the tail
+/// of a rate list is where the hi-res rates are.
+const RATES_PER_LINE: usize = 8;
+
+/// A rate list as a SPA-JSON array, on one line where it fits and carried onto
+/// further lines where it does not.
+///
+/// `indent` is how far the *property* is indented, so the wrapped form can put
+/// its rates one step further in and its closing bracket back under the opening
+/// one. Whitespace separates array elements in SPA-JSON, and a newline is
+/// whitespace, so both forms parse the same.
+///
+/// Ten rates is what a hi-res DAC advertises, and ten on one line ran twenty
+/// columns past the preview box. That is the case this whole feature is about,
+/// so it is the case the format is chosen for.
+fn rate_list(allowed_hz: &[u32], indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    if allowed_hz.len() <= RATES_PER_LINE {
+        let rates = allowed_hz
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!("[ {rates} ]");
+    }
+    let mut out = "[\n".to_string();
+    for row in allowed_hz.chunks(RATES_PER_LINE) {
+        let rates = row.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+        let _ = writeln!(out, "{pad}    {rates}");
+    }
+    let _ = write!(out, "{pad}]");
+    out
 }
 
 /// The directory priel's drop-in belongs in: the user's `pipewire.conf.d`.
@@ -297,11 +332,12 @@ const NAME_MAX: usize = 120;
 /// to the hardware's own range - so this cannot claim a rate the device lacks.
 #[must_use]
 pub fn device_rates_conf_text(node_name: &str, allowed_hz: &[u32]) -> String {
-    let rates = allowed_hz
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let rates = rate_list(allowed_hz, 8);
+    // Broken across more lines than the reservation rule needs, because both of
+    // the long parts here are unbounded: a node name comes from a device the
+    // listener plugged in, and the rate list grows with what the DAC does. The
+    // preview shows this file whole before it is written, and a line that ran
+    // past the box would be a promise kept only for short names.
     format!(
         "# Written by priel: the rates this output actually supports, so the\n\
          # sound server never drives it at one of the others in the permitted\n\
@@ -312,7 +348,11 @@ pub fn device_rates_conf_text(node_name: &str, allowed_hz: &[u32]) -> String {
          matches = [\n      \
          {{ node.name = \"{node_name}\" }}\n    \
          ]\n    \
-         actions = {{ update-props = {{ audio.allowed-rates = [ {rates} ] }} }}\n  \
+         actions = {{\n      \
+         update-props = {{\n        \
+         audio.allowed-rates = {rates}\n      \
+         }}\n    \
+         }}\n  \
          }}\n\
          ]\n"
     )
@@ -545,6 +585,60 @@ mod tests {
         let body = std::fs::read_to_string(&path).expect("read back");
         assert!(body.contains("alsa_card.usb-x"), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every rate a hi-res DAC of the kind priel exists for advertises. Ten of
+    /// them, which is the case that broke the one-line list.
+    const FULL: [u32; 10] = [
+        44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600, 768_000,
+    ];
+
+    #[test]
+    fn every_line_of_a_drop_in_fits_the_preview_that_has_to_show_it_whole() {
+        // Goal: nothing is written unseen, and the preview clips rather than
+        // wrapping - so a file whose lines run past the box breaks the one
+        // promise the preview makes. Both rate lists were one line long, which
+        // fits four rates and not the ten a hi-res DAC advertises: the very
+        // case "add every rate at once" is about. The node name is unbounded
+        // too, and comes from a device the listener plugged in.
+        //
+        // 80 columns: the overlay is 84 wide, two go to the border, and the
+        // content is drawn at an indent of two.
+        const BUDGET: usize = 80;
+        let files = [
+            rates_conf_text(&FULL),
+            super::device_rates_conf_text(
+                "alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0",
+                &FULL,
+            ),
+        ];
+        for text in &files {
+            for line in text.lines() {
+                assert!(
+                    line.chars().count() <= BUDGET,
+                    "{} columns of {BUDGET}: {line:?}",
+                    line.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrapped_rate_list_still_carries_every_rate() {
+        // Goal: the wrapping is a layout change and may not become a content
+        // change - the tail of a rate list is where the hi-res rates are, and
+        // losing one silently is worse than a line that ran off the screen.
+        let text = rates_conf_text(&FULL);
+        for hz in FULL {
+            assert!(text.contains(&hz.to_string()), "{hz} is missing: {text}");
+        }
+        let device = super::device_rates_conf_text("alsa_output.x", &FULL);
+        for hz in FULL {
+            assert!(
+                device.contains(&hz.to_string()),
+                "{hz} is missing: {device}"
+            );
+        }
     }
 
     #[test]

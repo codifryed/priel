@@ -34,6 +34,7 @@ use crate::app::{
 };
 use crate::cli::ThemeName;
 use crate::theme::{self, Theme};
+use crate::worker::DeviceRates;
 
 /// The width at which the queue gets a column of its own beside the list.
 ///
@@ -1413,50 +1414,119 @@ fn key_label(code: KeyCode) -> String {
 /// whatever they are approving. The pin is the exception on both counts: it
 /// writes nothing, so it answers `None` for the file and says what it will run
 /// instead.
+/// The words and the files of a rates pass, pushed onto the preview's body.
+///
+/// Split out of [`confirm_view`] because it is the one action that writes more
+/// than one file and has to explain why - and because what it may *say* depends
+/// on what was read, which is a paragraph of its own.
+fn rates_preview(
+    adding_hz: &[u32],
+    reason: SetupReason,
+    allowed_hz: &[u32],
+    device: Option<&DeviceRates>,
+    t: &Theme,
+    body: &mut Vec<Line<'static>>,
+) -> Vec<((String, String), String)> {
+    let styled = |s: String, c| Line::from(Span::styled(s, Style::default().fg(c)));
+    // What may be said depends on what was read. The device's rates come from
+    // the kernel, so that sentence can claim what the hardware does; a rate the
+    // server refused is known only from the server's own setting, and a sink
+    // whose rates were never read - every Bluetooth and network sink - must not
+    // be described as capable of anything on the strength of it.
+    body.push(styled(
+        match reason {
+            SetupReason::DeviceRates => format!(
+                "Your DAC can do {} rate{} PipeWire is not using: {}.",
+                adding_hz.len(),
+                if adding_hz.len() == 1 { "" } else { "s" },
+                fmt_khz_list(adding_hz)
+            ),
+            SetupReason::ThisTrack => format!(
+                "This track plays at {}, which PipeWire is not set to use.",
+                fmt_khz_list(adding_hz)
+            ),
+        },
+        t.text,
+    ));
+    // Every rate the DAC does goes in at once - there is no adding them one
+    // track at a time - so say that where the rates were read, and say what the
+    // second file is for. The permitted list is one list shared by the whole
+    // machine, which is why the DAC needs a rule of its own.
+    if let Some(d) = device {
+        body.push(Line::default());
+        body.push(styled(
+            format!(
+                "That is every rate it supports: {}.",
+                fmt_khz_list(&d.rates_hz)
+            ),
+            t.muted,
+        ));
+        body.push(styled(
+            "The permitted list is shared by every device here, so the".to_string(),
+            t.muted,
+        ));
+        body.push(styled(
+            "second file holds this one to the rates above.".to_string(),
+            t.muted,
+        ));
+    }
+    let mut files = vec![(
+        preview_path(
+            priel_player::setup::conf_dir(),
+            priel_player::setup::RATES_CONF,
+        ),
+        priel_player::setup::rates_conf_text(allowed_hz),
+    )];
+    if let Some(d) = device {
+        files.push((
+            preview_path(
+                priel_player::setup::reserve_conf_dir(),
+                &priel_player::setup::device_rates_conf(&d.node_name),
+            ),
+            priel_player::setup::device_rates_conf_text(&d.node_name, &d.rates_hz),
+        ));
+    }
+    files
+}
+
+/// A file the preview will name, as its directory and then its basename.
+///
+/// Two pieces, kept apart so neither can be cut off. Both halves are unbounded -
+/// a per-device rule is named after a node the listener plugged in - and the
+/// preview box clips rather than wrapping, so one path on one line is a promise
+/// kept only for short names.
+fn preview_path(dir: Option<std::path::PathBuf>, name: &str) -> (String, String) {
+    dir.map_or_else(
+        || {
+            (
+                "(priel could not find your config directory)".to_string(),
+                name.to_string(),
+            )
+        },
+        |d| (format!("{}/", d.display()), name.to_string()),
+    )
+}
+
 fn confirm_view(what: &SetupWhat, t: &Theme) -> Vec<Line<'static>> {
     let styled = |s: String, c| Line::from(Span::styled(s, Style::default().fg(c)));
-    let file = |dir: Option<std::path::PathBuf>, name: &str| {
-        dir.map_or_else(
-            || "(priel could not find your config directory)".to_string(),
-            |d| d.join(name).display().to_string(),
-        )
-    };
     let mut body = Vec::new();
-    let (path, contents) = match what {
+    // Every file this action would write, in the order it writes them. A list,
+    // because a rates pass writes two where it can: the permitted list the graph
+    // reads, and the rule that holds this one output to its own rates.
+    let files: Vec<((String, String), String)> = match what {
         SetupWhat::Rates {
             adding_hz,
             reason,
             allowed_hz,
-        } => {
-            // What may be said depends on what was read. The device's rates come
-            // from the kernel, so that sentence can claim what the hardware
-            // does; a rate the server refused is known only from the server's
-            // own setting, and a sink whose rates were never read - every
-            // Bluetooth and network sink - must not be described as capable of
-            // anything on the strength of it.
-            body.push(styled(
-                match reason {
-                    SetupReason::DeviceRates => format!(
-                        "Your DAC can do {} rate{} PipeWire is not using: {}.",
-                        adding_hz.len(),
-                        if adding_hz.len() == 1 { "" } else { "s" },
-                        fmt_khz_list(adding_hz)
-                    ),
-                    SetupReason::ThisTrack => format!(
-                        "This track plays at {}, which PipeWire is not set to use.",
-                        fmt_khz_list(adding_hz)
-                    ),
-                },
-                t.text,
-            ));
-            (
-                Some(file(
-                    priel_player::setup::conf_dir(),
-                    priel_player::setup::RATES_CONF,
-                )),
-                priel_player::setup::rates_conf_text(allowed_hz),
-            )
-        }
+            device,
+        } => rates_preview(
+            adding_hz,
+            *reason,
+            allowed_hz,
+            device.as_ref(),
+            t,
+            &mut body,
+        ),
         SetupWhat::Reserve { card_name, device } => {
             body.push(styled(
                 format!("The sound server is holding {device} and mixing into it."),
@@ -1470,13 +1540,13 @@ fn confirm_view(what: &SetupWhat, t: &Theme) -> Vec<Line<'static>> {
                 "Nothing else on this machine will be able to play through it.".to_string(),
                 t.verdict_altered,
             ));
-            (
-                Some(file(
+            vec![(
+                preview_path(
                     priel_player::setup::reserve_conf_dir(),
                     priel_player::setup::RESERVE_CONF,
-                )),
+                ),
                 priel_player::setup::reserve_conf_text(card_name),
-            )
+            )]
         }
         SetupWhat::ClearPin { at_hz } => {
             body.push(styled(
@@ -1493,19 +1563,30 @@ fn confirm_view(what: &SetupWhat, t: &Theme) -> Vec<Line<'static>> {
                 t.muted,
             ));
             body.push(styled(format!("  {cmd} {}", args.join(" ")), t.accent));
-            (None, String::new())
+            Vec::new()
         }
     };
-    if let Some(path) = path {
+    if !files.is_empty() {
         body.push(Line::default());
         body.push(styled(
-            "priel will write this file \u{2014} its own; nothing else is touched:".to_string(),
+            format!(
+                "priel will write {} \u{2014} its own; nothing else is touched:",
+                if files.len() == 1 {
+                    "this file".to_string()
+                } else {
+                    format!("these {} files", files.len())
+                }
+            ),
             t.muted,
         ));
-        body.push(styled(format!("  {path}"), t.accent));
-        body.push(Line::default());
-        for line in contents.lines() {
-            body.push(styled(format!("  {line}"), t.faint));
+        for ((dir, name), contents) in files {
+            body.push(styled(format!("  {dir}"), t.muted));
+            body.push(styled(format!("    {name}"), t.accent));
+            body.push(Line::default());
+            for line in contents.lines() {
+                body.push(styled(format!("  {line}"), t.faint));
+            }
+            body.push(Line::default());
         }
     }
     body
@@ -1553,8 +1634,22 @@ fn setup_step_view(
             ));
             Vec::new()
         }
-        SetupStep::Restart { path } => {
-            body.push(styled(format!("Written to {path}."), t.text));
+        SetupStep::Restart { paths } => {
+            // Every path, one per line. A pass that wrote two files and reported
+            // one would leave the second unaccounted for on the only screen that
+            // says what priel put on the machine.
+            body.push(styled(
+                if paths.len() == 1 {
+                    "Written to:"
+                } else {
+                    "Written:"
+                }
+                .to_string(),
+                t.text,
+            ));
+            for path in paths {
+                body.push(styled(format!("  {path}"), t.accent));
+            }
             body.push(Line::default());
             body.push(styled(
                 format!("PipeWire has to restart to {}.", what.restart_promise()),
@@ -6168,6 +6263,75 @@ mod tests {
     }
 
     #[test]
+    fn the_confirm_shows_both_files_and_says_why_the_second_one_is_there() {
+        // Goal: a rates pass writes two files where it can, and the rule is that
+        // nothing is written unseen - so the preview has to carry both, and say
+        // why. The second is not obvious: the permitted list is one list for the
+        // whole machine, and holding this output to its own rates is what keeps
+        // that list off a DAC that cannot do all of it.
+        let mut sc = screen();
+        with_chain(&mut sc, blocked_chain());
+        sc.app.mode = Mode::Graph;
+        let _ = text(&mut sc.app, 100, 40);
+        click_hit(&mut sc.app, Hit::Key(KeyCode::Char('A')));
+        let out = text(&mut sc.app, 100, 44);
+        assert!(out.contains("these 2 files"), "both, counted: {out}");
+        assert!(out.contains("99-priel-rates.conf"), "the list: {out}");
+        assert!(
+            out.contains("99-priel-rates-Studio_DAC.conf"),
+            "and the rule, named after the node it matches: {out}"
+        );
+        assert!(
+            out.contains("audio.allowed-rates = [ 44100 48000 88200 176400 ]"),
+            "the rule's whole content, before it is written: {out}"
+        );
+        assert!(
+            out.contains("every rate it supports"),
+            "the rates go in at once, not one track at a time: {out}"
+        );
+        assert!(
+            out.contains("shared by every device"),
+            "and why a second file is needed at all: {out}"
+        );
+    }
+
+    #[test]
+    fn an_output_with_no_readable_rates_is_previewed_as_one_file() {
+        // Goal: the rule asserts what a device takes, so it is only written from
+        // rates priel read. A Bluetooth sink has none, and the preview must then
+        // show the one file it will actually write rather than a second the pass
+        // is not going to produce.
+        let mut sc = screen();
+        // A track the server will not clock at, which is the only reason a sink
+        // with no readable rates is offered the setup at all.
+        chain(&mut sc, 24, 44_100, 44_100, "s32");
+        with_chain(
+            &mut sc,
+            AudioGraph {
+                path: vec![
+                    node("mpv", NodeRole::Stream, 44_100, "S32LE"),
+                    node("Px7 S3", NodeRole::Device, 48_000, "S24LE"),
+                ],
+                clock: ClockRates {
+                    allowed_hz: Some(vec![48_000]),
+                    current_hz: Some(48_000),
+                    forced_hz: None,
+                },
+                ..AudioGraph::default()
+            },
+        );
+        sc.app.mode = Mode::Graph;
+        let _ = text(&mut sc.app, 100, 40);
+        click_hit(&mut sc.app, Hit::Key(KeyCode::Char('A')));
+        let out = text(&mut sc.app, 100, 40);
+        assert!(out.contains("this file"), "one file, singular: {out}");
+        assert!(
+            !out.contains("audio.allowed-rates"),
+            "and no rule built from rates nobody read: {out}"
+        );
+    }
+
+    #[test]
     fn clicking_write_it_sends_the_write_the_same_as_the_key() {
         // Goal: [y] is a real button; a click on it writes exactly as pressing y
         // does, and carries the list the preview showed.
@@ -6183,7 +6347,7 @@ mod tests {
         assert!(
             matches!(
                 sent.as_slice(),
-                [ToWorker::SetUpAudio { allowed_hz }]
+                [ToWorker::SetUpAudio { allowed_hz, .. }]
                     if *allowed_hz == vec![44_100, 48_000, 88_200, 176_400]
             ),
             "the click wrote the whole list"
