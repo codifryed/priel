@@ -138,8 +138,12 @@ pub fn supported_playback_rates(body: &str) -> Vec<u32> {
 /// The union across every `stream` file, because a device with more than one
 /// interface splits them. That is an over-estimate on a card whose outputs
 /// differ from one another - one advertising 192 kHz speakers and 384 kHz
-/// headphones reports 384 kHz for both - and mapping a `stream` file back to the
-/// PCM a node opened is not reliable enough to do instead.
+/// headphones reports 384 kHz for both - so a caller writing this list onto one
+/// output narrows it by that node's own
+/// [`sink_ceiling_hz`](crate::graph::AudioGraph::sink_ceiling_hz) first. Mapping
+/// a `stream` file back to the PCM a node opened would settle it at the source,
+/// but the numbering is per interface and does not follow the PCM index
+/// reliably enough to key on.
 #[must_use]
 pub fn supported_rates_for_card(index: u32) -> Vec<u32> {
     supported_rates_in(Path::new(ASOUND), index)

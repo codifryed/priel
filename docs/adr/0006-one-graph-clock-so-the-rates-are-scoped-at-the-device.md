@@ -76,11 +76,25 @@ USB-Audio only, which covers the hi-res DACs priel exists for and nothing else.
 Where it is absent - a Bluetooth sink, an HDA codec - no rule is written at all.
 
 Every ALSA node does publish an `EnumFormat` rate *range*, and
-`AudioGraph::sink_ceiling_hz` reads it so a card whose exact rates are unreadable
-can still say what it tops out at. It is **not** promoted into a list. Filling
-the 44.1k and 48k families in between would put rates in the assertion that the
-device may not support, which is the precise failure this rule exists to
+`AudioGraph::sink_ceiling_hz` reads it. It is **not** promoted into a list.
+Filling the 44.1k and 48k families in between would put rates in the assertion
+that the device may not support, which is the precise failure this rule exists to
 prevent, and priel's name would be on it.
+
+What the ceiling *is* used for is narrowing the list that was read, which is a
+different thing from filling a gap in it. `stream*` is per USB **interface** and
+unioned across the card, so a card whose outputs differ from one another reports
+the best of them for all of them. A measured example has 192 kHz speakers and
+384 kHz headphones on one card: without the ceiling the speakers' rule would have
+carried 384 kHz, which is priel asserting a rate that output does not have. With
+it the speakers get their six rates and the headphones their seven, from the same
+unioned list.
+
+`mediaSubtype: "dsd"` entries are skipped when taking that ceiling. A hi-res DAC
+advertises DSD beside PCM and the DSD figure is the bit rate of a one-bit stream
+- the SMSL publishes 3.072 MHz next to its 768 kHz of PCM. It is not a sample
+rate anything is compared against, and counting it would both put an
+unreachable number on screen and wave every PCM rate past the filter.
 
 ## The line-length consequence
 
@@ -103,11 +117,11 @@ plugged in, so neither half of that path has a bound priel controls.
   accumulation harmless.
 - **A per-device rule for a Bluetooth sink.** Its rates are the codec's, not a
   card's, and `monitor.alsa.rules` does not reach it.
-- **Splitting a card's rates by output.** `supported_rates_for_card` unions every
-  `stream*` file on a card, so a card whose outputs differ - 192 kHz speakers and
-  384 kHz headphones on one device - reports the union for both. Mapping a
-  `stream` file back to the PCM a node opened is not reliable enough to do
-  instead, and the over-estimate is bounded by the hardware clamp above.
+- **Mapping a `stream*` file back to the PCM a node opened.** That would give
+  each output its own list at the source rather than a unioned one narrowed by
+  the node's ceiling. The file numbering is per USB interface and does not follow
+  the PCM index reliably enough to key on, and the ceiling already lands the same
+  answer on the card that motivated it.
 
 ## Consequences
 

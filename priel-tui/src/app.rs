@@ -6618,14 +6618,33 @@ fn hit(r: Rect, col: u16, row: u16) -> bool {
 /// which is all a non-USB card publishes - is not a list, and turning one into
 /// a list would put rates in the assertion that the device may not support,
 /// which is the one thing this rule exists to prevent.
+///
+/// **Narrowed by what this node itself advertises.** The kernel's list is read
+/// per USB *interface* and unioned across the card, so a card whose outputs
+/// differ reports the best of them for all of them - one measured has 192 kHz
+/// speakers and 384 kHz headphones on one card, and the union would write
+/// 384 kHz into the speakers' rule. Dropping what sits above the node's own
+/// ceiling is narrowing a reading by another reading, which is a different thing
+/// from filling a gap with a guess; an absent ceiling narrows nothing.
+///
+/// An empty result is `None` rather than an empty list: `audio.allowed-rates`
+/// reads `[ ]` as "any rate the device supports", so writing one would assert
+/// the opposite of what an empty result means.
 fn device_pin(graph: &AudioGraph) -> Option<DeviceRates> {
-    let node_name = graph.sink_node_name()?;
-    if graph.supported_hz.is_empty() {
+    let node_name = graph.sink_node_name()?.to_string();
+    let ceiling_hz = graph.sink_ceiling_hz.unwrap_or(u32::MAX);
+    let rates_hz: Vec<u32> = graph
+        .supported_hz
+        .iter()
+        .copied()
+        .filter(|hz| *hz <= ceiling_hz)
+        .collect();
+    if rates_hz.is_empty() {
         return None;
     }
     Some(DeviceRates {
-        node_name: node_name.to_string(),
-        rates_hz: graph.supported_hz.clone(),
+        node_name,
+        rates_hz,
     })
 }
 
@@ -10115,6 +10134,59 @@ mod tests {
                 rates_hz: vec![44_100, 48_000, 88_200, 176_400],
             }),
             "and the output is held to every rate it supports, by node name"
+        );
+    }
+
+    #[test]
+    fn a_rate_above_what_this_output_advertises_is_not_pinned_onto_it() {
+        // Goal: a real card, and the reason the ceiling is read at all. The
+        // rates come from /proc/asound/card<N>/stream*, which is per USB
+        // *interface* and unioned across the card - so a card whose outputs
+        // differ from one another reports the best of them for all of them. One
+        // measured here has 192 kHz speakers and 384 kHz headphones on the same
+        // card, and the union would have written 384 kHz into the speakers'
+        // rule: priel asserting a rate that output does not have, which is the
+        // one thing this rule exists not to do.
+        //
+        // The node's own advertised ceiling settles it. That is narrowing a
+        // reading by another reading, not filling a gap with a guess.
+        let mut g = chain_clocked(&[44_100], 44_100);
+        g.supported_hz = vec![44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 384_000];
+        g.sink_ceiling_hz = Some(192_000);
+        let mut r = playing_hires(g);
+        r.app.on_key(key('A'));
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        let reqs = requests(&r);
+        let [ToWorker::SetUpAudio { device, .. }] = reqs.as_slice() else {
+            panic!("one write request, got {}", reqs.len());
+        };
+        assert_eq!(
+            device.as_ref().map(|d| d.rates_hz.clone()),
+            Some(vec![44_100, 48_000, 88_200, 96_000, 176_400, 192_000]),
+            "384 kHz is above what this output advertises and is dropped"
+        );
+    }
+
+    #[test]
+    fn an_output_that_advertises_no_ceiling_keeps_the_rates_as_read() {
+        // Goal: an absent ceiling is an absence, not a bound of zero. Nothing
+        // to narrow by means the kernel's list stands as it was read - the same
+        // rule every other reading in this workspace follows.
+        let mut g = chain_clocked(&[44_100], 44_100);
+        g.supported_hz = vec![44_100, 48_000, 88_200];
+        g.sink_ceiling_hz = None;
+        let mut r = playing_hires(g);
+        r.app.on_key(key('A'));
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        let reqs = requests(&r);
+        let [ToWorker::SetUpAudio { device, .. }] = reqs.as_slice() else {
+            panic!("one write request, got {}", reqs.len());
+        };
+        assert_eq!(
+            device.as_ref().map(|d| d.rates_hz.clone()),
+            Some(vec![44_100, 48_000, 88_200])
         );
     }
 

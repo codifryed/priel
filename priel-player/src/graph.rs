@@ -1325,12 +1325,20 @@ fn bt_codec_of(objects: &[Value], path: &[GraphNode]) -> Option<String> {
 /// .., "max": ..}` for a range, or `{"default": ..}` where there is only one -
 /// so the max is taken where there is one and the default stands in where there
 /// is not. `None` for anything else, which is an absence and never a zero.
+///
+/// **`raw` entries only.** A hi-res DAC advertises DSD beside PCM, and the DSD
+/// figure is the bit rate of a one-bit stream - the SMSL publishes 3.072 MHz
+/// next to its 768 kHz of PCM. It is not a sample rate anything here is compared
+/// against, and counting it would put a number on screen the device cannot be
+/// clocked at and would wave every PCM rate past a filter that exists to catch
+/// the ones it cannot do.
 fn sink_ceiling_of(objects: &[Value], path: &[GraphNode]) -> Option<u32> {
     let sink = path.last().filter(|n| n.role == NodeRole::Device)?;
     let node = object_at(objects, "PipeWire:Interface:Node", sink.id)?;
     node.pointer("/info/params/EnumFormat")?
         .as_array()?
         .iter()
+        .filter(|f| f.get("mediaSubtype").and_then(Value::as_str) != Some("dsd"))
         .filter_map(|f| {
             let rate = f.get("rate")?;
             rate.get("max").and_then(as_u32).or_else(|| as_u32(rate))
@@ -1784,6 +1792,26 @@ mod tests {
             42,
         );
         assert_eq!(g.sink_ceiling_hz, Some(384_000));
+    }
+
+    #[test]
+    fn a_dsd_capability_does_not_raise_the_pcm_ceiling() {
+        // Goal: the shape a real hi-res DAC publishes. The SMSL advertises two
+        // formats - PCM to 768 kHz and DSD to 3.072 MHz - and the DSD figure is
+        // a bit rate for a one-bit stream, not a sample rate this ceiling is
+        // ever compared against. Taking the highest of all of them would have
+        // put 3072000 on screen as what the device tops out at, and would have
+        // let every PCM rate through a filter that exists to catch the ones the
+        // device cannot do.
+        let g = path_of(
+            &chain_to_sink(
+                r#", "params": {"EnumFormat": [
+                     {"mediaSubtype": "raw", "rate": {"default": 48000, "min": 44100, "max": 768000}},
+                     {"mediaSubtype": "dsd", "rate": {"default": 384000, "min": 352800, "max": 3072000}}]}"#,
+            ),
+            42,
+        );
+        assert_eq!(g.sink_ceiling_hz, Some(768_000));
     }
 
     #[test]
