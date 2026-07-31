@@ -1000,7 +1000,7 @@ fn serve(
             cover_id,
             protocol,
         } => {
-            let bytes = cover_bytes(client, &cover_id, cache_cap)?;
+            let bytes = cover_bytes(client, &cover_id, cover_fetch_px(protocol), cache_cap)?;
             let image = crate::art::decode_jpeg(&bytes)?;
             let payload = protocol.and_then(|p| encode_cover(p, &image, &bytes));
             FromWorker::Cover {
@@ -1055,13 +1055,34 @@ fn fill_queue(
     }
 }
 
-/// The square size the cover is fetched at, in pixels.
+/// The square size the cover is fetched at when it is drawn as half blocks.
 ///
 /// Close to what it is drawn at - `COVER_ROWS` rows is a block of a few dozen
 /// cells - so the downscale averages a handful of source pixels rather than
 /// resampling a large image. A little larger than the largest block, so the art
 /// is sharp rather than upscaled.
 const COVER_FETCH_PX: u32 = 160;
+
+/// The square size the cover is fetched at when the terminal draws real pixels.
+///
+/// A mosaic of a few dozen cells wants a small picture; a photograph does not.
+/// The full-pane cover on a large screen is several hundred pixels on a side and
+/// 160 is visibly soft blown up to it - measured on a 4K panel, where it was the
+/// first thing anyone said about the feature.
+///
+/// 640 rather than the 1280 the service will also serve: the picture is
+/// transmitted to the terminal as raw pixels, and 1280 square is five megabytes
+/// before base64 - once per track, but a hitch at every track change is a poor
+/// trade for detail past what the box can show.
+const COVER_FETCH_PX_PICTURE: u32 = 640;
+
+/// The size to fetch for a terminal that speaks `protocol`.
+const fn cover_fetch_px(protocol: Option<crate::graphics::Protocol>) -> u32 {
+    match protocol {
+        Some(_) => COVER_FETCH_PX_PICTURE,
+        None => COVER_FETCH_PX,
+    }
+}
 
 /// The most a cover fetch will read into memory.
 ///
@@ -1118,10 +1139,15 @@ fn encode_cover(
 /// tell apart.
 const COVER_IMAGE_ID: u32 = 1;
 
-fn cover_bytes(client: &mut Client, cover_id: &str, cache_cap: u64) -> Option<Vec<u8>> {
+fn cover_bytes(client: &mut Client, cover_id: &str, px: u32, cache_cap: u64) -> Option<Vec<u8>> {
     let dir = crate::cache::cover_dir();
-    cached_or_fetch(dir.as_deref(), cover_id, cache_cap, || {
-        let url = priel_core::cover_url(cover_id, COVER_FETCH_PX)?;
+    // The size is part of the key. Two of them are fetched now - a small one for
+    // the half blocks and a large one for a terminal that draws pixels - and a
+    // key that named only the cover would serve whichever was cached first, so
+    // starting priel in one terminal would leave the other with the wrong size.
+    let key = format!("{cover_id}-{px}");
+    cached_or_fetch(dir.as_deref(), &key, cache_cap, || {
+        let url = priel_core::cover_url(cover_id, px)?;
         client.fetch_bytes(&url, COVER_FETCH_CAP).ok()
     })
 }
@@ -1303,9 +1329,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        FAVORITES_KEY, Fault, FromWorker, PLAYLISTS_KEY, Page, Playlist, QueueSource, Task,
-        ToWorker, Track, Worker, cached_or_fetch, playlist_tracks_key, revalidate_playlists,
-        revalidate_tracks, spawn_with,
+        COVER_FETCH_PX, COVER_FETCH_PX_PICTURE, FAVORITES_KEY, Fault, FromWorker, PLAYLISTS_KEY,
+        Page, Playlist, QueueSource, Task, ToWorker, Track, Worker, cached_or_fetch,
+        cover_fetch_px, playlist_tracks_key, revalidate_playlists, revalidate_tracks, spawn_with,
     };
     use priel_core::Client;
     use std::io::{BufRead, BufReader, Read, Write};
@@ -2349,6 +2375,43 @@ mod tests {
         // playlist.
         assert_eq!(playlist_tracks_key("abc"), "playlist:abc");
         assert_ne!(playlist_tracks_key("abc"), playlist_tracks_key("xyz"));
+    }
+
+    #[test]
+    fn the_two_cover_sizes_do_not_serve_each_other_from_the_cache() {
+        // Goal: a half-block terminal wants a small picture and one that draws
+        // real pixels wants a large one, and both are cached. Keyed on the cover
+        // alone, whichever was fetched first would be served to the other - so
+        // starting priel in kitty after starting it in a plain terminal would
+        // hand the photograph path a 160-pixel picture and look worse than the
+        // mosaic it replaced. Silent, and only visible as "the art is soft".
+        let dir = scratch("sizes");
+        let small = format!("cov1-{COVER_FETCH_PX}");
+        let large = format!("cov1-{COVER_FETCH_PX_PICTURE}");
+        assert_ne!(small, large, "the size has to be part of the key");
+        crate::cache::put(&dir, &small, b"small", crate::cache::DEFAULT_CAP_BYTES)
+            .expect("seed the cache");
+        let mut fetched = false;
+        let out = cached_or_fetch(Some(&dir), &large, crate::cache::DEFAULT_CAP_BYTES, || {
+            fetched = true;
+            Some(b"large".to_vec())
+        });
+        assert!(fetched, "the large one is a miss and is fetched");
+        assert_eq!(out.as_deref(), Some(&b"large"[..]));
+    }
+
+    #[test]
+    fn a_terminal_that_draws_pixels_asks_for_a_bigger_picture() {
+        // Goal: the size follows what will draw it, and nothing else. 160 is
+        // sized for a mosaic of a few dozen cells; the full-pane cover on a
+        // large screen is several hundred pixels on a side, and that is the
+        // difference between a photograph and a blur.
+        assert_eq!(cover_fetch_px(None), COVER_FETCH_PX);
+        assert_eq!(
+            cover_fetch_px(Some(crate::graphics::Protocol::Kitty)),
+            COVER_FETCH_PX_PICTURE
+        );
+        const { assert!(COVER_FETCH_PX_PICTURE > COVER_FETCH_PX) };
     }
 
     #[test]

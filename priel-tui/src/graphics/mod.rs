@@ -81,11 +81,16 @@ pub enum Protocol {
 /// multiplexer check is still here for.
 #[must_use]
 pub fn detect_with(env: &Env, reply: &[u8]) -> Option<Protocol> {
-    if let Some(answered) = query::parse_reply(reply) {
-        return Some(answered);
-    }
+    // Before the answer, not after it. A multiplexer can forward the question
+    // and answer it honestly on the terminal's behalf while still swallowing the
+    // picture that follows - measured on herdr, which replies `OK` to the query
+    // and draws nothing at all. What a query establishes is that the far end
+    // speaks the protocol, which is not the same as the bytes surviving the trip.
     if in_multiplexer(env) {
         return None;
+    }
+    if let Some(answered) = query::parse_reply(reply) {
+        return Some(answered);
     }
     let term = env.get("TERM").unwrap_or_default().to_lowercase();
     let program = env.get("TERM_PROGRAM").unwrap_or_default().to_lowercase();
@@ -100,9 +105,11 @@ pub fn detect_with(env: &Env, reply: &[u8]) -> Option<Protocol> {
 
 /// Is something sitting between priel and the terminal?
 ///
-/// Only consulted for the one protocol that cannot be asked about. A
-/// multiplexer needs every escape wrapped and its passthrough turned on, and
-/// even then its own redraws move and corrupt what was placed.
+/// Consulted before anything else, and it overrules the terminal's own answer.
+/// A multiplexer needs every escape wrapped and its passthrough turned on, its
+/// redraws move and corrupt what was placed, and - measured - it may answer the
+/// capability query perfectly while dropping the picture on the floor. Half
+/// blocks work in all of them, so half blocks are what they get.
 fn in_multiplexer(env: &Env) -> bool {
     ["TMUX", "STY", "HERDR_ENV", "ZELLIJ", "ABDUCO_SOCKET"]
         .iter()
@@ -268,8 +275,9 @@ mod tests {
         );
         assert_eq!(
             detect_with(&under_a_multiplexer, SAYS_KITTY),
-            Some(Protocol::Kitty),
-            "and a multiplexer that does forward it is believed"
+            None,
+            "and answering the question is not a promise to carry the picture: \
+             measured on herdr, which replies OK and then draws nothing"
         );
     }
 
