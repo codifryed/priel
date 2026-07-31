@@ -47,7 +47,7 @@ use crate::bus::mpris::{self, BusCommand, Entry, Now, Snapshot};
 use crate::cli::ThemeName;
 use crate::settings::Settings;
 use crate::theme::{self, Theme};
-use crate::worker::{self, FromWorker, QueueSource, Task, ToWorker, Worker};
+use crate::worker::{self, DeviceRates, FromWorker, QueueSource, Task, ToWorker, Worker};
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum View {
@@ -475,6 +475,15 @@ pub(crate) enum SetupWhat {
         /// plus `adding_hz`. This is what is written, because a later drop-in
         /// replaces the property rather than adding to it.
         allowed_hz: Vec<u32>,
+        /// The active output and the rates it supports, for the second drop-in
+        /// that holds it to them - the half that keeps the list above off a
+        /// device that cannot do all of it.
+        ///
+        /// `None` where the device's exact rates were not read, which is every
+        /// Bluetooth sink and any card without the USB-Audio descriptor they
+        /// come from. See [`priel_player::graph::AudioGraph::sink_ceiling_hz`]
+        /// for why a range is not promoted to a list.
+        device: Option<DeviceRates>,
     },
     /// Stop the session manager claiming the card, by writing priel's own
     /// `wireplumber.conf.d` drop-in. The one change here that takes something
@@ -513,6 +522,25 @@ impl SetupWhat {
     }
 }
 
+/// Everything a "set up audio" pass would change, settled from one reading of
+/// the graph.
+///
+/// One value rather than a tuple because it grew a fourth member and the fourth
+/// is an `Option` of a struct: at that point a caller unpacking it positionally
+/// is a caller that can silently take the wrong one.
+struct RatesTarget {
+    /// The rates being added, to name them in the sentence and on the row.
+    adding_hz: Vec<u32>,
+    /// Which finding the offer came from, so nothing is claimed that was not
+    /// read.
+    reason: SetupReason,
+    /// The whole permitted list the drop-in would write.
+    allowed_hz: Vec<u32>,
+    /// The output to hold to its own rates, where they were read. See
+    /// [`device_pin`].
+    device: Option<DeviceRates>,
+}
+
 /// Why the "set up audio" offer is being made, which decides what the preview
 /// may say.
 ///
@@ -541,8 +569,10 @@ pub(crate) enum SetupStep {
     Confirm,
     /// The write request is out; the overlay says so and waits for the reply.
     Writing,
-    /// The file landed at `path`; offering the restart that makes it take effect.
-    Restart { path: String },
+    /// The files landed at `paths`; offering the restart that makes them take
+    /// effect. A list because a rates pass writes two where it can, and a
+    /// listener who approved a preview showing both is told about both.
+    Restart { paths: Vec<String> },
     /// The restart request is out; the overlay says so and waits for the reply.
     Restarting,
     /// The flow is over, for good or ill; `message` is what it came to.
@@ -5053,7 +5083,7 @@ impl App {
     /// [`AudioGraph::rate_advice`](priel_player::graph::AudioGraph::rate_advice)
     /// and the same observation the report reads, so the offer cannot appear
     /// over a section that says there is nothing to change.
-    fn setup_targets(&self) -> Option<(Vec<u32>, SetupReason, Vec<u32>)> {
+    fn setup_targets(&self) -> Option<RatesTarget> {
         let Some(Ok(graph)) = &self.audio_graph else {
             return None;
         };
@@ -5076,7 +5106,12 @@ impl App {
         }
         let permitted = graph.clock.permitted_hz().unwrap_or_default();
         let allowed = priel_player::setup::desired_allowed_hz(&permitted, &adding);
-        Some((adding, reason, allowed))
+        Some(RatesTarget {
+            adding_hz: adding,
+            reason,
+            allowed_hz: allowed,
+            device: device_pin(graph),
+        })
     }
 
     /// The "set up audio" flow while its overlay is up, for the renderer to draw.
@@ -5088,13 +5123,14 @@ impl App {
     /// Open the "set up audio" preview, or do nothing when there is nothing to
     /// add. The rates are settled here, once, from the graph already read.
     fn begin_setup(&mut self) {
-        let Some((adding_hz, reason, allowed_hz)) = self.setup_targets() else {
+        let Some(t) = self.setup_targets() else {
             return;
         };
         self.begin_apply(SetupWhat::Rates {
-            adding_hz,
-            reason,
-            allowed_hz,
+            adding_hz: t.adding_hz,
+            reason: t.reason,
+            allowed_hz: t.allowed_hz,
+            device: t.device,
         });
     }
 
@@ -5164,9 +5200,12 @@ impl App {
     /// each action *does* is one place to read next to what its preview *says*.
     fn approved(what: &SetupWhat) -> (ToWorker, SetupStep) {
         match what {
-            SetupWhat::Rates { allowed_hz, .. } => (
+            SetupWhat::Rates {
+                allowed_hz, device, ..
+            } => (
                 ToWorker::SetUpAudio {
                     allowed_hz: allowed_hz.clone(),
+                    device: device.clone(),
                 },
                 SetupStep::Writing,
             ),
@@ -5207,14 +5246,18 @@ impl App {
                 }
                 _ => {}
             },
-            SetupStep::Restart { path } => match key.code {
+            SetupStep::Restart { paths } => match key.code {
                 KeyCode::Char('r' | 'R') => {
                     self.setup_step(SetupStep::Restarting);
                     self.ask(ToWorker::RestartAudio);
                 }
                 KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc | KeyCode::Enter => {
+                    // The count rather than the names: a notice is one line, and
+                    // the overlay that just closed listed every path in full.
                     self.notice = Some(format!(
-                        "Written to {path}. Restart PipeWire to {}.",
+                        "Wrote {} file{}. Restart PipeWire to {}.",
+                        paths.len(),
+                        if paths.len() == 1 { "" } else { "s" },
                         setup.what.restart_promise()
                     ));
                     self.setup = None;
@@ -5245,7 +5288,7 @@ impl App {
     /// The flow is matched on what it is doing as well as which step it is in.
     /// One in-flight step now serves all three actions, and a reply that belongs
     /// to another of them must not advance this one.
-    fn on_audio_set_up(&mut self, result: Result<String, String>) {
+    fn on_audio_set_up(&mut self, result: Result<Vec<String>, String>) {
         if !matches!(
             &self.setup,
             Some(Setup {
@@ -5256,7 +5299,7 @@ impl App {
             return;
         }
         self.setup_step(match result {
-            Ok(path) => SetupStep::Restart { path },
+            Ok(paths) => SetupStep::Restart { paths },
             Err(e) => SetupStep::Done {
                 message: format!("Could not write it: {e}"),
             },
@@ -5387,11 +5430,11 @@ impl App {
     fn action_rows(&self) -> Vec<GraphRow> {
         let mut rows = vec![note(""), note("  Actions")];
         let before = rows.len();
-        if let Some((adding_hz, _, _)) = self.setup_targets() {
+        if let Some(t) = self.setup_targets() {
             rows.push(action(
                 KeyCode::Char('A'),
                 "set up audio",
-                format!("permit {}", crate::ui::fmt_khz_list(&adding_hz)),
+                format!("permit {}", crate::ui::fmt_khz_list(&t.adding_hz)),
             ));
         }
         if let Some((_, _, better)) = self.codec_switch_target() {
@@ -6565,6 +6608,46 @@ fn hit(r: Rect, col: u16, row: u16) -> bool {
 }
 
 /// A line of prose in the audio-graph overlay.
+/// The output to hold to its own rates, and what those rates are - or nothing,
+/// where saying so would be a claim priel did not read.
+///
+/// Both halves have to be there. The node has to be named, because the rule
+/// matches `node.name` and one matching nothing is a file that lands and does
+/// nothing; and the rates have to be the *exact* list from the kernel, because
+/// `audio.allowed-rates` is priel asserting what this device takes. A range -
+/// which is all a non-USB card publishes - is not a list, and turning one into
+/// a list would put rates in the assertion that the device may not support,
+/// which is the one thing this rule exists to prevent.
+///
+/// **Narrowed by what this node itself advertises.** The kernel's list is read
+/// per USB *interface* and unioned across the card, so a card whose outputs
+/// differ reports the best of them for all of them - one measured has 192 kHz
+/// speakers and 384 kHz headphones on one card, and the union would write
+/// 384 kHz into the speakers' rule. Dropping what sits above the node's own
+/// ceiling is narrowing a reading by another reading, which is a different thing
+/// from filling a gap with a guess; an absent ceiling narrows nothing.
+///
+/// An empty result is `None` rather than an empty list: `audio.allowed-rates`
+/// reads `[ ]` as "any rate the device supports", so writing one would assert
+/// the opposite of what an empty result means.
+fn device_pin(graph: &AudioGraph) -> Option<DeviceRates> {
+    let node_name = graph.sink_node_name()?.to_string();
+    let ceiling_hz = graph.sink_ceiling_hz.unwrap_or(u32::MAX);
+    let rates_hz: Vec<u32> = graph
+        .supported_hz
+        .iter()
+        .copied()
+        .filter(|hz| *hz <= ceiling_hz)
+        .collect();
+    if rates_hz.is_empty() {
+        return None;
+    }
+    Some(DeviceRates {
+        node_name,
+        rates_hz,
+    })
+}
+
 fn note(text: &str) -> GraphRow {
     GraphRow {
         label: text.to_string(),
@@ -9891,14 +9974,19 @@ mod tests {
             "drawn the colour the badge uses for the same finding: {text}"
         );
         assert!(
-            text.contains("default.clock.allowed-rates = [ 44100 48000 ]"),
-            "the whole setting, copyable: {text}"
+            !text.contains("default.clock.allowed-rates"),
+            "the setting itself belongs to [A] and its preview, not to a \
+             section a reader is getting a reading out of: {text}"
         );
         assert!(
-            text.contains("~/.config/pipewire/pipewire.conf.d/"),
-            "and where it goes: {text}"
+            rows.iter()
+                .any(|row| row.kind == GraphRowKind::Action(KeyCode::Char('A'))),
+            "and the key that writes it is offered: {text}"
         );
-        assert!(text.contains("Restart the sound server"), "{text}");
+        assert!(
+            !text.contains("Restart the sound server"),
+            "the restart is promised by the flow behind the key: {text}"
+        );
     }
 
     #[test]
@@ -10018,6 +10106,115 @@ mod tests {
     }
 
     #[test]
+    fn setting_up_pins_the_active_output_to_the_rates_it_actually_has() {
+        // Goal: `default.clock.allowed-rates` is one list for the whole graph -
+        // PipeWire has one clock - so it has to hold the union of every rate any
+        // device should run at, and it only ever grows as DACs come and go.
+        // Switching to a DAC that does less than the last one then leaves it
+        // being driven at rates it does not have. The second file is what stops
+        // that: it holds this one output to its own rates, named the way a
+        // session-manager rule matches, and both go out on one approval.
+        let mut r = playing_hires(chain_with_blocked());
+        r.app.on_key(key('A'));
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        let reqs = requests(&r);
+        let [ToWorker::SetUpAudio { allowed_hz, device }] = reqs.as_slice() else {
+            panic!("one write request, got {}", reqs.len());
+        };
+        assert_eq!(
+            *allowed_hz,
+            vec![44_100, 48_000, 88_200, 176_400],
+            "the permitted list is still the union, and still only grows"
+        );
+        assert_eq!(
+            device.as_ref(),
+            Some(&DeviceRates {
+                node_name: "alsa_output.usb-DAC".into(),
+                rates_hz: vec![44_100, 48_000, 88_200, 176_400],
+            }),
+            "and the output is held to every rate it supports, by node name"
+        );
+    }
+
+    #[test]
+    fn a_rate_above_what_this_output_advertises_is_not_pinned_onto_it() {
+        // Goal: a real card, and the reason the ceiling is read at all. The
+        // rates come from /proc/asound/card<N>/stream*, which is per USB
+        // *interface* and unioned across the card - so a card whose outputs
+        // differ from one another reports the best of them for all of them. One
+        // measured here has 192 kHz speakers and 384 kHz headphones on the same
+        // card, and the union would have written 384 kHz into the speakers'
+        // rule: priel asserting a rate that output does not have, which is the
+        // one thing this rule exists not to do.
+        //
+        // The node's own advertised ceiling settles it. That is narrowing a
+        // reading by another reading, not filling a gap with a guess.
+        let mut g = chain_clocked(&[44_100], 44_100);
+        g.supported_hz = vec![44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 384_000];
+        g.sink_ceiling_hz = Some(192_000);
+        let mut r = playing_hires(g);
+        r.app.on_key(key('A'));
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        let reqs = requests(&r);
+        let [ToWorker::SetUpAudio { device, .. }] = reqs.as_slice() else {
+            panic!("one write request, got {}", reqs.len());
+        };
+        assert_eq!(
+            device.as_ref().map(|d| d.rates_hz.clone()),
+            Some(vec![44_100, 48_000, 88_200, 96_000, 176_400, 192_000]),
+            "384 kHz is above what this output advertises and is dropped"
+        );
+    }
+
+    #[test]
+    fn an_output_that_advertises_no_ceiling_keeps_the_rates_as_read() {
+        // Goal: an absent ceiling is an absence, not a bound of zero. Nothing
+        // to narrow by means the kernel's list stands as it was read - the same
+        // rule every other reading in this workspace follows.
+        let mut g = chain_clocked(&[44_100], 44_100);
+        g.supported_hz = vec![44_100, 48_000, 88_200];
+        g.sink_ceiling_hz = None;
+        let mut r = playing_hires(g);
+        r.app.on_key(key('A'));
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        let reqs = requests(&r);
+        let [ToWorker::SetUpAudio { device, .. }] = reqs.as_slice() else {
+            panic!("one write request, got {}", reqs.len());
+        };
+        assert_eq!(
+            device.as_ref().map(|d| d.rates_hz.clone()),
+            Some(vec![44_100, 48_000, 88_200])
+        );
+    }
+
+    #[test]
+    fn an_output_whose_rates_were_never_read_is_not_pinned_to_a_guess() {
+        // Goal: `audio.allowed-rates` is priel asserting what a device takes, so
+        // it may only ever be written from the exact list the kernel gave. Every
+        // Bluetooth sink and every card without the USB-Audio descriptor those
+        // come from has no such list - and a rule built from the range a node
+        // advertises would put rates in the assertion priel never read, which is
+        // the one thing this file exists to prevent.
+        // The offer still stands - the track's own rate is not permitted, which
+        // is the reason a sink with no readable rates gets one at all - so this
+        // measures what the approval carries, not whether it happens.
+        let mut g = chain_clocked(&[48_000], 48_000);
+        g.supported_hz = Vec::new();
+        let mut r = playing_hires(g);
+        r.app.on_key(key('A'));
+        let _ = requests(&r);
+        r.app.on_key(key('y'));
+        let reqs = requests(&r);
+        let [ToWorker::SetUpAudio { device, .. }] = reqs.as_slice() else {
+            panic!("one write request, got {}", reqs.len());
+        };
+        assert_eq!(*device, None, "nothing read, nothing claimed");
+    }
+
+    #[test]
     fn set_up_audio_is_not_offered_when_nothing_is_blocked() {
         // Goal: a device whose rates are all permitted has nothing to set up, and
         // the key that would do it does nothing.
@@ -10124,8 +10321,8 @@ mod tests {
         );
         let text = overlay_text(&r.app);
         assert!(
-            text.contains("allowed-rates"),
-            "the advice is given: {text}"
+            text.contains("not one the server is permitted to use"),
+            "the finding is given: {text}"
         );
         assert!(
             r.app.setup_targets().is_some(),
@@ -10273,9 +10470,9 @@ mod tests {
         r.app.on_key(key('R'));
         r.app.on_key(key('y'));
         r.to_app
-            .send(FromWorker::AudioSetUp(Ok(
-                "/tmp/99-priel-reserve.conf".into()
-            )))
+            .send(FromWorker::AudioSetUp(Ok(vec![
+                "/tmp/99-priel-reserve.conf".into(),
+            ])))
             .expect("send");
         r.app.drain_worker();
         assert!(
@@ -10351,7 +10548,7 @@ mod tests {
         assert!(
             matches!(
                 reqs.as_slice(),
-                [ToWorker::SetUpAudio { allowed_hz }]
+                [ToWorker::SetUpAudio { allowed_hz, .. }]
                     if *allowed_hz == vec![44_100, 48_000, 88_200, 176_400]
             ),
             "the write carries the whole list"
@@ -10371,9 +10568,9 @@ mod tests {
         r.app.on_key(key('y'));
         let _ = requests(&r);
         r.to_app
-            .send(FromWorker::AudioSetUp(Ok(
+            .send(FromWorker::AudioSetUp(Ok(vec![
                 "/x/pipewire.conf.d/99-priel-rates.conf".into(),
-            )))
+            ])))
             .expect("send");
         r.app.drain_worker();
         assert!(matches!(
@@ -10407,7 +10604,9 @@ mod tests {
         r.app.on_key(key('A'));
         r.app.on_key(key('y'));
         r.to_app
-            .send(FromWorker::AudioSetUp(Ok("/x/99-priel-rates.conf".into())))
+            .send(FromWorker::AudioSetUp(Ok(vec![
+                "/x/99-priel-rates.conf".into(),
+            ])))
             .expect("send");
         r.app.drain_worker();
         let _ = requests(&r);
@@ -10457,7 +10656,9 @@ mod tests {
         r.app.on_key(key('A'));
         r.app.on_key(key('y'));
         r.to_app
-            .send(FromWorker::AudioSetUp(Ok("/x/99-priel-rates.conf".into())))
+            .send(FromWorker::AudioSetUp(Ok(vec![
+                "/x/99-priel-rates.conf".into(),
+            ])))
             .expect("send");
         r.app.drain_worker();
         r.app.on_key(key('r'));
@@ -10573,7 +10774,6 @@ mod tests {
         let gap = text.find("nothing on this path").expect("the admitted gap");
         let why = text.find("not permitted").expect("and what explains it");
         assert!(gap < why, "the answer follows the question: {text}");
-        assert!(text.contains("default.clock.allowed-rates"), "{text}");
     }
 
     #[test]
@@ -10720,24 +10920,37 @@ mod tests {
     }
 
     #[test]
-    fn a_device_the_server_holds_comes_with_what_it_takes_to_reserve_it() {
-        // Goal: the second half - the change, where it goes, and what is given
-        // up. The trade is not a footnote: reserving the card silences every
-        // other application on the machine, and someone who finds that out
-        // afterwards was misled.
+    fn a_device_the_server_holds_is_reported_and_offered_a_key_not_a_rule() {
+        // Goal: the section answers what has the device open, which is a
+        // reading. The rule that would take it back, the file it goes in and
+        // the trade it makes all belong to `[R]` and the preview behind it -
+        // where someone is deciding - rather than to a section they are reading
+        // to find out what is happening now.
         let r = playing_hires(chain_held_by_the_server(Some(
             "alsa_card.usb-Studio_DAC-00",
         )));
         let text = overlay_text(&r.app);
-        assert!(text.contains("wireplumber.conf.d"), "where: {text}");
-        assert!(text.contains("device.disabled = true"), "what: {text}");
         assert!(
-            text.contains("alsa_card.usb-Studio_DAC-00"),
-            "which card: {text}"
+            text.contains("sound server has this device open"),
+            "the finding: {text}"
+        );
+        assert!(!text.contains("wireplumber.conf.d"), "not where: {text}");
+        assert!(!text.contains("device.disabled = true"), "not what: {text}");
+        assert!(
+            !text.contains("alsa_card.usb-Studio_DAC-00"),
+            "the rule and the card it matches belong to [R] and its preview: {text}"
         );
         assert!(
-            text.contains("Nothing else on this machine"),
-            "what it costs: {text}"
+            !text.contains("Nothing else on this machine"),
+            "and so does what it costs, which is a warning about a change the \
+             reader has not asked to make yet: {text}"
+        );
+        assert!(
+            r.app
+                .graph_rows()
+                .iter()
+                .any(|row| row.kind == GraphRowKind::Action(KeyCode::Char('R'))),
+            "what is offered here is the key: {text}"
         );
         assert!(
             !text.contains("--exclusive"),

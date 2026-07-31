@@ -20,17 +20,26 @@
 //!
 //! These are the actions that reach outside priel's own files, and they are kept
 //! to the narrowest shape that can. **priel only ever writes files it is the
-//! sole author of** - [`RATES_CONF`] under the user's `pipewire.conf.d` and
-//! [`RESERVE_CONF`] under their `wireplumber.conf.d` - and never edits the sound
-//! server's own configuration or one the listener wrote. Dropping a file into
-//! those directories is how each is meant to be configured, so this is priel
-//! managing its own files, not priel editing another program's.
+//! sole author of** - [`RATES_CONF`] under the user's `pipewire.conf.d`,
+//! [`RESERVE_CONF`] and one [`device_rates_conf`] per output node under their
+//! `wireplumber.conf.d` - and never edits the sound server's own configuration
+//! or one the listener wrote. Dropping a file into those directories is how each
+//! is meant to be configured, so this is priel managing its own files, not priel
+//! editing another program's.
+//!
+//! The two rate files are two halves of one setup, and neither does the other's
+//! job. `default.clock.allowed-rates` is **one list for the whole graph** -
+//! `PipeWire` has one clock, so there is no per-device version of it - and it has
+//! to hold the union of every rate any device should run at. It only ever grows,
+//! because a rate priel did not add may be there for something else on the
+//! machine. [`device_rates_conf_text`] is what keeps that union from being
+//! applied to a DAC that cannot do it, by holding one node to its own rates.
 //!
 //! Every content here is a pure function of what it is given
-//! ([`rates_conf_text`], [`reserve_conf_text`]) and every command is a pure
-//! function that can be read without being run ([`restart_argv`],
-//! [`clear_pin_argv`], [`switch_argv`]) - so the preview a listener approves and
-//! what actually happens are computed the same way, once.
+//! ([`rates_conf_text`], [`reserve_conf_text`], [`device_rates_conf_text`]) and
+//! every command is a pure function that can be read without being run
+//! ([`restart_argv`], [`clear_pin_argv`], [`switch_argv`]) - so the preview a
+//! listener approves and what actually happens are computed the same way, once.
 //!
 //! The one change that is not a file is [`clear_rate_pin`]: `clock.force-rate`
 //! is live metadata rather than configuration, so it is set back to zero and
@@ -38,6 +47,7 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -74,21 +84,55 @@ pub fn desired_allowed_hz(permitted: &[u32], blocked_supported: &[u32]) -> Vec<u
 ///
 /// Opens with a line saying priel wrote it and that it is safe to delete, so
 /// anyone who finds the file knows what put it there and that removing it is
-/// harmless. The rates go on one line, spelled the way the server's own core
-/// object publishes them.
+/// harmless. The rates are spelled the way the server's own core object
+/// publishes them, and carried onto further lines once there are more than
+/// [`RATES_PER_LINE`] of them - see [`rate_list`].
 #[must_use]
 pub fn rates_conf_text(allowed_hz: &[u32]) -> String {
-    let rates = allowed_hz
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let rates = rate_list(allowed_hz, 4);
     format!(
         "# Written by priel: the sample rates your DAC supports, added to the\n\
          # sound server's permitted list so hi-res tracks play at their own rate\n\
          # rather than being resampled. Safe to delete; priel offers it again.\n\
-         context.properties = {{\n    default.clock.allowed-rates = [ {rates} ]\n}}\n"
+         context.properties = {{\n    default.clock.allowed-rates = {rates}\n}}\n"
     )
+}
+
+/// How many rates go on one line before the list is carried onto the next.
+///
+/// The same figure the report's own rate rows use, for the same reason: the
+/// preview shows these files whole and clips rather than wrapping, and the tail
+/// of a rate list is where the hi-res rates are.
+const RATES_PER_LINE: usize = 8;
+
+/// A rate list as a SPA-JSON array, on one line where it fits and carried onto
+/// further lines where it does not.
+///
+/// `indent` is how far the *property* is indented, so the wrapped form can put
+/// its rates one step further in and its closing bracket back under the opening
+/// one. Whitespace separates array elements in SPA-JSON, and a newline is
+/// whitespace, so both forms parse the same.
+///
+/// Ten rates is what a hi-res DAC advertises, and ten on one line ran twenty
+/// columns past the preview box. That is the case this whole feature is about,
+/// so it is the case the format is chosen for.
+fn rate_list(allowed_hz: &[u32], indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    if allowed_hz.len() <= RATES_PER_LINE {
+        let rates = allowed_hz
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!("[ {rates} ]");
+    }
+    let mut out = "[\n".to_string();
+    for row in allowed_hz.chunks(RATES_PER_LINE) {
+        let rates = row.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+        let _ = writeln!(out, "{pad}    {rates}");
+    }
+    let _ = write!(out, "{pad}]");
+    out
 }
 
 /// The directory priel's drop-in belongs in: the user's `pipewire.conf.d`.
@@ -236,6 +280,104 @@ pub fn write_reserve(dir: &Path, card_name: &str) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(RESERVE_CONF);
     std::fs::write(&path, reserve_conf_text(card_name))?;
+    Ok(path)
+}
+
+/// The drop-in that holds one output node to its own rates, and the third and
+/// last file priel writes.
+///
+/// **One file per node, keyed by the node's own name.** Switching DACs is
+/// routine, and a single shared file would mean reading back what priel wrote
+/// for the last one and merging - parse-and-merge machinery this module exists
+/// without, or a state file to regenerate from. A file per node keeps every
+/// rule independently authored and independently deletable, which is the same
+/// bargain [`RESERVE_CONF`] makes.
+///
+/// `99-` for the same reason as the other two: it sorts last, so what priel
+/// wrote wins over an earlier drop-in.
+#[must_use]
+pub fn device_rates_conf(node_name: &str) -> String {
+    // Anything a node name carries that a path should not. `node.name` is
+    // already conservative in practice, but it comes from a device the listener
+    // plugged in, and a name is not a place to find out otherwise.
+    let safe: String = node_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(NAME_MAX)
+        .collect();
+    format!("99-priel-rates-{safe}.conf")
+}
+
+/// How much of a node's name goes in the filename, so a long one cannot push the
+/// whole basename past what a filesystem accepts.
+const NAME_MAX: usize = 120;
+
+/// The contents of priel's per-device rates drop-in for one output node.
+///
+/// The other half of a "set up audio" pass, and the half that answers what the
+/// global list cannot: `default.clock.allowed-rates` is one list for the whole
+/// graph - `PipeWire` has one clock - so it has to hold the union of every rate
+/// any device should run at, and it only ever grows as DACs come and go. This is
+/// what stops that union being applied to a DAC that cannot do it.
+///
+/// `audio.allowed-rates` is a *node* property, so the rule matches `node.name`
+/// and not the card: a card has one node per profile, and only the one in use is
+/// being spoken for. It can only ever narrow - `alsa-pcm.c` clamps every entry
+/// to the hardware's own range - so this cannot claim a rate the device lacks.
+#[must_use]
+pub fn device_rates_conf_text(node_name: &str, allowed_hz: &[u32]) -> String {
+    let rates = rate_list(allowed_hz, 8);
+    // Broken across more lines than the reservation rule needs, because both of
+    // the long parts here are unbounded: a node name comes from a device the
+    // listener plugged in, and the rate list grows with what the DAC does. The
+    // preview shows this file whole before it is written, and a line that ran
+    // past the box would be a promise kept only for short names.
+    format!(
+        "# Written by priel: the rates this output actually supports, so the\n\
+         # sound server never drives it at one of the others in the permitted\n\
+         # list - which is one list shared by every device on this machine.\n\
+         # Safe to delete; priel offers it again.\n\
+         monitor.alsa.rules = [\n  \
+         {{\n    \
+         matches = [\n      \
+         {{ node.name = \"{node_name}\" }}\n    \
+         ]\n    \
+         actions = {{\n      \
+         update-props = {{\n        \
+         audio.allowed-rates = {rates}\n      \
+         }}\n    \
+         }}\n  \
+         }}\n\
+         ]\n"
+    )
+}
+
+/// Write priel's per-device rates drop-in for `node_name` into `dir`, and return
+/// the path written.
+///
+/// The session manager's directory ([`reserve_conf_dir`]) rather than the
+/// server's, because it is the session manager that applies node properties -
+/// the same reason the reservation rule lives there. `dir` is passed in and
+/// never resolved from a global here, so a test writes to a directory it made
+/// and never to a real home.
+///
+/// # Errors
+///
+/// The `std::io::Error` from creating the directory or writing the file.
+pub fn write_device_rates(
+    dir: &Path,
+    node_name: &str,
+    allowed_hz: &[u32],
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(device_rates_conf(node_name));
+    std::fs::write(&path, device_rates_conf_text(node_name, allowed_hz))?;
     Ok(path)
 }
 
@@ -442,6 +584,133 @@ mod tests {
         assert_eq!(path, dir.join(super::RESERVE_CONF));
         let body = std::fs::read_to_string(&path).expect("read back");
         assert!(body.contains("alsa_card.usb-x"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every rate a hi-res DAC of the kind priel exists for advertises. Ten of
+    /// them, which is the case that broke the one-line list.
+    const FULL: [u32; 10] = [
+        44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600, 768_000,
+    ];
+
+    #[test]
+    fn every_line_of_a_drop_in_fits_the_preview_that_has_to_show_it_whole() {
+        // Goal: nothing is written unseen, and the preview clips rather than
+        // wrapping - so a file whose lines run past the box breaks the one
+        // promise the preview makes. Both rate lists were one line long, which
+        // fits four rates and not the ten a hi-res DAC advertises: the very
+        // case "add every rate at once" is about. The node name is unbounded
+        // too, and comes from a device the listener plugged in.
+        //
+        // 80 columns: the overlay is 84 wide, two go to the border, and the
+        // content is drawn at an indent of two.
+        const BUDGET: usize = 80;
+        let files = [
+            rates_conf_text(&FULL),
+            super::device_rates_conf_text(
+                "alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0",
+                &FULL,
+            ),
+        ];
+        for text in &files {
+            for line in text.lines() {
+                assert!(
+                    line.chars().count() <= BUDGET,
+                    "{} columns of {BUDGET}: {line:?}",
+                    line.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrapped_rate_list_still_carries_every_rate() {
+        // Goal: the wrapping is a layout change and may not become a content
+        // change - the tail of a rate list is where the hi-res rates are, and
+        // losing one silently is worse than a line that ran off the screen.
+        let text = rates_conf_text(&FULL);
+        for hz in FULL {
+            assert!(text.contains(&hz.to_string()), "{hz} is missing: {text}");
+        }
+        let device = super::device_rates_conf_text("alsa_output.x", &FULL);
+        for hz in FULL {
+            assert!(
+                device.contains(&hz.to_string()),
+                "{hz} is missing: {device}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_per_device_rule_pins_one_node_to_its_own_rates() {
+        // Goal: the half of the setup that keeps a global list off a device
+        // that cannot do it. `audio.allowed-rates` is a *node* property, so the
+        // rule matches `node.name` and not the card - a card has one node per
+        // profile and only the one in use is being spoken for.
+        let text = super::device_rates_conf_text(
+            "alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0",
+            &[44_100, 48_000, 88_200, 96_000],
+        );
+        assert!(text.contains("monitor.alsa.rules"), "{text}");
+        assert!(
+            text.contains("node.name = \"alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0\""),
+            "matched exactly, not by pattern: {text}"
+        );
+        assert!(
+            text.contains("audio.allowed-rates = [ 44100 48000 88200 96000 ]"),
+            "the whole list on one line: {text}"
+        );
+        assert!(text.contains("priel"), "and says what wrote it: {text}");
+        assert!(
+            text.contains("Safe to delete"),
+            "because the file outlives the screen that explained it: {text}"
+        );
+    }
+
+    #[test]
+    fn each_node_gets_a_file_of_its_own_that_no_other_node_can_claim() {
+        // Goal: switching DACs is routine, and one file per node is what keeps
+        // setting up the second from disturbing the first - no reading back and
+        // merging a file priel wrote earlier, which is the machinery this
+        // module exists without. So the basename has to be derived from the
+        // node, safe to put on a filesystem, and never shared by two nodes.
+        let smsl = super::device_rates_conf("alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0");
+        let other =
+            super::device_rates_conf("alsa_output.usb-Generic_USB_Audio-00.HiFi__Speaker__sink");
+        assert_eq!(
+            smsl, "99-priel-rates-alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0.conf",
+            "the node's own name, so the file is recognisable in a directory"
+        );
+        assert_ne!(smsl, other, "two nodes never collide");
+        assert_eq!(
+            smsl,
+            super::device_rates_conf("alsa_output.usb-SMSL_SMSL_USB_AUDIO-00.pro-output-0"),
+            "and the same node is always the same file, so setting up twice \
+             rewrites one rather than leaving two"
+        );
+        assert!(
+            !super::device_rates_conf("a/b c:d\0e").contains(['/', ' ', ':', '\0']),
+            "nothing a node name carries reaches the path"
+        );
+    }
+
+    #[test]
+    fn writing_the_per_device_rule_creates_the_directory_and_the_file() {
+        // Goal: the same rule the other two writes keep - the bytes that land
+        // are the ones the preview showed, in a directory priel was told to
+        // write, which in a test is a temporary one it made and never a real
+        // home. The session manager's directory, because it applies node props.
+        let dir = std::env::temp_dir().join(format!("priel-devrates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path =
+            super::write_device_rates(&dir, "alsa_output.usb-x", &[44_100, 96_000]).expect("write");
+        assert_eq!(
+            path,
+            dir.join(super::device_rates_conf("alsa_output.usb-x"))
+        );
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert!(body.contains("44100 96000"), "{body}");
+        assert!(body.contains("alsa_output.usb-x"), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
