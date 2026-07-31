@@ -693,17 +693,16 @@ pub enum RateAdvice {
     Unsupported { ceiling_hz: u32 },
 }
 
-/// The longest line the audio-graph overlay can draw without losing its tail.
-///
-/// The box is 76 columns at most, two of which are the border and two the
-/// indent the overlay adds to prose.
-const ADVICE_WIDTH: usize = 70;
-
-/// How many rates go on one line once the list stops fitting on one.
-const RATES_PER_LINE: usize = 6;
-
 impl RateAdvice {
     /// What to tell the reader, one line per row of the overlay.
+    ///
+    /// **The finding, never the fix.** These used to carry the drop-in to write
+    /// and the command to run, from back when reading them out was the only way
+    /// to act on them. The report now has an Actions section with a key for each
+    /// (`[A]` writes the rates, `[P]` clears the pin), and the preview behind
+    /// that key shows the exact bytes before anything lands. Printing the config
+    /// here as well was two places saying the same thing, in the middle of a
+    /// section a reader is trying to read a *reading* out of.
     ///
     /// Empty where there is nothing to advise. Lines rather than a paragraph
     /// because the overlay draws one row per line and cannot rewrap without its
@@ -713,31 +712,12 @@ impl RateAdvice {
     pub fn lines(&self) -> Vec<String> {
         match self {
             Self::NoTrack | Self::Unknown | Self::Permitted => Vec::new(),
-            Self::Missing { proposed_hz } => {
-                let mut out = vec![
-                    "This rate is not one the server is permitted to use.".to_string(),
-                    // The file priel writes itself, named from the one constant,
-                    // so the change made by hand and the change made by the key
-                    // land in the same place. Naming a different file taught the
-                    // reader to write a second drop-in that the first would then
-                    // silently override: the server takes the last value of the
-                    // property, not the union of them.
-                    format!(
-                        "Put this in ~/.config/pipewire/pipewire.conf.d/{}:",
-                        crate::setup::RATES_CONF
-                    ),
-                    "  context.properties = {".to_string(),
-                ];
-                out.extend(allowed_rates_lines(proposed_hz));
-                out.push("  }".to_string());
-                out.push("Restart the sound server for it to take effect.".to_string());
-                out
+            Self::Missing { .. } => {
+                vec!["This rate is not one the server is permitted to use.".to_string()]
             }
-            Self::Pinned { at_hz } => vec![
-                format!("The server is pinned to {at_hz} Hz, whatever the list allows."),
-                "Clear the pin with:".to_string(),
-                "  pw-metadata -n settings 0 clock.force-rate 0".to_string(),
-            ],
+            Self::Pinned { at_hz } => vec![format!(
+                "The server is pinned to {at_hz} Hz, whatever the list allows."
+            )],
             Self::Unsupported { ceiling_hz } => vec![
                 format!(
                     "Your DAC does not do this rate; it tops out at {}.",
@@ -756,35 +736,6 @@ fn khz(hz: u32) -> String {
     } else {
         format!("{:.1} kHz", f64::from(hz) / 1000.0)
     }
-}
-
-/// The setting itself, in lines that fit the box it is drawn in.
-///
-/// A ten-rate list runs well past the overlay, and the renderer clips rather
-/// than wrapping - which would leave a configuration line that still looks
-/// copyable and is not. The server's own core object publishes the list across
-/// several lines, so the spread-out spelling is one it writes itself.
-fn allowed_rates_lines(rates_hz: &[u32]) -> Vec<String> {
-    let one = format!("    default.clock.allowed-rates = [ {} ]", spaced(rates_hz));
-    if one.chars().count() <= ADVICE_WIDTH {
-        return vec![one];
-    }
-    let mut out = vec!["    default.clock.allowed-rates = [".to_string()];
-    out.extend(
-        rates_hz
-            .chunks(RATES_PER_LINE)
-            .map(|chunk| format!("      {}", spaced(chunk))),
-    );
-    out.push("    ]".to_string());
-    out
-}
-
-fn spaced(rates_hz: &[u32]) -> String {
-    rates_hz
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// What has the output device open.
@@ -849,13 +800,18 @@ pub struct HeldDevice {
 }
 
 impl DeviceHolder {
-    /// What it would take to hand the device over, one line per row.
+    /// What holds the device, one line per row.
     ///
-    /// Empty wherever there is nothing to hand over or nothing to name. The
-    /// advice is about freeing the card *from the server*, which is a change to
-    /// the server's own configuration; asking priel to take a free card is a
-    /// separate thing that already has a flag and a toggle, and repeating it
-    /// here would teach the reader that this section restates what they know.
+    /// **The finding, never the fix**, for the reason
+    /// [`RateAdvice::lines`] gives: `[R]` in the Actions section reserves the
+    /// card and its preview shows the rule before it lands, so the rule printed
+    /// here as well was a second copy in the middle of a reading. What it costs
+    /// went with it - that belongs beside the key that does it, where a listener
+    /// is deciding, not in a section describing what already is.
+    ///
+    /// The one line left is the admission: where the dump does not name the card
+    /// there is no action to offer, and a section that simply went quiet would
+    /// look like a device with nothing wrong.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let Self::Server(held) = self else {
@@ -865,39 +821,12 @@ impl DeviceHolder {
             "The sound server has this device open and mixes everything on".to_string(),
             "the machine into it.".to_string(),
         ];
-        let Some(card_name) = held.card_name.as_deref() else {
-            out.push("The graph does not name the card behind it, so there is no".to_string());
-            out.push("rule to reserve here.".to_string());
-            return out;
-        };
-        out.push("To reserve the card, stop the server from claiming it. Put".to_string());
-        out.push("this in ~/.config/wireplumber/wireplumber.conf.d/51-reserve.conf:".to_string());
-        out.extend(reserve_lines(card_name));
-        out.push("Restart the sound server for it to take effect.".to_string());
-        out.push("Nothing else on this machine will be able to play through this".to_string());
-        out.push("device while that rule is in place.".to_string());
+        if held.card_name.is_none() {
+            out.push("The graph does not name the card behind it, so priel".to_string());
+            out.push("cannot offer to reserve it.".to_string());
+        }
         out
     }
-}
-
-/// The rule that stops the sound server claiming one card.
-///
-/// Spread over lines rather than written as the one-liner it could be: the card
-/// name is the longest thing in the overlay and the renderer clips instead of
-/// wrapping, so the compact spelling would lose its tail on exactly the cards
-/// with the longest names. This layout leaves the name over forty columns, which
-/// is more than the bus-derived names ALSA builds have ever needed.
-fn reserve_lines(card_name: &str) -> Vec<String> {
-    vec![
-        "  monitor.alsa.rules = [".to_string(),
-        "    {".to_string(),
-        "      matches = [".to_string(),
-        format!("        {{ device.name = \"{card_name}\" }}"),
-        "      ]".to_string(),
-        "      actions = { update-props = { device.disabled = true } }".to_string(),
-        "    }".to_string(),
-        "  ]".to_string(),
-    ]
 }
 
 /// The track as the decoder produced it, which every node is compared against.
@@ -2783,17 +2712,17 @@ mod tests {
     }
 
     #[test]
-    fn the_advice_names_the_file_priel_writes_itself() {
-        // Goal: the prose and the key have to land in the same place. They named
-        // two different drop-ins, so a reader who followed the words wrote one
-        // file while the offer wrote another - and the server takes the last
-        // value of the property rather than the union of them, so whichever
-        // sorted later silently won and the other looked ignored.
+    fn the_advice_names_no_file_at_all() {
+        // Goal: the prose and the key used to name two different drop-ins, and
+        // whichever sorted later silently won. There is now one place a file is
+        // named - the preview behind `[A]`, built from the same constant the
+        // writer uses - so the two cannot come apart again.
         let text = clock(Some(&[48_000]), Some(48_000))
             .advise(44_100, &[])
             .lines()
             .join("\n");
-        assert!(text.contains(crate::setup::RATES_CONF), "{text}");
+        assert!(!text.contains(crate::setup::RATES_CONF), "{text}");
+        assert!(!text.contains("conf.d"), "{text}");
     }
 
     #[test]
@@ -2966,81 +2895,75 @@ mod tests {
     }
 
     #[test]
-    fn the_change_is_quoted_whole_with_where_it_goes_and_that_it_needs_a_restart() {
-        // Goal: the three things that make the advice actionable rather than
-        // merely correct - the exact text, the file it belongs in, and the fact
-        // that the server has to be restarted before any of it applies.
+    fn the_advice_states_the_finding_and_leaves_the_fix_to_the_action() {
+        // Goal: this used to quote the whole drop-in, the file it goes in and
+        // the restart it needs, from back when reading it out was the only way
+        // to act on it. `[A]` in the report's Actions section writes exactly
+        // that file now, and its preview shows the bytes before they land - so
+        // the config here was a second copy, sitting in the middle of a section
+        // a reader is trying to get a *reading* out of.
         let advice = ClockRates {
             allowed_hz: Some(vec![48_000]),
             current_hz: Some(48_000),
             forced_hz: None,
         }
         .advise(44_100, &[]);
-        let lines = advice.lines();
-        let text = lines.join("\n");
+        let text = advice.lines().join("\n");
         assert!(
-            text.contains("default.clock.allowed-rates = [ 44100 48000 ]"),
-            "the whole setting, copyable: {text}"
+            text.contains("not one the server is permitted to use"),
+            "the finding stays: {text}"
         );
         assert!(
-            text.contains("context.properties = {"),
-            "and the section it has to sit in, or pasting it does nothing: {text}"
+            !text.contains("context.properties") && !text.contains("allowed-rates"),
+            "and the config goes: {text}"
         );
+        assert!(!text.contains("conf.d"), "including where it goes: {text}");
         assert!(
-            text.contains("~/.config/pipewire/pipewire.conf.d/"),
-            "which file it goes in: {text}"
-        );
-        assert!(
-            text.to_lowercase().contains("restart"),
-            "and that it takes a restart: {text}"
+            !text.to_lowercase().contains("restart"),
+            "which the action's own flow promises: {text}"
         );
     }
 
     #[test]
-    fn a_pinned_server_is_told_to_clear_the_pin_rather_than_to_extend_the_list() {
-        // Goal: the wrong-explanation case. `clock.force-rate` is set at
-        // runtime and has no spelling in the configuration file, so advising a
-        // file edit here would be a change that cannot work.
-        let lines = pinned_at(48_000, Some(&[44_100, 48_000]))
+    fn a_pinned_server_is_reported_as_pinned_and_not_as_a_list_to_extend() {
+        // Goal: the wrong-explanation case. `clock.force-rate` holds the graph
+        // whatever the permitted list says, so a reader sent to that list would
+        // change a setting the server has stopped consulting. `[P]` clears the
+        // pin; this only has to say that there is one.
+        let text = pinned_at(48_000, Some(&[44_100, 48_000]))
             .advise(44_100, &[])
-            .lines();
-        let text = lines.join("\n");
-        assert!(text.contains("clock.force-rate"), "names the pin: {text}");
+            .lines()
+            .join("\n");
+        assert!(text.contains("pinned"), "names the pin: {text}");
         assert!(
             !text.contains("allowed-rates"),
             "and does not send the reader to the list: {text}"
         );
         assert!(
-            !text.to_lowercase().contains("restart"),
-            "clearing it applies at once: {text}"
+            !text.contains("pw-metadata"),
+            "the command belongs to the key that runs it: {text}"
         );
     }
 
     #[test]
-    fn every_line_of_advice_fits_the_box_it_is_drawn_in() {
-        // Goal: the overlay draws one row per line and does not rewrap, so a
-        // line longer than the box loses its tail - and a configuration line
-        // with its tail clipped is worse than no advice at all, because it
-        // still looks like something that can be copied.
+    fn the_advice_is_a_sentence_rather_than_a_list_of_rates() {
+        // Goal: what is left once the drop-in moved to the action. The rate
+        // list was the only part that needed wrapping to fit the box, and the
+        // proposal it came from is still carried on the variant for `[A]` to
+        // write - it just is not read out here any more.
         let long = [
             44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600,
         ];
         let advice = clock(Some(&long), Some(48_000)).advise(768_000, &[]);
+        assert!(
+            matches!(&advice, RateAdvice::Missing { proposed_hz } if proposed_hz.contains(&768_000)),
+            "the proposal is still there for the action to write: {advice:?}"
+        );
         let lines = advice.lines();
+        assert_eq!(lines.len(), 1, "one sentence: {lines:?}");
         for line in &lines {
             assert!(line.chars().count() <= 70, "too long to draw: {line}");
         }
-        let text = lines.join("\n");
-        for rate in long.iter().chain(std::iter::once(&768_000)) {
-            assert!(
-                text.contains(&rate.to_string()),
-                "{rate} was dropped from the wrapped list: {text}"
-            );
-        }
-        assert!(
-            text.contains("default.clock.allowed-rates = ["),
-            "still the same setting, just spread over lines: {text}"
-        );
     }
 
     // ---- what has the output device open ----
@@ -3120,30 +3043,25 @@ mod tests {
     }
 
     #[test]
-    fn reserving_the_card_names_the_card_the_file_and_what_it_costs() {
-        // Goal: the second half of the question - what it would take to hand
-        // the device over. All three parts have to be there: the change, the
-        // file it goes in, and the thing that is given up by making it.
+    fn the_holder_is_reported_and_the_rule_is_left_to_the_action() {
+        // Goal: the section answers "what has this device open", which is a
+        // reading. What it would take to get it back is `[R]`, whose preview
+        // names the card, shows the rule and says in red what it costs - so
+        // printing all three here as well put the loudest warning in the report
+        // on a change the reader had not asked to make.
         let text = path_of(DUMP, PID).holder.lines().join("\n");
         assert!(
-            text.contains("wireplumber.conf.d"),
-            "the file the rule goes in: {text}"
+            text.contains("sound server has this device open"),
+            "the finding: {text}"
         );
         assert!(
-            text.contains("alsa_card.usb-SMSL_SMSL_USB_AUDIO-00"),
-            "the card the rule matches: {text}"
+            !text.contains("device.disabled") && !text.contains("monitor.alsa.rules"),
+            "and not the rule: {text}"
         );
+        assert!(!text.contains("conf.d"), "nor where it goes: {text}");
         assert!(
-            text.contains("device.disabled = true"),
-            "the change itself: {text}"
-        );
-        assert!(
-            text.to_lowercase().contains("restart"),
-            "a rule in a file does nothing until the server is restarted: {text}"
-        );
-        assert!(
-            text.contains("Nothing else on this machine"),
-            "what is given up: {text}"
+            !text.contains("Nothing else on this machine"),
+            "nor what it costs, which belongs beside the key: {text}"
         );
     }
 
@@ -3194,26 +3112,20 @@ mod tests {
     }
 
     #[test]
-    fn every_line_of_the_reservation_advice_fits_the_box_it_is_drawn_in() {
-        // Goal: the same rule the rate advice follows. A configuration line
-        // with its tail clipped still looks copyable and is not, and a card
-        // name is the longest thing in this one.
+    fn the_holder_section_stays_inside_the_box() {
+        // Goal: the overlay draws one row per line and clips rather than
+        // wrapping. The card name was the longest thing here and has gone with
+        // the rule, but the sentences are still hand-wrapped and still have to
+        // fit.
         let held = DeviceHolder::Server(HeldDevice {
             sink: "Some Interface".to_string(),
             opened_by: Some("wireplumber".to_string()),
             pcm: Some("hw:3,0".to_string()),
             card_name: Some("alsa_card.usb-Example_Audio_Interface-00".to_string()),
         });
-        let lines = held.lines();
-        for line in &lines {
+        for line in &held.lines() {
             assert!(line.chars().count() <= 70, "too long to draw: {line}");
         }
-        assert!(
-            lines
-                .join("\n")
-                .contains("alsa_card.usb-Example_Audio_Interface-00"),
-            "the name survived the layout: {lines:?}"
-        );
     }
 
     // ---- the sink's own volume ----

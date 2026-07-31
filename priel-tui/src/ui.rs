@@ -5927,7 +5927,7 @@ mod tests {
     }
 
     #[test]
-    fn the_configuration_change_reaches_the_screen_whole() {
+    fn the_clock_section_reports_and_leaves_the_setting_to_the_key() {
         // Goal: the overlay clips rather than wrapping, and a setting whose
         // tail is clipped is worse than no advice at all - it still looks like
         // something that can be copied. Ten permitted rates is a real machine's
@@ -5965,15 +5965,27 @@ mod tests {
             out.contains("768 kHz"),
             "the readout carries onto a second row rather than losing its tail: {out}"
         );
-        assert!(out.contains("default.clock.allowed-rates = ["), "{out}");
-        assert!(out.contains("352800"), "the rate being added: {out}");
-        assert!(out.contains("768000"), "and the tail of the list: {out}");
-        assert!(out.contains("pipewire.conf.d"), "where it goes: {out}");
-        assert!(out.contains("Restart the sound server"), "{out}");
+        assert!(
+            !out.contains("default.clock.allowed-rates"),
+            "the setting itself moved to [A] and the preview behind it, so the \
+             report reads as a reading rather than as a config file: {out}"
+        );
+        assert!(
+            !out.contains("pipewire.conf.d"),
+            "and so did the path: {out}"
+        );
+        assert!(
+            !out.contains("Restart the sound server"),
+            "and the restart, which the action's own flow promises: {out}"
+        );
+        assert!(
+            out.contains("[A] set up audio"),
+            "what is here is the key: {out}"
+        );
     }
 
     #[test]
-    fn the_reservation_rule_reaches_the_screen_whole() {
+    fn the_holder_section_reports_and_leaves_the_rule_to_the_key() {
         // Goal: the same hazard the rate advice has. The ownership section is
         // the last thing in a box sized to its content, so it is the first
         // thing lost when anything above it grows - and a rule with its tail
@@ -6001,17 +6013,21 @@ mod tests {
         );
         assert!(out.contains("hw:2,0"), "which device: {out}");
         assert!(
-            out.contains("wireplumber.conf.d"),
-            "where the rule goes: {out}"
+            !out.contains("wireplumber.conf.d"),
+            "the rule and where it goes moved to [R] and the preview behind it: {out}"
         );
         assert!(
-            out.contains("alsa_card.usb-Studio_DAC-00"),
-            "the card name survives the box: {out}"
+            !out.contains("device.disabled = true"),
+            "including the change itself: {out}"
         );
-        assert!(out.contains("device.disabled = true"), "the change: {out}");
         assert!(
-            out.contains("Nothing else on this machine"),
-            "and what it costs: {out}"
+            !out.contains("Nothing else on this machine"),
+            "and what it costs, which belongs beside the key that does it \
+             rather than in a section describing what already is: {out}"
+        );
+        assert!(
+            out.contains("[R] reserve the device"),
+            "what is here is the key: {out}"
         );
     }
 

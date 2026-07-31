@@ -9955,14 +9955,19 @@ mod tests {
             "drawn the colour the badge uses for the same finding: {text}"
         );
         assert!(
-            text.contains("default.clock.allowed-rates = [ 44100 48000 ]"),
-            "the whole setting, copyable: {text}"
+            !text.contains("default.clock.allowed-rates"),
+            "the setting itself belongs to [A] and its preview, not to a \
+             section a reader is getting a reading out of: {text}"
         );
         assert!(
-            text.contains("~/.config/pipewire/pipewire.conf.d/"),
-            "and where it goes: {text}"
+            rows.iter()
+                .any(|row| row.kind == GraphRowKind::Action(KeyCode::Char('A'))),
+            "and the key that writes it is offered: {text}"
         );
-        assert!(text.contains("Restart the sound server"), "{text}");
+        assert!(
+            !text.contains("Restart the sound server"),
+            "the restart is promised by the flow behind the key: {text}"
+        );
     }
 
     #[test]
@@ -10244,8 +10249,8 @@ mod tests {
         );
         let text = overlay_text(&r.app);
         assert!(
-            text.contains("allowed-rates"),
-            "the advice is given: {text}"
+            text.contains("not one the server is permitted to use"),
+            "the finding is given: {text}"
         );
         assert!(
             r.app.setup_targets().is_some(),
@@ -10697,7 +10702,6 @@ mod tests {
         let gap = text.find("nothing on this path").expect("the admitted gap");
         let why = text.find("not permitted").expect("and what explains it");
         assert!(gap < why, "the answer follows the question: {text}");
-        assert!(text.contains("default.clock.allowed-rates"), "{text}");
     }
 
     #[test]
@@ -10844,24 +10848,37 @@ mod tests {
     }
 
     #[test]
-    fn a_device_the_server_holds_comes_with_what_it_takes_to_reserve_it() {
-        // Goal: the second half - the change, where it goes, and what is given
-        // up. The trade is not a footnote: reserving the card silences every
-        // other application on the machine, and someone who finds that out
-        // afterwards was misled.
+    fn a_device_the_server_holds_is_reported_and_offered_a_key_not_a_rule() {
+        // Goal: the section answers what has the device open, which is a
+        // reading. The rule that would take it back, the file it goes in and
+        // the trade it makes all belong to `[R]` and the preview behind it -
+        // where someone is deciding - rather than to a section they are reading
+        // to find out what is happening now.
         let r = playing_hires(chain_held_by_the_server(Some(
             "alsa_card.usb-Studio_DAC-00",
         )));
         let text = overlay_text(&r.app);
-        assert!(text.contains("wireplumber.conf.d"), "where: {text}");
-        assert!(text.contains("device.disabled = true"), "what: {text}");
         assert!(
-            text.contains("alsa_card.usb-Studio_DAC-00"),
-            "which card: {text}"
+            text.contains("sound server has this device open"),
+            "the finding: {text}"
+        );
+        assert!(!text.contains("wireplumber.conf.d"), "not where: {text}");
+        assert!(!text.contains("device.disabled = true"), "not what: {text}");
+        assert!(
+            !text.contains("alsa_card.usb-Studio_DAC-00"),
+            "the rule and the card it matches belong to [R] and its preview: {text}"
         );
         assert!(
-            text.contains("Nothing else on this machine"),
-            "what it costs: {text}"
+            !text.contains("Nothing else on this machine"),
+            "and so does what it costs, which is a warning about a change the \
+             reader has not asked to make yet: {text}"
+        );
+        assert!(
+            r.app
+                .graph_rows()
+                .iter()
+                .any(|row| row.kind == GraphRowKind::Action(KeyCode::Char('R'))),
+            "what is offered here is the key: {text}"
         );
         assert!(
             !text.contains("--exclusive"),
