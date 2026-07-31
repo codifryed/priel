@@ -37,13 +37,14 @@ mod art;
 mod bus;
 mod cache;
 mod cli;
+mod graphics;
 mod logging;
 mod settings;
 mod theme;
 mod ui;
 mod worker;
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write as _};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -242,7 +243,23 @@ fn session(
         if args.update_check(remembered.update_check) {
             app.check_for_updates();
         }
-        let outcome = run(&mut terminal, &mut app, &mut TerminalEvents);
+        // Which picture protocol this terminal speaks, settled once. `None` is
+        // every terminal that takes none, and is the half-block path that has
+        // always been there - so being wrong here costs a photograph and
+        // nothing else.
+        app.cover_protocol = graphics::detect(&graphics::Env::from_process());
+        if let Some(protocol) = app.cover_protocol {
+            log::info!("cover pictures: {protocol:?}");
+        }
+        let mut pictures = io::stdout();
+        let outcome = run(&mut terminal, &mut app, &mut TerminalEvents, &mut pictures);
+        // Whatever is on screen goes with us. A protocol that holds pictures
+        // outside the cell grid keeps drawing one after priel has gone, and
+        // leaving a cover over the shell that comes back is rude.
+        if let Some(payload) = app.cover_payload() {
+            let _ = pictures.write_all(&graphics::clear(payload));
+            let _ = pictures.flush();
+        }
         if let Err(e) = settings::save(settings_path, app.chosen()) {
             not_saved = Some(e);
         }
@@ -332,6 +349,7 @@ fn run<B: ratatui::backend::Backend, E: EventSource>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     events: &mut E,
+    pictures: &mut dyn io::Write,
 ) -> Result<()> {
     app.start();
     // Draw only when something actually changed. priel runs for hours, and an
@@ -341,6 +359,11 @@ fn run<B: ratatui::backend::Backend, E: EventSource>(
     loop {
         if needs_draw {
             terminal.draw(|f| ui::render(f, app))?;
+            // After the draw and its flush, never inside it: the picture
+            // protocols write escape sequences straight to the terminal, and
+            // ratatui owns the frame until then. `place_cover` writes nothing on
+            // the frames - almost all of them - where the cover has not moved.
+            place_cover(app, pictures)?;
         }
 
         match events.next(Duration::from_millis(100))? {
@@ -357,6 +380,58 @@ fn run<B: ratatui::backend::Backend, E: EventSource>(
             break;
         }
     }
+    Ok(())
+}
+
+/// Put the cover picture where the frame just said it goes, or take it off.
+///
+/// Writes nothing at all unless the placement actually changed - see
+/// [`App::cover_paint`], whose common answer by a very long way is `Nothing`.
+/// That is what keeps a photograph on screen for the length of a track without
+/// costing a byte a frame.
+fn place_cover(app: &mut App, out: &mut dyn io::Write) -> Result<()> {
+    use crate::app::CoverPaint;
+    let paint = app.cover_paint();
+    if paint == CoverPaint::Nothing {
+        return Ok(());
+    }
+    let Some(payload) = app.cover_payload().cloned() else {
+        return Ok(());
+    };
+    let mut bytes = Vec::new();
+    let placed = match paint {
+        CoverPaint::Nothing => None,
+        CoverPaint::Clear => {
+            bytes.extend_from_slice(&graphics::clear(&payload));
+            None
+        }
+        CoverPaint::Replace { rect } => {
+            bytes.extend_from_slice(&graphics::clear(&payload));
+            bytes.extend_from_slice(&graphics::place(
+                &payload,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                false,
+            ));
+            Some(rect)
+        }
+        CoverPaint::Show { rect, transmitted } => {
+            bytes.extend_from_slice(&graphics::place(
+                &payload,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                transmitted,
+            ));
+            Some(rect)
+        }
+    };
+    out.write_all(&bytes)?;
+    out.flush()?;
+    app.cover_placed(placed);
     Ok(())
 }
 
@@ -391,7 +466,7 @@ mod tests {
         let (mut app, _to, _from) = App::rigged();
         let mut term = Terminal::new(TestBackend::new(80, 12)).expect("backend");
         let mut events = Scripted(script.into_iter());
-        run(&mut term, &mut app, &mut events).expect("loop");
+        run(&mut term, &mut app, &mut events, &mut Vec::new()).expect("loop");
         app
     }
 

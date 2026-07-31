@@ -275,6 +275,11 @@ pub enum ToWorker {
     FetchCover {
         track_id: u64,
         cover_id: String,
+        /// The picture protocol this terminal speaks, so the cover is encoded
+        /// for it *here* rather than on the render thread: base64 of a megabyte
+        /// and sixel's palette quantisation are not frame work. `None` on a
+        /// terminal that takes no picture, and then only the pixels come back.
+        protocol: Option<crate::graphics::Protocol>,
     },
 }
 
@@ -509,6 +514,11 @@ pub enum FromWorker {
     Cover {
         track_id: u64,
         image: crate::art::Image,
+        /// The same cover, encoded for the terminal's picture protocol. `None`
+        /// where there is no protocol or the encode did not work out, and then
+        /// the half blocks draw the pixels beside it - a cover that will not
+        /// encode is a mosaic rather than a banner.
+        payload: Option<crate::graphics::Payload>,
     },
     /// A request failed. `task` says which one, so the view that was waiting can
     /// stop; `fault` is what the interface branches on; `detail` is the sentence
@@ -985,10 +995,19 @@ fn serve(
         // body that was not a picture - because an absent cover is a state the
         // box already draws, and an error banner over the now-playing row would
         // be louder than a missing picture is worth.
-        ToWorker::FetchCover { track_id, cover_id } => {
+        ToWorker::FetchCover {
+            track_id,
+            cover_id,
+            protocol,
+        } => {
             let bytes = cover_bytes(client, &cover_id, cache_cap)?;
             let image = crate::art::decode_jpeg(&bytes)?;
-            FromWorker::Cover { track_id, image }
+            let payload = protocol.and_then(|p| encode_cover(p, &image, &bytes));
+            FromWorker::Cover {
+                track_id,
+                image,
+                payload,
+            }
         }
     })
 }
@@ -1059,6 +1078,46 @@ const COVER_FETCH_CAP: usize = 4 * 1024 * 1024;
 /// cache directory, or a write that fails, just falls back to fetching, exactly
 /// as before the cache existed. `None` (the whole thing is `?`-chained) is the
 /// same silence the caller already treats as "no cover to draw".
+/// The cover, encoded for one terminal picture protocol.
+///
+/// Here rather than on the render thread, which is the whole reason the worker
+/// is handed the protocol at all. Each arm reuses what priel already holds: the
+/// decoded pixels for kitty, whose payload is raw RGB, and the service's own
+/// JPEG for iTerm2, whose payload is a picture file.
+///
+/// The kitty id is fixed. priel places one cover at a time and deletes the last
+/// before putting up the next, so a second id would only be a second thing to
+/// keep track of.
+fn encode_cover(
+    protocol: crate::graphics::Protocol,
+    image: &crate::art::Image,
+    jpeg: &[u8],
+) -> Option<crate::graphics::Payload> {
+    use crate::graphics::{Payload, Protocol};
+    match protocol {
+        Protocol::Kitty => {
+            let transmit = crate::graphics::kitty::transmit(COVER_IMAGE_ID, image);
+            (!transmit.is_empty()).then_some(Payload::Kitty {
+                id: COVER_IMAGE_ID,
+                transmit,
+            })
+        }
+        Protocol::ITerm2 => (!jpeg.is_empty()).then(|| Payload::ITerm2 {
+            base64_jpeg: crate::graphics::iterm2::encode(jpeg),
+        }),
+        Protocol::Sixel => {
+            crate::graphics::sixel::encode(image).map(|bytes| Payload::Sixel { bytes })
+        }
+    }
+}
+
+/// The id kitty holds priel's cover against.
+///
+/// One, fixed: priel shows one cover at a time and takes the last one off before
+/// putting up the next, so there is never a second picture for a second id to
+/// tell apart.
+const COVER_IMAGE_ID: u32 = 1;
+
 fn cover_bytes(client: &mut Client, cover_id: &str, cache_cap: u64) -> Option<Vec<u8>> {
     let dir = crate::cache::cover_dir();
     cached_or_fetch(dir.as_deref(), cover_id, cache_cap, || {

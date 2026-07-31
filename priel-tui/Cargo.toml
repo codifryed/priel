@@ -42,6 +42,15 @@ unicode-width.workspace = true
 # workspace manifest and `docs/cover-art.md`.
 zune-jpeg.workspace = true
 zune-core.workspace = true
+# Already in the tree via priel-core, which decodes stream manifests with it, so
+# naming it here costs no new crate. Two of the three terminal picture protocols
+# want their payload base64'd - see `graphics`.
+base64.workspace = true
+# One crate with no dependencies of its own, and the only encoder here: sixel
+# is a palette format, so a cover has to be quantised to at most 256 colours.
+# It is what buys foot and xterm, which take no other picture protocol. The two
+# other protocols cost nothing - see `graphics`.
+icy_sixel = "0.1"
 ratatui = "0.29"
 crossterm = "0.28"
 rand = "0.8"

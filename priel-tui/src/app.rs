@@ -541,6 +541,25 @@ struct RatesTarget {
     device: Option<DeviceRates>,
 }
 
+/// What the terminal has to be told about the cover picture.
+///
+/// Four answers, and the first one is the common case by a very long way - see
+/// [`App::cover_paint`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CoverPaint {
+    /// The screen already says what it should. Write nothing.
+    Nothing,
+    /// Put the picture at `rect`. `transmitted` says the terminal already holds
+    /// the bytes and needs only to be told where to draw them, which is a saving
+    /// only kitty's protocol can take.
+    Show { rect: Rect, transmitted: bool },
+    /// A different track's picture is on screen: take it off, then put this one
+    /// at `rect`.
+    Replace { rect: Rect },
+    /// There should be no picture. Take off whatever is there.
+    Clear,
+}
+
 /// Why the "set up audio" offer is being made, which decides what the preview
 /// may say.
 ///
@@ -1321,6 +1340,29 @@ pub struct App {
     /// cover that arrives after the track changed is dropped rather than drawn
     /// over the one now playing.
     pub cover: Option<(u64, crate::art::Image)>,
+    /// The cover encoded for this terminal's picture protocol, keyed by track
+    /// like [`Self::cover`] and for the same reason.
+    ///
+    /// Built on the worker, never here: base64 of a megabyte and sixel's palette
+    /// quantisation are not work for the thread that draws frames. `None` on a
+    /// terminal that takes no picture, which is the half-block path.
+    pub cover_payload: Option<(u64, crate::graphics::Payload)>,
+    /// Where the renderer painted the cover, or a zero rect where it painted
+    /// none. Written by the renderer every frame, exactly as `list_inner` and
+    /// `queue_inner` are, and the only thing that says where a picture goes.
+    pub cover_rect: Rect,
+    /// The picture protocol this terminal speaks, settled once at startup.
+    ///
+    /// `None` is every terminal that takes no picture, and is what the whole
+    /// half-block path already handles - so this being wrong costs a listener a
+    /// photograph rather than anything worse.
+    pub cover_protocol: Option<crate::graphics::Protocol>,
+    /// The picture believed to be on screen, and where it was put.
+    ///
+    /// The whole point of holding it: comparing what is wanted against what is
+    /// already there is what lets almost every frame write nothing at all. See
+    /// [`App::cover_paint`].
+    placed: Option<(u64, Rect)>,
     pub progress_rect: Rect,
     /// Clickable regions, rebuilt by the renderer every frame.
     pub hits: Vec<(Rect, Hit)>,
@@ -1514,6 +1556,10 @@ impl App {
             queue_shown: true,
             cover_mode: CoverMode::Thumbnail,
             cover: None,
+            cover_payload: None,
+            cover_rect: Rect::default(),
+            cover_protocol: None,
+            placed: None,
             progress_rect: Rect::default(),
             hits: Vec::new(),
             last_click: None,
@@ -2862,7 +2908,11 @@ impl App {
                 // The clock read at track start: hand it to the player, where the
                 // verdict falls back to it when there is no ALSA readout.
                 FromWorker::OutputClock(clock) => self.player.set_clock(clock),
-                FromWorker::Cover { track_id, image } => self.on_cover(track_id, image),
+                FromWorker::Cover {
+                    track_id,
+                    image,
+                    payload,
+                } => self.on_cover(track_id, image, payload),
                 FromWorker::UpdateAvailable(tag) => self.on_update_available(tag),
                 FromWorker::Failed {
                     task,
@@ -3436,6 +3486,74 @@ impl App {
     #[must_use]
     pub fn cover_on(&self) -> bool {
         !matches!(self.cover_mode, CoverMode::Hidden)
+    }
+
+    /// What the terminal has to be told about the cover picture, this frame.
+    ///
+    /// **[`CoverPaint::Nothing`] is the answer almost every time, and that is
+    /// the point.** The cover changes when the track does and hardly ever
+    /// otherwise, so a picture put on screen once should stay there for the
+    /// thousands of frames that follow without a byte being written for it.
+    /// ratatui repaints only the cells that changed, so a placement survives
+    /// every frame that does not touch its rect - and this decides the frames
+    /// that do.
+    ///
+    /// Pure over the state it reads, and settled here rather than in the
+    /// renderer, because the renderer cannot write escape sequences: ratatui
+    /// owns the frame. `run` asks this once the draw has flushed. Compare
+    /// [`App::decide`], which has this shape for the same reason.
+    ///
+    /// Asked after the renderer has published [`Self::cover_rect`], so a zero
+    /// rect is the honest reading of "no picture is wanted here". That one
+    /// reading covers all four ways the art leaves the screen: folded away with
+    /// `C`, a terminal too short for it, an overlay standing over it, and a
+    /// track with no art at all.
+    #[must_use]
+    pub fn cover_paint(&self) -> CoverPaint {
+        let wanted = self
+            .now_playing
+            .as_ref()
+            .map(|t| t.id)
+            .filter(|_| self.cover_rect.width > 0 && self.cover_rect.height > 0)
+            .filter(|id| self.cover_payload.as_ref().is_some_and(|(p, _)| p == id));
+        match (wanted, self.placed) {
+            (None, None) => CoverPaint::Nothing,
+            (None, Some(_)) => CoverPaint::Clear,
+            (Some(_), None) => CoverPaint::Show {
+                rect: self.cover_rect,
+                transmitted: false,
+            },
+            // A different track: the one on screen goes before the new one
+            // arrives, or a terminal that holds pictures by id keeps both.
+            (Some(id), Some((was, _))) if was != id => CoverPaint::Replace {
+                rect: self.cover_rect,
+            },
+            (Some(_), Some((_, rect))) if rect == self.cover_rect => CoverPaint::Nothing,
+            // The same picture, somewhere else. The terminal already has the
+            // bytes, where the protocol lets it be told so.
+            (Some(_), Some(_)) => CoverPaint::Show {
+                rect: self.cover_rect,
+                transmitted: true,
+            },
+        }
+    }
+
+    /// Record what was just put on screen, so the next frame can decide to do
+    /// nothing. `None` means the screen now has no picture on it.
+    pub fn cover_placed(&mut self, at: Option<Rect>) {
+        self.placed = match (at, self.now_playing.as_ref()) {
+            (Some(rect), Some(track)) => Some((track.id, rect)),
+            _ => None,
+        };
+    }
+
+    /// The picture to put on screen, for the caller that writes it.
+    #[must_use]
+    pub fn cover_payload(&self) -> Option<&crate::graphics::Payload> {
+        let playing = self.now_playing.as_ref()?.id;
+        self.cover_payload
+            .as_ref()
+            .and_then(|(id, payload)| (*id == playing).then_some(payload))
     }
 
     /// Point the keyboard at a region, clamping the cursor it finds there.
@@ -4986,6 +5104,7 @@ impl App {
         let _ = self.worker.tx.send(ToWorker::FetchCover {
             track_id: track.id,
             cover_id: track.cover.clone(),
+            protocol: self.cover_protocol,
         });
     }
 
@@ -4998,9 +5117,18 @@ impl App {
     /// at draw time, so this is belt and braces - but storing a stale cover at
     /// all is worth avoiding, because it would sit in memory keyed to a track
     /// that will not come back.
-    fn on_cover(&mut self, track_id: u64, image: crate::art::Image) {
+    fn on_cover(
+        &mut self,
+        track_id: u64,
+        image: crate::art::Image,
+        payload: Option<crate::graphics::Payload>,
+    ) {
         if self.now_playing.as_ref().is_some_and(|t| t.id == track_id) {
             self.cover = Some((track_id, image));
+            // Kept even where the pixels are also kept: the half blocks are
+            // still what draws on a terminal that takes no picture, and are
+            // what the box falls back to if a protocol turns out not to work.
+            self.cover_payload = payload.map(|p| (track_id, p));
         }
     }
 
@@ -9580,6 +9708,124 @@ mod tests {
             audio_device: "pipewire/alsa_output.usb-x".into(),
             ..PlaybackStatus::default()
         }
+    }
+
+    // ---- what the terminal is told about the cover picture ----
+
+    /// An app with a track playing, its picture encoded, and a box to put it in.
+    fn with_cover(app: &mut App, id: u64, rect: Rect) {
+        app.now_playing = Some(track(id, "T", "A"));
+        app.cover_payload = Some((
+            id,
+            crate::graphics::Payload::Kitty {
+                id: 1,
+                transmit: b"PIC".to_vec(),
+            },
+        ));
+        app.cover_rect = rect;
+    }
+
+    fn box_at(x: u16, y: u16) -> Rect {
+        Rect {
+            x,
+            y,
+            width: 16,
+            height: 8,
+        }
+    }
+
+    #[test]
+    fn a_settled_screen_is_told_nothing_about_the_cover() {
+        // Goal: the whole reason this decision exists. A cover changes when the
+        // track does and hardly ever otherwise, and ratatui repaints only the
+        // cells that changed - so a picture placed once survives the thousands
+        // of frames after it, and writing anything for them would be a megabyte
+        // of base64 a second for a picture that did not move.
+        let mut r = rig();
+        with_cover(&mut r.app, 7, box_at(0, 0));
+        r.app.cover_placed(Some(box_at(0, 0)));
+        assert_eq!(r.app.cover_paint(), CoverPaint::Nothing);
+    }
+
+    #[test]
+    fn a_picture_with_nowhere_to_go_is_never_placed() {
+        // Goal: the renderer publishes a zero rect wherever it painted no cover,
+        // and that one reading stands for all four causes - folded away with
+        // `C`, a terminal below the height the box needs, an overlay standing
+        // over it, and a track with no art. A picture placed against any of them
+        // would sit on top of whatever took the space.
+        let mut r = rig();
+        with_cover(&mut r.app, 7, Rect::default());
+        assert_eq!(r.app.cover_paint(), CoverPaint::Nothing);
+    }
+
+    #[test]
+    fn a_picture_that_has_lost_its_place_is_taken_off_the_screen() {
+        // Goal: the other half of the rect going to zero. A terminal that holds
+        // pictures outside the cell grid keeps drawing one until it is told not
+        // to, so folding the cover away has to say so - otherwise `C` hides the
+        // box and leaves the photograph floating over what replaced it.
+        let mut r = rig();
+        with_cover(&mut r.app, 7, box_at(0, 0));
+        r.app.cover_placed(Some(box_at(0, 0)));
+        r.app.cover_rect = Rect::default();
+        assert_eq!(r.app.cover_paint(), CoverPaint::Clear);
+    }
+
+    #[test]
+    fn a_new_track_replaces_the_picture_rather_than_drawing_over_it() {
+        // Goal: a protocol that holds pictures by id keeps every one it is given
+        // until told otherwise. Placing the new cover without taking the old one
+        // off leaks one picture per track for the length of the session.
+        let mut r = rig();
+        with_cover(&mut r.app, 7, box_at(0, 0));
+        r.app.cover_placed(Some(box_at(0, 0)));
+        with_cover(&mut r.app, 8, box_at(0, 0));
+        assert_eq!(
+            r.app.cover_paint(),
+            CoverPaint::Replace { rect: box_at(0, 0) }
+        );
+    }
+
+    #[test]
+    fn a_box_that_moved_re_places_the_picture_without_sending_it_again() {
+        // Goal: a resize moves the box and the terminal already has the bytes.
+        // `transmitted` is what says so, and it is the difference between a
+        // dozen bytes and a megabyte on every resize step as a window is dragged.
+        let mut r = rig();
+        with_cover(&mut r.app, 7, box_at(0, 0));
+        r.app.cover_placed(Some(box_at(0, 0)));
+        r.app.cover_rect = box_at(4, 2);
+        assert_eq!(
+            r.app.cover_paint(),
+            CoverPaint::Show {
+                rect: box_at(4, 2),
+                transmitted: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_cover_that_has_not_been_encoded_yet_is_not_placed() {
+        // Goal: the picture arrives from the worker a moment after the track
+        // starts, and is encoded there rather than here. Until it lands there is
+        // nothing to place, and the half blocks hold the box in the meantime -
+        // the same rule `now_playing_has_cover` already keeps for the column.
+        let mut r = rig();
+        r.app.now_playing = Some(track(7, "T", "A"));
+        r.app.cover_rect = box_at(0, 0);
+        assert_eq!(r.app.cover_paint(), CoverPaint::Nothing);
+    }
+
+    #[test]
+    fn a_picture_for_a_track_that_has_moved_on_is_not_placed() {
+        // Goal: replies are correlated by id and never by request order, the
+        // rule the whole worker path keeps. A cover that finished encoding after
+        // its track ended would otherwise be drawn over the one now playing.
+        let mut r = rig();
+        with_cover(&mut r.app, 7, box_at(0, 0));
+        r.app.now_playing = Some(track(9, "Other", "A"));
+        assert_eq!(r.app.cover_paint(), CoverPaint::Nothing);
     }
 
     #[test]
@@ -15677,7 +15923,9 @@ mod tests {
         let fetches: Vec<_> = requests(&r)
             .into_iter()
             .filter_map(|c| match c {
-                ToWorker::FetchCover { track_id, cover_id } => Some((track_id, cover_id)),
+                ToWorker::FetchCover {
+                    track_id, cover_id, ..
+                } => Some((track_id, cover_id)),
                 _ => None,
             })
             .collect();
@@ -15720,6 +15968,7 @@ mod tests {
             .send(FromWorker::Cover {
                 track_id: 1,
                 image: image.clone(),
+                payload: None,
             })
             .expect("send");
         r.app.drain_worker();
@@ -15745,6 +15994,7 @@ mod tests {
                     height: 1,
                     rgb: vec![9, 9, 9],
                 },
+                payload: None,
             })
             .expect("send");
         r.app.drain_worker();
