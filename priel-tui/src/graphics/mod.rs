@@ -38,6 +38,7 @@
 
 pub mod iterm2;
 pub mod kitty;
+pub mod query;
 pub mod sixel;
 
 use std::ffi::OsString;
@@ -57,60 +58,58 @@ pub enum Protocol {
     Sixel,
 }
 
-/// Which protocol this terminal speaks, from the environment it was started in.
+/// Which protocol this terminal speaks, by asking it and reading the answer.
 ///
-/// Read from variables rather than by asking the terminal. A query means writing
-/// an escape and *reading the reply*, which is a blocking read on startup, a
-/// timeout to pick, and a reply that arrives interleaved with whatever the user
-/// typed. The variables are what every other terminal-graphics implementation
-/// leans on in practice, and being wrong here costs a listener a picture rather
-/// than anything worse - the half blocks are still there.
+/// **The environment cannot answer this.** It says what terminal the session
+/// started under, not what sits between priel and the screen. Measured: kitty
+/// running a multiplexer passes `KITTY_WINDOW_ID` straight into the pane, so
+/// every variable said kitty, the pictures were written, the multiplexer
+/// swallowed them, and the cover was a blank box - strictly worse than the half
+/// blocks it replaced. See [`query`].
 ///
-/// **Inside tmux or screen this is deliberately `None`.** Passing graphics
-/// through a multiplexer needs every escape wrapped and `allow-passthrough on`
-/// set, and even then the multiplexer's own redraws move and corrupt what was
-/// placed. Half blocks are what works there, so half blocks are what it gets.
+/// The question a query asks is the one actually being asked: *will a picture I
+/// write arrive*. Anything in between that does not forward the question does
+/// not forward the reply either, so silence is a correct no.
+///
+/// `probe` writes [`query::request`] and hands back whatever came back within
+/// `timeout`. It is the caller's because reading from a terminal is not
+/// something this module should own - and everything that decides anything is
+/// [`query::parse_reply`], which is pure.
+///
+/// iTerm2's dialect has no query of its own, so it is the one that still rests
+/// on the environment - and only where nothing is in the way, which is what the
+/// multiplexer check is still here for.
 #[must_use]
-pub fn detect(env: &Env) -> Option<Protocol> {
-    if env.get("TMUX").is_some() || env.get("STY").is_some() {
+pub fn detect_with(env: &Env, reply: &[u8]) -> Option<Protocol> {
+    if let Some(answered) = query::parse_reply(reply) {
+        return Some(answered);
+    }
+    if in_multiplexer(env) {
         return None;
     }
     let term = env.get("TERM").unwrap_or_default().to_lowercase();
     let program = env.get("TERM_PROGRAM").unwrap_or_default().to_lowercase();
-
-    // kitty first: it is the only one that can re-place a picture without
-    // sending it again, so where a terminal speaks more than one it wins.
-    if term.contains("kitty")
-        || env.get("KITTY_WINDOW_ID").is_some()
-        || program == "ghostty"
-        || program == "wezterm"
-        || env.get("KONSOLE_VERSION").is_some()
-    {
-        return Some(Protocol::Kitty);
-    }
-    if program == "iterm.app"
+    (program == "iterm.app"
         || env.get("LC_TERMINAL").unwrap_or_default().to_lowercase() == "iterm2"
         || program == "rio"
         || program == "warpterminal"
         || program == "tabby"
-        || term.contains("mintty")
-    {
-        return Some(Protocol::ITerm2);
-    }
-    if term.contains("foot") || term.contains("mlterm") || term.contains("contour") {
-        return Some(Protocol::Sixel);
-    }
-    // xterm only with sixel compiled in and turned on, which it advertises by
-    // being started as a VT340. A plain `xterm` gets half blocks: drawing sixels
-    // at a terminal that does not take them prints the escape as text, which is
-    // a screen full of rubbish rather than a missing picture.
-    if term == "xterm-sixel" || term.starts_with("vt340") {
-        return Some(Protocol::Sixel);
-    }
-    None
+        || term.contains("mintty"))
+    .then_some(Protocol::ITerm2)
 }
 
-/// The environment [`detect`] reads, so it is a table of tests rather than
+/// Is something sitting between priel and the terminal?
+///
+/// Only consulted for the one protocol that cannot be asked about. A
+/// multiplexer needs every escape wrapped and its passthrough turned on, and
+/// even then its own redraws move and corrupt what was placed.
+fn in_multiplexer(env: &Env) -> bool {
+    ["TMUX", "STY", "HERDR_ENV", "ZELLIJ", "ABDUCO_SOCKET"]
+        .iter()
+        .any(|k| env.get(k).is_some())
+}
+
+/// The environment [`detect_with`] reads, so it is a table of tests rather than
 /// something only the real process can answer.
 ///
 /// The same shape `priel_player::setup::conf_dir_from` uses for the same reason:
@@ -244,54 +243,71 @@ pub fn clear(payload: &Payload) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Env, Payload, Protocol, clear, cursor_to, detect, place};
+    use super::{Env, Payload, Protocol, clear, cursor_to, detect_with, place};
+
+    /// What a terminal that answers nothing sends back.
+    const SILENT: &[u8] = b"";
+    /// What a terminal that takes kitty's pictures sends back.
+    const SAYS_KITTY: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[?62;22c";
 
     #[test]
-    fn each_terminal_gets_the_protocol_it_actually_speaks() {
-        // Goal: the whole of the detection, as a table. Getting one wrong costs
-        // a listener their picture - or, for a terminal that takes none of
-        // these, a screen full of escape text, which is why the last two rows
-        // matter as much as the first.
-        type Case = (&'static [(&'static str, &'static str)], Option<Protocol>);
-        let cases: [Case; 12] = [
-            (&[("TERM", "xterm-kitty")], Some(Protocol::Kitty)),
-            (&[("KITTY_WINDOW_ID", "1")], Some(Protocol::Kitty)),
-            (&[("TERM_PROGRAM", "ghostty")], Some(Protocol::Kitty)),
-            (&[("TERM_PROGRAM", "WezTerm")], Some(Protocol::Kitty)),
-            (&[("KONSOLE_VERSION", "220400")], Some(Protocol::Kitty)),
-            (&[("TERM_PROGRAM", "iTerm.app")], Some(Protocol::ITerm2)),
-            (&[("LC_TERMINAL", "iTerm2")], Some(Protocol::ITerm2)),
-            (&[("TERM", "foot")], Some(Protocol::Sixel)),
-            (&[("TERM", "xterm-sixel")], Some(Protocol::Sixel)),
-            // No image support at all: half blocks, and nothing written that a
-            // terminal would print as text.
-            (&[("TERM", "alacritty")], None),
-            (&[("TERM", "xterm-256color")], None),
-            (&[("TERM", "dumb")], None),
-        ];
-        for (vars, want) in cases {
-            assert_eq!(detect(&Env::fixed(vars)), want, "for {vars:?}");
+    fn the_terminals_own_answer_beats_anything_the_environment_claims() {
+        // Goal: the bug this replaced. A multiplexer under kitty passes
+        // `KITTY_WINDOW_ID` straight into the pane, so every variable said kitty
+        // while the pictures were being swallowed and the cover was a blank box.
+        // What the terminal actually answers is the only thing that knows.
+        let under_a_multiplexer = Env::fixed(&[
+            ("TERM", "xterm-256color"),
+            ("KITTY_WINDOW_ID", "1"),
+            ("HERDR_ENV", "1"),
+        ]);
+        assert_eq!(
+            detect_with(&under_a_multiplexer, SILENT),
+            None,
+            "nothing answered, so nothing is drawn"
+        );
+        assert_eq!(
+            detect_with(&under_a_multiplexer, SAYS_KITTY),
+            Some(Protocol::Kitty),
+            "and a multiplexer that does forward it is believed"
+        );
+    }
+
+    #[test]
+    fn a_terminal_that_says_nothing_gets_no_pictures_however_it_is_named() {
+        // Goal: the half-block path, which works everywhere and is what an
+        // unanswered question falls back to. Being wrong in this direction costs
+        // a photograph; being wrong in the other costs a blank box or a screen
+        // full of escape text.
+        for vars in [
+            &[("TERM", "xterm-kitty")][..],
+            &[("KITTY_WINDOW_ID", "1")][..],
+            &[("TERM", "foot")][..],
+            &[("TERM", "alacritty")][..],
+            &[("TERM", "dumb")][..],
+        ] {
+            assert_eq!(detect_with(&Env::fixed(vars), SILENT), None, "for {vars:?}");
         }
     }
 
     #[test]
-    fn a_multiplexer_gets_half_blocks_however_capable_the_terminal_under_it_is() {
-        // Goal: tmux needs every escape wrapped and `allow-passthrough on`, and
-        // even then its own redraws move and corrupt what was placed. A picture
-        // that works until the pane is resized is worse than no picture, so the
-        // multiplexer wins over the terminal it is running in.
+    fn iterm2_is_the_one_left_to_the_environment_and_only_with_nothing_in_the_way() {
+        // Goal: that dialect has no query to ask, so it is the one guess left.
+        // It is still refused inside a multiplexer, because there the guess is
+        // known to be wrong in the way that costs a blank box.
         assert_eq!(
-            detect(&Env::fixed(&[
-                ("TERM", "xterm-kitty"),
-                ("TMUX", "/tmp/tmux-1000/default,1,0")
-            ])),
-            None
+            detect_with(&Env::fixed(&[("TERM_PROGRAM", "iTerm.app")]), SILENT),
+            Some(Protocol::ITerm2)
         );
         assert_eq!(
-            detect(&Env::fixed(&[
-                ("TERM", "xterm-kitty"),
-                ("STY", "1234.pts-0.host")
-            ])),
+            detect_with(&Env::fixed(&[("LC_TERMINAL", "iTerm2")]), SILENT),
+            Some(Protocol::ITerm2)
+        );
+        assert_eq!(
+            detect_with(
+                &Env::fixed(&[("TERM_PROGRAM", "iTerm.app"), ("TMUX", "/tmp/x,1,0")]),
+                SILENT
+            ),
             None
         );
     }

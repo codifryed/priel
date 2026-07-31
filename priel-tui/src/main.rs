@@ -44,7 +44,7 @@ mod theme;
 mod ui;
 mod worker;
 
-use std::io::{self, Stdout, Write as _};
+use std::io::{self, Read as _, Stdout, Write as _};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -247,7 +247,7 @@ fn session(
         // every terminal that takes none, and is the half-block path that has
         // always been there - so being wrong here costs a photograph and
         // nothing else.
-        app.cover_protocol = graphics::detect(&graphics::Env::from_process());
+        app.cover_protocol = graphics::detect_with(&graphics::Env::from_process(), &ask_terminal());
         if let Some(protocol) = app.cover_protocol {
             log::info!("cover pictures: {protocol:?}");
         }
@@ -383,6 +383,46 @@ fn run<B: ratatui::backend::Backend, E: EventSource>(
     Ok(())
 }
 
+/// Ask the terminal what pictures it can take, and read the answer.
+///
+/// Runs after raw mode is on and before the interface starts, which is the only
+/// window where stdin carries the terminal's replies rather than the listener's
+/// keys. The reply is read on a thread so a terminal that answers nothing cannot
+/// hold the start: every real one answers the device-attributes half at once,
+/// and that arriving is what ends the read - see [`graphics::query`].
+///
+/// Empty on any failure, which [`graphics::detect_with`] reads as "no pictures",
+/// and that is the half-block path priel has always had.
+fn ask_terminal() -> Vec<u8> {
+    /// Long enough for a terminal on the other end of an ssh link, short enough
+    /// that a terminal which will never answer does not make the start feel
+    /// broken. Only ever waited out in full by something that answers nothing.
+    const PATIENCE: Duration = Duration::from_millis(250);
+
+    let mut out = io::stdout();
+    if out.write_all(&graphics::query::request()).is_err() || out.flush().is_err() {
+        return Vec::new();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Detached on purpose: a terminal that never answers leaves this parked on a
+    // read, and joining it would be the very hang this timeout exists to avoid.
+    // It reads one byte at a time and stops the moment the answer is complete,
+    // so on every terminal that answers at all it is gone before the first frame.
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let mut reply = Vec::new();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = stdin.read(&mut byte) {
+            reply.push(byte[0]);
+            if graphics::query::is_complete(&reply) {
+                break;
+            }
+        }
+        let _ = tx.send(reply);
+    });
+    rx.recv_timeout(PATIENCE).unwrap_or_default()
+}
+
 /// Put the cover picture where the frame just said it goes, or take it off.
 ///
 /// Writes nothing at all unless the placement actually changed - see
@@ -462,6 +502,58 @@ mod tests {
 
     /// Drive the real loop over a script that ends in `q`, and hand back the app
     /// so the test can assert on what the events did to it.
+    /// Drive the loop over a script, handing back what was written to the
+    /// terminal for the cover picture. Tall enough for the cover box, which is
+    /// gated on the terminal's height.
+    fn drive_pictures(app: &mut App, script: Vec<Option<Event>>) -> Vec<u8> {
+        let mut term = Terminal::new(TestBackend::new(100, 40)).expect("backend");
+        let mut events = Scripted(script.into_iter());
+        let mut pictures = Vec::new();
+        run(&mut term, app, &mut events, &mut pictures).expect("loop");
+        pictures
+    }
+
+    #[test]
+    fn a_cover_that_is_ready_is_actually_written_to_the_terminal() {
+        // Goal: the end of the plumbing. Every piece of this is tested on its
+        // own - the escape, the decision, the rect the renderer publishes - and
+        // none of that says the bytes reach the terminal. This drives the real
+        // loop and reads what came out of it.
+        let (mut app, _to, _from) = App::rigged();
+        app.cover_protocol = Some(crate::graphics::Protocol::Kitty);
+        app.now_playing = Some(priel_core::Track {
+            id: 7,
+            title: "T".into(),
+            cover: "abc".into(),
+            ..priel_core::Track::default()
+        });
+        app.cover_payload = Some((
+            7,
+            crate::graphics::Payload::Kitty {
+                id: 1,
+                transmit: b"\x1b_Ga=t;PIC\x1b\\".to_vec(),
+            },
+        ));
+        let out = drive_pictures(&mut app, vec![None, Some(press('q'))]);
+        assert!(
+            !out.is_empty(),
+            "the cover never reached the terminal; rect was {:?}",
+            app.cover_rect
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("a=p,i=1"), "and it was placed: {text:?}");
+    }
+
+    #[test]
+    fn a_settled_screen_writes_no_picture_bytes_at_all() {
+        // Goal: the whole reason the decision exists. A run where nothing about
+        // the cover changed must cost nothing - not a smaller escape, none.
+        let (mut app, _to, _from) = App::rigged();
+        app.cover_protocol = Some(crate::graphics::Protocol::Kitty);
+        let out = drive_pictures(&mut app, vec![None, None, None, Some(press('q'))]);
+        assert!(out.is_empty(), "wrote {} bytes for nothing", out.len());
+    }
+
     fn drive(script: Vec<Option<Event>>) -> App {
         let (mut app, _to, _from) = App::rigged();
         let mut term = Terminal::new(TestBackend::new(80, 12)).expect("backend");
