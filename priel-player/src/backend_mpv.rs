@@ -1102,6 +1102,17 @@ fn handle_cmd(
             arm_exclusive_check(mpv, output);
         }
         Cmd::Append(id, src) => {
+            // One entry behind the one playing, and no more. The caller asks for
+            // a preload by track id, and a reply for a track it asked about
+            // twice - a walk back and forth through the queue does exactly
+            // that - would otherwise put a second copy of it here. mpv then
+            // chews through [A, B, B] and plays B twice, which is a same-id
+            // transition the caller cannot see. Refused here because this is
+            // where the playlist is known.
+            if entries.len() > 1 {
+                log::debug!("refusing a second preload ({id}): one is already queued");
+                return false;
+            }
             let (arg, s) = register_source(registry, seq, id, src, output.resolver.clone());
             command(mpv, "loadfile", &[&arg, "append"]);
             entries.push(Entry {
@@ -1632,6 +1643,11 @@ mod tests {
             seq: None,
             source: format!("http://127.0.0.1:1/{id}"),
         }
+    }
+
+    /// What the playlist holds, in order.
+    fn ids(entries: &[Entry]) -> Vec<u64> {
+        entries.iter().map(|e| e.id).collect()
     }
 
     /// An empty stream registry, for the tests that need one to pass along.
@@ -3394,6 +3410,42 @@ mod tests {
             handle_cmd(&mpv, &reg, &mut entries, &mut seq, &mut output, Cmd::Quit),
             "only Quit ends the loop"
         );
+    }
+
+    #[test]
+    fn only_one_entry_is_ever_held_behind_the_one_playing() {
+        // Goal: the caller asks for a preload by track id and correlates the
+        // reply by that id, so a track it asked about twice - which a walk back
+        // and forth through the queue does - comes back twice and would append
+        // twice. mpv then chews through [A, B, B] and plays B a second time,
+        // which is a same-id transition the caller cannot see. Method: append
+        // the same entry twice and count what the playlist holds.
+        let mpv = silent_mpv();
+        let reg = registry();
+        let mut entries = Vec::new();
+        let mut seq = 0;
+        let mut output = no_output();
+        let mut run = |cmd, entries: &mut Vec<Entry>| {
+            handle_cmd(&mpv, &reg, entries, &mut seq, &mut output, cmd);
+        };
+
+        let src = |id: u64| PlayableSource::Direct(format!("http://127.0.0.1:1/{id}"));
+        run(Cmd::Load(1, src(1)), &mut entries);
+        run(Cmd::Append(2, src(2)), &mut entries);
+        assert_eq!(ids(&entries), vec![1, 2], "the current one and its next");
+
+        run(Cmd::Append(2, src(2)), &mut entries);
+        assert_eq!(ids(&entries), vec![1, 2], "a second copy is refused");
+
+        // And a different track is refused just the same: one is the limit, not
+        // one *per id*.
+        run(Cmd::Append(3, src(3)), &mut entries);
+        assert_eq!(ids(&entries), vec![1, 2], "and so is a second entry at all");
+
+        // A fresh load clears the playlist, so the next preload is taken again.
+        run(Cmd::Load(4, src(4)), &mut entries);
+        run(Cmd::Append(5, src(5)), &mut entries);
+        assert_eq!(ids(&entries), vec![4, 5], "room again once it is replaced");
     }
 
     #[test]
