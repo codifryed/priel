@@ -58,6 +58,8 @@ const HEADER: &str = "\
 #   exclusive     true or false; --exclusive and --shared override it
 #   log_level     off, error, warn, info, debug or trace
 #   update_check  true or false; whether to check the forge for a newer release
+#   cover_graphics  true or false; draw the cover as a real picture where the
+#                   terminal can take one, rather than as half blocks
 #   cache_size    album-art cache ceiling in MiB (default 256)
 ";
 
@@ -88,6 +90,11 @@ pub struct Settings {
     /// the default (on). Only ever read from the file - no picker sets it, so it
     /// is never written back automatically; a user turns it off by hand.
     pub update_check: Option<bool>,
+    /// Whether the cover may be drawn as a real picture. Like
+    /// [`Self::update_check`], only ever read from the file - no picker sets it,
+    /// because it is a statement about the terminal rather than a choice made
+    /// while listening.
+    pub cover_graphics: Option<bool>,
     /// The album-art cache ceiling in MiB. Unset means the default (256). Like
     /// [`Self::update_check`], only ever read from the file - no picker sets it -
     /// so it is never written back automatically; a user sets it by hand.
@@ -136,6 +143,9 @@ impl Settings {
         }
         if let Some(level) = self.log_level {
             out.push(("log_level", value_name(&level)));
+        }
+        if let Some(pictures) = self.cover_graphics {
+            out.push(("cover_graphics", pictures.to_string()));
         }
         if let Some(check) = self.update_check {
             out.push(("update_check", check.to_string()));
@@ -243,6 +253,14 @@ pub fn parse(text: &str) -> Loaded {
             "log_level" => set_once(
                 &mut settings.log_level,
                 LogLevel::from_str(value, true).ok(),
+                key,
+                value,
+                line_no,
+                &mut notes,
+            ),
+            "cover_graphics" => set_once(
+                &mut settings.cover_graphics,
+                parse_bool(value),
                 key,
                 value,
                 line_no,
@@ -694,6 +712,7 @@ oversampling = 4
             device: Some("alsa/hw:CARD=AUDIO,DEV=0".into()),
             exclusive: Some(true),
             log_level: None,
+            cover_graphics: None,
             update_check: None,
             cache_size: None,
         };

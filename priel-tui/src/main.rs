@@ -37,13 +37,14 @@ mod art;
 mod bus;
 mod cache;
 mod cli;
+mod graphics;
 mod logging;
 mod settings;
 mod theme;
 mod ui;
 mod worker;
 
-use std::io::{self, Stdout};
+use std::io::{self, Read as _, Stdout, Write as _};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -242,7 +243,29 @@ fn session(
         if args.update_check(remembered.update_check) {
             app.check_for_updates();
         }
-        let outcome = run(&mut terminal, &mut app, &mut TerminalEvents);
+        // Which picture protocol this terminal speaks, settled once. `None` is
+        // every terminal that takes none, and is the half-block path that has
+        // always been there - so being wrong here costs a photograph and
+        // nothing else.
+        // Asked only where pictures are wanted at all: the probe writes an
+        // escape and waits on a reply, and doing that on the way to a mosaic
+        // nobody asked to replace would be a quarter of a second of nothing.
+        app.cover_protocol = args
+            .cover_graphics(remembered.cover_graphics)
+            .then(|| graphics::detect_with(&graphics::Env::from_process(), &ask_terminal()))
+            .flatten();
+        if let Some(protocol) = app.cover_protocol {
+            log::info!("cover pictures: {protocol:?}");
+        }
+        let mut pictures = io::stdout();
+        let outcome = run(&mut terminal, &mut app, &mut TerminalEvents, &mut pictures);
+        // Whatever is on screen goes with us. A protocol that holds pictures
+        // outside the cell grid keeps drawing one after priel has gone, and
+        // leaving a cover over the shell that comes back is rude.
+        if let Some(payload) = app.cover_payload() {
+            let _ = pictures.write_all(&graphics::clear(payload));
+            let _ = pictures.flush();
+        }
         if let Err(e) = settings::save(settings_path, app.chosen()) {
             not_saved = Some(e);
         }
@@ -332,6 +355,7 @@ fn run<B: ratatui::backend::Backend, E: EventSource>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     events: &mut E,
+    pictures: &mut dyn io::Write,
 ) -> Result<()> {
     app.start();
     // Draw only when something actually changed. priel runs for hours, and an
@@ -341,6 +365,11 @@ fn run<B: ratatui::backend::Backend, E: EventSource>(
     loop {
         if needs_draw {
             terminal.draw(|f| ui::render(f, app))?;
+            // After the draw and its flush, never inside it: the picture
+            // protocols write escape sequences straight to the terminal, and
+            // ratatui owns the frame until then. `place_cover` writes nothing on
+            // the frames - almost all of them - where the cover has not moved.
+            place_cover(app, pictures)?;
         }
 
         match events.next(Duration::from_millis(100))? {
@@ -357,6 +386,101 @@ fn run<B: ratatui::backend::Backend, E: EventSource>(
             break;
         }
     }
+    Ok(())
+}
+
+/// Ask the terminal what pictures it can take, and read the answer.
+///
+/// Runs after raw mode is on and before the interface starts, which is the only
+/// window where stdin carries the terminal's replies rather than the listener's
+/// keys. The reply is read on a thread so a terminal that answers nothing cannot
+/// hold the start: every real one answers the device-attributes half at once,
+/// and that arriving is what ends the read - see [`graphics::query`].
+///
+/// Empty on any failure, which [`graphics::detect_with`] reads as "no pictures",
+/// and that is the half-block path priel has always had.
+fn ask_terminal() -> Vec<u8> {
+    /// Long enough for a terminal on the other end of an ssh link, short enough
+    /// that a terminal which will never answer does not make the start feel
+    /// broken. Only ever waited out in full by something that answers nothing.
+    const PATIENCE: Duration = Duration::from_millis(250);
+
+    let mut out = io::stdout();
+    if out.write_all(&graphics::query::request()).is_err() || out.flush().is_err() {
+        return Vec::new();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Detached on purpose: a terminal that never answers leaves this parked on a
+    // read, and joining it would be the very hang this timeout exists to avoid.
+    // It reads one byte at a time and stops the moment the answer is complete,
+    // so on every terminal that answers at all it is gone before the first frame.
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let mut reply = Vec::new();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = stdin.read(&mut byte) {
+            reply.push(byte[0]);
+            if graphics::query::is_complete(&reply) {
+                break;
+            }
+        }
+        let _ = tx.send(reply);
+    });
+    rx.recv_timeout(PATIENCE).unwrap_or_default()
+}
+
+/// Put the cover picture where the frame just said it goes, or take it off.
+///
+/// Writes nothing at all unless the placement actually changed - see
+/// [`App::cover_paint`], whose common answer by a very long way is `Nothing`.
+/// That is what keeps a photograph on screen for the length of a track without
+/// costing a byte a frame.
+fn place_cover(app: &mut App, out: &mut dyn io::Write) -> Result<()> {
+    use crate::app::CoverPaint;
+    let paint = app.cover_paint();
+    if paint == CoverPaint::Nothing {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    // What would take the picture already on screen off. Held from when it was
+    // placed rather than looked up now: a track with art followed by one with
+    // none leaves nothing to look it up *from*, and the old cover stayed on
+    // screen over the track that had none.
+    if matches!(paint, CoverPaint::Clear | CoverPaint::Replace { .. }) {
+        bytes.extend_from_slice(app.cover_undo());
+    }
+    let placed = match paint {
+        CoverPaint::Nothing | CoverPaint::Clear => None,
+        CoverPaint::Replace { rect } | CoverPaint::Show { rect, .. } => {
+            let Some(payload) = app.cover_payload().cloned() else {
+                // Nothing to put up. Whatever was there has been taken off
+                // above, so the screen is right and the record has to say so.
+                out.write_all(&bytes)?;
+                out.flush()?;
+                app.cover_placed(None);
+                return Ok(());
+            };
+            let transmitted = matches!(
+                paint,
+                CoverPaint::Show {
+                    transmitted: true,
+                    ..
+                }
+            );
+            bytes.extend_from_slice(&graphics::place(
+                &payload,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                transmitted,
+            ));
+            Some((rect, graphics::clear(&payload)))
+        }
+    };
+    out.write_all(&bytes)?;
+    out.flush()?;
+    app.cover_placed(placed);
     Ok(())
 }
 
@@ -387,11 +511,125 @@ mod tests {
 
     /// Drive the real loop over a script that ends in `q`, and hand back the app
     /// so the test can assert on what the events did to it.
+    /// Drive the loop over a script, handing back what was written to the
+    /// terminal for the cover picture. Tall enough for the cover box, which is
+    /// gated on the terminal's height.
+    fn drive_pictures(app: &mut App, script: Vec<Option<Event>>) -> Vec<u8> {
+        let mut term = Terminal::new(TestBackend::new(100, 40)).expect("backend");
+        let mut events = Scripted(script.into_iter());
+        let mut pictures = Vec::new();
+        run(&mut term, app, &mut events, &mut pictures).expect("loop");
+        pictures
+    }
+
+    #[test]
+    fn a_cover_that_is_ready_is_actually_written_to_the_terminal() {
+        // Goal: the end of the plumbing. Every piece of this is tested on its
+        // own - the escape, the decision, the rect the renderer publishes - and
+        // none of that says the bytes reach the terminal. This drives the real
+        // loop and reads what came out of it.
+        let (mut app, _to, _from) = App::rigged();
+        app.cover_protocol = Some(crate::graphics::Protocol::Kitty);
+        app.now_playing = Some(priel_core::Track {
+            id: 7,
+            title: "T".into(),
+            cover: "abc".into(),
+            ..priel_core::Track::default()
+        });
+        app.cover_payload = Some((
+            7,
+            crate::graphics::Payload::Kitty {
+                id: 1,
+                transmit: b"\x1b_Ga=t;PIC\x1b\\".to_vec(),
+            },
+        ));
+        let out = drive_pictures(&mut app, vec![None, Some(press('q'))]);
+        assert!(
+            !out.is_empty(),
+            "the cover never reached the terminal; rect was {:?}",
+            app.cover_rect
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("a=p,i=1"), "and it was placed: {text:?}");
+    }
+
+    #[test]
+    fn the_picture_switch_only_ever_turns_pictures_off() {
+        // Goal: neither the flag nor the file can force a picture onto a
+        // terminal that cannot take one - what the terminal answers decides
+        // that, and this only ever says "not even if it can". Worth having
+        // because a terminal can be wrong about itself, and because a picture
+        // that half-arrives is worse than a mosaic that arrives whole.
+        assert!(Cli::resolve_cover_graphics(false, None), "on by default");
+        assert!(
+            !Cli::resolve_cover_graphics(true, None),
+            "the flag turns it off for the run"
+        );
+        assert!(
+            !Cli::resolve_cover_graphics(false, Some(false)),
+            "and the file turns it off for good"
+        );
+        assert!(
+            !Cli::resolve_cover_graphics(true, Some(true)),
+            "a file that says yes cannot overrule the flag that says not now"
+        );
+    }
+
+    #[test]
+    fn a_track_with_no_art_takes_the_last_ones_picture_off() {
+        // Goal: the bug this shape fixes. The erasure used to be looked up from
+        // the track playing *now*, and a track with art followed by one with
+        // none leaves nothing to look it up from - so the request to take the
+        // picture off was made, found nothing to make it with, and gave up. The
+        // previous cover then sat over a track that had none, for as long as
+        // that track played.
+        let (mut app, _to, _from) = App::rigged();
+        app.cover_protocol = Some(crate::graphics::Protocol::Kitty);
+        app.now_playing = Some(priel_core::Track {
+            id: 7,
+            title: "With art".into(),
+            cover: "abc".into(),
+            ..priel_core::Track::default()
+        });
+        app.cover_payload = Some((
+            7,
+            crate::graphics::Payload::Kitty {
+                id: 1,
+                transmit: b"PIC".to_vec(),
+            },
+        ));
+        let up = drive_pictures(&mut app, vec![None, Some(press('q'))]);
+        assert!(!up.is_empty(), "the picture went up");
+
+        // The next track has none at all, so nothing can be derived from it.
+        app.now_playing = Some(priel_core::Track {
+            id: 8,
+            title: "No art".into(),
+            ..priel_core::Track::default()
+        });
+        let down = drive_pictures(&mut app, vec![None, Some(press('q'))]);
+        let text = String::from_utf8_lossy(&down);
+        assert!(
+            text.contains("a=d"),
+            "and the erasure was still written: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_screen_writes_no_picture_bytes_at_all() {
+        // Goal: the whole reason the decision exists. A run where nothing about
+        // the cover changed must cost nothing - not a smaller escape, none.
+        let (mut app, _to, _from) = App::rigged();
+        app.cover_protocol = Some(crate::graphics::Protocol::Kitty);
+        let out = drive_pictures(&mut app, vec![None, None, None, Some(press('q'))]);
+        assert!(out.is_empty(), "wrote {} bytes for nothing", out.len());
+    }
+
     fn drive(script: Vec<Option<Event>>) -> App {
         let (mut app, _to, _from) = App::rigged();
         let mut term = Terminal::new(TestBackend::new(80, 12)).expect("backend");
         let mut events = Scripted(script.into_iter());
-        run(&mut term, &mut app, &mut events).expect("loop");
+        run(&mut term, &mut app, &mut events, &mut Vec::new()).expect("loop");
         app
     }
 
@@ -603,6 +841,7 @@ mod tests {
             exclusive: Some(true),
             log_level: Some(LogLevel::Info),
             update_check: None,
+            cover_graphics: None,
             cache_size: None,
         };
         let bare = parse(&[]);

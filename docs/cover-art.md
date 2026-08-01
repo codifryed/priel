@@ -9,8 +9,9 @@ Every heading below was settled with the maintainer question by question. Where
 the answer went against a recommendation, both the answer and the recommendation
 are recorded, so the choice reads as made rather than as overlooked.
 
-**Status: built.** The renderer, the layout and the fold are in `art.rs` and
-`ui.rs`; the cover id and byte fetch are in `priel-core`; the fetch, decode and
+**Status: built**, and since extended with real picture protocols for the
+terminals that take them (`graphics/`, and ADR 0007). The half-block renderer,
+the layout and the fold are in `art.rs` and `ui.rs`; the cover id and byte fetch are in `priel-core`; the fetch, decode and
 wiring are in `worker.rs` and `app.rs`. The one thing that could not be verified
 here - the cover URL pattern - is called out again under *Open* at the foot, and
 is isolated in `priel_core::cover_url` so that a correction touches one function
@@ -23,10 +24,23 @@ colour is **two pixels in one cell**: the foreground fills the top half, the
 background the bottom. Nothing but coloured text is involved, so it survives
 `ssh`, `tmux`, `script`, and a plain text dump of a frame.
 
-Kitty's graphics protocol and sixel both look better and were both rejected:
-they draw outside ratatui's cell grid, so a redraw of the cells underneath does
-not repaint them and the image tears. They would also make the feature
-conditional on a terminal priel cannot detect reliably.
+Kitty's graphics protocol and sixel both look better and were both rejected at
+first, on two grounds: they draw outside ratatui's cell grid, so a redraw of the
+cells underneath does not repaint them and the image tears; and they would make
+the feature conditional on a terminal priel cannot detect reliably.
+
+**Both objections have since been answered, and all three protocols are now
+built** - see `docs/adr/0007-pictures-where-the-terminal-will-take-them.md`. Half
+blocks remain the path for every terminal that takes no picture, which is what
+this section describes and what most of it still governs: the layout, the
+resolution table below, and the fold are the same either way.
+
+The tearing objection was right and is what the placement decision exists for:
+ratatui repaints only the cells that changed, so a picture placed once survives
+until something touches its rect, and priel writes nothing on the frames where
+nothing did. The detection objection was also right, and the environment turned
+out to be no answer at all - priel asks the terminal instead, and refuses
+outright inside a multiplexer.
 
 `▀` is single width in every font that has it, which matters here: this
 repository already has a rule against glyphs with emoji presentation, because a

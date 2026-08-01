@@ -205,6 +205,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     // Hit boxes are geometry, so the renderer owns them. Rebuilt every frame.
     app.hits.clear();
+    // And so is where the cover went. Cleared here and set only where a picture
+    // is actually painted, so a frame that draws none says so - `cover_paint`
+    // reads a zero rect as "no picture wanted", which is what takes one off the
+    // screen when the box folds away or an overlay stands over it.
+    app.cover_rect = Rect::default();
     header(f, app, rows[0]);
     if f.area().width >= WIDE_COLS && app.queue_shown {
         let cols =
@@ -2609,7 +2614,7 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
 /// a decode would replace a frame later, mirroring [`cover_column`]. Nothing
 /// playing, or a track with no art at all, gets a centred word so the pane reads
 /// as chosen rather than as broken.
-fn full_pane_cover(f: &mut Frame, app: &App, inner: Rect) {
+fn full_pane_cover(f: &mut Frame, app: &mut App, inner: Rect) {
     let t = app.theme();
     let rows = inner.height.min(inner.width / 2);
     if rows > 0 {
@@ -2620,6 +2625,10 @@ fn full_pane_cover(f: &mut Frame, app: &App, inner: Rect) {
             width: cols,
             height: rows,
         };
+        if app.cover_payload().is_some() {
+            app.cover_rect = square;
+            return;
+        }
         match app.cover_for_now_playing() {
             Some(image) => {
                 f.render_widget(Paragraph::new(crate::art::draw(image, rows, cols)), square);
@@ -3183,7 +3192,7 @@ fn key_row(f: &mut Frame, app: &mut App, area: Rect) {
 /// the text in empty rows. When the column is wanted but the art has not decoded
 /// yet, the column is held with a muted placeholder rather than left empty, so
 /// the box keeps the height it was sized for.
-fn cover_column(f: &mut Frame, app: &App, inner: Rect) -> Rect {
+fn cover_column(f: &mut Frame, app: &mut App, inner: Rect) -> Rect {
     if !cover_wanted(f.area(), app) {
         return inner;
     }
@@ -3197,6 +3206,20 @@ fn cover_column(f: &mut Frame, app: &App, inner: Rect) -> Rect {
         width: cols,
         ..inner
     };
+    // The picture protocols draw outside ratatui's buffer, so the renderer
+    // publishes where the box is and paints nothing into it - `run` puts the
+    // picture there once the frame has flushed. Leaving the cells blank is what
+    // makes the placement survive: ratatui repaints only what changed, and
+    // nothing here changes from one frame to the next.
+    if app.cover_payload().is_some() {
+        app.cover_rect = art_rect;
+        let taken = cols.saturating_add(1);
+        return Rect {
+            x: inner.x.saturating_add(taken),
+            width: inner.width.saturating_sub(taken),
+            ..inner
+        };
+    }
     match app.cover_for_now_playing() {
         Some(image) => f.render_widget(
             Paragraph::new(crate::art::draw(image, rows, cols)),
