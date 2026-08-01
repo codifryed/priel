@@ -325,7 +325,14 @@ pub enum Task {
         query: String,
         offset: u32,
     },
-    Resolve,
+    /// A stream that could not be resolved. Named by the track for the reason
+    /// the radio is named by its mix: a resolve for the track being loaded now
+    /// and a resolve for the one preloaded behind it are in flight together, and
+    /// a failure that stood for either would stop playback because a preload
+    /// could not be fetched.
+    Resolve {
+        track_id: u64,
+    },
     /// A favorite that could not be changed. The track names it, and `wanted`
     /// is the state that was asked for: "add track 7" and "remove track 7" are
     /// two different requests, and the interface has to know which of them it
@@ -367,7 +374,7 @@ impl std::fmt::Display for Task {
             Self::MixTracks { .. } => "mix tracks",
             Self::Radio { .. } => "the radio",
             Self::Search { .. } => "search",
-            Self::Resolve => "resolve",
+            Self::Resolve { .. } => "resolve",
             // Named by what did not happen rather than by the endpoint: this is
             // the only failure here the user asked for directly, so the notice
             // should read back the action they took.
@@ -897,7 +904,7 @@ fn serve(
         },
         ToWorker::Resolve(id) => match client.resolve_stream(id, Quality::HiRes) {
             Ok(r) => FromWorker::Resolved(id, r),
-            Err(e) => failed(Task::Resolve, &e),
+            Err(e) => failed(Task::Resolve { track_id: id }, &e),
         },
         ToWorker::SetFavorite { track_id, favorite } => {
             match client.set_favorite_track(track_id, favorite) {

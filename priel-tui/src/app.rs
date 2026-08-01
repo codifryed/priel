@@ -2248,7 +2248,7 @@ impl App {
             // A radio belongs to no listing either: it extends the play queue,
             // which has no page and no offset to latch.
             Task::Startup
-            | Task::Resolve
+            | Task::Resolve { .. }
             | Task::Radio { .. }
             | Task::SetFavorite { .. }
             | Task::CreatePlaylist
@@ -2790,16 +2790,20 @@ impl App {
         // Without this the interface spins on "resolving" (current_target stays
         // set) or "buffering" (now_playing set, nothing playing) forever.
         //
-        // A preload is only ever scheduled once the current track has settled -
-        // `decide` gates it on `!resolving_current` - so a resolve that fails
-        // while `current_target` is set can only be the track being loaded now.
-        // Stop it cleanly. A resolve that fails with nothing loading was a
-        // gapless preload; drop it and let the end-of-track fallback ask again.
-        if matches!(task, Task::Resolve) {
-            self.next_intended = None;
-            if self.current_target.is_some() {
+        // Told apart by the track, never by what happens to be loading: a
+        // navigation asks for the track to play now and the one to hold behind
+        // it in the same breath, so both are in flight together and a preload
+        // that could not be fetched must not stop the track that could. The
+        // current track's load stops cleanly, and the preload it asked for goes
+        // with it; a preload that fails on its own is dropped and the
+        // end-of-track fallback asks again.
+        if let Task::Resolve { track_id } = task {
+            if self.current_target == Some(*track_id) {
                 self.current_target = None;
                 self.now_playing = None;
+                self.next_intended = None;
+            } else if self.next_intended == Some(*track_id) {
+                self.next_intended = None;
             }
         }
         // Branching on the classification, never on the words. This was
@@ -3902,6 +3906,16 @@ impl App {
         self.now_playing = Some(t.clone());
         self.now_meta = StreamMeta::default();
         self.ask(ToWorker::Resolve(t.id));
+        // And what follows it, in the same breath. mpv is still holding the
+        // entry the *last* load put behind it, and `play_now` will not take that
+        // away until this resolve lands: clearing the record of it above without
+        // naming what replaces it left priel believing nothing was queued while
+        // mpv still had somewhere to go, which after a walk back and forth
+        // through the queue was the track just heard. Asked here rather than
+        // waited for, because the two resolves are answered in the order they
+        // were asked, so the append lands after the load that clears the
+        // playlist.
+        self.schedule_next();
     }
 
     /// The queue entry at this row of the play order, or `None` past the end.
@@ -4014,6 +4028,14 @@ impl App {
             // preload like any other: mpv's playlist takes a second entry for
             // it, so the repeat is gapless exactly as a change of track is.
             let id = self.queue[p].id;
+            // Already asked for, and the answer is on its way to mpv's playlist.
+            // Asking again would put a second copy of the same entry there, and
+            // mpv chewing through [A, B, B] is a B -> B transition the app
+            // cannot see. Callers that mean to preload something *else* clear
+            // the record first, so this can only be the same question twice.
+            if self.next_intended == Some(id) {
+                return;
+            }
             self.next_intended = Some(id);
             self.ask(ToWorker::Resolve(id));
         } else {
@@ -7755,7 +7777,7 @@ mod tests {
 
         r.to_app
             .send(FromWorker::Failed {
-                task: Task::Resolve,
+                task: Task::Resolve { track_id: 1 },
                 fault: Fault::Refused,
                 detail: "resolve: no".into(),
             })
@@ -12236,7 +12258,11 @@ mod tests {
         assert_eq!(r.app.queue.len(), 3);
         assert_eq!(r.app.queue_pos, 1);
         assert_eq!(r.app.now_playing.as_ref().unwrap().id, 2);
-        assert_eq!(resolved_ids(&requests(&r)), vec![2]);
+        assert_eq!(
+            resolved_ids(&requests(&r)),
+            vec![2, 3],
+            "the track that was played, and the one to hold behind it"
+        );
         assert!(
             r.app.is_resolving(),
             "the spinner runs until the stream arrives"
@@ -12245,13 +12271,19 @@ mod tests {
 
     #[test]
     fn a_resolved_stream_starts_playback_and_preloads_the_next() {
-        // Goal: this is the gapless pipeline. Once the current track resolves,
-        // the following one must be requested straight away or the transition
-        // has nothing preloaded to move to.
+        // Goal: this is the gapless pipeline. The following track is requested
+        // as the current one is, or the transition has nothing preloaded to move
+        // to - and it must not be requested a second time when the current one's
+        // stream comes back, because a second copy of the same entry in mpv's
+        // playlist is a track that plays twice.
         let mut r = rig();
         r.app.favorites = vec![track(1, "A", "X"), track(2, "B", "Y")];
         r.app.on_key(code(KeyCode::Enter));
-        let _ = requests(&r);
+        assert_eq!(
+            resolved_ids(&requests(&r)),
+            vec![1, 2],
+            "the next is preloaded"
+        );
 
         r.to_app.send(FromWorker::Resolved(1, stream(1))).unwrap();
         r.app.drain_worker();
@@ -12261,10 +12293,10 @@ mod tests {
             r.app.now_meta.sample_rate, 192_000,
             "the badge reads from here"
         );
-        assert_eq!(
-            resolved_ids(&requests(&r)),
-            vec![2],
-            "the next is preloaded"
+        assert_eq!(r.app.next_intended, Some(2), "and it is still what follows");
+        assert!(
+            resolved_ids(&requests(&r)).is_empty(),
+            "asked for once, and not again"
         );
     }
 
@@ -12315,7 +12347,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reproduces an open bug: no preload is scheduled after navigating"]
     fn walking_back_and_forth_does_not_leave_a_stale_track_queued_to_play() {
         // Goal: reported from a real session, with shuffle on - go back, then
         // forward, then back, let the track finish, and the one that had just
@@ -12402,7 +12433,11 @@ mod tests {
         r.app.status.position = 1.0;
         r.app.on_key(key('p'));
         assert_eq!(r.app.queue_pos, 0);
-        assert_eq!(resolved_ids(&requests(&r)), vec![1]);
+        assert_eq!(
+            resolved_ids(&requests(&r)),
+            vec![1, 2],
+            "the track stepped back to, and what follows it from there"
+        );
     }
 
     #[test]
@@ -12425,7 +12460,11 @@ mod tests {
 
         assert!(r.app.shuffle);
         assert!(r.app.now_playing.is_some());
-        assert_eq!(resolved_ids(&requests(&r)).len(), 1);
+        assert_eq!(
+            resolved_ids(&requests(&r)).len(),
+            2,
+            "the track to play, and the one to hold behind it"
+        );
 
         r.app.on_key(key('s'));
         assert!(!r.app.shuffle);
@@ -12842,18 +12881,15 @@ mod tests {
         ];
         r.app.view = View::Favorites;
         r.app.selected = 2;
+        let _ = requests(&r);
         r.app.on_key(code(KeyCode::Enter));
         assert_eq!(ids(&r.app.queue), vec![5, 6, 1]);
         assert_eq!(r.app.queue_pos, 2);
         assert!(!r.app.playing_from_radio(), "nothing here was suggested");
 
         // And the same track is asked about again: what was already asked is
-        // part of the queue that asked it.
-        r.app.current_target = None;
-        r.app.status.playing = true;
-        r.app.status.current_id = 1;
-        let _ = requests(&r);
-        r.app.refresh_for_test();
+        // part of the queue that asked it. Asked as the queue is built, because
+        // that is where the row it starts on learns nothing follows it.
         assert_eq!(radios_asked(&r), vec!["0016d".to_string()]);
     }
 
@@ -13025,8 +13061,9 @@ mod tests {
         assert_eq!(r.app.queue_pos, 1, "the skip goes to the next track");
         assert_eq!(
             preloaded(&r),
-            vec![2],
-            "loaded from scratch, not skipped to"
+            vec![2, 2],
+            "loaded from scratch, not skipped to - and the repeat holds it behind \
+             itself, which is what makes a repeat gapless like any other change"
         );
     }
 
@@ -13067,8 +13104,14 @@ mod tests {
         r.app.favorites = (1..=n).map(|i| track(i, "T", "A")).collect();
         r.app.on_key(code(KeyCode::Enter));
         r.app.on_key(key('s'));
-        // The resolve for the first track has landed, so nothing is in flight.
+        // The resolve for the first track has landed, so nothing is in flight -
+        // and nothing is held behind it either. The preload asked for as the
+        // track was loaded named the row that followed it in the *listing*
+        // order, which the shuffle has since dealt away; a change of order does
+        // not reach into what mpv already has, so the fixture starts from
+        // before there is anything to reach into.
         r.app.current_target = None;
+        r.app.next_intended = None;
         let _ = requests(&r);
         r
     }
@@ -13173,7 +13216,10 @@ mod tests {
         // advance, so the track fetched during the last minute of the current
         // one was usually not the track that turned up - a whole track
         // downloaded for nothing, and a gap where the gapless handover should
-        // have been. With an order the two are the same question.
+        // have been. With an order the two are the same question. Read from what
+        // the queue says it is holding rather than from the requests, because
+        // the ask goes out as the track is loaded and a later tick has nothing
+        // left to send.
         let mut r = playing_shuffled(10);
         for round in 0..3 {
             let expected = r
@@ -13183,8 +13229,8 @@ mod tests {
             r.app.status.playing = true;
             r.app.status.ended = false;
             r.app.refresh_for_test();
-            let asked = preloaded(&r);
-            assert_eq!(asked, expected.into_iter().collect::<Vec<_>>(), "{round}");
+            let asked = r.app.next_intended;
+            assert_eq!(asked, expected, "{round}");
 
             // The track ends before mpv took the preload, so the fallback loads
             // the next one from scratch: the same one, or it was a guess.
@@ -13195,7 +13241,7 @@ mod tests {
             let _ = requests(&r);
             assert_eq!(
                 r.app.now_playing.as_ref().map(|t| t.id),
-                asked.first().copied(),
+                asked,
                 "what was preloaded is what plays, round {round}"
             );
         }
@@ -13385,16 +13431,19 @@ mod tests {
         r.app.on_key(key('s'));
         r.app.current_target = None;
         r.app.continue_radio = true;
-        for _ in 0..8 {
-            if !play_on(&mut r) {
-                break;
-            }
+        for _ in 0..6 {
+            assert!(play_on(&mut r), "eight rows leave seven advances");
         }
         let before = play_order(&r.app);
         assert_ne!(before, listing(8), "shuffled before the queue grew");
 
+        // The last row of the order, loaded rather than advanced onto by a tick:
+        // loading a track is where the queue learns nothing follows it, and the
+        // radio is asked from there.
+        let last = r.app.next_pos(Repeat::Off).expect("one row still to play");
+        r.app.load_fresh(last);
+        r.app.current_target = None;
         r.app.status.playing = true;
-        r.app.refresh_for_test();
         assert_eq!(radios_asked(&r), vec!["0016d".to_string()]);
         r.to_app
             .send(radio_page("0016d", 20..28))
@@ -14284,7 +14333,7 @@ mod tests {
             .set_paths_for_test("/nonexistent/token.json".into(), credentials_fixture());
         r.to_app
             .send(FromWorker::Failed {
-                task: Task::Resolve,
+                task: Task::Resolve { track_id: 1 },
                 fault: Fault::SignedOut,
                 detail: "resolve: refused".into(),
             })
@@ -14305,7 +14354,7 @@ mod tests {
         r.app.current_target = Some(1); // the current track is loading
         r.to_app
             .send(FromWorker::Failed {
-                task: Task::Resolve,
+                task: Task::Resolve { track_id: 1 },
                 fault: Fault::Unreachable,
                 detail: "resolve: connection reset".into(),
             })
@@ -14315,14 +14364,16 @@ mod tests {
         assert!(!r.app.is_buffering(), "and not stuck buffering either");
         assert!(r.app.now_playing.is_none(), "the failed track is cleared");
 
-        // A preload resolve failure (nothing loading) only drops the preload.
+        // A preload resolve failure only drops the preload - and the track
+        // being loaded now stays untouched even though its own resolve is in
+        // flight beside it, which is what naming the failure by its track buys.
         r.app.now_playing = Some(track(2, "U", "B"));
         r.app.status.playing = true; // the current track plays fine
-        r.app.current_target = None; // it already resolved
+        r.app.current_target = Some(2); // and its stream is still on its way
         r.app.next_intended = Some(3); // a gapless preload was requested
         r.to_app
             .send(FromWorker::Failed {
-                task: Task::Resolve,
+                task: Task::Resolve { track_id: 3 },
                 fault: Fault::Unreachable,
                 detail: "resolve: connection reset".into(),
             })
@@ -14332,6 +14383,11 @@ mod tests {
         assert!(
             r.app.now_playing.is_some(),
             "but the playing track is untouched"
+        );
+        assert_eq!(
+            r.app.current_target,
+            Some(2),
+            "and the load it is waiting on is still waited on"
         );
     }
 
@@ -15190,7 +15246,11 @@ mod tests {
             Some(3),
             "the entry under the cursor is the one that plays"
         );
-        assert_eq!(resolved_ids(&requests(&r)), vec![3]);
+        assert_eq!(
+            resolved_ids(&requests(&r)),
+            vec![3, 4],
+            "and the row under it is held behind it"
+        );
     }
 
     #[test]
