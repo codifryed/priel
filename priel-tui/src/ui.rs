@@ -3273,7 +3273,14 @@ fn push_heart(bar: &mut ControlBar, app: &App, t: &Theme) {
         Hit::FavoriteNowPlaying,
         heart_style(kept, t),
     );
-    bar.button("+ ", Hit::AddNowPlaying, t.control());
+    // Foreground only, like the heart it sits beside. `t.control()` is the
+    // header's raised surface, and it belongs to controls that stand alone on a
+    // backing of their own; used here it painted a grey block into the middle of
+    // a line of text, between the heart and the title, on the one row where the
+    // three facts are meant to read as a sentence. Faint rather than the accent
+    // because it is the quieter of the pair: the heart carries a state in its
+    // colour, and this carries none.
+    bar.button("+ ", Hit::AddNowPlaying, Style::default().fg(t.faint));
 }
 
 /// The bar and the two times: elapsed pinned left, length pinned right, bar
@@ -5487,6 +5494,29 @@ mod tests {
             // The add-to-playlist control sits between the heart and the title.
             text(&mut sc.app, 100, 20).contains("\u{2661} + Playing"),
             "and the glyph followed it"
+        );
+    }
+
+    #[test]
+    fn the_playing_tracks_two_controls_sit_on_the_row_rather_than_on_a_block() {
+        // Goal: the heart and the plus are one pair of per-track controls in the
+        // middle of a line of text, not header controls. The plus carried the
+        // header's raised backing, so a grey block sat between the heart and the
+        // title on a row where nothing else has one. Method: read both backings
+        // out of one frame - the only place the two can be compared as painted.
+        let mut sc = screen();
+        favorites_arrive(&mut sc, vec![track(1, "Playing")]);
+        sc.app.now_playing = Some(track(1, "Playing"));
+        let heart = painted_backing(&mut sc.app, 100, 20, Hit::FavoriteNowPlaying);
+        assert_eq!(
+            painted_backing(&mut sc.app, 100, 20, Hit::AddNowPlaying),
+            heart,
+            "the two controls of one row are backed alike"
+        );
+        assert_eq!(
+            heart,
+            sc.app.theme().background,
+            "and by the row they are on, not by a raised surface"
         );
     }
 
