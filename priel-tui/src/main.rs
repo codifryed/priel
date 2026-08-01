@@ -247,7 +247,13 @@ fn session(
         // every terminal that takes none, and is the half-block path that has
         // always been there - so being wrong here costs a photograph and
         // nothing else.
-        app.cover_protocol = graphics::detect_with(&graphics::Env::from_process(), &ask_terminal());
+        // Asked only where pictures are wanted at all: the probe writes an
+        // escape and waits on a reply, and doing that on the way to a mosaic
+        // nobody asked to replace would be a quarter of a second of nothing.
+        app.cover_protocol = args
+            .cover_graphics(remembered.cover_graphics)
+            .then(|| graphics::detect_with(&graphics::Env::from_process(), &ask_terminal()))
+            .flatten();
         if let Some(protocol) = app.cover_protocol {
             log::info!("cover pictures: {protocol:?}");
         }
@@ -545,6 +551,28 @@ mod tests {
     }
 
     #[test]
+    fn the_picture_switch_only_ever_turns_pictures_off() {
+        // Goal: neither the flag nor the file can force a picture onto a
+        // terminal that cannot take one - what the terminal answers decides
+        // that, and this only ever says "not even if it can". Worth having
+        // because a terminal can be wrong about itself, and because a picture
+        // that half-arrives is worse than a mosaic that arrives whole.
+        assert!(Cli::resolve_cover_graphics(false, None), "on by default");
+        assert!(
+            !Cli::resolve_cover_graphics(true, None),
+            "the flag turns it off for the run"
+        );
+        assert!(
+            !Cli::resolve_cover_graphics(false, Some(false)),
+            "and the file turns it off for good"
+        );
+        assert!(
+            !Cli::resolve_cover_graphics(true, Some(true)),
+            "a file that says yes cannot overrule the flag that says not now"
+        );
+    }
+
+    #[test]
     fn a_settled_screen_writes_no_picture_bytes_at_all() {
         // Goal: the whole reason the decision exists. A run where nothing about
         // the cover changed must cost nothing - not a smaller escape, none.
@@ -770,6 +798,7 @@ mod tests {
             exclusive: Some(true),
             log_level: Some(LogLevel::Info),
             update_check: None,
+            cover_graphics: None,
             cache_size: None,
         };
         let bare = parse(&[]);

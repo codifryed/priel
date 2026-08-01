@@ -119,6 +119,18 @@ pub struct Cli {
     #[arg(long)]
     pub no_update_check: bool,
 
+    /// Draw the album cover as half blocks, never as a picture
+    ///
+    /// priel asks the terminal at startup whether it can take a real image and
+    /// uses one where it can - kitty's protocol, iTerm2's, or sixel. This says
+    /// use the half-block mosaic instead, for the run; `cover_graphics = false`
+    /// in the settings file says it for good.
+    ///
+    /// Worth having because a terminal can be wrong about itself, and because a
+    /// picture that half-arrives is worse than a mosaic that does.
+    #[arg(long)]
+    pub no_cover_graphics: bool,
+
     /// Colour theme
     ///
     /// Defaults to `nord`, a dark theme. `terminal` uses your terminal's own
@@ -312,6 +324,23 @@ impl Cli {
             return false;
         }
         from_file.unwrap_or(true)
+    }
+
+    /// Whether the cover may be drawn as a real picture at all.
+    ///
+    /// Only ever turns it *off*: the flag is a per-run "not this time" and the
+    /// file is a standing one, and neither can force a picture onto a terminal
+    /// that cannot take one - what the terminal answers still decides that. The
+    /// same shape [`Cli::update_check`] has, for the same reason.
+    #[must_use]
+    pub fn cover_graphics(&self, from_file: Option<bool>) -> bool {
+        Self::resolve_cover_graphics(self.no_cover_graphics, from_file)
+    }
+
+    /// Pure, so it is a table of tests rather than something that needs a
+    /// terminal and a home directory.
+    pub(crate) fn resolve_cover_graphics(flag_off: bool, from_file: Option<bool>) -> bool {
+        !flag_off && from_file.unwrap_or(true)
     }
 
     /// The level to log at, from the flag, the environment, the file or the
