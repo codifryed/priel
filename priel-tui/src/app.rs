@@ -1357,12 +1357,18 @@ pub struct App {
     /// half-block path already handles - so this being wrong costs a listener a
     /// photograph rather than anything worse.
     pub cover_protocol: Option<crate::graphics::Protocol>,
-    /// The picture believed to be on screen, and where it was put.
+    /// The picture believed to be on screen: which track's, where it was put,
+    /// and **the bytes that would take it off again**.
     ///
-    /// The whole point of holding it: comparing what is wanted against what is
-    /// already there is what lets almost every frame write nothing at all. See
-    /// [`App::cover_paint`].
-    placed: Option<(u64, Rect)>,
+    /// Comparing what is wanted against what is already there is what lets
+    /// almost every frame write nothing at all - see [`App::cover_paint`].
+    ///
+    /// The erasure is kept here rather than derived from the current track,
+    /// which is the bug this shape fixes: a track with art followed by one with
+    /// none leaves nothing to look the erasure up *from*, and the picture stayed
+    /// on screen over the track that had none. Only ever a few bytes - the two
+    /// grid-drawn protocols need none at all, and kitty's is an id.
+    placed: Option<(u64, Rect, Vec<u8>)>,
     pub progress_rect: Rect,
     /// Clickable regions, rebuilt by the renderer every frame.
     pub hits: Vec<(Rect, Hit)>,
@@ -3516,7 +3522,10 @@ impl App {
             .map(|t| t.id)
             .filter(|_| self.cover_rect.width > 0 && self.cover_rect.height > 0)
             .filter(|id| self.cover_payload.as_ref().is_some_and(|(p, _)| p == id));
-        match (wanted, self.placed) {
+        match (
+            wanted,
+            self.placed.as_ref().map(|(id, rect, _)| (*id, *rect)),
+        ) {
             (None, None) => CoverPaint::Nothing,
             (None, Some(_)) => CoverPaint::Clear,
             (Some(_), None) => CoverPaint::Show {
@@ -3540,11 +3549,23 @@ impl App {
 
     /// Record what was just put on screen, so the next frame can decide to do
     /// nothing. `None` means the screen now has no picture on it.
-    pub fn cover_placed(&mut self, at: Option<Rect>) {
+    ///
+    /// `undo` is what will take this picture off again, kept now because the
+    /// moment it is needed may be a moment when there is nothing to derive it
+    /// from - see [`Self::placed`].
+    pub fn cover_placed(&mut self, at: Option<(Rect, Vec<u8>)>) {
         self.placed = match (at, self.now_playing.as_ref()) {
-            (Some(rect), Some(track)) => Some((track.id, rect)),
+            (Some((rect, undo)), Some(track)) => Some((track.id, rect, undo)),
             _ => None,
         };
+    }
+
+    /// The bytes that would take the picture on screen off again, or none.
+    #[must_use]
+    pub fn cover_undo(&self) -> &[u8] {
+        self.placed
+            .as_ref()
+            .map_or(&[], |(_, _, undo)| undo.as_slice())
     }
 
     /// The picture to put on screen, for the caller that writes it.
@@ -9743,7 +9764,7 @@ mod tests {
         // of base64 a second for a picture that did not move.
         let mut r = rig();
         with_cover(&mut r.app, 7, box_at(0, 0));
-        r.app.cover_placed(Some(box_at(0, 0)));
+        r.app.cover_placed(Some((box_at(0, 0), Vec::new())));
         assert_eq!(r.app.cover_paint(), CoverPaint::Nothing);
     }
 
@@ -9767,7 +9788,7 @@ mod tests {
         // box and leaves the photograph floating over what replaced it.
         let mut r = rig();
         with_cover(&mut r.app, 7, box_at(0, 0));
-        r.app.cover_placed(Some(box_at(0, 0)));
+        r.app.cover_placed(Some((box_at(0, 0), Vec::new())));
         r.app.cover_rect = Rect::default();
         assert_eq!(r.app.cover_paint(), CoverPaint::Clear);
     }
@@ -9779,7 +9800,7 @@ mod tests {
         // off leaks one picture per track for the length of the session.
         let mut r = rig();
         with_cover(&mut r.app, 7, box_at(0, 0));
-        r.app.cover_placed(Some(box_at(0, 0)));
+        r.app.cover_placed(Some((box_at(0, 0), Vec::new())));
         with_cover(&mut r.app, 8, box_at(0, 0));
         assert_eq!(
             r.app.cover_paint(),
@@ -9794,7 +9815,7 @@ mod tests {
         // dozen bytes and a megabyte on every resize step as a window is dragged.
         let mut r = rig();
         with_cover(&mut r.app, 7, box_at(0, 0));
-        r.app.cover_placed(Some(box_at(0, 0)));
+        r.app.cover_placed(Some((box_at(0, 0), Vec::new())));
         r.app.cover_rect = box_at(4, 2);
         assert_eq!(
             r.app.cover_paint(),

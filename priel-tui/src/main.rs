@@ -441,29 +441,32 @@ fn place_cover(app: &mut App, out: &mut dyn io::Write) -> Result<()> {
     if paint == CoverPaint::Nothing {
         return Ok(());
     }
-    let Some(payload) = app.cover_payload().cloned() else {
-        return Ok(());
-    };
     let mut bytes = Vec::new();
+    // What would take the picture already on screen off. Held from when it was
+    // placed rather than looked up now: a track with art followed by one with
+    // none leaves nothing to look it up *from*, and the old cover stayed on
+    // screen over the track that had none.
+    if matches!(paint, CoverPaint::Clear | CoverPaint::Replace { .. }) {
+        bytes.extend_from_slice(app.cover_undo());
+    }
     let placed = match paint {
-        CoverPaint::Nothing => None,
-        CoverPaint::Clear => {
-            bytes.extend_from_slice(&graphics::clear(&payload));
-            None
-        }
-        CoverPaint::Replace { rect } => {
-            bytes.extend_from_slice(&graphics::clear(&payload));
-            bytes.extend_from_slice(&graphics::place(
-                &payload,
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-                false,
-            ));
-            Some(rect)
-        }
-        CoverPaint::Show { rect, transmitted } => {
+        CoverPaint::Nothing | CoverPaint::Clear => None,
+        CoverPaint::Replace { rect } | CoverPaint::Show { rect, .. } => {
+            let Some(payload) = app.cover_payload().cloned() else {
+                // Nothing to put up. Whatever was there has been taken off
+                // above, so the screen is right and the record has to say so.
+                out.write_all(&bytes)?;
+                out.flush()?;
+                app.cover_placed(None);
+                return Ok(());
+            };
+            let transmitted = matches!(
+                paint,
+                CoverPaint::Show {
+                    transmitted: true,
+                    ..
+                }
+            );
             bytes.extend_from_slice(&graphics::place(
                 &payload,
                 rect.x,
@@ -472,7 +475,7 @@ fn place_cover(app: &mut App, out: &mut dyn io::Write) -> Result<()> {
                 rect.height,
                 transmitted,
             ));
-            Some(rect)
+            Some((rect, graphics::clear(&payload)))
         }
     };
     out.write_all(&bytes)?;
@@ -569,6 +572,46 @@ mod tests {
         assert!(
             !Cli::resolve_cover_graphics(true, Some(true)),
             "a file that says yes cannot overrule the flag that says not now"
+        );
+    }
+
+    #[test]
+    fn a_track_with_no_art_takes_the_last_ones_picture_off() {
+        // Goal: the bug this shape fixes. The erasure used to be looked up from
+        // the track playing *now*, and a track with art followed by one with
+        // none leaves nothing to look it up from - so the request to take the
+        // picture off was made, found nothing to make it with, and gave up. The
+        // previous cover then sat over a track that had none, for as long as
+        // that track played.
+        let (mut app, _to, _from) = App::rigged();
+        app.cover_protocol = Some(crate::graphics::Protocol::Kitty);
+        app.now_playing = Some(priel_core::Track {
+            id: 7,
+            title: "With art".into(),
+            cover: "abc".into(),
+            ..priel_core::Track::default()
+        });
+        app.cover_payload = Some((
+            7,
+            crate::graphics::Payload::Kitty {
+                id: 1,
+                transmit: b"PIC".to_vec(),
+            },
+        ));
+        let up = drive_pictures(&mut app, vec![None, Some(press('q'))]);
+        assert!(!up.is_empty(), "the picture went up");
+
+        // The next track has none at all, so nothing can be derived from it.
+        app.now_playing = Some(priel_core::Track {
+            id: 8,
+            title: "No art".into(),
+            ..priel_core::Track::default()
+        });
+        let down = drive_pictures(&mut app, vec![None, Some(press('q'))]);
+        let text = String::from_utf8_lossy(&down);
+        assert!(
+            text.contains("a=d"),
+            "and the erasure was still written: {text:?}"
         );
     }
 
