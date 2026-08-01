@@ -12315,6 +12315,76 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reproduces an open bug: no preload is scheduled after navigating"]
+    fn walking_back_and_forth_does_not_leave_a_stale_track_queued_to_play() {
+        // Goal: reported from a real session, with shuffle on - go back, then
+        // forward, then back, let the track finish, and the one that had just
+        // played comes round again. Afterwards `H` would not step back at all
+        // until `L` was pressed once.
+        //
+        // The suspicion this pins down: `schedule_next` puts an entry in mpv's
+        // own playlist, and navigating clears priel's record of it
+        // (`next_intended`) without taking mpv's copy away. mpv then hands over
+        // gaplessly to the entry it still holds, which after this dance is the
+        // track just heard - and `adopt` is handed an id that `next_pos` no
+        // longer agrees with, so `queue_pos` lands wherever that track sits.
+        let mut r = rig();
+        r.app.favorites = (1..=4).map(|i| track(i, "T", "A")).collect();
+        r.app.shuffle = true;
+        r.app.selected = 0;
+        r.app.on_key(code(KeyCode::Enter));
+        let _ = requests(&r);
+        // Settled and playing, so the guards are where a real session has them.
+        r.app.status.playing = true;
+        r.app.status.current_id = r.app.now_playing.as_ref().expect("playing").id;
+        r.app.expected_id = r.app.status.current_id;
+        r.app.refresh_for_test();
+
+        let started_on = r.app.queue_pos;
+        // Back, forward, back. `p` steps back only near the start of a track.
+        r.app.status.position = 0.5;
+        r.app.on_key(key('p'));
+        r.app.on_key(key('n'));
+        r.app.status.position = 0.5;
+        r.app.on_key(key('p'));
+        let _ = requests(&r);
+
+        let here = r.app.queue_pos;
+        let playing_now = r.app.now_playing.as_ref().expect("a track").id;
+        let should_follow = r
+            .app
+            .next_pos(r.app.repeat)
+            .map(|p| r.app.queue[p].id)
+            .expect("something follows");
+        assert_ne!(
+            should_follow, playing_now,
+            "the track that follows is not the one playing"
+        );
+
+        // The track ends and mpv hands over. Whatever it hands over is what is
+        // in *its* playlist, which is the entry priel last asked it to preload.
+        let handed_over = r.app.next_intended.expect("a preload was scheduled");
+        assert_eq!(
+            handed_over, should_follow,
+            "what mpv holds has to be what priel now thinks comes next - a stale \
+             entry here is the bug, and it is the track just played"
+        );
+
+        r.app.status.current_id = handed_over;
+        r.app.status.ended = false;
+        r.app.refresh_for_test();
+        assert_ne!(
+            r.app.now_playing.as_ref().expect("a track").id,
+            playing_now,
+            "the track that just played must not come round again"
+        );
+        assert!(
+            r.app.playing_row() > 0 || here != started_on,
+            "and the position has to be somewhere `H` can still step back from"
+        );
+    }
+
+    #[test]
     fn previous_restarts_the_track_before_it_steps_back() {
         // Goal: the familiar transport behaviour - `p` part-way through a track
         // returns to its start, and only steps back when already near the start.
